@@ -6,100 +6,172 @@ import internal.GlobalVariable as GlobalVariable
 
 String errors = ''
 
-def rows = GlobalVariable.compareRows as ArrayList
-
+def rows  = GlobalVariable.compareRows as ArrayList
 def files = GlobalVariable.compareFiles as ArrayList
 
 String evPath = ((RunConfiguration.getReportFolder() + '\\Evidences\\Evidence_') + GlobalVariable.currencyType) + '\\'
+String validationType = GlobalVariable.currencyType   // EUR / USD / Mixte
 
-String validationType = GlobalVariable.currencyType //configuration of the currency on ematch
+// Getting file path
+String file1 = evPath + files.get(0)
 
-//Getting files path
-String file1 = evPath + files.get(0);
+FileInputStream input1 = null
+Workbook wbEnv1 = null
 
-//Reading excel files for comparison
-input1 = new FileInputStream(file1)
+try {
 
-wbEnv1 = WorkbookFactory.create(input1)
+    input1 = new FileInputStream(file1)
+    wbEnv1 = WorkbookFactory.create(input1)
 
-sheetEnv1 = wbEnv1.getSheetAt(0)
+    Sheet sheetEnv1 = wbEnv1.getSheetAt(0)
 
-int linesEnv1 = sheetEnv1.getLastRowNum()
+    int lastRowNum = sheetEnv1.getLastRowNum()                 // last index
+    int physicalRows = sheetEnv1.getPhysicalNumberOfRows()     // count of physical rows
 
-int Devise = findHeaderColumn(sheetEnv1,"Devise")
-int DeviseRef = findHeaderColumn(sheetEnv1,"Devise de ref.")
-int MontantCcy = findHeaderColumn(sheetEnv1,"Montant ccy")
-int MontantBase = findHeaderColumn(sheetEnv1,"Montant base ccy")
+    KeywordUtil.logInfo("📄 Excel file: " + file1)
+    KeywordUtil.logInfo("📊 Sheet stats -> lastRowNum(index)=" + lastRowNum + " | physicalRows=" + physicalRows + " | rowsToProcess=" + (lastRowNum))
 
-KeywordUtil.logInfo("Devise: "+Devise+"DeviseRef: "+DeviseRef+"MontantCcy"+MontantCcy+"MontantBase"+MontantBase)
+    int Devise      = findHeaderColumn(sheetEnv1, "Devise")
+    int DeviseRef   = findHeaderColumn(sheetEnv1, "Devise de ref.")
+    int MontantCcy  = findHeaderColumn(sheetEnv1, "Montant ccy")
+    int MontantBase = findHeaderColumn(sheetEnv1, "Montant base ccy")
 
-//Verify what configuration was done in ematch (EUR, USD or Mixte)
-if (validationType.contains('EUR')) {
-    for (Row row : sheetEnv1) {
-        if (row.rowNum != 0) {
-            //if currency is the same, amounts must be the same
-            if (row.getCell(Devise).toString().equalsIgnoreCase('EUR')) {
-                if (row.getCell(MontantCcy).getNumericCellValue().round(2) != row.getCell(MontantBase).getNumericCellValue().round(
-                    2)) {
-                    errors += (('[ERROR] In row number ' + row.rowNum) + ' the amounts of EUR are different.')
-                }
+    KeywordUtil.logInfo("🧾 Headers -> Devise=" + Devise + " | DeviseRef=" + DeviseRef + " | MontantCcy=" + MontantCcy + " | MontantBase=" + MontantBase)
+    KeywordUtil.logInfo("⚙️ ValidationType=" + validationType)
+
+    // stop early if header missing (prevents -1 index issues)
+    boolean needDeviseRef = !(validationType.contains("EUR") || validationType.contains("USD"))
+    if (Devise < 0 || MontantCcy < 0 || MontantBase < 0 || (needDeviseRef && DeviseRef < 0)) {
+        KeywordUtil.markFailed("[ERROR] Missing required headers. Check Excel header names.")
+        return
+    }
+
+    int processed = 0
+    int skippedNullRow = 0
+    int skippedEmptyRow = 0
+
+    // ✅ Use index loop to avoid “infinite” iteration caused by POI iterator
+    for (int i = 1; i <= lastRowNum; i++) {
+
+        Row row = sheetEnv1.getRow(i)
+
+        if (row == null) {
+            skippedNullRow++
+            continue
+        }
+
+        // skip totally empty rows (fast)
+        if (row.getLastCellNum() <= 0) {
+            skippedEmptyRow++
+            continue
+        }
+
+        processed++
+
+        String devise    = getCellText(row, Devise)
+        String deviseRef = needDeviseRef ? getCellText(row, DeviseRef) : ""
+
+        Double montantCcy  = getCellNumber(row, MontantCcy)
+        Double montantBase = getCellNumber(row, MontantBase)
+
+        if (montantCcy == null || montantBase == null) {
+            errors += "[ERROR] In row number ${i} numeric values are invalid.\n"
+            continue
+        }
+
+        double ccy  = round2(montantCcy)
+        double base = round2(montantBase)
+
+        if (validationType.contains('EUR')) {
+
+            if ("EUR".equalsIgnoreCase(devise) && ccy != base) {
+                errors += "[ERROR] In row number ${i} the amounts of EUR are different.\n"
+            }
+
+        } else if (validationType.contains('USD')) {
+
+            if ("USD".equalsIgnoreCase(devise) && ccy != base) {
+                errors += "[ERROR] In row number ${i} the amounts of USD are different.\n"
+            }
+
+        } else {
+
+            if (devise.equalsIgnoreCase(deviseRef) && ccy != base) {
+                errors += "[ERROR] In row number ${i} the amounts should be same, but they are different.\n"
             }
         }
     }
-    //if currency is the same, amounts must be the same
-    //if currency is the same, amounts must be the same
-} else if (validationType.contains('USD')) {
-    for (Row row : sheetEnv1) {
-        if (row.rowNum != 0) {
-            if (row.getCell(Devise).toString().equalsIgnoreCase('USD')) {
-                if (row.getCell(MontantCcy).getNumericCellValue().round(2) != row.getCell(MontantBase).getNumericCellValue().round(
-                    2)) {
-                    errors += (('[ERROR] In row number ' + row.rowNum) + ' the amounts of USD are different.')
-                }
-            }
-        }
-    }
-} else {
-    for (Row row : sheetEnv1) {
-        if (row.rowNum != 0) {
-            if (row.getCell(Devise).toString().equalsIgnoreCase(row.getCell(DeviseRef).toString())) {
 
-                if (row.getCell(MontantCcy).getNumericCellValue().round(2) != row.getCell(MontantBase).getNumericCellValue().round(
-                    2)) {
-                    errors += (('[ERROR] In row number ' + row.rowNum) + ' the amounts should be same, but they are different.')
-                }
-                
-            }
-        }
+    KeywordUtil.logInfo("✅ Loop finished -> processed=" + processed + " | skippedNullRow=" + skippedNullRow + " | skippedEmptyRow=" + skippedEmptyRow + " | lastRowNum=" + lastRowNum)
+
+    if (errors.trim().length() > 0) {
+        KeywordUtil.markFailed(errors)
+    } else {
+        KeywordUtil.markPassed("\n[SUCCESS] Validation of PL Economique finished successfully!\n")
     }
+
+} catch (Exception e) {
+
+    KeywordUtil.markFailed("[ERROR] Excel validation failed: " + e.getClass().getSimpleName() + " | " + e.getMessage())
+
+} finally {
+
+    try { if (wbEnv1 != null) wbEnv1.close() } catch (Exception ignored) {}
+    try { if (input1 != null) input1.close() } catch (Exception ignored) {}
 }
 
-//Fails if any validation didn't pass
-if (errors.length() > 1) {
-    KeywordUtil.markFailed(errors)
-} // Assume que o cabeçalho está na primeira linha
-// Verifica se a linha do cabeçalho existe
-// Retorna o índice da coluna se o cabeçalho for encontrado
-// Retorna -1 se o cabeçalho não for encontrado
-else {
-    KeywordUtil.markPassed('\n[SUCCESS] Validation of PL Economique finished successfully!\n')
-}
+
+// =========================
+// Helpers
+// =========================
 
 int findHeaderColumn(Sheet sheet, String headerName) {
-	Row headerRow = sheet.getRow(0)
-   
-    if (headerRow == null) {
-        KeywordUtil.markFailed("The Header "+headerName+" not found.");
-		return -1
-    }
-    
-    for (int i = 0; i < headerRow.getPhysicalNumberOfCells(); i++) {
-        Cell cell = headerRow.getCell(i)
 
-        if ((cell != null) && cell.getStringCellValue().equalsIgnoreCase(headerName)) {
+    Row headerRow = sheet.getRow(0)
+    if (headerRow == null) {
+        KeywordUtil.logInfo("[ERROR] Header row not found (row 0).")
+        return -1
+    }
+
+    DataFormatter df = new DataFormatter()
+
+    for (int i = 0; i < headerRow.getLastCellNum(); i++) {
+        Cell cell = headerRow.getCell(i)
+        String value = (cell == null) ? "" : df.formatCellValue(cell).trim()
+
+        if (value.equalsIgnoreCase(headerName)) {
             return i
         }
     }
-	KeywordUtil.markFailed("The Header "+headerName+" not found.");
+
+    KeywordUtil.logInfo("[ERROR] The Header '" + headerName + "' not found.")
     return -1
+}
+
+String getCellText(Row row, int col) {
+    Cell cell = row.getCell(col)
+    if (cell == null) return ""
+    DataFormatter df = new DataFormatter()
+    return df.formatCellValue(cell).trim()
+}
+
+Double getCellNumber(Row row, int col) {
+    Cell cell = row.getCell(col)
+    if (cell == null) return null
+
+    try {
+        if (cell.getCellType() == CellType.NUMERIC) {
+            return cell.getNumericCellValue()
+        }
+        // if number is stored as text
+        String txt = new DataFormatter().formatCellValue(cell).trim()
+        if (txt.length() == 0) return null
+        return Double.parseDouble(txt.replace(",", "."))
+    } catch (Exception e) {
+        return null
+    }
+}
+
+double round2(Double v) {
+    return Math.round(v * 100.0d) / 100.0d
 }
