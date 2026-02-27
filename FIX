@@ -1,113 +1,140 @@
-import com.kms.katalon.core.annotation.Keyword
-import com.kms.katalon.core.testdata.TestData
-import com.kms.katalon.core.util.KeywordUtil
-import com.kms.katalon.core.configuration.RunConfiguration
-import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
-import com.kms.katalon.core.windows.driver.WindowsDriverFactory
-import com.kms.katalon.core.windows.util.WindowsActionHelper
-import internal.GlobalVariable
-
 class OpenReport {
 
+    // =========================
+    // MAIN FLOW
+    // =========================
     def reportSearch(TestData refInput) {
 
-        for (int i = 1; i <= refInput.getRowNumbers(); i++) {
+        int totalRows = refInput.getRowNumbers()
+        KeywordUtil.logInfo("🟦 [START] Report generation started | rows=${totalRows}")
 
-            String reportName   = refInput.getValue(2, i)
-            String reportFormat = refInput.getValue(3, i)
-            String closingDate  = GlobalVariable.date_arrete
+        for (int i = 1; i <= totalRows; i++) {
 
+            String reportName   = safe(refInput.getValue(2, i))
+            String reportFormat = safe(refInput.getValue(3, i))
+            String closingDate  = safe(GlobalVariable.date_arrete)
+
+            KeywordUtil.logInfo("🟨 [ROW] i=${i}/${totalRows} | reportName='${reportName}' | reportFormat='${reportFormat}' | closingDate='${closingDate}'")
+
+            KeywordUtil.logInfo("🟦 [STEP] Filling inputs (Name + Format)")
             Windows.setText(findWindowsObject('Object Repository/Reports/txt_NomRapport'), reportName)
             Windows.setText(findWindowsObject('Object Repository/Reports/cbb_Format'), reportFormat)
 
-            // ✅ String compare fixed
             if (!"Rapprochement D1".equals(reportName)) {
+                KeywordUtil.logInfo("🟦 [STEP] Filling Closing Date (Date d'arrêté) because report != 'Rapprochement D1'")
                 Windows.setText(findWindowsObject('Object Repository/Reports/cbb_DateArrete'), closingDate)
+            } else {
+                KeywordUtil.logInfo("🟦 [STEP] Skipping Closing Date (Date d'arrêté) because report == 'Rapprochement D1'")
             }
 
+            KeywordUtil.logInfo("🟩 [CLICK] btn_ReportGeneration | reportName='${reportName}' | reportFormat='${reportFormat}'")
             Windows.click(findWindowsObject('Reports/btn_ReportGeneration'))
 
             Windows.delay(2)
 
+            KeywordUtil.logInfo("🟦 [STEP] Waiting report status to finish (Généré / En erreur / other)")
             clickReport(reportName, reportFormat)
 
-            WindowsActionHelper.create(WindowsDriverFactory.getWindowsSession())
-                .takeScreenshot(RunConfiguration.getReportFolder() + '\\Evidences\\' + reportName + '_' + reportFormat + '.PNG')
+            KeywordUtil.logInfo("🟦 [STEP] Taking final evidence screenshot")
+            takeShot("\\Evidences\\FINAL_${i}_${reportName}_${reportFormat}.PNG")
+
+            KeywordUtil.logInfo("✅ [DONE] Row finished i=${i}/${totalRows} | reportName='${reportName}' | reportFormat='${reportFormat}'")
         }
+
+        KeywordUtil.logInfo("🟦 [END] Report generation finished | rows=${totalRows}")
     }
 
-    // ✅ waits until status is NOT "En attente" / "En cours"
-    def void waitReportFinish() {
+    // =========================
+    // WAIT UNTIL FINISH
+    // =========================
+    def void waitReportFinish(String expectedReportName, String expectedFormat) {
+
+        KeywordUtil.logInfo("🕒 [WAIT] Start polling status | timeout=${GlobalVariable.timeout} cycles | interval=60s")
+
         for (int count = 1; count <= GlobalVariable.timeout; count++) {
 
+            String code   = getCode()
             String status = getStatus()
+
+            KeywordUtil.logInfo("🕒 [WAIT] poll=${count}/${GlobalVariable.timeout} | code='${code}' | status='${status}' | expected='${expectedReportName}' (${expectedFormat})")
 
             if (isPending(status)) {
                 Windows.delay(60)
                 continue
             }
 
-            // finished (Généré / En erreur / other)
+            KeywordUtil.logInfo("🟦 [WAIT] Status finished (not pending) | status='${status}'")
             return
         }
-        // timeout hit
+
         throw new RuntimeException("TIMEOUT")
     }
 
+    // =========================
+    // CLICK + VALIDATE
+    // =========================
     @Keyword
     def clickReport(String nom_du_rapport, String format_du_rapport) {
 
         Windows.delay(2)
 
-        String screenshotLocation = RunConfiguration.getReportFolder() + '\\Evidences\\'
+        String screenshotLocation = RunConfiguration.getReportFolder() + "\\Evidences\\"
 
-        // ✅ always read latest values BEFORE decisions
         String code   = getCode()
         String status = getStatus()
 
+        KeywordUtil.logInfo("🟦 [CHECK] Initial read | code='${code}' | status='${status}' | expectedReport='${nom_du_rapport}' | expectedFormat='${format_du_rapport}'")
+
         try {
 
-            // Only wait if we are on the expected report AND it's still processing
             if (code.equals(nom_du_rapport) && isPending(status)) {
-                waitReportFinish()
+                KeywordUtil.logInfo("🟦 [STEP] Report is pending -> waiting until finish")
+                waitReportFinish(nom_du_rapport, format_du_rapport)
+            } else {
+                KeywordUtil.logInfo("🟦 [STEP] No wait needed | (code match? ${code.equals(nom_du_rapport)}) | (pending? ${isPending(status)})")
             }
 
-            // Re-read after wait (very important)
+            // Re-read after wait
             code   = getCode()
             status = getStatus()
 
+            KeywordUtil.logInfo("🟦 [CHECK] After wait read | code='${code}' | status='${status}'")
+
             if (code.equals(nom_du_rapport) && "Généré".equalsIgnoreCase(status)) {
+
+                KeywordUtil.logInfo("✅ [SUCCESS] Report generated | report='${code}' | format='${format_du_rapport}' | status='${status}'")
+                takeShot("\\Evidences\\SUCCESS_${code}_${format_du_rapport}.PNG")
                 KeywordUtil.markPassed("[SUCCESS] Report generated: ${code} (${format_du_rapport})")
                 return
             }
 
             if (code.equals(nom_du_rapport) && "En erreur".equalsIgnoreCase(status)) {
-                WindowsActionHelper.create(WindowsDriverFactory.getWindowsSession())
-                    .takeScreenshot(screenshotLocation + '[ERROR]_' + code + '_' + format_du_rapport + '.PNG')
+
+                KeywordUtil.logInfo("🟥 [ERROR] Report in error | report='${code}' | format='${format_du_rapport}' | status='${status}'")
+                takeShot("\\Evidences\\ERROR_${code}_${format_du_rapport}.PNG")
                 KeywordUtil.markFailed("[ERROR] Report in error: ${code} (${format_du_rapport}) | Status=${status}")
                 return
             }
 
-            // any other finished status
-            WindowsActionHelper.create(WindowsDriverFactory.getWindowsSession())
-                .takeScreenshot(screenshotLocation + '[UNEXPECTED]_' + code + '_' + format_du_rapport + '.PNG')
+            KeywordUtil.logInfo("🟧 [UNEXPECTED] Finished but not success/error | report='${code}' | format='${format_du_rapport}' | status='${status}'")
+            takeShot("\\Evidences\\UNEXPECTED_${code}_${format_du_rapport}.PNG")
             KeywordUtil.markFailed("[UNEXPECTED] ${code} (${format_du_rapport}) | Status=${status}")
 
         } catch (RuntimeException e) {
 
-            // TIMEOUT
             code   = getCode()
             status = getStatus()
 
-            WindowsActionHelper.create(WindowsDriverFactory.getWindowsSession())
-                .takeScreenshot(screenshotLocation + '[TIMEOUT]_' + code + '_' + format_du_rapport + '.PNG')
+            KeywordUtil.logInfo("⏰ [TIMEOUT] Timeout waiting for report | report='${code}' | format='${format_du_rapport}' | lastStatus='${status}'")
+            takeShot("\\Evidences\\TIMEOUT_${code}_${format_du_rapport}.PNG")
 
             KeywordUtil.markFailed("[TIMEOUT] ${code} (${format_du_rapport}) | LastStatus=${status}")
         }
     }
 
-    // ---------------- helpers ----------------
-
+    // =========================
+    // HELPERS
+    // =========================
     private String getCode() {
         return Windows.getText(findWindowsObject('Reports/dat_CodeReport')).trim()
     }
@@ -118,5 +145,14 @@ class OpenReport {
 
     private boolean isPending(String status) {
         return "En attente".equalsIgnoreCase(status) || "En cours".equalsIgnoreCase(status)
+    }
+
+    private String safe(def v) {
+        return (v == null) ? "" : v.toString().trim()
+    }
+
+    private void takeShot(String relativePathFromReportFolder) {
+        WindowsActionHelper.create(WindowsDriverFactory.getWindowsSession())
+            .takeScreenshot(RunConfiguration.getReportFolder() + relativePathFromReportFolder)
     }
 }
