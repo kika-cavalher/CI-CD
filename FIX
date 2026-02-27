@@ -1,158 +1,105 @@
-class OpenReport {
+import org.apache.poi.ss.usermodel.*
+import org.apache.poi.ss.usermodel.WorkbookFactory as WorkbookFactory
+import com.kms.katalon.core.configuration.RunConfiguration as RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil as KeywordUtil
+import internal.GlobalVariable as GlobalVariable
 
-    // =========================
-    // MAIN FLOW
-    // =========================
-    def reportSearch(TestData refInput) {
+String errors = ''
 
-        int totalRows = refInput.getRowNumbers()
-        KeywordUtil.logInfo("🟦 [START] Report generation started | rows=${totalRows}")
+def rows = GlobalVariable.compareRows as ArrayList
 
-        for (int i = 1; i <= totalRows; i++) {
+def files = GlobalVariable.compareFiles as ArrayList
 
-            String reportName   = safe(refInput.getValue(2, i))
-            String reportFormat = safe(refInput.getValue(3, i))
-            String closingDate  = safe(GlobalVariable.date_arrete)
+String evPath = ((RunConfiguration.getReportFolder() + '\\Evidences\\Evidence_') + GlobalVariable.currencyType) + '\\'
 
-            KeywordUtil.logInfo("🟨 [ROW] i=${i}/${totalRows} | reportName='${reportName}' | reportFormat='${reportFormat}' | closingDate='${closingDate}'")
+String validationType = GlobalVariable.currencyType //configuration of the currency on ematch
 
-            KeywordUtil.logInfo("🟦 [STEP] Filling inputs (Name + Format)")
-            Windows.setText(findWindowsObject('Object Repository/Reports/txt_NomRapport'), reportName)
-            Windows.setText(findWindowsObject('Object Repository/Reports/cbb_Format'), reportFormat)
+//Getting files path
+String file1 = evPath + files.get(0);
 
-            if (!"Rapprochement D1".equals(reportName)) {
-                KeywordUtil.logInfo("🟦 [STEP] Filling Closing Date (Date d'arrêté) because report != 'Rapprochement D1'")
-                Windows.setText(findWindowsObject('Object Repository/Reports/cbb_DateArrete'), closingDate)
-            } else {
-                KeywordUtil.logInfo("🟦 [STEP] Skipping Closing Date (Date d'arrêté) because report == 'Rapprochement D1'")
+//Reading excel files for comparison
+input1 = new FileInputStream(file1)
+
+wbEnv1 = WorkbookFactory.create(input1)
+
+sheetEnv1 = wbEnv1.getSheetAt(0)
+
+int linesEnv1 = sheetEnv1.getLastRowNum()
+
+int Devise = findHeaderColumn(sheetEnv1,"Devise")
+int DeviseRef = findHeaderColumn(sheetEnv1,"Devise de ref.")
+int MontantCcy = findHeaderColumn(sheetEnv1,"Montant ccy")
+int MontantBase = findHeaderColumn(sheetEnv1,"Montant base ccy")
+
+KeywordUtil.logInfo("Devise: "+Devise+"DeviseRef: "+DeviseRef+"MontantCcy"+MontantCcy+"MontantBase"+MontantBase)
+
+//Verify what configuration was done in ematch (EUR, USD or Mixte)
+if (validationType.contains('EUR')) {
+    for (Row row : sheetEnv1) {
+        if (row.rowNum != 0) {
+            //if currency is the same, amounts must be the same
+            if (row.getCell(Devise).toString().equalsIgnoreCase('EUR')) {
+                if (row.getCell(MontantCcy).getNumericCellValue().round(2) != row.getCell(MontantBase).getNumericCellValue().round(
+                    2)) {
+                    errors += (('[ERROR] In row number ' + row.rowNum) + ' the amounts of EUR are different.')
+                }
             }
-
-            KeywordUtil.logInfo("🟩 [CLICK] btn_ReportGeneration | reportName='${reportName}' | reportFormat='${reportFormat}'")
-            Windows.click(findWindowsObject('Reports/btn_ReportGeneration'))
-
-            Windows.delay(2)
-
-            KeywordUtil.logInfo("🟦 [STEP] Waiting report status to finish (Généré / En erreur / other)")
-            clickReport(reportName, reportFormat)
-
-            KeywordUtil.logInfo("🟦 [STEP] Taking final evidence screenshot")
-            takeShot("\\Evidences\\FINAL_${i}_${reportName}_${reportFormat}.PNG")
-
-            KeywordUtil.logInfo("✅ [DONE] Row finished i=${i}/${totalRows} | reportName='${reportName}' | reportFormat='${reportFormat}'")
-        }
-
-        KeywordUtil.logInfo("🟦 [END] Report generation finished | rows=${totalRows}")
-    }
-
-    // =========================
-    // WAIT UNTIL FINISH
-    // =========================
-    def void waitReportFinish(String expectedReportName, String expectedFormat) {
-
-        KeywordUtil.logInfo("🕒 [WAIT] Start polling status | timeout=${GlobalVariable.timeout} cycles | interval=60s")
-
-        for (int count = 1; count <= GlobalVariable.timeout; count++) {
-
-            String code   = getCode()
-            String status = getStatus()
-
-            KeywordUtil.logInfo("🕒 [WAIT] poll=${count}/${GlobalVariable.timeout} | code='${code}' | status='${status}' | expected='${expectedReportName}' (${expectedFormat})")
-
-            if (isPending(status)) {
-                Windows.delay(60)
-                continue
-            }
-
-            KeywordUtil.logInfo("🟦 [WAIT] Status finished (not pending) | status='${status}'")
-            return
-        }
-
-        throw new RuntimeException("TIMEOUT")
-    }
-
-    // =========================
-    // CLICK + VALIDATE
-    // =========================
-    @Keyword
-    def clickReport(String nom_du_rapport, String format_du_rapport) {
-
-        Windows.delay(2)
-
-        String screenshotLocation = RunConfiguration.getReportFolder() + "\\Evidences\\"
-
-        String code   = getCode()
-        String status = getStatus()
-
-        KeywordUtil.logInfo("🟦 [CHECK] Initial read | code='${code}' | status='${status}' | expectedReport='${nom_du_rapport}' | expectedFormat='${format_du_rapport}'")
-
-        try {
-
-            if (code.equals(nom_du_rapport) && isPending(status)) {
-                KeywordUtil.logInfo("🟦 [STEP] Report is pending -> waiting until finish")
-                waitReportFinish(nom_du_rapport, format_du_rapport)
-            } else {
-                KeywordUtil.logInfo("🟦 [STEP] No wait needed | (code match? ${code.equals(nom_du_rapport)}) | (pending? ${isPending(status)})")
-            }
-
-            // Re-read after wait
-            code   = getCode()
-            status = getStatus()
-
-            KeywordUtil.logInfo("🟦 [CHECK] After wait read | code='${code}' | status='${status}'")
-
-            if (code.equals(nom_du_rapport) && "Généré".equalsIgnoreCase(status)) {
-
-                KeywordUtil.logInfo("✅ [SUCCESS] Report generated | report='${code}' | format='${format_du_rapport}' | status='${status}'")
-                takeShot("\\Evidences\\SUCCESS_${code}_${format_du_rapport}.PNG")
-                KeywordUtil.markPassed("[SUCCESS] Report generated: ${code} (${format_du_rapport})")
-                return
-            }
-
-            if (code.equals(nom_du_rapport) && "En erreur".equalsIgnoreCase(status)) {
-
-                KeywordUtil.logInfo("🟥 [ERROR] Report in error | report='${code}' | format='${format_du_rapport}' | status='${status}'")
-                takeShot("\\Evidences\\ERROR_${code}_${format_du_rapport}.PNG")
-                KeywordUtil.markFailed("[ERROR] Report in error: ${code} (${format_du_rapport}) | Status=${status}")
-                return
-            }
-
-            KeywordUtil.logInfo("🟧 [UNEXPECTED] Finished but not success/error | report='${code}' | format='${format_du_rapport}' | status='${status}'")
-            takeShot("\\Evidences\\UNEXPECTED_${code}_${format_du_rapport}.PNG")
-            KeywordUtil.markFailed("[UNEXPECTED] ${code} (${format_du_rapport}) | Status=${status}")
-
-        } catch (RuntimeException e) {
-
-            code   = getCode()
-            status = getStatus()
-
-            KeywordUtil.logInfo("⏰ [TIMEOUT] Timeout waiting for report | report='${code}' | format='${format_du_rapport}' | lastStatus='${status}'")
-            takeShot("\\Evidences\\TIMEOUT_${code}_${format_du_rapport}.PNG")
-
-            KeywordUtil.markFailed("[TIMEOUT] ${code} (${format_du_rapport}) | LastStatus=${status}")
         }
     }
-
-    // =========================
-    // HELPERS
-    // =========================
-    private String getCode() {
-        return Windows.getText(findWindowsObject('Reports/dat_CodeReport')).trim()
+    //if currency is the same, amounts must be the same
+    //if currency is the same, amounts must be the same
+} else if (validationType.contains('USD')) {
+    for (Row row : sheetEnv1) {
+        if (row.rowNum != 0) {
+            if (row.getCell(Devise).toString().equalsIgnoreCase('USD')) {
+                if (row.getCell(MontantCcy).getNumericCellValue().round(2) != row.getCell(MontantBase).getNumericCellValue().round(
+                    2)) {
+                    errors += (('[ERROR] In row number ' + row.rowNum) + ' the amounts of USD are different.')
+                }
+            }
+        }
     }
+} else {
+    for (Row row : sheetEnv1) {
+        if (row.rowNum != 0) {
+            if (row.getCell(Devise).toString().equalsIgnoreCase(row.getCell(DeviseRef).toString())) {
 
-    private String getStatus() {
-        return Windows.getText(findWindowsObject('Reports/dat_ReportStatus')).trim()
+                if (row.getCell(MontantCcy).getNumericCellValue().round(2) != row.getCell(MontantBase).getNumericCellValue().round(
+                    2)) {
+                    errors += (('[ERROR] In row number ' + row.rowNum) + ' the amounts should be same, but they are different.')
+                }
+                
+            }
+        }
     }
+}
 
-    private boolean isPending(String status) {
-        return "En attente".equalsIgnoreCase(status) || "En cours".equalsIgnoreCase(status)
-    }
+//Fails if any validation didn't pass
+if (errors.length() > 1) {
+    KeywordUtil.markFailed(errors)
+} // Assume que o cabeçalho está na primeira linha
+// Verifica se a linha do cabeçalho existe
+// Retorna o índice da coluna se o cabeçalho for encontrado
+// Retorna -1 se o cabeçalho não for encontrado
+else {
+    KeywordUtil.markPassed('\n[SUCCESS] Validation of PL Economique finished successfully!\n')
+}
 
-    private String safe(def v) {
-        return (v == null) ? "" : v.toString().trim()
+int findHeaderColumn(Sheet sheet, String headerName) {
+	Row headerRow = sheet.getRow(0)
+   
+    if (headerRow == null) {
+        KeywordUtil.markFailed("The Header "+headerName+" not found.");
+		return -1
     }
+    
+    for (int i = 0; i < headerRow.getPhysicalNumberOfCells(); i++) {
+        Cell cell = headerRow.getCell(i)
 
-    private void takeShot(String relativePathFromReportFolder) {
-        WindowsActionHelper.create(WindowsDriverFactory.getWindowsSession())
-            .takeScreenshot(RunConfiguration.getReportFolder() + relativePathFromReportFolder)
+        if ((cell != null) && cell.getStringCellValue().equalsIgnoreCase(headerName)) {
+            return i
+        }
     }
+	KeywordUtil.markFailed("The Header "+headerName+" not found.");
+    return -1
 }
