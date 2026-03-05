@@ -42,76 +42,96 @@ pipeline {
     
 }
 
-C:\Users\adgi5appjenkins>findstr /n "^" C:\Gaia\run_katalon_visible_from_jenkins.bat
-1:@echo off
-2:setlocal EnableExtensions EnableDelayedExpansion
-3:
-4:REM English comments only
-5:REM This script is called by Task Scheduler.
-6:REM Jenkins must create: C:\Gaia\katalon_args.txt (one single line with args).
-7:REM This script runs Katalon with visible Chrome (noHeadless).
-8:REM IMPORTANT: do NOT use any input/output redirection (<, >, >>, 2>&1) here.
-9:
-10:set "KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0"
-11:set "ARGS_FILE=C:\Gaia\katalon_args.txt"
-12:
-13:if not exist "%KATALON_HOME%\katalonc.exe" (
-14:  echo [bat] ERROR: katalonc.exe not found at "%KATALON_HOME%\katalonc.exe"
-15:  exit /b 3
-16:)
-17:
-18:if not exist "%ARGS_FILE%" (
-19:  echo [bat] ERROR: Args file not found: "%ARGS_FILE%"
-20:  exit /b 2
-21:)
-22:
-23:set "KATALON_ARGS="
-24:for /f "usebackq delims=" %%A in ("%ARGS_FILE%") do (
-25:  set "KATALON_ARGS=%%A"
-26:  goto :gotArgs
-27:)
-28::gotArgs
-29:
-30:if "%KATALON_ARGS%"=="" (
-31:  echo [bat] ERROR: Args file is empty: "%ARGS_FILE%"
-32:  exit /b 4
-33:)
-34:
-35:echo [bat] Running Katalon with args:
-36:echo [bat] %KATALON_ARGS%
-37:
-38:"%KATALON_HOME%\katalonc.exe" -noSplash -runMode=console %KATALON_ARGS% -browserType="Chrome" -noHeadless
-39:exit /b %ERRORLEVEL%
-C:\Users\adgi5appjenkins>schtasks /query /tn "GaiaKatalon_Visible" /v /fo list
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
 
-Folder: \
-HostName:                             SWDCFRNXGI55817
-TaskName:                             \GaiaKatalon_Visible
-Next Run Time:                        N/A
-Status:                               Ready
-Logon Mode:                           Interactive only
-Last Run Time:                        05/03/2026 18:49:47
-Last Result:                          255
-Author:                               CIB\adgi5appjenkins
-Task To Run:                          C:\Windows\System32\cmd.exe /c "C:\Gaia\run_katalon_visible_from_jenkins.bat"
-Start In:                             N/A
-Comment:                              Run Katalon Gaia TSC with visible chrome
-Scheduled Task State:                 Enabled
-Idle Time:                            Disabled
-Power Management:                     Stop On Battery Mode, No Start On Batteries
-Run As User:                          CIB\adgi5appjenkins
-Delete Task If Not Rescheduled:       Disabled
-Stop Task If Runs X Hours and X Mins: 72:00:00
-Schedule:                             Scheduling data is not available in this format.
-Schedule Type:                        At system start up
-Start Time:                           N/A
-Start Date:                           N/A
-End Date:                             N/A
-Days:                                 N/A
-Months:                               N/A
-Repeat: Every:                        N/A
-Repeat: Until: Time:                  N/A
-Repeat: Until: Duration:              N/A
-Repeat: Stop If Still Running:        N/A
+  parameters {
+    booleanParam(name: 'SHOW_BROWSER', defaultValue: true, description: 'Show Chrome UI during execution')
+  }
 
-C:\Users\adgi5appjenkins>
+  stages {
+
+    stage('Start Gaia Backend and Frontend') {
+      steps {
+        // Start backend/frontend via Windows Scheduled Task
+        bat 'schtasks /run /tn "GaiaBackFrontSetup"'
+        // Give services time to boot
+        sleep(time: 300, unit: 'SECONDS')
+      }
+    }
+
+    stage('Get bitbucket source code') {
+      steps {
+        // Clean workspace (best effort; do not fail build if something is locked)
+        cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+        // Checkout source code
+        git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f',
+            url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+      }
+    }
+
+    stage('GAIA TSC (Visible Chrome)') {
+      steps {
+        script {
+          // Fixed config (NOT parameters): suite collection stays in Jenkins, not in the task
+          def PROJECT_PATH = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
+          def TSC_PATH     = 'Test Suites/GAIA TSC'
+
+          if (!params.SHOW_BROWSER) {
+            // Headless mode: keep it simple (no task)
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              executeKatalon(
+                executeArgs: "-projectPath=\"${PROJECT_PATH}\" -browserType=\"Chrome (headless)\" -testSuiteCollectionPath=\"${TSC_PATH}\" -consoleLog -logLevel=DEBUG",
+                location: 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0',
+                version: '',
+                x11Display: '',
+                xvfbConfiguration: ''
+              )
+            }
+            return
+          }
+
+          // Visible mode: Jenkins triggers the task (Chrome visible)
+          bat """
+            if not exist C:\\Gaia mkdir C:\\Gaia
+            rem Keep TC fixed in Jenkinsfile (not a parameter)
+            echo -projectPath="${PROJECT_PATH}" -testSuiteCollectionPath="${TSC_PATH}" -consoleLog -logLevel=DEBUG > C:\\Gaia\\katalon_args.txt
+          """
+
+          bat 'schtasks /run /tn "GaiaKatalon_Visible"'
+
+          // Wait until task is no longer "Running"
+          bat '''
+            @echo off
+            set TASK=GaiaKatalon_Visible
+            set /a tries=0
+
+            :check
+            for /f "tokens=3" %%S in ('schtasks /query /tn "%TASK%" ^| findstr /i "%TASK%"') do set STATUS=%%S
+
+            echo [jenkins] Task status: %STATUS%
+
+            if /i "%STATUS%"=="Running" (
+              timeout /t 10 /nobreak >nul
+              set /a tries+=1
+              if %tries% GEQ 540 (
+                echo [jenkins] ERROR: Timeout waiting for task to finish
+                exit /b 1
+              )
+              goto check
+            )
+
+            rem Read Last Result (exit code) from verbose query
+            for /f "tokens=2 delims=:" %%R in ('schtasks /query /tn "%TASK%" /v /fo list ^| findstr /i "Last Result"') do set RESULT=%%R
+            set RESULT=%RESULT: =%
+
+            echo [jenkins] Task Last Result=%RESULT%
+
+            rem 0x0 = success; anything else = fail
+            if /i not "%RESULT%"=="0x0" exit /b 1
+          '''
+        }
+      }
+    }
+  }
+}
