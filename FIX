@@ -39,24 +39,103 @@ pipeline {
  
     
 
-@echo off
-setlocal
-start C:\Gaia\gaia-start-front.bat
-start C:\Gaia\gaia-start-back.bat
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
 
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    timeout(time: 75, unit: 'MINUTES')
+  }
 
+  environment {
+    KATALON_HOME  = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
+    PROJECT_PATH  = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
+    TSC_PATH      = 'Test Suites/GAIA TSC'
+    REPORT_FOLDER = 'Reports'
+  }
 
+  stages {
 
+    stage('🚀 Start Gaia Backend and Frontend') {
+      steps {
+        // Start backend/frontend via Scheduled Task
+        bat 'schtasks /run /tn "GaiaBackFrontSetup"'
 
+        // Short wait for services to boot (1 minute)
+        sleep(time: 60, unit: 'SECONDS')
+      }
+    }
 
+    stage('📥 Checkout gaia-portal') {
+      steps {
+        cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+        git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f',
+            url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+      }
+    }
 
+    stage('🧪 Run GAIA TSC (Katalon)') {
+      steps {
+        // Run Katalon and stream logs into Jenkins console
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+          executeKatalon(
+            location: "${env.KATALON_HOME}",
+            executeArgs:
+              "-projectPath=\"${env.PROJECT_PATH}\" " +
+              "-testSuiteCollectionPath=\"${env.TSC_PATH}\" " +
+              "-browserType=\"Chrome\" " +
+              "-noHeadless " +
+              "-consoleLog -logLevel=DEBUG " +
+              "-reportFolder=\"${env.PROJECT_PATH}\\\\${env.REPORT_FOLDER}\"",
+            version: '',
+            x11Display: '',
+            xvfbConfiguration: ''
+          )
+        }
+      }
+    }
+  }
 
+  post {
+    always {
+      // Archive reports so they are downloadable from Jenkins
+      archiveArtifacts artifacts: 'Reports/**/*.*', allowEmptyArchive: true
 
+      // Publish JUnit results (best effort)
+      junit testResults: 'Reports/**/JUnit_Report.xml', allowEmptyResults: true
 
+      // Stop Gaia Front/Back processes started by BATs (best effort)
+      powershell '''
+        $ErrorActionPreference = "SilentlyContinue"
+        function Log($m){ Write-Host "[cleanup] $m" }
 
+        Log "Stopping Gaia Front/Back processes started from C:\\Gaia..."
 
+        # Kill Node processes started from the front folder (npm start)
+        $nodeTargets = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+          Where-Object { $_.CommandLine -and $_.CommandLine -match "C:\\\\Gaia\\\\web_portal" }
 
+        foreach ($p in $nodeTargets) {
+          Log ("Stopping node PID=" + $p.ProcessId + " | " + $p.CommandLine)
+          try { Stop-Process -Id $p.ProcessId -Force } catch {}
+        }
 
+        # Kill Java processes started from the back folder (mvn spring-boot:run)
+        $javaTargets = Get-CimInstance Win32_Process -Filter "Name='java.exe'" |
+          Where-Object { $_.CommandLine -and $_.CommandLine -match "C:\\\\Gaia\\\\web_portal_back" }
 
+        foreach ($p in $javaTargets) {
+          Log ("Stopping java PID=" + $p.ProcessId + " | " + $p.CommandLine)
+          try { Stop-Process -Id $p.ProcessId -Force } catch {}
+        }
 
+        Log ("Stopped node count: " + ($nodeTargets | Measure-Object).Count)
+        Log ("Stopped java count: " + ($javaTargets | Measure-Object).Count)
+        Log "Cleanup done."
 
+        exit 0
+      '''
+    }
+  }
+}
