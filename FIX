@@ -1,353 +1,46 @@
-/*
-  File: correctionJenkins.groovy
-
-  Use in 2 ways:
-  1) Paste in Jenkins job (Pipeline script) to test quickly
-  2) Save in repo as correctionJenkins.groovy and set Jenkins job:
-     - Pipeline script from SCM
-     - Script Path: correctionJenkins.groovy
-*/
 
 pipeline {
-  agent { label 'GI5_SWDCFRNXGI55817' }
+    agent { label 'GI5_SWDCFRNXGI55817' }
 
-  parameters {
-    // Toggle UI visibility without editing code
-    booleanParam(name: 'SHOW_BROWSER', defaultValue: false, description: 'If true, try to show Chrome UI (requires interactive session). If false, run headless.')
-  }
-
-  options {
-    timestamps()                 // [LOG] timestamps in console output
-    disableConcurrentBuilds()    // [SAFETY] avoid overlapping runs on same agent
-    timeout(time: 60, unit: 'MINUTES')
-    buildDiscarder(logRotator(numToKeepStr: '30'))
-  }
-
-  environment {
-    // Katalon Engine folder (single source of truth)
-    KATALON_HOME = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
-
-    // Your known fixed location (works when project is already on disk)
-    FIXED_GAIA_DIR = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
-
-    // Suite Collection path (as used in your original pipeline)
-    GAIA_TSC_PATH = 'Test Suites/GAIA TSC'
-  }
-
-  stages {
-
-    stage('Init / Context Logs') {
-      steps {
-        script {
-          echo "[init] Node         : ${env.NODE_NAME}"
-          echo "[init] Workspace    : ${env.WORKSPACE}"
-          echo "[init] KATALON_HOME : ${env.KATALON_HOME}"
-          echo "[init] Fixed Gaia   : ${env.FIXED_GAIA_DIR}"
-          echo "[init] TSC Path     : ${env.GAIA_TSC_PATH}"
-          echo "[init] SHOW_BROWSER : ${params.SHOW_BROWSER}"
-        }
-      }
-    }
-
-    stage('UI Session Diagnostics') {
-      steps {
-        script {
-          def canShow = powershell(returnStdout: true, script: """
-            function Log(\$m){ Write-Host "[ui] \$m" }
-
-            Log ("SESSIONNAME       : " + \$env:SESSIONNAME)
-            Log ("Current PID       : " + \$PID)
-
-            \$p = Get-Process -Id \$PID -ErrorAction SilentlyContinue
-            if (\$p) { Log ("Current SessionId : " + \$p.SessionId) }
-
-            \$explorer = Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (\$explorer) {
-              Log ("Explorer SessionId: " + \$explorer.SessionId)
-            } else {
-              Log ("Explorer          : not running in this session")
+    stages {
+        
+    stage('Start Gaia Backend and Frontend'){
+        steps{
+            script{
+                echo "Start Gaia Backend and Frontend"
+                def setupTask = "GaiaBackFrontSetup"
+                bat "schtasks /run /tn \"${setupTask}\""
+                echo "Wait 180 seconds for the backend and frontend to start..."
+                sleep(time: 300, unit: 'SECONDS')
+        
             }
-
-            try {
-              Log "query user:"
-              query user | ForEach-Object { Write-Host ("[ui] " + \$_) }
-            } catch {
-              Log "query user not available (not critical)"
+            
+            
+        }
+    }
+      
+    stage('Get bitbucket source code') {
+         steps {
+            cleanWs()
+            git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f', url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+         }
+    }
+    
+    
+    
+    stage('GAIA TSC') {
+        steps {
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                executeKatalon executeArgs: '-projectPath="D:/jenkins/work/workspace/GI5/Gaia/Gaia" -browserType="Chrome" -testSuiteCollectionPath="Test Suites/GAIA TSC"', location: 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0', version: '', x11Display: '', xvfbConfiguration: ''
             }
-
-            # Heuristic for UI capability
-            \$interactive = \$false
-            if (\$p -and \$p.SessionId -ne 0 -and \$explorer) { \$interactive = \$true }
-
-            if (\$interactive) { "true" } else { "false" }
-          """).trim()
-
-          env.CAN_SHOW_UI = canShow
-          echo "[ui] CAN_SHOW_UI    : ${env.CAN_SHOW_UI}"
-
-          if (params.SHOW_BROWSER && env.CAN_SHOW_UI != 'true') {
-            echo "[ui] WARNING: SHOW_BROWSER=true but agent seems non interactive (Session 0 or no Explorer). Chrome may run invisible."
-          }
         }
-      }
     }
-
-    stage('PreClean (light)') {
-      options { timeout(time: 3, unit: 'MINUTES') }
-      steps {
-        powershell """
-          #=========================================================
-          # Light cleanup with detailed logs
-          # Safe: avoids killing Java/Katalon, only removes drivers and lock leftovers
-          #=========================================================
-          \$ErrorActionPreference = "SilentlyContinue"
-          function Log([string]\$m){ Write-Host "[preclean] \$m" }
-
-          Log ("Workspace    : " + \$env:WORKSPACE)
-          Log ("KATALON_HOME : " + \$env:KATALON_HOME)
-
-          # 1) Kill webdriver leftovers only
-          \$driverNames = @('chromedriver.exe','msedgedriver.exe','geckodriver.exe')
-          foreach (\$exe in \$driverNames) {
-            cmd /c "taskkill /IM \$exe /F /T >NUL 2>&1 & exit /b 0" | Out-Null
-          }
-          Log "Webdriver leftovers cleanup done."
-
-          # 2) Clean .katalon locks/pids only if Katalon is not running
-          \$katalonRunning = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                            Where-Object { \$_.Name -in @('katalonc.exe','eclipsec.exe') } |
-                            Select-Object -First 1
-
-          if (\$katalonRunning) {
-            Log "INFO: Katalon process detected. Skipping .katalon lock cleanup."
-          } else {
-            \$khome = Join-Path \$env:USERPROFILE '.katalon'
-            if (Test-Path \$khome) {
-              \$targets = Get-ChildItem -Path \$khome -Recurse -Include @('*.pid','*.lock','*usage*') -File -ErrorAction SilentlyContinue |
-                         Where-Object { \$_.FullName -notlike '*.lic' }
-
-              if (\$targets) {
-                \$count = 0
-                foreach (\$t in \$targets) {
-                  try { Remove-Item \$t.FullName -Force -ErrorAction Stop; \$count++; Log ("Removed: " + \$t.FullName) }
-                  catch { Log ("Remove failed: " + \$t.FullName + " -> " + \$_.Exception.Message) }
-                }
-                Log ("Lock files removed: \$count")
-              } else {
-                Log ("No lock/pid/usage files found under: " + \$khome)
-              }
-            } else {
-              Log ("No .katalon folder at: " + \$khome)
-            }
-          }
-
-          Log "PreClean done."
-        """
-
-        // Workspace clean (best effort)
-        cleanWs deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true
-      }
-    }
-
-    stage('Start Gaia Backend and Frontend') {
-      options { timeout(time: 10, unit: 'MINUTES') }
-      steps {
-        script {
-          echo "[gaia-start] Starting Backend + Frontend via Scheduled Task..."
-          def setupTask = "GaiaBackFrontSetup"
-
-          bat """
-            @echo [gaia-start] schtasks /run /tn "${setupTask}"
-            schtasks /run /tn "${setupTask}"
-            exit /b %ERRORLEVEL%
-          """
-
-          echo "[gaia-start] Waiting 300 seconds for startup..."
-          sleep(time: 300, unit: 'SECONDS')
-          echo "[gaia-start] Done waiting."
-        }
-      }
-    }
-
-    stage('Get Bitbucket Source Code') {
-      steps {
-        script { echo "[checkout] Cloning gaia-portal..." }
-        git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f',
-            url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        script { echo "[checkout] Checkout done." }
-      }
-    }
-
-    stage('Resolve Katalon Project (works in both cases)') {
-      steps {
-        script {
-          echo "[path] Resolving Katalon project .prj..."
-
-          def resolvedPrj = powershell(returnStdout: true, script: """
-            function Log(\$m){ Write-Host "[path] \$m" }
-
-            \$fixed = '${env.FIXED_GAIA_DIR}'
-            \$ws    = '${env.WORKSPACE}'
-
-            # 1) Try fixed folder first
-            if (Test-Path \$fixed) {
-              Log ("Fixed path exists: " + \$fixed)
-              \$p = Get-ChildItem -Path \$fixed -Recurse -Filter '*.prj' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-              if (\$p) {
-                Log ("Found .prj under fixed path: " + \$p.FullName)
-                return \$p.FullName
-              }
-              Log "No .prj found under fixed path."
-            } else {
-              Log ("Fixed path does not exist: " + \$fixed)
-            }
-
-            # 2) Search inside WORKSPACE
-            Log ("Searching WORKSPACE for *.prj (may take a bit if workspace is large): " + \$ws)
-            \$p2 = Get-ChildItem -Path \$ws -Recurse -Filter '*.prj' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (\$p2) {
-              Log ("Found .prj under WORKSPACE: " + \$p2.FullName)
-              return \$p2.FullName
-            }
-
-            ""
-          """).trim()
-
-          if (!resolvedPrj) {
-            error("[path] ERROR: Could not find any Katalon *.prj in fixed path or WORKSPACE.")
-          }
-
-          env.RESOLVED_PROJECT_PRJ = resolvedPrj
-          echo "[path] RESOLVED_PROJECT_PRJ: ${env.RESOLVED_PROJECT_PRJ}"
-        }
-      }
-    }
-
-    stage('GAIA TSC (logs + show or headless)') {
-      steps {
-        script {
-          //=========================================================
-          // Browser visibility decision
-          // - SHOW_BROWSER=true tries to show Chrome UI
-          // - If agent session is not interactive, we force headless to avoid confusion
-          //=========================================================
-          def wantUI = params.SHOW_BROWSER
-          def canUI  = (env.CAN_SHOW_UI == 'true')
-          def useUI  = (wantUI && canUI)
-
-          def browserType = useUI ? 'Chrome' : 'Chrome (headless)'
-          def noHeadless  = useUI ? '-noHeadless' : ''
-
-          echo "[katalon] wantUI=${wantUI} canUI=${canUI} useUI=${useUI}"
-          echo "[katalon] browserType=${browserType} noHeadless='${noHeadless}'"
-
-          def reportFolder = "${env.WORKSPACE}\\Reports"
-          def logFile      = "${env.WORKSPACE}\\katalon_console.log"
-
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            powershell """
-              #=========================================================
-              # Run Katalon with:
-              # - Live console logs (Jenkins Console Output)
-              # - File log via Tee-Object: katalon_console.log
-              #=========================================================
-              \$ErrorActionPreference = "Stop"
-
-              function Log(\$m){ Write-Host "[katalon] \$m" }
-
-              \$exe = Join-Path '${env.KATALON_HOME}' 'katalonc.exe'
-              if (!(Test-Path \$exe)) {
-                throw "Katalon engine not found at: \$exe"
-              }
-
-              # Build args as an array to avoid quoting issues
-              \$args = @(
-                '-projectPath="${env.RESOLVED_PROJECT_PRJ}"',
-                '-browserType="${browserType}"',
-                '-testSuiteCollectionPath="${env.GAIA_TSC_PATH}"',
-                '${noHeadless}',
-                '-consoleLog',
-                '-logLevel=DEBUG',
-                '-reportFolder="${reportFolder}"'
-              ) | Where-Object { \$_ -and \$_.Trim() -ne '' }
-
-              Log ("Engine      : " + \$exe)
-              Log ("Log file    : " + '${logFile}')
-              Log ("ReportFolder: " + '${reportFolder}')
-              Log ("Args        : " + (\$args -join ' '))
-
-              New-Item -ItemType Directory -Force -Path '${reportFolder}' | Out-Null
-
-              # Execute and tee output to file (keeps live logs + saves for download)
-              & \$exe \$args 2>&1 | Tee-Object -FilePath '${logFile}'
-
-              \$code = \$LASTEXITCODE
-              Log ("Exit code   : " + \$code)
-
-              exit \$code
-            """
-          }
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      script {
-        echo "[post] Final Build Result: ${currentBuild.currentResult}"
-      }
-
-      powershell """
-        function Log(\$m){ Write-Host "[post] \$m" }
-
-        \$wk = \$env:WORKSPACE
-        Log ("Workspace: " + \$wk)
-
-        \$log = Join-Path \$wk 'katalon_console.log'
-        if (Test-Path \$log) {
-          Log "katalon_console.log exists. Last 80 lines:"
-          Get-Content \$log -Tail 80 | ForEach-Object { Write-Host ("[post] " + \$_) }
-        } else {
-          Log "katalon_console.log not found."
-        }
-
-        \$rep = Join-Path \$wk 'Reports'
-        if (Test-Path \$rep) {
-          Log "Reports folder exists. Latest files:"
-          Get-ChildItem \$rep -Recurse -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 15 FullName,Length,LastWriteTime |
-            ForEach-Object { Write-Host ("[post] " + \$_.FullName) }
-        } else {
-          Log "Reports folder not found."
-        }
-      """
-
-      // Archive build artifacts for after-run inspection
-      archiveArtifacts artifacts: 'katalon_console.log, Reports/**/*.*', allowEmptyArchive: true
-
-      // Optional: single zip for convenience
-      powershell """
-        \$wk  = \$env:WORKSPACE
-        \$zip = Join-Path \$wk 'gaia_artifacts.zip'
-        if (Test-Path \$zip) { Remove-Item \$zip -Force -ErrorAction SilentlyContinue }
-
-        \$toZip = @()
-        \$log = Join-Path \$wk 'katalon_console.log'
-        \$rep = Join-Path \$wk 'Reports'
-
-        if (Test-Path \$log) { \$toZip += \$log }
-        if (Test-Path \$rep) { \$toZip += \$rep }
-
-        if (\$toZip.Count -gt 0) {
-          Compress-Archive -Path \$toZip -DestinationPath \$zip -Force
-          Write-Host "[post] Created zip: \$zip"
-        } else {
-          Write-Host "[post] Nothing to zip."
-        }
-      """
-      archiveArtifacts artifacts: 'gaia_artifacts.zip', allowEmptyArchive: true
-    }
-  }
+    
+ 
+    
 }
+    
+}
+
+
+
