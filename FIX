@@ -46,96 +46,36 @@ pipeline {
 
 
 
-
 pipeline {
   agent { label 'GI5_SWDCFRNXGI55817' }
 
   parameters {
-    // If true -> tries to run with visible Chrome (requires interactive agent session)
-    // If false -> forces headless browser type
-    booleanParam(name: 'SHOW_BROWSER', defaultValue: true, description: 'Try to SHOW Chrome UI. If agent is Session 0 (Windows Service), Chrome may be invisible.')
+    booleanParam(name: 'SHOW_BROWSER', defaultValue: true, description: 'Show Chrome UI using Scheduled Task (works even if agent is Windows Service).')
   }
 
   options {
-    timestamps()              // Console log with timestamps
-    disableConcurrentBuilds() // Avoid parallel executions on same agent
+    timestamps()
+    disableConcurrentBuilds()
     timeout(time: 60, unit: 'MINUTES')
   }
 
   environment {
-    // Katalon engine folder
-    KATALON_HOME   = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
-
-    // Your old working path (keep as fallback)
-    FIXED_GAIA_DIR = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
-
-    // Same suite collection path you already run
-    GAIA_TSC_PATH  = 'Test Suites/GAIA TSC'
+    KATALON_HOME      = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
+    FIXED_GAIA_DIR    = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
+    GAIA_TSC_PATH     = 'Test Suites/GAIA TSC'
+    REPORT_FOLDER     = "${env.WORKSPACE}\\Reports"
+    KATALON_LOG_FILE  = "${env.WORKSPACE}\\katalon_console.log"
   }
 
   stages {
 
-    stage('Init / Context Logs') {
-      steps {
-        script {
-          echo "[init] Node         : ${env.NODE_NAME}"
-          echo "[init] Workspace    : ${env.WORKSPACE}"
-          echo "[init] KATALON_HOME : ${env.KATALON_HOME}"
-          echo "[init] FIXED_GAIA   : ${env.FIXED_GAIA_DIR}"
-          echo "[init] SHOW_BROWSER : ${params.SHOW_BROWSER}"
-        }
-      }
-    }
-
-    stage('UI Diagnostics (non-blocking)') {
-      steps {
-        script {
-          // NOTE: This stage MUST NEVER fail the pipeline.
-          // We force exit 0 no matter what.
-          def diag = powershell(returnStdout: true, script: '''
-            $ErrorActionPreference = "SilentlyContinue"
-            function Log($m){ Write-Host "[ui] $m" }
-
-            Log ("SESSIONNAME        : " + $env:SESSIONNAME)
-
-            $p = Get-Process -Id $PID -ErrorAction SilentlyContinue
-            if ($p) { Log ("Current SessionId  : " + $p.SessionId) }
-
-            $explorer = Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($explorer) { Log ("Explorer SessionId : " + $explorer.SessionId) }
-            else { Log ("Explorer           : not running in this session") }
-
-            # query user can set LASTEXITCODE != 0 sometimes -> force cmd exit 0
-            cmd /c "query user & exit 0" | ForEach-Object { Write-Host ("[ui] " + $_) }
-
-            # Print final hint (does NOT affect pipeline result)
-            if ($p -and $p.SessionId -eq 0) {
-              Log "HINT: SessionId=0 usually means Jenkins agent runs as Windows Service. UI apps may be invisible."
-            } else {
-              Log "HINT: Interactive session detected. UI should be visible when SHOW_BROWSER=true."
-            }
-
-            exit 0
-          ''').trim()
-
-          // Just to keep the console friendly
-          echo "[ui] Diagnostics finished."
-        }
-      }
-    }
-
     stage('Start Gaia Backend and Frontend') {
       steps {
         script {
-          echo "[gaia-start] Start Gaia Backend and Frontend"
-          def setupTask = "GaiaBackFrontSetup"
-
-          // Scheduled task trigger
-          bat "schtasks /run /tn \"${setupTask}\""
-
-          echo "[gaia-start] Wait 300 seconds for backend/frontend..."
+          echo "[gaia-start] Starting Backend + Frontend (Scheduled Task)"
+          bat 'schtasks /run /tn "GaiaBackFrontSetup"'
+          echo "[gaia-start] Waiting 300 seconds..."
           sleep(time: 300, unit: 'SECONDS')
-          echo "[gaia-start] Done waiting."
         }
       }
     }
@@ -143,39 +83,26 @@ pipeline {
     stage('Get Bitbucket Source Code') {
       steps {
         cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
-
         echo "[checkout] Cloning gaia-portal..."
         git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f',
             url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        echo "[checkout] Done."
       }
     }
 
-    stage('Resolve Katalon Project Path (works in both cases)') {
+    stage('Resolve Katalon Project Path') {
       steps {
         script {
-          echo "[path] Resolving Katalon project..."
-
-          // Return a directory path that contains *.prj, preferring FIXED_GAIA_DIR
           def resolvedDir = powershell(returnStdout: true, script: """
             \$ErrorActionPreference = "SilentlyContinue"
-
-            \$fixed = '${env.FIXED_GAIA_DIR}'
-            \$ws    = '${env.WORKSPACE}'
-
             function FindPrjDir(\$root) {
               if (!(Test-Path \$root)) { return '' }
               \$p = Get-ChildItem -Path \$root -Recurse -Filter '*.prj' -File -ErrorAction SilentlyContinue | Select-Object -First 1
               if (\$p) { return \$p.Directory.FullName }
               return ''
             }
-
-            \$dir = FindPrjDir \$fixed
-            if ([string]::IsNullOrWhiteSpace(\$dir)) {
-              \$dir = FindPrjDir \$ws
-            }
-
-            if ([string]::IsNullOrWhiteSpace(\$dir)) { Write-Output '' } else { Write-Output \$dir }
+            \$dir = FindPrjDir '${env.FIXED_GAIA_DIR}'
+            if ([string]::IsNullOrWhiteSpace(\$dir)) { \$dir = FindPrjDir '${env.WORKSPACE}' }
+            if ([string]::IsNullOrWhiteSpace(\$dir)) { '' } else { \$dir }
             exit 0
           """).trim()
 
@@ -189,42 +116,50 @@ pipeline {
       }
     }
 
-    stage('GAIA TSC (logs + show or headless toggle)') {
+    stage('GAIA TSC (VISIBLE or HEADLESS)') {
       steps {
         script {
-          //========================================================
-          // Visibility toggle
-          //========================================================
-          // If SHOW_BROWSER=true -> try normal Chrome + -noHeadless
-          // If SHOW_BROWSER=false -> force Chrome (headless)
-          //
-          // IMPORTANT: If Jenkins agent is Session 0 (Windows Service),
-          // Chrome may still be invisible even with -noHeadless.
-          //========================================================
-          def browserType = params.SHOW_BROWSER ? 'Chrome' : 'Chrome (headless)'
-          def noHeadless  = params.SHOW_BROWSER ? ' -noHeadless' : ''
+          echo "[katalon] SHOW_BROWSER=${params.SHOW_BROWSER}"
 
-          def args =
-            "-projectPath=\"${env.RESOLVED_PROJECT_DIR}\" " +
-            "-browserType=\"${browserType}\" " +
-            "-testSuiteCollectionPath=\"${env.GAIA_TSC_PATH}\"" +
-            "${noHeadless} " +
-            "-consoleLog -logLevel=DEBUG " +
-            "-reportFolder=\"${env.WORKSPACE}\\\\Reports\""
+          // Pick which Scheduled Task to run
+          def taskName = params.SHOW_BROWSER ? 'GaiaKatalon_Visible' : 'GaiaKatalon_Headless'
+          echo "[katalon] Running Scheduled Task: ${taskName}"
 
-          echo "[katalon] browserType : ${browserType}"
-          echo "[katalon] args        : ${args}"
+          // Trigger task
+          bat "schtasks /run /tn \"${taskName}\""
 
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            // Keep the original style that was working for you
-            executeKatalon(
-              executeArgs: args,
-              location: "${env.KATALON_HOME}",
-              version: '',
-              x11Display: '',
-              xvfbConfiguration: ''
-            )
-          }
+          // Wait for Katalon log to appear (means it started)
+          powershell """
+            \$ErrorActionPreference = "SilentlyContinue"
+            function Log(\$m){ Write-Host "[katalon] \$m" }
+
+            New-Item -ItemType Directory -Force -Path '${env.REPORT_FOLDER}' | Out-Null
+
+            \$log = '${env.KATALON_LOG_FILE}'
+            \$tries = 0
+            while (\$tries -lt 60 -and !(Test-Path \$log)) {
+              Start-Sleep -Seconds 2
+              \$tries++
+            }
+
+            if (Test-Path \$log) { Log "Detected log file: \$log" }
+            else { Log "WARNING: log file not detected yet (task may still be starting)." }
+
+            exit 0
+          """
+
+          // Tail log while running (best effort)
+          powershell """
+            \$ErrorActionPreference = "SilentlyContinue"
+            \$log = '${env.KATALON_LOG_FILE}'
+            if (Test-Path \$log) {
+              Write-Host "[katalon] Last 60 lines:"
+              Get-Content \$log -Tail 60 | ForEach-Object { Write-Host ("[katalon] " + \$_) }
+            } else {
+              Write-Host "[katalon] No katalon_console.log to tail yet."
+            }
+            exit 0
+          """
         }
       }
     }
@@ -232,29 +167,8 @@ pipeline {
 
   post {
     always {
-      echo "[post] Final Build Result: ${currentBuild.currentResult}"
-
-      powershell '''
-        $ErrorActionPreference = "SilentlyContinue"
-        function Log($m){ Write-Host "[post] $m" }
-
-        Log ("Workspace: " + $env:WORKSPACE)
-
-        $rep = Join-Path $env:WORKSPACE "Reports"
-        if (Test-Path $rep) {
-          Log "Reports folder exists. Latest files:"
-          Get-ChildItem $rep -Recurse -File |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 20 FullName,Length,LastWriteTime |
-            ForEach-Object { Write-Host ("[post] " + $_.FullName) }
-        } else {
-          Log "Reports folder not found."
-        }
-
-        exit 0
-      '''
-
-      archiveArtifacts artifacts: 'Reports/**/*.*', allowEmptyArchive: true
+      echo "[post] Archiving reports/logs..."
+      archiveArtifacts artifacts: 'katalon_console.log, Reports/**/*.*', allowEmptyArchive: true
     }
   }
 }
