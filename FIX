@@ -46,152 +46,139 @@ pipeline {
   }
 }
 
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-
-REM English comments only
-REM Task Scheduler calls THIS bat.
-REM Jenkins writes the Katalon arguments (WITHOUT browser flags) to:
-REM   C:\Gaia\katalon_args.txt
-REM This bat:
-REM   - reads that file
-REM   - runs Katalon with visible Chrome (adds -browserType="Chrome" -noHeadless)
-REM   - captures stdout/stderr to C:\Gaia\katalon_task.log (NO cmd redirection)
-REM   - writes exit code to C:\Gaia\katalon_exit.txt (Jenkins will read it)
-
-set "KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0"
-set "ARGS_FILE=C:\Gaia\katalon_args.txt"
-set "LOG_FILE=C:\Gaia\katalon_task.log"
-set "EXIT_FILE=C:\Gaia\katalon_exit.txt"
-
-if not exist "%KATALON_HOME%\katalonc.exe" (
-  powershell -NoProfile -Command "Set-Content -Path '%LOG_FILE%' -Value '[bat] ERROR: katalonc.exe not found' -Encoding ASCII"
-  powershell -NoProfile -Command "Set-Content -Path '%EXIT_FILE%' -Value '3' -Encoding ASCII"
-  exit /b 3
-)
-
-if not exist "%ARGS_FILE%" (
-  powershell -NoProfile -Command "Set-Content -Path '%LOG_FILE%' -Value '[bat] ERROR: katalon_args.txt not found' -Encoding ASCII"
-  powershell -NoProfile -Command "Set-Content -Path '%EXIT_FILE%' -Value '2' -Encoding ASCII"
-  exit /b 2
-)
-
-set "KATALON_ARGS="
-for /f "usebackq delims=" %%A in ("%ARGS_FILE%") do (
-  set "KATALON_ARGS=%%A"
-  goto :gotArgs
-)
-:gotArgs
-
-if "%KATALON_ARGS%"=="" (
-  powershell -NoProfile -Command "Set-Content -Path '%LOG_FILE%' -Value '[bat] ERROR: katalon_args.txt is empty' -Encoding ASCII"
-  powershell -NoProfile -Command "Set-Content -Path '%EXIT_FILE%' -Value '4' -Encoding ASCII"
-  exit /b 4
-)
-
-REM Add ONLY visibility flags here (TC stays in Jenkins)
-set "FULL_ARGS=-noSplash -runMode=console %KATALON_ARGS% -browserType=""Chrome"" -noHeadless"
-
-REM Write header to the log
-powershell -NoProfile -Command ^
-  "$h=@(); $h+='[bat] Starting Katalon'; $h+='[bat] EXE=%KATALON_HOME%\\katalonc.exe'; $h+='[bat] ARGS=%FULL_ARGS%'; Set-Content -Path '%LOG_FILE%' -Value $h -Encoding ASCII"
-
-REM Run katalonc via PowerShell and safely capture output to the log file
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$exe='%KATALON_HOME%\\katalonc.exe';" ^
-  "$args='%FULL_ARGS%';" ^
-  "$p=Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -NoNewWindow -RedirectStandardOutput '%LOG_FILE%' -RedirectStandardError '%LOG_FILE%';" ^
-  "Set-Content -Path '%EXIT_FILE%' -Value $p.ExitCode -Encoding ASCII; exit $p.ExitCode"
-
-exit /b %ERRORLEVEL%
 
 
 
-
-
-pipeline {
-  agent { label 'GI5_SWDCFRNXGI55817' }
-
-  options {
-    timestamps()
-    timeout(time: 75, unit: 'MINUTES')
-    disableConcurrentBuilds()
-  }
-
-  stages {
-
-    stage('Start Gaia Backend and Frontend') {
-      steps {
-        // Start backend/frontend via Windows Scheduled Task
-        bat 'schtasks /run /tn "GaiaBackFrontSetup"'
-        // Give services time to boot
-        sleep(time: 300, unit: 'SECONDS')
-      }
-    }
-
-    stage('Get bitbucket source code') {
-      steps {
-        // Clean workspace (best effort; do not fail build if something is locked)
-        cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
-
-        // Checkout source code
-        git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f',
-            url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-      }
-    }
-
-    stage('GAIA TSC (Visible Chrome via Task)') {
-      steps {
-        script {
-          // Fixed config (NOT parameters): TC stays hardcoded in Jenkins
-          def PROJECT_PATH = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
-          def TSC_PATH     = 'Test Suites/GAIA TSC'
-
-          // Write args file that the bat reads (WITHOUT browser flags)
-          bat """
-            if not exist C:\\Gaia mkdir C:\\Gaia
-            echo -projectPath="${PROJECT_PATH}" -testSuiteCollectionPath="${TSC_PATH}" -consoleLog -logLevel=DEBUG > C:\\Gaia\\katalon_args.txt
-            del /q C:\\Gaia\\katalon_exit.txt >NUL 2>&1
-            del /q C:\\Gaia\\katalon_task.log >NUL 2>&1
-            type C:\\Gaia\\katalon_args.txt
-          """
-
-          // Trigger scheduled task (Chrome visible)
-          bat 'schtasks /run /tn "GaiaKatalon_Visible"'
-
-          // Wait until exit code file exists (means bat finished)
-          bat '''
-            @echo off
-            set EXIT=C:\\Gaia\\katalon_exit.txt
-            set LOG=C:\\Gaia\\katalon_task.log
-
-            set /a tries=0
-            :wait
-            if exist "%EXIT%" goto done
-            timeout /t 5 /nobreak >nul
-            set /a tries+=1
-            if %tries% GEQ 600 (
-              echo [jenkins] ERROR: Timeout waiting for %EXIT%
-              if exist "%LOG%" (
-                echo [jenkins] Showing last 80 lines of log:
-                powershell -NoProfile -Command "Get-Content -Path '%LOG%' -Tail 80 -ErrorAction SilentlyContinue"
-              )
-              exit /b 1
-            )
-            goto wait
-
-            :done
-            for /f %%C in (%EXIT%) do set CODE=%%C
-            echo [jenkins] Katalon exit code=%CODE%
-
-            if not "%CODE%"=="0" (
-              echo [jenkins] Showing last 120 lines of log:
-              powershell -NoProfile -Command "Get-Content -Path '%LOG%' -Tail 120 -ErrorAction SilentlyContinue"
-              exit /b 1
-            )
-          '''
-        }
-      }
-    }
-  }
-}
+Started by user erica.cavalher-ext@natixis.com
+Running as erica.cavalher-ext@natixis.com
+[Pipeline] Start of Pipeline
+[Pipeline] node
+Running on GI5_SWDCFRNXGI55817 in D:\jenkins\work\workspace\GI5\Gaia\Gaia
+[Pipeline] {
+[Pipeline] timestamps
+[Pipeline] {
+[Pipeline] timeout
+18:42:42  Timeout set to expire in 1 hr 15 min
+[Pipeline] {
+[Pipeline] stage
+[Pipeline] { (Start Gaia Backend and Frontend)
+[Pipeline] bat
+18:42:42  
+18:42:42  D:\jenkins\work\workspace\GI5\Gaia\Gaia>schtasks /run /tn "GaiaBackFrontSetup" 
+18:42:42  SUCCESS: Attempted to run the scheduled task "GaiaBackFrontSetup".
+[Pipeline] sleep
+18:42:42  Sleeping for 1 min 40 sec
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Get bitbucket source code)
+[Pipeline] cleanWs
+18:44:23  [WS-CLEANUP] Deleting project workspace...
+18:44:23  [WS-CLEANUP] Deferred wipeout is disabled by the job configuration...
+18:44:23  [WS-CLEANUP] done
+[Pipeline] git
+18:44:23  The recommended git tool is: NONE
+18:44:23  using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+18:44:23  Cloning the remote Git repository
+18:44:23  Cloning repository https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git
+18:44:23   > git init D:\jenkins\work\workspace\GI5\Gaia\Gaia # timeout=10
+18:44:23  Fetching upstream changes from https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git
+18:44:23   > git --version # timeout=10
+18:44:23   > git --version # 'git version 2.53.0.windows.1'
+18:44:23  using GIT_ASKPASS to set credentials 
+18:44:23   > git fetch --tags --force --progress -- https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git +refs/heads/*:refs/remotes/origin/* # timeout=10
+18:44:32  Avoid second fetch
+18:44:32  Checking out Revision 1d64ed64549a41310ebd968c8c9df7dc1d92e86f (refs/remotes/origin/master)
+18:44:32   > git config remote.origin.url https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git # timeout=10
+18:44:32   > git config --add remote.origin.fetch +refs/heads/*:refs/remotes/origin/* # timeout=10
+18:44:32   > git rev-parse "refs/remotes/origin/master^{commit}" # timeout=10
+18:44:32   > git config core.sparsecheckout # timeout=10
+18:44:32   > git checkout -f 1d64ed64549a41310ebd968c8c9df7dc1d92e86f # timeout=10
+18:44:33  Commit message: "start the project"
+18:44:33   > git branch -a -v --no-abbrev # timeout=10
+18:44:33   > git checkout -b master 1d64ed64549a41310ebd968c8c9df7dc1d92e86f # timeout=10
+18:44:33   > git rev-list --no-walk 1d64ed64549a41310ebd968c8c9df7dc1d92e86f # timeout=10
+18:44:33  The recommended git tool is: NONE
+18:44:33  using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+18:44:33  The recommended git tool is: NONE
+18:44:33  using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+18:44:33  [GitCheckoutListener] Recording commits of 'git https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+18:44:33  [GitCheckoutListener] Found previous build 'GI5/Gaia/Gaia #102' that contains recorded Git commits
+18:44:33  [GitCheckoutListener] -> Starting recording of new commits since '1d64ed6'
+18:44:33  [GitCheckoutListener] -> Using head commit '1d64ed6' as starting point
+18:44:33  [GitCheckoutListener] -> Git commit decorator could not be created for SCM 'hudson.plugins.git.GitSCM@76257120'
+18:44:33  [GitCheckoutListener] -> No new commits found
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (GAIA TSC (Visible Chrome via Task))
+[Pipeline] script
+[Pipeline] {
+[Pipeline] bat
+18:44:33   > git rev-parse "HEAD^{commit}" # timeout=10
+18:44:34  
+18:44:34  D:\jenkins\work\workspace\GI5\Gaia\Gaia>if not exist C:\Gaia mkdir C:\Gaia 
+18:44:34  
+18:44:34  D:\jenkins\work\workspace\GI5\Gaia\Gaia>echo -projectPath="D:/jenkins/work/workspace/GI5/Gaia/Gaia" -testSuiteCollectionPath="Test Suites/GAIA TSC" -consoleLog -logLevel=DEBUG  1>C:\Gaia\katalon_args.txt 
+18:44:34  
+18:44:34  D:\jenkins\work\workspace\GI5\Gaia\Gaia>del /q C:\Gaia\katalon_exit.txt  1>NUL 2>&1 
+18:44:34  
+18:44:34  D:\jenkins\work\workspace\GI5\Gaia\Gaia>del /q C:\Gaia\katalon_task.log  1>NUL 2>&1 
+18:44:34  
+18:44:34  D:\jenkins\work\workspace\GI5\Gaia\Gaia>type C:\Gaia\katalon_args.txt 
+18:44:34  -projectPath="D:/jenkins/work/workspace/GI5/Gaia/Gaia" -testSuiteCollectionPath="Test Suites/GAIA TSC" -consoleLog -logLevel=DEBUG 
+[Pipeline] bat
+18:44:34  
+18:44:34  D:\jenkins\work\workspace\GI5\Gaia\Gaia>schtasks /run /tn "GaiaKatalon_Visible" 
+18:44:34  SUCCESS: Attempted to run the scheduled task "GaiaKatalon_Visible".
+[Pipeline] bat
+18:44:35  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  ERROR: Input redirection is not supported, exiting the process immediately.
+18:44:45  [jenkins] ERROR: Timeout waiting for C:\Gaia\katalon_exit.txt
+[Pipeline] }
+[Pipeline] // script
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // timeout
+[Pipeline] }
+[Pipeline] // timestamps
+[Pipeline] }
+[Pipeline] // node
+[Pipeline] End of Pipeline
+ERROR: script returned exit code 1
+Finished: FAILURE
