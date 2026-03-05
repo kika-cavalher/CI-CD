@@ -37,20 +37,106 @@ pipeline {
     }
 
 
-stage('🧹 PreClean (minimal)') {
-  steps {
-    powershell '''
-      # English comments only
-      $ErrorActionPreference = "SilentlyContinue"
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
 
-      $names = @("katalonc.exe","java.exe","chrome.exe","chromedriver.exe")
-      foreach ($n in $names) { try { taskkill /IM $n /F /T | Out-Null } catch {} }
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    timeout(time: 75, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
+  }
 
-      # Remove lock files (best effort)
-      if (Test-Path "$env:WORKSPACE\\Reports") {
-        Get-ChildItem "$env:WORKSPACE\\Reports" -Recurse -Filter "*.lck" -ErrorAction SilentlyContinue |
-          ForEach-Object { try { Remove-Item $_.FullName -Force } catch {} }
+  environment {
+    KATALON_HOME = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
+    GIT_URL      = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+    GIT_CRED     = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+    REPORTS_DIR  = 'Reports'
+  }
+
+  stages {
+
+    stage('🚀 Start Gaia Backend + Frontend') {
+      steps {
+        bat 'schtasks /run /tn "GaiaBackFrontSetup"'
+        echo '⏳ Waiting 60s for Gaia to start...'
+        sleep(time: 60, unit: 'SECONDS')
       }
-    '''
+    }
+
+    stage('📥 Checkout gaia-portal') {
+      steps {
+        script {
+          // Wipe workspace without PreClean
+          deleteDir()
+
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: '*/master']],
+            userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
+            extensions: [
+              [$class: 'WipeWorkspace'],
+              [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+            ]
+          ])
+        }
+      }
+    }
+
+    stage('🧪 Run GAIA TSC (Chrome visible)') {
+      steps {
+        script {
+          echo '🟦 Starting Katalon... (Chrome visible)'
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            executeKatalon(
+              location: env.KATALON_HOME,
+              executeArgs:
+                "-projectPath=\"${env.WORKSPACE}\" " +
+                "-testSuiteCollectionPath=\"Test Suites/GAIA TSC\" " +
+                "-browserType=\"Chrome\" " +
+                "-noHeadless " +
+                "-consoleLog -logLevel=DEBUG " +
+                "-reportFolder=\"${env.WORKSPACE}\\${env.REPORTS_DIR}\"",
+              version: '',
+              x11Display: '',
+              xvfbConfiguration: ''
+            )
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      script {
+        echo '📦 Archiving reports...'
+      }
+
+      // Avoid .lck files (they commonly break archive on Windows)
+      archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+
+      // If you have JUnit XML available, publish it (adjust pattern if needed)
+      catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+        junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
+      }
+
+      script {
+        def result = currentBuild.currentResult ?: 'UNKNOWN'
+        if (result == 'SUCCESS') {
+          echo '✅ DONE: All good!'
+        } else if (result == 'UNSTABLE') {
+          echo '⚠️ DONE: Finished with test failures.'
+        } else {
+          echo '❌ DONE: Pipeline failed. Check console + Reports.'
+        }
+      }
+    }
+
+    aborted {
+      echo '🛑 ABORTED: canceled by user.'
+    }
   }
 }
