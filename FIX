@@ -1,42 +1,106 @@
 pipeline {
-    agent { label 'GI5_SWDCFRNXGI55817' }
+  agent { label 'GI5_SWDCFRNXGI55817' }
 
-    stages {
-        
-    stage('Start Gaia Backend and Frontend'){
-        steps{
-            script{
-                echo "Start Gaia Backend and Frontend"
-                def setupTask = "GaiaBackFrontSetup"
-                bat "schtasks /run /tn \"${setupTask}\""
-                echo "Wait 180 seconds for the backend and frontend to start..."
-                sleep(time: 300, unit: 'SECONDS')
-        
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    timeout(time: 45, unit: 'MINUTES')
+  }
+
+  environment {
+    // Browser for HTML→PDF helper
+    CHROME_BIN        = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
+    // Default execution profile
+    EXECUTION_PROFILE = 'prepevol05'
+    // Engine location (single source of truth)
+    KATALON_HOME      = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
+  }
+
+  stages {
+    stage('PreClean (light)') {
+      options { timeout(time: 2, unit: 'MINUTES') }
+      steps {
+        powershell '''
+          #=================
+          # Setup & Logging
+          #=================
+          $ErrorActionPreference = "SilentlyContinue"
+          function Log([string]$m){ Write-Host "[preclean] $m" }
+
+          Log ("User         : " + $env:USERNAME)
+          Log ("Workspace    : " + $env:WORKSPACE)
+          Log ("KATALON_HOME : " + $env:KATALON_HOME)
+
+          #=================
+          # 1) Do NOT kill Katalon/Java here
+          #    Only ensure webdriver leftovers are gone
+          #=================
+          $driverNames = @('chromedriver.exe','msedgedriver.exe','geckodriver.exe')
+          foreach ($exe in $driverNames) {
+            cmd /c "taskkill /IM $exe /F /T >NUL 2>&1 & exit /b 0" | Out-Null
+          }
+
+          #=================
+          # 2) Clean .katalon locks/pids/usage ONLY if no Katalon running
+          #=================
+          $katalonRunning = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -in @('katalonc.exe','eclipsec.exe') } |
+                            Select-Object -First 1
+          if ($katalonRunning) {
+            Log "INFO: Katalon process detected. Skipping .katalon lock cleanup."
+          } else {
+            $khome = Join-Path $env:USERPROFILE '.katalon'
+            if (Test-Path $khome) {
+              $targets = Get-ChildItem -Path $khome -Recurse -Include @('*.pid','*.lock','*usage*') -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.FullName -notlike '*.lic' }
+              if ($targets) {
+                $count = 0
+                foreach ($t in $targets) {
+                  try { Remove-Item $t.FullName -Force -ErrorAction Stop; $count++; Log ("Removed: " + $t.FullName) }
+                  catch { Log ("Remove failed: " + $t.FullName + " -> " + $_.Exception.Message) }
+                }
+                Log ("Lock files removed: $count")
+              } else {
+                Log ("No lock/pid/usage files found under: " + $khome)
+              }
+            } else {
+              Log ("No .katalon folder at: " + $khome)
             }
-            
-            
+          }
+
+          Log "PreClean done."
+        '''
+        // Keep workspace tidy but don't fail build if there's nothing
+        cleanWs deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true
+      }
+    }
+
+    stage('Checkout P2P project') {
+      steps {
+        git credentialsId: '40130d40-5b6c-4c9d-9314-ae82746b7456',
+            url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/p2p.git',
+            branch: 'master'
+      }
+    }
+
+    stage('Run Katalon Login Suite') {
+      steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+          executeKatalon(
+            location: "${env.KATALON_HOME}",
+            executeArgs:
+              "-projectPath=\"${env.WORKSPACE}\" " +
+              "-executionProfile=\"${env.EXECUTION_PROFILE}\" " +
+              "-browserType=\"Chrome\" " +
+              "-testSuitePath=\"Test Suites/LOGIN_GENERIC/login_suite\" " +
+              "-noHeadless -consoleLog " +
+              "-reportFolder=\"${env.WORKSPACE}\\Reports\"",
+            version: '',
+            x11Display: '',
+            xvfbConfiguration: ''
+          )
         }
+      }
     }
-      
-    stage('Get bitbucket source code') {
-         steps {
-            cleanWs()
-            git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f', url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-         }
-    }
-    
-    
-    
-    stage('GAIA TSC') {
-        steps {
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                executeKatalon executeArgs: '-projectPath="D:/jenkins/work/workspace/GI5/Gaia/Gaia" -browserType="Chrome" -testSuiteCollectionPath="Test Suites/GAIA TSC"', location: 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0', version: '', x11Display: '', xvfbConfiguration: ''
-            }
-        }
-    }
-    
- 
-    
-}
-    
+  }
 }
