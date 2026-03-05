@@ -48,4 +48,95 @@ pipeline {
 
 
 
-type C:\Gaia\katalon_args.txt
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
+
+  parameters {
+    booleanParam(name: 'SHOW_BROWSER', defaultValue: true, description: 'Show Chrome UI during execution')
+  }
+
+  stages {
+
+    stage('Start Gaia Backend and Frontend') {
+      steps {
+        // Start backend/frontend via Windows Scheduled Task
+        bat 'schtasks /run /tn "GaiaBackFrontSetup"'
+
+        // Give services time to boot
+        sleep(time: 300, unit: 'SECONDS')
+      }
+    }
+
+    stage('Get bitbucket source code') {
+      steps {
+        // Clean workspace (best effort; do not fail build if something is locked)
+        cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+
+        // Checkout source code
+        git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f',
+            url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+      }
+    }
+
+    stage('GAIA TSC (Visible Chrome)') {
+      steps {
+        script {
+          // Fixed config (NOT parameters): suite collection is hardcoded here
+          def PROJECT_PATH = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
+          def TSC_PATH     = 'Test Suites/GAIA TSC'
+
+          if (!params.SHOW_BROWSER) {
+            // Headless mode: run inside Jenkins and capture exit code normally
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+              executeKatalon(
+                executeArgs: "-projectPath=\"${PROJECT_PATH}\" -browserType=\"Chrome (headless)\" -testSuiteCollectionPath=\"${TSC_PATH}\" -consoleLog -logLevel=DEBUG",
+                location: 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0',
+                version: '',
+                x11Display: '',
+                xvfbConfiguration: ''
+              )
+            }
+            return
+          }
+
+          // Visible mode: Jenkins writes args, triggers task, waits for completion, fails if needed
+          bat """
+            if not exist C:\\Gaia mkdir C:\\Gaia
+            rem Write args file (TC is fixed here, not a parameter)
+            echo -projectPath="${PROJECT_PATH}" -testSuiteCollectionPath="${TSC_PATH}" -consoleLog -logLevel=DEBUG > C:\\Gaia\\katalon_args.txt
+          """
+
+          // Trigger the scheduled task (Chrome visible)
+          bat 'schtasks /run /tn "GaiaKatalon_Visible"'
+
+          // Wait until task is no longer "Running" and then read Last Result
+          bat '''
+            @echo off
+            set TASK=GaiaKatalon_Visible
+            set /a tries=0
+
+            :check
+            for /f "tokens=3" %%S in ('schtasks /query /tn "%TASK%" ^| findstr /i "%TASK%"') do set STATUS=%%S
+            echo [jenkins] Task status: %STATUS%
+
+            if /i "%STATUS%"=="Running" (
+              timeout /t 10 /nobreak >nul
+              set /a tries+=1
+              if %tries% GEQ 540 (
+                echo [jenkins] ERROR: Timeout waiting for task to finish
+                exit /b 1
+              )
+              goto check
+            )
+
+            for /f "tokens=2 delims=:" %%R in ('schtasks /query /tn "%TASK%" /v /fo list ^| findstr /i "Last Result"') do set RESULT=%%R
+            set RESULT=%RESULT: =%
+            echo [jenkins] Task Last Result=%RESULT%
+
+            if /i not "%RESULT%"=="0x0" exit /b 1
+          '''
+        }
+      }
+    }
+  }
+}
