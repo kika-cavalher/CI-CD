@@ -45,109 +45,101 @@ pipeline {
 
   }
 }
-
-
 pipeline {
   agent { label 'GI5_SWDCFRNXGI55817' }
 
-  parameters {
-    booleanParam(name: 'SHOW_BROWSER', defaultValue: true, description: 'Show Chrome UI during execution')
+  options {
+    timestamps()                 // Add timestamps to Jenkins console output
+    disableConcurrentBuilds()    // Prevent parallel runs on the same agent
+    timeout(time: 75, unit: 'MINUTES')
   }
 
-  options {
-    timestamps()
-    timeout(time: 75, unit: 'MINUTES')
-    disableConcurrentBuilds()
+  environment {
+    // Single source of truth for Katalon Engine location
+    KATALON_HOME   = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
+
+    // Project path used by Katalon
+    PROJECT_PATH   = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
+
+    // Suite Collection to run (fixed, not a parameter)
+    TSC_PATH       = 'Test Suites/GAIA TSC'
+
+    // Where Jenkins will keep reports
+    REPORT_FOLDER  = 'Reports'
   }
 
   stages {
 
     stage('Start Gaia Backend and Frontend') {
       steps {
-        // Start backend/frontend via Windows Scheduled Task
+        // Start backend/frontend via Scheduled Task
         bat 'schtasks /run /tn "GaiaBackFrontSetup"'
 
-        // Give services time to boot
-        sleep(time: 300, unit: 'SECONDS')
+        // Short wait for services to boot (1 minute)
+        sleep(time: 60, unit: 'SECONDS')
       }
     }
 
-    stage('Get bitbucket source code') {
+    stage('Checkout gaia-portal') {
       steps {
-        // Clean workspace (best effort; do not fail build if something is locked)
+        // Clean workspace (best effort)
         cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
 
-        // Checkout source code
+        // Clone repository
         git credentialsId: '965eceec-b3a3-4ec5-8820-a857c87dd80f',
             url: 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
       }
     }
 
-    stage('GAIA TSC') {
+    stage('Run GAIA TSC (Katalon)') {
       steps {
-        script {
-          // Fixed config (NOT parameters): suite collection is hardcoded here
-          def PROJECT_PATH = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
-          def TSC_PATH     = 'Test Suites/GAIA TSC'
-          def KATALON_HOME = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
-          def VISIBLE_TASK = 'GaiaKatalon_Visible'
-
-          if (params.SHOW_BROWSER) {
-            // Visible mode:
-            // 1) Jenkins writes args file using PowerShell (no cmd redirection)
-            // 2) Jenkins triggers Scheduled Task (Chrome visible)
-            // 3) Jenkins waits for task completion and fails build if it failed
-            bat """
-              powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-                "if (!(Test-Path 'C:\\\\Gaia')) { New-Item -ItemType Directory -Path 'C:\\\\Gaia' | Out-Null } ; " ^
-                "Set-Content -Path 'C:\\\\Gaia\\\\katalon_args.txt' -Value '-projectPath=\\"${PROJECT_PATH}\\" -testSuiteCollectionPath=\\"${TSC_PATH}\\" -consoleLog -logLevel=DEBUG' -Encoding ASCII"
-            """
-
-            bat "schtasks /query /tn \"${VISIBLE_TASK}\""
-            bat "schtasks /run /tn \"${VISIBLE_TASK}\""
-
-            // Wait until task is no longer Running, then read Last Result (0x0 = success)
-            bat """
-              @echo off
-              set TASK=${VISIBLE_TASK}
-              set /a tries=0
-
-              :check
-              for /f "tokens=3" %%S in ('schtasks /query /tn "%TASK%" ^| findstr /i "%TASK%"') do set STATUS=%%S
-              echo [jenkins] Task status: %STATUS%
-
-              if /i "%STATUS%"=="Running" (
-                timeout /t 10 /nobreak >nul
-                set /a tries+=1
-                if %tries% GEQ 540 (
-                  echo [jenkins] ERROR: Timeout waiting for task to finish
-                  exit /b 1
-                )
-                goto check
-              )
-
-              for /f "tokens=2 delims=:" %%R in ('schtasks /query /tn "%TASK%" /v /fo list ^| findstr /i "Last Result"') do set RESULT=%%R
-              set RESULT=%RESULT: =%
-              echo [jenkins] Task Last Result=%RESULT%
-
-              if /i not "%RESULT%"=="0x0" exit /b 1
-            """
-
-          } else {
-            // Headless mode:
-            // Run inside Jenkins and capture exit code normally
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-              executeKatalon(
-                executeArgs: "-projectPath=\"${PROJECT_PATH}\" -browserType=\"Chrome (headless)\" -testSuiteCollectionPath=\"${TSC_PATH}\" -consoleLog -logLevel=DEBUG",
-                location: KATALON_HOME,
-                version: '',
-                x11Display: '',
-                xvfbConfiguration: ''
-              )
-            }
-          }
+        // Run Katalon from Jenkins and stream logs in Console Output
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+          executeKatalon(
+            location: "${env.KATALON_HOME}",
+            executeArgs:
+              "-projectPath=\"${env.PROJECT_PATH}\" " +
+              "-testSuiteCollectionPath=\"${env.TSC_PATH}\" " +
+              "-browserType=\"Chrome\" " +
+              "-noHeadless " +
+              "-consoleLog -logLevel=DEBUG " +
+              "-reportFolder=\"${env.PROJECT_PATH}\\\\${env.REPORT_FOLDER}\"",
+            version: '',
+            x11Display: '',
+            xvfbConfiguration: ''
+          )
         }
       }
+    }
+  }
+
+  post {
+    always {
+      // Archive Katalon reports so you can download them from Jenkins
+      archiveArtifacts artifacts: 'Reports/**/*.*', allowEmptyArchive: true
+
+      // Publish JUnit results in Jenkins (best effort)
+      junit testResults: 'Reports/**/JUnit_Report.xml', allowEmptyResults: true
+
+      // Quick tail of the latest execution log if it exists (best effort)
+      powershell '''
+        $ErrorActionPreference="SilentlyContinue"
+        $rep = Join-Path $env:WORKSPACE "Reports"
+        if (Test-Path $rep) {
+          $lastLog = Get-ChildItem $rep -Recurse -Filter "execution*.log" -ErrorAction SilentlyContinue |
+                     Sort-Object LastWriteTime -Descending |
+                     Select-Object -First 1
+          if ($lastLog) {
+            Write-Host "[post] Last execution log: $($lastLog.FullName)"
+            Get-Content $lastLog.FullName -Tail 120 | ForEach-Object { Write-Host $_ }
+          } else {
+            Write-Host "[post] No execution*.log found."
+          }
+        } else {
+          Write-Host "[post] Reports folder not found."
+        }
+        exit 0
+      '''
     }
   }
 }
