@@ -37,141 +37,20 @@ pipeline {
     }
 
 
+stage('🧹 PreClean (minimal)') {
+  steps {
+    powershell '''
+      # English comments only
+      $ErrorActionPreference = "SilentlyContinue"
 
-pipeline {
-  agent { label 'GI5_SWDCFRNXGI55817' }
+      $names = @("katalonc.exe","java.exe","chrome.exe","chromedriver.exe")
+      foreach ($n in $names) { try { taskkill /IM $n /F /T | Out-Null } catch {} }
 
-  options {
-    timestamps()
-    disableConcurrentBuilds()
-    timeout(time: 75, unit: 'MINUTES')
-    ansiColor('xterm')
-  }
-
-  environment {
-    KATALON_HOME  = 'C:/Users/adgi5appjenkins/Documents/Katalon_Studio_Engine_Windows_64-8.1.0'
-    REPO_URL      = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-    REPO_CRED     = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-    PROJECT_PATH  = 'D:/jenkins/work/workspace/GI5/Gaia/Gaia'
-    TSC_PATH      = 'Test Suites/GAIA TSC'
-    REPORT_DIR    = 'Reports'
-  }
-
-  stages {
-
-    stage('🧹 PreClean (unlock workspace)') {
-      steps {
-        powershell '''
-          # English comments only
-          $ErrorActionPreference = "SilentlyContinue"
-          function Log($m){ Write-Host "[preclean] $m" }
-
-          Log "Killing common lockers (best effort)..."
-
-          $names = @(
-            "katalonc.exe","eclipsec.exe",
-            "java.exe",
-            "chrome.exe","chromedriver.exe",
-            "node.exe","npm.exe",
-            "cmd.exe"
-          )
-
-          foreach ($n in $names) {
-            try { taskkill /IM $n /F /T | Out-Null } catch {}
-          }
-
-          Start-Sleep -Seconds 2
-          Log "PreClean done."
-        '''
+      # Remove lock files (best effort)
+      if (Test-Path "$env:WORKSPACE\\Reports") {
+        Get-ChildItem "$env:WORKSPACE\\Reports" -Recurse -Filter "*.lck" -ErrorAction SilentlyContinue |
+          ForEach-Object { try { Remove-Item $_.FullName -Force } catch {} }
       }
-    }
-
-    stage('🚀 Start Gaia Backend and Frontend') {
-      steps {
-        // Start backend/frontend via Scheduled Task
-        bat 'schtasks /run /tn "GaiaBackFrontSetup"'
-
-        // Short wait for services to boot (1 minute)
-        sleep(time: 60, unit: 'SECONDS')
-      }
-    }
-
-    stage('📥 Checkout gaia-portal (fresh)') {
-      steps {
-        script {
-          // Hard reset workspace to avoid corrupt .git and locked files
-          deleteDir()
-        }
-
-        // Try a normal cleanup too (best effort)
-        cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
-
-        // Fresh clone
-        git credentialsId: "${env.REPO_CRED}", url: "${env.REPO_URL}", branch: 'master'
-      }
-    }
-
-    stage('🧪 Run GAIA TSC (Katalon)') {
-      steps {
-        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-          executeKatalon(
-            location: "${env.KATALON_HOME}",
-            executeArgs:
-              "-projectPath=\"${env.PROJECT_PATH}\" " +
-              "-testSuiteCollectionPath=\"${env.TSC_PATH}\" " +
-              "-browserType=\"Chrome\" " +
-              "-noHeadless " +
-              "-consoleLog -logLevel=DEBUG " +
-              "-reportFolder=\"${env.PROJECT_PATH}\\\\${env.REPORT_DIR}\"",
-            version: '',
-            x11Display: '',
-            xvfbConfiguration: ''
-          )
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      // Ensure no process is still locking report files before archiving
-      powershell '''
-        # English comments only
-        $ErrorActionPreference = "SilentlyContinue"
-        function Log($m){ Write-Host "[post] $m" }
-
-        Log "Stopping lockers before archiving..."
-
-        $names = @(
-          "katalonc.exe","eclipsec.exe",
-          "java.exe",
-          "chrome.exe","chromedriver.exe",
-          "node.exe","npm.exe"
-        )
-
-        foreach ($n in $names) {
-          try { taskkill /IM $n /F /T | Out-Null } catch {}
-        }
-
-        # Remove lock files if they exist
-        $locks = Get-ChildItem -Path "$env:WORKSPACE\\Reports" -Recurse -Filter "*.lck" -ErrorAction SilentlyContinue
-        foreach ($f in $locks) {
-          try { Remove-Item $f.FullName -Force } catch {}
-        }
-
-        Log "Post cleanup done."
-      '''
-
-      // Archive without failing the post block
-      catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-        archiveArtifacts artifacts: 'Reports/**/*.*', excludes: '**/*.lck', allowEmptyArchive: true
-      }
-
-      // Optional JUnit publish (best effort)
-      catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-        junit testResults: 'Reports/**/JUnit_Report.xml', allowEmptyResults: true
-      }
-    }
+    '''
   }
 }
-    
