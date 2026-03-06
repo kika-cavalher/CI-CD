@@ -1,53 +1,26 @@
-2️⃣ Volta este arquivo fixo
-C:\Gaia\run_katalon_visible_from_jenkins.bat
-@echo off
-setlocal
-
-set COMMAND_FILE=C:\Gaia\visible_katalon_command.bat
-set STATUS_FILE=C:\Gaia\gaia_visible_status.txt
-set LOG_FILE=C:\Gaia\gaia_visible_console.log
-
-if exist "%STATUS_FILE%" del /f /q "%STATUS_FILE%"
-if exist "%LOG_FILE%" del /f /q "%LOG_FILE%"
-
-if not exist "%COMMAND_FILE%" (
-    > "%STATUS_FILE%" echo EXIT_CODE=999
-    exit /b 999
-)
-
-call "%COMMAND_FILE%" > "%LOG_FILE%" 2>&1
-set EXIT_CODE=%ERRORLEVEL%
-
-> "%STATUS_FILE%" echo EXIT_CODE=%EXIT_CODE%
-exit /b %EXIT_CODE%
-3️⃣ Mantém estes BATs simples
-C:\Gaia\gaia-start-front.bat
-@echo off
-setlocal
-title GAIA_FRONT_CMD
-
-cd /d C:\Gaia\web_portal
-npm start
-C:\Gaia\gaia-start-back.bat
-@echo off
-setlocal
-title GAIA_BACK_CMD
-
-set JAVA_HOME=C:\Program Files\Microsoft\jdk-21.0.2.13-hotspot
-set PATH=%JAVA_HOME%\bin;%PATH%
-
-cd /d C:\Gaia\web_portal_back
-mvn spring-boot:run
-4️⃣ Pipeline rollback para o ponto que estava funcionando melhor
 pipeline {
-    agent { label 'GI5_SWDCFRNXGI55817' }
+    // Do not allocate a node globally.
+    // We will choose the node inside the main execution stage.
+    agent none
 
     options {
+        // Add timestamps to every console line.
         timestamps()
+
+        // Enable ANSI colors in console output.
         ansiColor('xterm')
+
+        // Do not allow two builds of this pipeline at the same time.
+        // This helps prevent workspace duplication and @2/@3 folders.
         disableConcurrentBuilds()
-        timeout(time: 75, unit: 'MINUTES')
+
+        // Global pipeline timeout.
+        timeout(time: 50, unit: 'MINUTES')
+
+        // Keep build history under control.
         buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
+
+        // We will checkout manually.
         skipDefaultCheckout(true)
     }
 
@@ -57,241 +30,318 @@ pipeline {
             choices: ['VISIBLE', 'HEADLESS'],
             description: 'Choose how Chrome should run'
         )
+
         string(
             name: 'STARTUP_WAIT_SECONDS',
-            defaultValue: '45',
+            defaultValue: '60',
             description: 'Seconds to wait after Gaia startup'
         )
     }
 
     environment {
-        KATALON_HOME        = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0'
-        GIT_URL             = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        GIT_CRED            = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-        REPORTS_DIR         = 'Reports'
-        DISPLAY_WIDTH       = '1920'
-        DISPLAY_HEIGHT      = '1080'
-        VISIBLE_TASK_NAME   = 'GaiaKatalon_Visible'
-        VISIBLE_COMMAND_BAT = 'C:\\Gaia\\visible_katalon_command.bat'
-        VISIBLE_STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
-        VISIBLE_LOG_FILE    = 'C:\\Gaia\\gaia_visible_console.log'
+        // Katalon Engine installation path.
+        KATALON_HOME   = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0'
+
+        // Repository URL.
+        GIT_URL        = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+
+        // Jenkins credential ID for Git access.
+        GIT_CRED       = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+
+        // Real project file name found in the Gaia workspace.
+        PROJECT_FILE   = 'gaia-portal.prj'
+
+        // Reports folder inside the fixed workspace.
+        REPORTS_DIR    = 'Reports'
+
+        // Browser display settings.
+        DISPLAY_WIDTH  = '1920'
+        DISPLAY_HEIGHT = '1080'
+
+        // Fixed workspace to avoid @2, @3 and @tmp folders.
+        FIXED_WS       = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia'
+
+        // Scheduled task used by Gaia backend and frontend startup.
+        GAIA_START_TASK = 'GaiaBackFrontSetup'
     }
 
     stages {
+        stage('Execute on proper node') {
+            agent {
+                node {
+                    // Use the visible node for visible runs.
+                    // Use the standard node for headless runs.
+                    label "${params.RUN_MODE == 'VISIBLE' ? 'GI5_SWDCFRNXGI55817_VISIBLE' : 'GI5_SWDCFRNXGI55817'}"
 
-        stage('Start Gaia Backend + Frontend') {
-            steps {
-                echo 'Starting Gaia backend and frontend'
-                bat 'schtasks /run /tn "GaiaBackFrontSetup"'
-                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
-            }
-        }
-
-        stage('Checkout gaia-portal') {
-            steps {
-                deleteDir()
-
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/master']],
-                    userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
-                    extensions: [
-                        [$class: 'WipeWorkspace'],
-                        [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-                    ]
-                ])
-            }
-        }
-
-        stage('Prepare Execution') {
-            steps {
-                script {
-                    bat """
-                        @echo off
-                        if exist "${env.WORKSPACE}\\${env.REPORTS_DIR}" rmdir /s /q "${env.WORKSPACE}\\${env.REPORTS_DIR}"
-                        mkdir "${env.WORKSPACE}\\${env.REPORTS_DIR}"
-                    """
-
-                    env.PROJECT_PATH = powershell(
-                        returnStdout: true,
-                        script: """
-                            \$prj = Get-ChildItem -Path "${env.WORKSPACE}" -Filter *.prj -Recurse -ErrorAction SilentlyContinue |
-                                   Select-Object -First 1 -ExpandProperty FullName
-                            if (-not \$prj) {
-                                Write-Error "No .prj file found under workspace: ${env.WORKSPACE}"
-                                exit 1
-                            }
-                            Write-Output \$prj
-                        """
-                    ).trim()
-
-                    env.PROJECT_DIR = powershell(
-                        returnStdout: true,
-                        script: """
-                            Split-Path -Path "${env.PROJECT_PATH}" -Parent
-                        """
-                    ).trim()
-
-                    echo "Project file found: ${env.PROJECT_PATH}"
-                    echo "Project directory: ${env.PROJECT_DIR}"
+                    // Force Jenkins to always use the exact same workspace.
+                    customWorkspace "${env.FIXED_WS}"
                 }
             }
-        }
 
-        stage('Execute Gaia Suites') {
-            steps {
-                script {
-                    def suites = [
-                        [name: 'Help',                   path: 'Test Suites/Help'],
-                        [name: 'AddCorrection',          path: 'Test Suites/AddCorrection'],
-                        [name: 'ComputationSelection',   path: 'Test Suites/Computation Selection'],
-                        [name: 'CorrectedDuplication',   path: 'Test Suites/CorrectedDuplication'],
-                        [name: 'CorrectionDetails',      path: 'Test Suites/CorrectionDetails'],
-                        [name: 'DownloadInvalidRecords', path: 'Test Suites/DownloadInvalidRecords']
-                    ]
+            stages {
 
-                    for (suite in suites) {
-                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            runGaiaSuite(suite)
+                stage('Environment Setup') {
+                    steps {
+                        script {
+                            // Print a clear execution header.
+                            echo "========================================"
+                            echo "Starting Gaia pipeline"
+                            echo "Build Number : ${env.BUILD_NUMBER}"
+                            echo "Node         : ${env.NODE_NAME}"
+                            echo "Workspace    : ${env.WORKSPACE}"
+                            echo "Run Mode     : ${params.RUN_MODE}"
+                            echo "Project File : ${env.PROJECT_FILE}"
+                            echo "========================================"
+                        }
+
+                        bat """
+                            @echo off
+                            REM -------------------------------------------------
+                            REM Prepare reports structure in the fixed workspace.
+                            REM -------------------------------------------------
+
+                            echo Preparing reports directory...
+
+                            if exist "${env.REPORTS_DIR}" (
+                                echo Cleaning existing reports...
+                                rmdir /s /q "${env.REPORTS_DIR}"
+                            )
+
+                            mkdir "${env.REPORTS_DIR}"
+                            mkdir "${env.REPORTS_DIR}\\_jenkins_summary"
+
+                            echo Reports directory ready.
+                            exit /b 0
+                        """
+
+                        script {
+                            // Create the summary file used later by Jenkins.
+                            writeFile file: "${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
+
+                            echo "Environment setup completed"
+                        }
+                    }
+                }
+
+                stage('Start Gaia Backend + Frontend') {
+                    steps {
+                        script {
+                            // Print a clear startup section.
+                            echo "========================================"
+                            echo "Starting Gaia backend and frontend"
+                            echo "Task Name: ${env.GAIA_START_TASK}"
+                            echo "========================================"
+                        }
+
+                        bat """
+                            @echo off
+                            REM -------------------------------------------------
+                            REM Start Gaia backend and frontend via Task Scheduler.
+                            REM -------------------------------------------------
+
+                            schtasks /run /tn "${env.GAIA_START_TASK}"
+                            exit /b 0
+                        """
+
+                        script {
+                            // Wait for Gaia startup to stabilize.
+                            echo "Waiting ${params.STARTUP_WAIT_SECONDS}s for Gaia to start..."
+                        }
+
+                        sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
+
+                        script {
+                            echo "Gaia startup wait finished"
+                        }
+                    }
+                }
+
+                stage('Checkout gaia-portal') {
+                    steps {
+                        script {
+                            // Print a clear workspace cleanup section.
+                            echo "========================================"
+                            echo "Cleaning fixed workspace before checkout"
+                            echo "Fixed Workspace: ${env.FIXED_WS}"
+                            echo "========================================"
+                        }
+
+                        // Clean the fixed workspace only.
+                        deleteDir()
+
+                        script {
+                            // Print checkout details.
+                            echo "========================================"
+                            echo "Checking out repository"
+                            echo "Branch: master"
+                            echo "Repo  : ${env.GIT_URL}"
+                            echo "========================================"
+                        }
+
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: '*/master']],
+                            userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
+                            extensions: [
+                                // Wipe the fixed workspace before checkout.
+                                [$class: 'WipeWorkspace'],
+
+                                // Full clone with timeout.
+                                [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+                            ]
+                        ])
+
+                        bat """
+                            @echo off
+                            REM -------------------------------------------------
+                            REM Recreate report folders after checkout.
+                            REM -------------------------------------------------
+
+                            if not exist "${env.REPORTS_DIR}" mkdir "${env.REPORTS_DIR}"
+                            if not exist "${env.REPORTS_DIR}\\_jenkins_summary" mkdir "${env.REPORTS_DIR}\\_jenkins_summary"
+
+                            exit /b 0
+                        """
+
+                        script {
+                            // Reset the summary file after checkout.
+                            writeFile file: "${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
+
+                            echo "Checkout completed successfully"
+                        }
+                    }
+                }
+
+                stage('Run GAIA TSC') {
+                    steps {
+                        script {
+                            // Define browser type.
+                            def browserType = 'Chrome'
+
+                            // Build Chrome arguments based on run mode.
+                            def chromeArgs = buildChromeArgs(params.RUN_MODE)
+
+                            // Print Katalon execution header.
+                            echo "========================================"
+                            echo "Starting Katalon"
+                            echo "Suite Collection : Test Suites/GAIA TSC"
+                            echo "Browser          : ${browserType}"
+                            echo "Run Mode         : ${params.RUN_MODE}"
+                            echo "Node             : ${env.NODE_NAME}"
+                            echo "Workspace        : ${env.WORKSPACE}"
+                            echo "Project Path     : ${env.WORKSPACE}\\${env.PROJECT_FILE}"
+                            echo "Report Folder    : ${env.WORKSPACE}\\${env.REPORTS_DIR}"
+                            echo "========================================"
+
+                            // Do not swallow manual aborts.
+                            // If the user aborts, Jenkins should stop immediately.
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE',
+                                catchInterruptions: false
+                            ) {
+                                executeKatalon(
+                                    // Katalon installation path.
+                                    location: env.KATALON_HOME,
+
+                                    // Full execution arguments.
+                                    executeArgs:
+                                        "-projectPath=\"${env.WORKSPACE}\\${env.PROJECT_FILE}\" " +
+                                        "-testSuiteCollectionPath=\"Test Suites/GAIA TSC\" " +
+                                        "-browserType=\"${browserType}\" " +
+                                        "-consoleLog -logLevel=DEBUG " +
+                                        "-reportFolder=\"${env.WORKSPACE}\\${env.REPORTS_DIR}\" " +
+                                        chromeArgs,
+
+                                    // Plugin required placeholders.
+                                    version: '',
+                                    x11Display: '',
+                                    xvfbConfiguration: ''
+                                )
+                            }
+
+                            echo "Katalon execution finished"
                         }
                     }
                 }
             }
-        }
-    }
 
-    post {
-        always {
-            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+            post {
+                always {
+                    script {
+                        echo "Archiving reports..."
+                    }
 
-            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
+                    archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                        junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
+                    }
+
+                    script {
+                        // Build a clear final status message.
+                        def result = currentBuild.currentResult ?: 'UNKNOWN'
+
+                        if (result == 'SUCCESS') {
+                            echo "SUCCESS: All good"
+                        } else if (result == 'UNSTABLE') {
+                            echo "UNSTABLE: Finished with test failures"
+                        } else if (result == 'ABORTED') {
+                            echo "ABORTED: Build was canceled by user"
+                        } else {
+                            echo "FAILURE: Pipeline failed. Check console and reports"
+                        }
+                    }
+                }
+
+                aborted {
+                    echo 'ABORTED: cancel requested by user. Stopping external processes now...'
+
+                    bat """
+                        @echo off
+                        REM -------------------------------------------------
+                        REM Stop external processes immediately when aborted.
+                        REM This helps Jenkins abort without waiting forever.
+                        REM -------------------------------------------------
+
+                        schtasks /end /tn "${env.GAIA_START_TASK}" >nul 2>&1
+
+                        taskkill /IM katalonc.exe /T /F >nul 2>&1
+                        taskkill /IM chrome.exe /T /F >nul 2>&1
+                        taskkill /IM chromedriver.exe /T /F >nul 2>&1
+                        taskkill /IM java.exe /T /F >nul 2>&1
+                        taskkill /IM cmd.exe /T /F >nul 2>&1
+
+                        exit /b 0
+                    """
+                }
             }
-        }
-
-        success {
-            echo 'SUCCESS: Pipeline completed successfully'
-        }
-
-        unstable {
-            echo 'UNSTABLE: Some suites failed, but execution continued'
-        }
-
-        failure {
-            echo 'FAILURE: Pipeline failed'
-        }
-
-        aborted {
-            echo 'ABORTED: Pipeline canceled by user'
         }
     }
 }
 
-def runGaiaSuite(suite) {
-    def reportDir = "${env.WORKSPACE}\\${env.REPORTS_DIR}\\${suite.name}"
+/**
+ * Build Chrome arguments for each execution mode.
+ */
+def buildChromeArgs(runMode) {
+    // Headless mode arguments.
+    if (runMode == 'HEADLESS') {
+        def args = [
+            '--headless=new',
+            "--window-size=${env.DISPLAY_WIDTH},${env.DISPLAY_HEIGHT}",
+            '--no-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage'
+        ]
 
-    echo "========================================"
-    echo "Suite Name : ${suite.name}"
-    echo "Suite Path : ${suite.path}"
-    echo "Run Mode   : ${params.RUN_MODE}"
-    echo "Project    : ${env.PROJECT_PATH}"
-    echo "Report Dir : ${reportDir}"
-    echo "========================================"
-
-    bat """
-        @echo off
-        if exist "${reportDir}" rmdir /s /q "${reportDir}"
-        mkdir "${reportDir}"
-    """
-
-    if (params.RUN_MODE == 'HEADLESS') {
-        executeKatalon(
-            location: env.KATALON_HOME,
-            executeArgs:
-                "-projectPath=\"${env.PROJECT_PATH}\" " +
-                "-testSuitePath=\"${suite.path}\" " +
-                "-browserType=\"Chrome\" " +
-                "-consoleLog -logLevel=DEBUG " +
-                "-reportFolder=\"${reportDir}\" " +
-                "--config -webui.chrome.args='--headless=new --window-size=1920,1080 --disable-gpu --disable-dev-shm-usage --no-sandbox'",
-            version: '',
-            x11Display: '',
-            xvfbConfiguration: ''
-        )
-        return
+        return "--config -webui.chrome.args='${args.join(' ')}'"
     }
 
-    def visibleCommand = """@echo off
-cd /d "${env.PROJECT_DIR}"
-call "C:\\Gaia\\set_java_17_gaia.bat"
-call "${env.KATALON_HOME}\\katalonc.exe" -projectPath="${env.PROJECT_PATH}" -testSuitePath="${suite.path}" -browserType="Chrome" -consoleLog -logLevel=DEBUG -reportFolder="${reportDir}" --config -webui.chrome.args="--window-size=1920,1080 --start-maximized"
-exit /b %ERRORLEVEL%
-"""
+    // Visible mode arguments.
+    def args = [
+        "--window-size=${env.DISPLAY_WIDTH},${env.DISPLAY_HEIGHT}",
+        '--start-maximized'
+    ]
 
-    writeFile file: 'visible_katalon_command.bat', text: visibleCommand
-
-    bat """
-        @echo off
-        copy /Y "${env.WORKSPACE}\\visible_katalon_command.bat" "${env.VISIBLE_COMMAND_BAT}" >nul
-        if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}"
-        if exist "${env.VISIBLE_LOG_FILE}" del /f /q "${env.VISIBLE_LOG_FILE}"
-    """
-
-    bat "schtasks /run /tn \"${env.VISIBLE_TASK_NAME}\""
-
-    powershell """
-        \$statusFile = "${env.VISIBLE_STATUS_FILE}"
-        \$timeoutMinutes = 30
-        \$start = Get-Date
-
-        Write-Host "Waiting visible execution for suite: ${suite.name}"
-
-        while (\$true) {
-            if (Test-Path \$statusFile) {
-                Write-Host "Status file found"
-                Get-Content \$statusFile
-                break
-            }
-
-            if (((Get-Date) - \$start).TotalMinutes -ge \$timeoutMinutes) {
-                Write-Error "Timeout waiting for suite ${suite.name}"
-                exit 1
-            }
-
-            Start-Sleep -Seconds 5
-        }
-    """
-
-    def exitCode = powershell(
-        returnStdout: true,
-        script: """
-            \$statusFile = "${env.VISIBLE_STATUS_FILE}"
-
-            if (!(Test-Path \$statusFile)) {
-                Write-Output "999"
-                exit 0
-            }
-
-            \$content = Get-Content \$statusFile | Select-Object -First 1
-
-            if (\$content -match 'EXIT_CODE=(\\d+)') {
-                Write-Output \$matches[1]
-            } else {
-                Write-Output "998"
-            }
-        """
-    ).trim()
-
-    echo "Suite ${suite.name} exit code: ${exitCode}"
-
-    if (exitCode != '0') {
-        powershell """
-            \$logFile = "${env.VISIBLE_LOG_FILE}"
-            if (Test-Path \$logFile) {
-                Write-Host "===== RUNNER LOG: ${suite.name} ====="
-                Get-Content \$logFile | Select-Object -Last 100
-            }
-        """
-        error("Suite ${suite.name} failed with exit code ${exitCode}")
-    }
+    return "--config -webui.chrome.args='${args.join(' ')}'"
 }
