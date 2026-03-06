@@ -1,55 +1,363 @@
-✅ Troca esse arquivo por este
-C:\Gaia\set_java_17_gaia.bat
-@echo off
-set JAVA_HOME=C:\config\jdk-17.0.12
-set PATH=%JAVA_HOME%\bin;%PATH%
-java -version
-exit /b 0
-O que removi
+pipeline {
+    agent {
+        node {
+            // Always run on the same Jenkins agent
+            label 'GI5_SWDCFRNXGI55817'
 
-setlocal
+            // Always use the same workspace to avoid @2, @3, @tmp folders
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+        }
+    }
 
-cmd
+    options {
+        // Add timestamps to console logs
+        timestamps()
 
-pause
+        // Enable colored console output
+        ansiColor('xterm')
 
-✅ Depois troca também o runner para esta versão
+        // Prevent parallel executions of the same pipeline
+        disableConcurrentBuilds()
 
-Quero deixar ele o mais direto possível.
+        // Stop the whole pipeline if it exceeds this total execution time
+        timeout(time: 75, unit: 'MINUTES')
 
-C:\Gaia\run_katalon_visible_from_jenkins.bat
-@echo off
-setlocal
-title GAIA_VISIBLE_RUNNER
+        // Keep build history under control
+        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
 
-set STATUS_FILE=C:\Gaia\gaia_visible_status.txt
+        // Checkout will be done manually
+        skipDefaultCheckout(true)
+    }
 
-if exist "%STATUS_FILE%" del /f /q "%STATUS_FILE%"
+    parameters {
+        choice(
+            name: 'RUN_MODE',
+            choices: ['VISIBLE', 'HEADLESS'],
+            description: 'Choose how Chrome should run'
+        )
 
-call "C:\Gaia\set_java_17_gaia.bat"
+        string(
+            name: 'STARTUP_WAIT_SECONDS',
+            defaultValue: '60',
+            description: 'Seconds to wait after Gaia startup'
+        )
 
-cd /d "D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections"
+        string(
+            name: 'SUITE_TIMEOUT_MINUTES',
+            defaultValue: '10',
+            description: 'Maximum execution time for each suite'
+        )
+    }
 
-echo Current folder:
-cd
+    environment {
+        // Fixed workspace path
+        WORK_DIR = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
 
-echo Starting Katalon...
+        // Fixed project file path
+        PROJECT_PATH = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
 
-"C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\katalonc.exe" ^
--projectPath="D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections\gaia-portal.prj" ^
--testSuitePath="Test Suites/PreLoad" ^
--browserType="Chrome" ^
--consoleLog ^
--logLevel=DEBUG ^
--reportFolder="D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections\Reports\PreLoad"
+        // Katalon Engine path
+        KATALON_HOME = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0'
 
-set EXIT_CODE=%ERRORLEVEL%
-echo EXIT_CODE=%EXIT_CODE%>"%STATUS_FILE%"
+        // Git repository configuration
+        GIT_URL = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+        GIT_CRED = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
 
-echo Finished with code %EXIT_CODE%
-exit /b %EXIT_CODE%
-✅ Teste manual agora
+        // Reports folder inside workspace
+        REPORTS_DIR = 'Reports'
 
-Abre um cmd e roda:
+        // Scheduled task names
+        GAIA_START_TASK = 'GaiaBackFrontSetup'
+        VISIBLE_TASK_NAME = 'GaiaKatalon_Visible'
 
-C:\Gaia\run_katalon_visible_from_jenkins.bat
+        // Visible execution support files
+        VISIBLE_RUNNER_BAT = 'C:\\Gaia\\run_katalon_visible_from_jenkins.bat'
+        VISIBLE_STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
+
+        // Display size for browser execution
+        DISPLAY_WIDTH = '1920'
+        DISPLAY_HEIGHT = '1080'
+    }
+
+    stages {
+        stage('Prepare Environment') {
+            steps {
+                script {
+                    echo '========================================'
+                    echo 'Starting Gaia pipeline'
+                    echo "Build Number : ${env.BUILD_NUMBER}"
+                    echo "Node         : ${env.NODE_NAME}"
+                    echo "Workspace    : ${env.WORKSPACE}"
+                    echo "Work Dir     : ${env.WORK_DIR}"
+                    echo "Project Path : ${env.PROJECT_PATH}"
+                    echo "Run Mode     : ${params.RUN_MODE}"
+                    echo '========================================'
+                }
+
+                bat """
+                    @echo off
+                    REM Clean reports folder before execution
+
+                    if exist "${env.WORK_DIR}\\${env.REPORTS_DIR}" rmdir /s /q "${env.WORK_DIR}\\${env.REPORTS_DIR}"
+                    mkdir "${env.WORK_DIR}\\${env.REPORTS_DIR}"
+
+                    exit /b 0
+                """
+            }
+        }
+
+        stage('Start Gaia Backend and Frontend') {
+            steps {
+                bat """
+                    @echo off
+                    REM Trigger Gaia startup task
+
+                    schtasks /run /tn "${env.GAIA_START_TASK}"
+                    exit /b 0
+                """
+
+                script {
+                    echo "Waiting ${params.STARTUP_WAIT_SECONDS} seconds for Gaia startup..."
+                }
+
+                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
+            }
+        }
+
+        stage('Checkout Repository') {
+            steps {
+                dir("${env.WORK_DIR}") {
+                    deleteDir()
+
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/master']],
+                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
+                        extensions: [
+                            [$class: 'WipeWorkspace'],
+                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+                        ]
+                    ])
+                }
+
+                script {
+                    echo 'Checkout completed successfully'
+                }
+            }
+        }
+
+        stage('Execute Gaia Suites Separately') {
+            steps {
+                script {
+                    def suites = [
+                        [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
+                        [name: 'Help',                   path: 'Test Suites/Help'],
+                        [name: 'AddCorrection',          path: 'Test Suites/AddCorrection'],
+                        [name: 'ComputationSelection',   path: 'Test Suites/Computation Selection'],
+                        [name: 'CorrectedDuplication',   path: 'Test Suites/CorrectedDuplication'],
+                        [name: 'CorrectionDetails',      path: 'Test Suites/CorrectionDetails'],
+                        [name: 'DownloadInvalidRecords', path: 'Test Suites/DownloadInvalidRecords']
+                    ]
+
+                    for (suite in suites) {
+                        catchError(
+                            buildResult: 'UNSTABLE',
+                            stageResult: 'FAILURE',
+                            catchInterruptions: false
+                        ) {
+                            timeout(time: params.SUITE_TIMEOUT_MINUTES.toInteger(), unit: 'MINUTES') {
+                                runGaiaSuite(suite)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
+                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
+            }
+        }
+
+        success {
+            echo 'SUCCESS: Pipeline finished successfully'
+        }
+
+        unstable {
+            echo 'UNSTABLE: Some suites failed, but execution continued'
+        }
+
+        failure {
+            echo 'FAILURE: Pipeline failed'
+        }
+
+        aborted {
+            echo 'ABORTED: Pipeline was canceled by user'
+
+            bat """
+                @echo off
+                REM Try to stop the visible scheduled task immediately
+
+                schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
+
+                REM Try to stop browser related processes immediately
+                taskkill /IM katalonc.exe /T /F >nul 2>&1
+                taskkill /IM chrome.exe /T /F >nul 2>&1
+                taskkill /IM chromedriver.exe /T /F >nul 2>&1
+
+                exit /b 0
+            """
+        }
+    }
+}
+
+/**
+ * Execute a single Gaia suite.
+ * Visible mode uses Task Scheduler.
+ * Headless mode runs directly in Jenkins.
+ */
+def runGaiaSuite(Map suite) {
+    def reportPath = "${env.WORK_DIR}\\${env.REPORTS_DIR}\\${suite.name}"
+
+    echo '========================================'
+    echo 'Starting suite execution'
+    echo "Suite Name   : ${suite.name}"
+    echo "Suite Path   : ${suite.path}"
+    echo "Run Mode     : ${params.RUN_MODE}"
+    echo "Project Path : ${env.PROJECT_PATH}"
+    echo "Report Path  : ${reportPath}"
+    echo '========================================'
+
+    bat """
+        @echo off
+        REM Recreate the suite report folder
+
+        if exist "${reportPath}" rmdir /s /q "${reportPath}"
+        mkdir "${reportPath}"
+
+        exit /b 0
+    """
+
+    if (params.RUN_MODE == 'HEADLESS') {
+        def chromeArgs = buildHeadlessChromeArgs()
+
+        executeKatalon(
+            location: env.KATALON_HOME,
+            executeArgs:
+                "-projectPath=\\"${env.PROJECT_PATH}\\" " +
+                "-testSuitePath=\\"${suite.path}\\" " +
+                "-browserType=\\"Chrome\\" " +
+                "-consoleLog -logLevel=DEBUG " +
+                "-reportFolder=\\"${reportPath}\\" " +
+                chromeArgs,
+            version: '',
+            x11Display: '',
+            xvfbConfiguration: ''
+        )
+
+        echo "Headless suite finished: ${suite.name}"
+        return
+    }
+
+    bat """
+        @echo off
+        REM Clean visible execution leftovers before each suite
+
+        if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}" >nul 2>&1
+
+        REM Rewrite the visible runner batch file for the current suite
+        (
+            echo @echo off
+            echo setlocal
+            echo title GAIA_VISIBLE_RUNNER
+            echo call "C:\\Gaia\\set_java_17_gaia.bat"
+            echo cd /d "${env.WORK_DIR}"
+            echo "C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe" ^
+            echo -projectPath="${env.PROJECT_PATH}" ^
+            echo -testSuitePath="${suite.path}" ^
+            echo -browserType="Chrome" ^
+            echo -consoleLog ^
+            echo -logLevel=DEBUG ^
+            echo -reportFolder="${reportPath}"
+            echo set EXIT_CODE=%%ERRORLEVEL%%
+            echo echo EXIT_CODE=%%EXIT_CODE%%^>"${env.VISIBLE_STATUS_FILE}"
+            echo exit /b %%EXIT_CODE%%
+        ) > "${env.VISIBLE_RUNNER_BAT}"
+
+        echo ===== FILE CREATED IN C:\\Gaia =====
+        type "${env.VISIBLE_RUNNER_BAT}"
+        echo ====================================
+
+        exit /b 0
+    """
+
+    bat """
+        @echo off
+        REM Trigger visible execution through Task Scheduler
+
+        schtasks /run /tn "${env.VISIBLE_TASK_NAME}"
+        exit /b 0
+    """
+
+    powershell """
+        \$statusFile = "${env.VISIBLE_STATUS_FILE}"
+        \$timeoutSeconds = ${params.SUITE_TIMEOUT_MINUTES.toInteger() * 60}
+        \$start = Get-Date
+
+        Write-Host "Waiting for visible suite: ${suite.name}"
+
+        while (-not (Test-Path \$statusFile)) {
+            if (((Get-Date) - \$start).TotalSeconds -ge \$timeoutSeconds) {
+                Write-Error "Timeout waiting for visible suite ${suite.name}"
+                exit 1
+            }
+
+            Start-Sleep -Seconds 2
+        }
+
+        Write-Host "Status file found for suite: ${suite.name}"
+        Get-Content \$statusFile
+    """
+
+    def exitCode = bat(
+        returnStdout: true,
+        script: """
+            @echo off
+            if not exist "${env.VISIBLE_STATUS_FILE}" (
+                echo 999
+                exit /b 0
+            )
+
+            for /f "tokens=2 delims==" %%A in ('type "${env.VISIBLE_STATUS_FILE}" ^| findstr /B "EXIT_CODE="') do echo %%A
+            exit /b 0
+        """
+    ).trim()
+
+    echo "Visible suite exit code for ${suite.name}: ${exitCode}"
+
+    if (exitCode != '0') {
+        error("Suite ${suite.name} failed with exit code ${exitCode}")
+    }
+
+    echo "Visible suite finished successfully: ${suite.name}"
+}
+
+/**
+ * Chrome arguments for headless mode.
+ */
+def buildHeadlessChromeArgs() {
+    def args = [
+        '--headless=new',
+        "--window-size=${env.DISPLAY_WIDTH},${env.DISPLAY_HEIGHT}",
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage'
+    ]
+
+    return "--config -webui.chrome.args='${args.join(' ')}'"
+}
