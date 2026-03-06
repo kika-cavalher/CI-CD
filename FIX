@@ -1,5 +1,9 @@
 2) Runner fixo da task
+
+Arquivo:
+
 C:\Gaia\run_katalon_visible_from_jenkins.bat
+
 @echo off
 setlocal
 title GAIA_VISIBLE_RUNNER
@@ -23,9 +27,10 @@ set EXIT_CODE=%ERRORLEVEL%
 exit /b %EXIT_CODE%
 3) Placeholder do comando visível
 
-Cria uma vez só este arquivo:
+Arquivo:
 
 C:\Gaia\visible_katalon_command.bat
+
 @echo off
 exit /b 0
 4) Pipeline completa
@@ -35,7 +40,7 @@ pipeline {
             // Always use the existing Jenkins node
             label 'GI5_SWDCFRNXGI55817'
 
-            // Always use the same workspace to avoid @2, @3 and @tmp folders
+            // Always use the same workspace for this pipeline
             customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
         }
     }
@@ -124,7 +129,7 @@ pipeline {
 
                 bat """
                     @echo off
-                    REM Prepare report folders in the fixed workspace
+                    REM Prepare reports in the fixed workspace
 
                     if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
                     mkdir "${env.REPORTS_DIR}"
@@ -151,7 +156,7 @@ pipeline {
 
                 bat """
                     @echo off
-                    REM Start Gaia backend and frontend in the proper Windows session
+                    REM Start Gaia backend and frontend in the correct Windows session
 
                     schtasks /run /tn "${env.GAIA_START_TASK}"
                     exit /b 0
@@ -218,11 +223,11 @@ pipeline {
         stage('Execute Gaia Suites Separately') {
             steps {
                 script {
-                    // Fixed project path in the fixed workspace
                     def projectPath = "${env.WORKSPACE}\\${env.PROJECT_FILE}"
 
-                    // Each suite is executed separately
+                    // Execute suites separately and keep PreLoad first
                     def suites = [
+                        [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
                         [name: 'Help',                   path: 'Test Suites/Help'],
                         [name: 'AddCorrection',          path: 'Test Suites/AddCorrection'],
                         [name: 'ComputationSelection',   path: 'Test Suites/Computation Selection'],
@@ -275,11 +280,11 @@ pipeline {
         }
 
         aborted {
-            echo 'ABORTED: cancel requested by user. Stopping visible execution now...'
+            echo 'ABORTED: cancel requested by user. Stopping current visible execution now...'
 
             bat """
                 @echo off
-                REM Stop only the visible execution bridge immediately
+                REM Stop only the current visible execution immediately
 
                 schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
                 taskkill /IM katalonc.exe /T /F >nul 2>&1
@@ -342,10 +347,11 @@ def runGaiaSuite(String projectPath, Map suite) {
         return
     }
 
-    // Visible mode: stop old visible leftovers before starting the next suite
     bat """
         @echo off
-        REM Clear visible leftovers before the next suite
+        REM Clean only the previous visible execution leftovers
+        REM Do not touch backend or frontend
+        REM Do not do final cleanup at the end of the pipeline
 
         schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
         taskkill /IM katalonc.exe /T /F >nul 2>&1
@@ -364,7 +370,7 @@ def runGaiaSuite(String projectPath, Map suite) {
 
     bat """
         @echo off
-        REM Trigger the visible task that runs in the correct Windows session
+        REM Trigger the visible task in the correct Windows session
 
         schtasks /run /tn "${env.VISIBLE_TASK_NAME}"
         exit /b 0
@@ -393,7 +399,7 @@ def runGaiaSuite(String projectPath, Map suite) {
     if (exitCode != '0') {
         bat """
             @echo off
-            REM Print the visible execution log when the suite fails
+            REM Print visible runner log when the suite fails
 
             if exist "${env.VISIBLE_LOG_FILE}" (
                 echo ===== VISIBLE RUNNER LOG: ${suite.name} =====
@@ -410,13 +416,12 @@ def runGaiaSuite(String projectPath, Map suite) {
 }
 
 /**
- * Create the command file executed by the Scheduled Task.
- * This file is recreated for each visible suite.
+ * Create the command file executed by the scheduled task.
  */
 def createVisibleCommandFile(String projectPath, Map suite, String reportPath) {
     bat """
         @echo off
-        REM Recreate the visible command file with the current suite information
+        REM Recreate the visible command file for the current suite
 
         (
             echo @echo off
@@ -440,7 +445,6 @@ def createVisibleCommandFile(String projectPath, Map suite, String reportPath) {
 
 /**
  * Wait until the visible execution writes the status file.
- * Short polling makes manual abort more responsive.
  */
 def waitForVisibleSuite(String suiteName) {
     int maxChecks = 240
@@ -470,7 +474,7 @@ def waitForVisibleSuite(String suiteName) {
 }
 
 /**
- * Build Chrome arguments according to the selected run mode.
+ * Build Chrome arguments for headless execution.
  */
 def buildChromeArgs(runMode) {
     if (runMode == 'HEADLESS') {
