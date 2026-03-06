@@ -1,5 +1,62 @@
+✅ Arquivos que ficam assim
+1) C:\Gaia\set_java_17_gaia.bat
 @echo off
+set JAVA_HOME=C:\config\jdk-17.0.12
+set PATH=%JAVA_HOME%\bin;%PATH%
+java -version
 exit /b 0
+
+
+
+
+
+
+
+2) C:\Gaia\run_katalon_visible_from_jenkins.bat
+
+
+@echo off
+setlocal
+title GAIA_VISIBLE_RUNNER
+
+set STATUS_FILE=C:\Gaia\gaia_visible_status.txt
+
+if exist "%STATUS_FILE%" del /f /q "%STATUS_FILE%"
+
+call "C:\Gaia\set_java_17_gaia.bat"
+
+cd /d "D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections"
+
+echo Current folder:
+cd
+
+echo Starting Katalon...
+
+"C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\katalonc.exe" ^
+-projectPath="D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections\gaia-portal.prj" ^
+-testSuitePath="Test Suites/PreLoad" ^
+-browserType="Chrome" ^
+-consoleLog ^
+-logLevel=DEBUG ^
+-reportFolder="D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections\Reports\PreLoad"
+
+set EXIT_CODE=%ERRORLEVEL%
+echo EXIT_CODE=%EXIT_CODE%>"%STATUS_FILE%"
+
+echo Finished with code %EXIT_CODE%
+exit /b %EXIT_CODE%
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -7,31 +64,31 @@ exit /b 0
 pipeline {
     agent {
         node {
-            // Always use the same Jenkins agent
+            // Use the same Jenkins agent every time
             label 'GI5_SWDCFRNXGI55817'
 
-            // Always use the same workspace
+            // Force the same workspace path to avoid @2, @3 and temp workspaces
             customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
         }
     }
 
     options {
-        // Add timestamps to all console lines
+        // Add timestamps to all log lines
         timestamps()
 
         // Enable ANSI colors in console
         ansiColor('xterm')
 
-        // Prevent parallel runs of this pipeline
+        // Prevent parallel executions of the same pipeline
         disableConcurrentBuilds()
 
-        // Stop the whole pipeline if total time is exceeded
+        // Global timeout for the whole pipeline
         timeout(time: 75, unit: 'MINUTES')
 
-        // Keep build history under control
+        // Keep a small build history
         buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
 
-        // Manual checkout will be used
+        // Checkout will be done manually
         skipDefaultCheckout(true)
     }
 
@@ -45,34 +102,30 @@ pipeline {
         string(
             name: 'SUITE_TIMEOUT_MINUTES',
             defaultValue: '10',
-            description: 'Maximum execution time for each suite'
+            description: 'Maximum minutes for each suite'
         )
     }
 
     environment {
-        // Fixed workspace path
+        // Fixed workspace and project paths
         WORK_DIR = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-
-        // Fixed Katalon project path
         PROJECT_PATH = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
+        REPORTS_DIR = 'Reports'
 
-        // Katalon Studio Engine path
+        // Katalon engine location
         KATALON_HOME = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0'
 
         // Git repository configuration
         GIT_URL = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
         GIT_CRED = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
 
-        // Reports root folder
-        REPORTS_DIR = 'Reports'
-
-        // Scheduled task names
+        // Scheduled tasks
         GAIA_START_TASK = 'GaiaBackFrontSetup'
         VISIBLE_TASK_NAME = 'GaiaKatalon_Visible'
 
-        // Visible execution files in C:\Gaia
-        VISIBLE_RUNNER_BAT = 'C:\\Gaia\\run_katalon_visible_from_jenkins.bat'
-        VISIBLE_STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
+        // Fixed visible execution files
+        RUNNER_BAT = 'C:\\Gaia\\run_katalon_visible_from_jenkins.bat'
+        STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
     }
 
     stages {
@@ -93,9 +146,11 @@ pipeline {
                 bat """
                     @echo off
                     REM Clean reports folder before execution
-
                     if exist "${env.WORK_DIR}\\${env.REPORTS_DIR}" rmdir /s /q "${env.WORK_DIR}\\${env.REPORTS_DIR}"
                     mkdir "${env.WORK_DIR}\\${env.REPORTS_DIR}"
+
+                    REM Remove old visible status file
+                    if exist "${env.STATUS_FILE}" del /f /q "${env.STATUS_FILE}" >nul 2>&1
 
                     exit /b 0
                 """
@@ -106,8 +161,7 @@ pipeline {
             steps {
                 bat """
                     @echo off
-                    REM Trigger Gaia startup task
-
+                    REM Trigger backend and frontend startup task
                     schtasks /run /tn "${env.GAIA_START_TASK}"
                     exit /b 0
                 """
@@ -123,8 +177,10 @@ pipeline {
         stage('Checkout Repository') {
             steps {
                 dir("${env.WORK_DIR}") {
+                    // Clean only the current fixed workspace
                     deleteDir()
 
+                    // Checkout master branch into the same workspace
                     checkout([
                         $class: 'GitSCM',
                         branches: [[name: '*/master']],
@@ -145,8 +201,8 @@ pipeline {
         stage('Execute Gaia Suites Separately') {
             steps {
                 script {
-                    // Each suite is executed independently.
-                    // If one suite fails, the pipeline continues to the next one.
+                    // Execute each suite separately
+                    // If one suite fails, continue to the next one
                     def suites = [
                         [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
                         [name: 'Help',                   path: 'Test Suites/Help'],
@@ -198,26 +254,15 @@ pipeline {
 
         aborted {
             echo 'ABORTED: Pipeline was canceled by user'
-
-            bat """
-                @echo off
-                REM Try to stop the visible task immediately
-
-                schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
-
-                REM Try to stop browser related processes immediately
-                taskkill /IM katalonc.exe /T /F >nul 2>&1
-                taskkill /IM chrome.exe /T /F >nul 2>&1
-                taskkill /IM chromedriver.exe /T /F >nul 2>&1
-
-                exit /b 0
-            """
         }
     }
 }
 
 /**
- * Run one Gaia suite in visible mode through Windows Task Scheduler.
+ * Rebuild the same runner batch for the current suite,
+ * trigger the visible scheduled task,
+ * wait for the status file,
+ * and continue to the next suite if this one fails.
  */
 def runVisibleGaiaSuite(Map suite) {
     def reportPath = "${env.WORK_DIR}\\${env.REPORTS_DIR}\\${suite.name}"
@@ -234,12 +279,11 @@ def runVisibleGaiaSuite(Map suite) {
     bat """
         @echo off
         REM Recreate the report folder for the current suite
-
         if exist "${reportPath}" rmdir /s /q "${reportPath}"
         mkdir "${reportPath}"
 
-        REM Remove previous status file
-        if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}" >nul 2>&1
+        REM Remove previous status file before starting the new suite
+        if exist "${env.STATUS_FILE}" del /f /q "${env.STATUS_FILE}" >nul 2>&1
 
         exit /b 0
     """
@@ -247,8 +291,20 @@ def runVisibleGaiaSuite(Map suite) {
     def runnerContent = """@echo off
 setlocal
 title GAIA_VISIBLE_RUNNER
+
+set STATUS_FILE=C:\\Gaia\\gaia_visible_status.txt
+
+if exist "%STATUS_FILE%" del /f /q "%STATUS_FILE%"
+
 call "C:\\Gaia\\set_java_17_gaia.bat"
+
 cd /d "${env.WORK_DIR}"
+
+echo Current folder:
+cd
+
+echo Starting Katalon...
+
 "${env.KATALON_HOME}\\katalonc.exe" ^
 -projectPath="${env.PROJECT_PATH}" ^
 -testSuitePath="${suite.path}" ^
@@ -256,31 +312,33 @@ cd /d "${env.WORK_DIR}"
 -consoleLog ^
 -logLevel=DEBUG ^
 -reportFolder="${reportPath}"
+
 set EXIT_CODE=%ERRORLEVEL%
-> "${env.VISIBLE_STATUS_FILE}" echo EXIT_CODE=%EXIT_CODE%
+echo EXIT_CODE=%EXIT_CODE%>"%STATUS_FILE%"
+
+echo Finished with code %EXIT_CODE%
 exit /b %EXIT_CODE%
 """
 
-    writeFile file: 'visible_runner_current.bat', text: runnerContent
+    writeFile file: 'run_katalon_visible_from_jenkins_local.bat', text: runnerContent
 
     bat """
         @echo off
-        REM Copy the current suite runner to C:\\Gaia
-
-        copy /Y "${env.WORK_DIR}\\visible_runner_current.bat" "${env.VISIBLE_RUNNER_BAT}" >nul
+        REM Copy the suite-specific runner to the fixed visible runner path
+        copy /Y "${env.WORK_DIR}\\run_katalon_visible_from_jenkins_local.bat" "${env.RUNNER_BAT}" >nul
 
         echo ===== FILE CREATED IN C:\\Gaia =====
-        type "${env.VISIBLE_RUNNER_BAT}"
+        type "${env.RUNNER_BAT}"
         echo ====================================
 
-        REM Trigger the scheduled task
+        REM Trigger the visible scheduled task
         schtasks /run /tn "${env.VISIBLE_TASK_NAME}"
 
         exit /b 0
     """
 
     powershell """
-        \$statusFile = "${env.VISIBLE_STATUS_FILE}"
+        \$statusFile = "${env.STATUS_FILE}"
         \$timeoutSeconds = ${params.SUITE_TIMEOUT_MINUTES.toInteger() * 60}
         \$start = Get-Date
 
@@ -303,12 +361,12 @@ exit /b %EXIT_CODE%
         returnStdout: true,
         script: """
             @echo off
-            if not exist "${env.VISIBLE_STATUS_FILE}" (
+            if not exist "${env.STATUS_FILE}" (
                 echo 999
                 exit /b 0
             )
 
-            for /f "tokens=2 delims==" %%A in ('type "${env.VISIBLE_STATUS_FILE}" ^| findstr /B "EXIT_CODE="') do echo %%A
+            for /f "tokens=2 delims==" %%A in ('type "${env.STATUS_FILE}" ^| findstr /B "EXIT_CODE="') do echo %%A
             exit /b 0
         """
     ).trim()
