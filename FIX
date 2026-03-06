@@ -1,59 +1,29 @@
-1) Keep these BAT files
-C:\Gaia\gaia-start-front.bat
+1️⃣ .bat da task
+
+📍 C:\Gaia\run_katalon_visible_from_jenkins.bat
+
 @echo off
 setlocal
-title GAIA_FRONT_CMD
-
-cd /d C:\Gaia\web_portal
-npm start
-C:\Gaia\gaia-start-back.bat
-@echo off
-setlocal
-title GAIA_BACK_CMD
-
-set JAVA_HOME=C:\Program Files\Microsoft\jdk-21.0.2.13-hotspot
-set PATH=%JAVA_HOME%\bin;%PATH%
-
-cd /d C:\Gaia\web_portal_back
-mvn spring-boot:run
-C:\Gaia\run_katalon_visible_from_jenkins.bat
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
 title GAIA_VISIBLE_RUNNER
 
 set COMMAND_FILE=C:\Gaia\visible_katalon_command.bat
 set STATUS_FILE=C:\Gaia\gaia_visible_status.txt
 set LOG_FILE=C:\Gaia\gaia_visible_console.log
-set JAVA_SETUP=C:\Gaia\set_java_17_gaia.bat
 
 if exist "%STATUS_FILE%" del /f /q "%STATUS_FILE%"
 if exist "%LOG_FILE%" del /f /q "%LOG_FILE%"
 
-echo ========================================>>"%LOG_FILE%"
-echo START %date% %time%>>"%LOG_FILE%"
-echo COMMAND_FILE=%COMMAND_FILE%>>"%LOG_FILE%"
-echo STATUS_FILE=%STATUS_FILE%>>"%LOG_FILE%"
-echo LOG_FILE=%LOG_FILE%>>"%LOG_FILE%"
-echo ========================================>>"%LOG_FILE%"
-
-if exist "%JAVA_SETUP%" (
-    call "%JAVA_SETUP%" >>"%LOG_FILE%" 2>&1
-)
-
-java -version >>"%LOG_FILE%" 2>&1
-
 if not exist "%COMMAND_FILE%" (
     > "%STATUS_FILE%" echo EXIT_CODE=999
-    >> "%STATUS_FILE%" echo ERROR=COMMAND_FILE_NOT_FOUND
     exit /b 999
 )
 
-call "%COMMAND_FILE%" >>"%LOG_FILE%" 2>&1
+call "%COMMAND_FILE%" > "%LOG_FILE%" 2>&1
 set EXIT_CODE=%ERRORLEVEL%
 
 > "%STATUS_FILE%" echo EXIT_CODE=%EXIT_CODE%
 exit /b %EXIT_CODE%
-2) Corrected full pipeline
+2️⃣ Pipeline completa simplificada
 pipeline {
     agent { label 'GI5_SWDCFRNXGI55817' }
 
@@ -73,9 +43,9 @@ pipeline {
             description: 'Choose how Chrome should run'
         )
         string(
-            name: 'STARTUP_TIMEOUT_SECONDS',
-            defaultValue: '90',
-            description: 'Maximum seconds to wait for Gaia frontend'
+            name: 'STARTUP_WAIT_SECONDS',
+            defaultValue: '40',
+            description: 'Seconds to wait after Gaia startup'
         )
     }
 
@@ -94,48 +64,11 @@ pipeline {
 
     stages {
 
-        stage('Cleanup Previous Processes') {
-            steps {
-                script {
-                    cleanupGaiaProcesses()
-                }
-            }
-        }
-
         stage('Start Gaia Backend + Frontend') {
             steps {
                 echo 'Starting Gaia backend and frontend'
                 bat 'schtasks /run /tn "GaiaBackFrontSetup"'
-            }
-        }
-
-        stage('Wait Gaia Front Ready') {
-            steps {
-                powershell """
-                    \$timeoutSeconds = ${params.STARTUP_TIMEOUT_SECONDS}
-                    \$start = Get-Date
-                    \$ready = \$false
-
-                    Write-Host "Waiting for frontend on http://localhost:4200"
-
-                    while (((Get-Date) - \$start).TotalSeconds -lt \$timeoutSeconds) {
-                        try {
-                            \$response = Invoke-WebRequest -Uri "http://localhost:4200" -UseBasicParsing -TimeoutSec 5
-                            if (\$response.StatusCode -ge 200 -and \$response.StatusCode -lt 500) {
-                                \$ready = \$true
-                                Write-Host "Frontend is ready"
-                                break
-                            }
-                        } catch {}
-
-                        Start-Sleep -Seconds 3
-                    }
-
-                    if (-not \$ready) {
-                        Write-Error "Frontend did not become ready in time"
-                        exit 1
-                    }
-                """
+                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
             }
         }
 
@@ -222,9 +155,16 @@ pipeline {
                 junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
             }
 
-            script {
-                cleanupGaiaProcesses()
-            }
+            bat """
+                @echo off
+                taskkill /FI "WINDOWTITLE eq GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
+                taskkill /FI "WINDOWTITLE eq GAIA_FRONT_CMD*" /T /F >nul 2>&1
+                taskkill /FI "WINDOWTITLE eq GAIA_BACK_CMD*" /T /F >nul 2>&1
+                taskkill /IM chromedriver.exe /T /F >nul 2>&1
+                taskkill /IM chrome.exe /T /F >nul 2>&1
+                taskkill /IM katalonc.exe /T /F >nul 2>&1
+                exit /b 0
+            """
         }
 
         success {
@@ -369,44 +309,4 @@ def buildChromeArgs(runMode) {
         '--start-maximized'
     ]
     return "--config -webui.chrome.args='${args.join(' ')}'"
-}
-
-def cleanupGaiaProcesses() {
-    bat """
-        @echo off
-        taskkill /FI "WINDOWTITLE eq GAIA_FRONT_CMD*" /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq GAIA_BACK_CMD*" /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
-    """
-
-    powershell """
-        \$ErrorActionPreference = 'SilentlyContinue'
-
-        Get-CimInstance Win32_Process | Where-Object {
-            (
-                \$_.Name -eq 'cmd.exe' -and (
-                    \$_.CommandLine -like '*gaia-start-front.bat*' -or
-                    \$_.CommandLine -like '*gaia-start-back.bat*' -or
-                    \$_.CommandLine -like '*run_katalon_visible_from_jenkins.bat*' -or
-                    \$_.CommandLine -like '*visible_katalon_command.bat*'
-                )
-            ) -or
-            (
-                \$_.Name -eq 'node.exe' -and
-                \$_.CommandLine -like '*C:\\Gaia\\web_portal*'
-            ) -or
-            (
-                \$_.Name -eq 'java.exe' -and (
-                    \$_.CommandLine -like '*web_portal_back*' -or
-                    \$_.CommandLine -like '*katalon*'
-                )
-            ) -or
-            \$_.Name -match 'katalon|katalonc|chrome|chromedriver'
-        } | ForEach-Object {
-            try {
-                Stop-Process -Id \$_.ProcessId -Force
-                Write-Host "Stopped process: \$($_.Name) PID=\$($_.ProcessId)"
-            } catch {}
-        }
-    """
 }
