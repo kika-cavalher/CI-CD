@@ -1,14 +1,44 @@
-Sim, muda para:
-
-/c C:\Gaia\visible_katalon_command.bat
-
-E sim, vale a pena criar esse arquivo manualmente uma vez com:
-
+2️⃣ Volta este arquivo fixo
+C:\Gaia\run_katalon_visible_from_jenkins.bat
 @echo off
-exit /b 0
+setlocal
 
+set COMMAND_FILE=C:\Gaia\visible_katalon_command.bat
+set STATUS_FILE=C:\Gaia\gaia_visible_status.txt
+set LOG_FILE=C:\Gaia\gaia_visible_console.log
 
+if exist "%STATUS_FILE%" del /f /q "%STATUS_FILE%"
+if exist "%LOG_FILE%" del /f /q "%LOG_FILE%"
 
+if not exist "%COMMAND_FILE%" (
+    > "%STATUS_FILE%" echo EXIT_CODE=999
+    exit /b 999
+)
+
+call "%COMMAND_FILE%" > "%LOG_FILE%" 2>&1
+set EXIT_CODE=%ERRORLEVEL%
+
+> "%STATUS_FILE%" echo EXIT_CODE=%EXIT_CODE%
+exit /b %EXIT_CODE%
+3️⃣ Mantém estes BATs simples
+C:\Gaia\gaia-start-front.bat
+@echo off
+setlocal
+title GAIA_FRONT_CMD
+
+cd /d C:\Gaia\web_portal
+npm start
+C:\Gaia\gaia-start-back.bat
+@echo off
+setlocal
+title GAIA_BACK_CMD
+
+set JAVA_HOME=C:\Program Files\Microsoft\jdk-21.0.2.13-hotspot
+set PATH=%JAVA_HOME%\bin;%PATH%
+
+cd /d C:\Gaia\web_portal_back
+mvn spring-boot:run
+4️⃣ Pipeline rollback para o ponto que estava funcionando melhor
 pipeline {
     agent { label 'GI5_SWDCFRNXGI55817' }
 
@@ -29,13 +59,8 @@ pipeline {
         )
         string(
             name: 'STARTUP_WAIT_SECONDS',
-            defaultValue: '40',
+            defaultValue: '45',
             description: 'Seconds to wait after Gaia startup'
-        )
-        string(
-            name: 'SUITE_TIMEOUT_MINUTES',
-            defaultValue: '8',
-            description: 'Max time per suite'
         )
     }
 
@@ -44,6 +69,8 @@ pipeline {
         GIT_URL             = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
         GIT_CRED            = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
         REPORTS_DIR         = 'Reports'
+        DISPLAY_WIDTH       = '1920'
+        DISPLAY_HEIGHT      = '1080'
         VISIBLE_TASK_NAME   = 'GaiaKatalon_Visible'
         VISIBLE_COMMAND_BAT = 'C:\\Gaia\\visible_katalon_command.bat'
         VISIBLE_STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
@@ -54,17 +81,13 @@ pipeline {
 
         stage('Start Gaia Backend + Frontend') {
             steps {
-                bat '''
-                    @echo off
-                    schtasks /run /tn "GaiaBackFrontSetup"
-                    exit /b 0
-                '''
-
+                echo 'Starting Gaia backend and frontend'
+                bat 'schtasks /run /tn "GaiaBackFrontSetup"'
                 sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
             }
         }
 
-        stage('Checkout Repository') {
+        stage('Checkout gaia-portal') {
             steps {
                 deleteDir()
 
@@ -73,6 +96,7 @@ pipeline {
                     branches: [[name: '*/master']],
                     userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
                     extensions: [
+                        [$class: 'WipeWorkspace'],
                         [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
                     ]
                 ])
@@ -86,14 +110,12 @@ pipeline {
                         @echo off
                         if exist "${env.WORKSPACE}\\${env.REPORTS_DIR}" rmdir /s /q "${env.WORKSPACE}\\${env.REPORTS_DIR}"
                         mkdir "${env.WORKSPACE}\\${env.REPORTS_DIR}"
-                        exit /b 0
                     """
 
                     env.PROJECT_PATH = powershell(
                         returnStdout: true,
                         script: """
                             \$prj = Get-ChildItem -Path "${env.WORKSPACE}" -Filter *.prj -Recurse -ErrorAction SilentlyContinue |
-                                   Sort-Object FullName |
                                    Select-Object -First 1 -ExpandProperty FullName
                             if (-not \$prj) {
                                 Write-Error "No .prj file found under workspace: ${env.WORKSPACE}"
@@ -105,7 +127,9 @@ pipeline {
 
                     env.PROJECT_DIR = powershell(
                         returnStdout: true,
-                        script: 'Split-Path -Path "' + env.PROJECT_PATH + '" -Parent'
+                        script: """
+                            Split-Path -Path "${env.PROJECT_PATH}" -Parent
+                        """
                     ).trim()
 
                     echo "Project file found: ${env.PROJECT_PATH}"
@@ -128,9 +152,7 @@ pipeline {
 
                     for (suite in suites) {
                         catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            timeout(time: params.SUITE_TIMEOUT_MINUTES.toInteger(), unit: 'MINUTES') {
-                                runGaiaSuite(suite)
-                            }
+                            runGaiaSuite(suite)
                         }
                     }
                 }
@@ -139,18 +161,7 @@ pipeline {
     }
 
     post {
-        aborted {
-            script {
-                echo 'Build aborted. Closing everything...'
-                closeEverythingAtEnd()
-            }
-        }
-
         always {
-            script {
-                closeEverythingAtEnd()
-            }
-
             archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
 
             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
@@ -168,6 +179,10 @@ pipeline {
 
         failure {
             echo 'FAILURE: Pipeline failed'
+        }
+
+        aborted {
+            echo 'ABORTED: Pipeline canceled by user'
         }
     }
 }
@@ -187,7 +202,6 @@ def runGaiaSuite(suite) {
         @echo off
         if exist "${reportDir}" rmdir /s /q "${reportDir}"
         mkdir "${reportDir}"
-        exit /b 0
     """
 
     if (params.RUN_MODE == 'HEADLESS') {
@@ -207,116 +221,77 @@ def runGaiaSuite(suite) {
         return
     }
 
-    createVisibleCommandFile(suite, reportDir)
+    def visibleCommand = """@echo off
+cd /d "${env.PROJECT_DIR}"
+call "C:\\Gaia\\set_java_17_gaia.bat"
+call "${env.KATALON_HOME}\\katalonc.exe" -projectPath="${env.PROJECT_PATH}" -testSuitePath="${suite.path}" -browserType="Chrome" -consoleLog -logLevel=DEBUG -reportFolder="${reportDir}" --config -webui.chrome.args="--window-size=1920,1080 --start-maximized"
+exit /b %ERRORLEVEL%
+"""
+
+    writeFile file: 'visible_katalon_command.bat', text: visibleCommand
 
     bat """
         @echo off
+        copy /Y "${env.WORKSPACE}\\visible_katalon_command.bat" "${env.VISIBLE_COMMAND_BAT}" >nul
         if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}"
         if exist "${env.VISIBLE_LOG_FILE}" del /f /q "${env.VISIBLE_LOG_FILE}"
-        schtasks /run /tn "${env.VISIBLE_TASK_NAME}"
-        exit /b 0
     """
 
-    waitForVisibleSuite(suite.name)
+    bat "schtasks /run /tn \"${env.VISIBLE_TASK_NAME}\""
 
-    def exitCode = bat(
+    powershell """
+        \$statusFile = "${env.VISIBLE_STATUS_FILE}"
+        \$timeoutMinutes = 30
+        \$start = Get-Date
+
+        Write-Host "Waiting visible execution for suite: ${suite.name}"
+
+        while (\$true) {
+            if (Test-Path \$statusFile) {
+                Write-Host "Status file found"
+                Get-Content \$statusFile
+                break
+            }
+
+            if (((Get-Date) - \$start).TotalMinutes -ge \$timeoutMinutes) {
+                Write-Error "Timeout waiting for suite ${suite.name}"
+                exit 1
+            }
+
+            Start-Sleep -Seconds 5
+        }
+    """
+
+    def exitCode = powershell(
         returnStdout: true,
         script: """
-            @echo off
-            if not exist "${env.VISIBLE_STATUS_FILE}" (
-                echo 999
-                exit /b 0
-            )
-            for /f "tokens=2 delims==" %%A in ('type "${env.VISIBLE_STATUS_FILE}" ^| findstr /B "EXIT_CODE="') do echo %%A
-            exit /b 0
+            \$statusFile = "${env.VISIBLE_STATUS_FILE}"
+
+            if (!(Test-Path \$statusFile)) {
+                Write-Output "999"
+                exit 0
+            }
+
+            \$content = Get-Content \$statusFile | Select-Object -First 1
+
+            if (\$content -match 'EXIT_CODE=(\\d+)') {
+                Write-Output \$matches[1]
+            } else {
+                Write-Output "998"
+            }
         """
     ).trim()
 
     echo "Suite ${suite.name} exit code: ${exitCode}"
 
     if (exitCode != '0') {
-        bat """
-            @echo off
-            if exist "${env.VISIBLE_LOG_FILE}" (
-                echo ===== RUNNER LOG: ${suite.name} =====
-                powershell -NoProfile -Command "Get-Content '${env.VISIBLE_LOG_FILE}' | Select-Object -Last 120"
-            )
-            exit /b 0
+        powershell """
+            \$logFile = "${env.VISIBLE_LOG_FILE}"
+            if (Test-Path \$logFile) {
+                Write-Host "===== RUNNER LOG: ${suite.name} ====="
+                Get-Content \$logFile | Select-Object -Last 100
+            }
         """
         error("Suite ${suite.name} failed with exit code ${exitCode}")
     }
-}
-
-def createVisibleCommandFile(suite, reportDir) {
-    bat """
-        @echo off
-        (
-            echo @echo off
-            echo setlocal
-            echo title GAIA_VISIBLE_RUNNER
-            echo if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}"
-            echo if exist "${env.VISIBLE_LOG_FILE}" del /f /q "${env.VISIBLE_LOG_FILE}"
-            echo cd /d "${env.PROJECT_DIR}"
-            echo call "C:\\Gaia\\set_java_17_gaia.bat"
-            echo call "${env.KATALON_HOME}\\katalonc.exe" -projectPath="${env.PROJECT_PATH}" -testSuitePath="${suite.path}" -browserType="Chrome" -consoleLog -logLevel=DEBUG -reportFolder="${reportDir}" ^> "${env.VISIBLE_LOG_FILE}" 2^>^&1
-            echo set EXIT_CODE=%%ERRORLEVEL%%
-            echo ^> "${env.VISIBLE_STATUS_FILE}" echo EXIT_CODE=%%EXIT_CODE%%
-            echo exit /b %%EXIT_CODE%%
-        ) > "${env.VISIBLE_COMMAND_BAT}"
-
-        echo ===== FILE CREATED IN C:\\Gaia =====
-        type "${env.VISIBLE_COMMAND_BAT}"
-        echo ====================================
-        exit /b 0
-    """
-}
-
-def waitForVisibleSuite(String suiteName) {
-    int maxChecks = 240
-
-    for (int i = 0; i < maxChecks; i++) {
-        int found = bat(
-            returnStatus: true,
-            script: """
-                @echo off
-                if exist "${env.VISIBLE_STATUS_FILE}" (
-                    exit /b 0
-                ) else (
-                    exit /b 1
-                )
-            """
-        )
-
-        if (found == 0) {
-            echo "Status file found for suite: ${suiteName}"
-            return
-        }
-
-        sleep(time: 2, unit: 'SECONDS')
-    }
-
-    error("Timeout waiting visible execution for suite ${suiteName}")
-}
-
-def closeEverythingAtEnd() {
-    bat """
-        @echo off
-
-        schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
-
-        taskkill /FI "WINDOWTITLE eq GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq Administrator: GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq GAIA_FRONT_CMD*" /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq GAIA_BACK_CMD*" /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq Administrator: GAIA_BACK_CMD*" /T /F >nul 2>&1
-
-        taskkill /IM chromedriver.exe /T /F >nul 2>&1
-        taskkill /IM chrome.exe /T /F >nul 2>&1
-        taskkill /IM katalonc.exe /T /F >nul 2>&1
-
-        if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}" >nul 2>&1
-        if exist "${env.VISIBLE_LOG_FILE}" del /f /q "${env.VISIBLE_LOG_FILE}" >nul 2>&1
-
-        exit /b 0
-    """
 }
