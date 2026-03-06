@@ -24,27 +24,347 @@ exit /b %EXIT_CODE%
 
 
 
+pipeline {
+    agent { label 'GI5_SWDCFRNXGI55817' }
 
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds(abortPrevious: true)
+        timeout(time: 75, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
+        skipDefaultCheckout(true)
+    }
 
-C:\Gaia\run_katalon_visible_from_jenkins.bat
-@echo off
-setlocal
-title GAIA_VISIBLE_RUNNER
+    parameters {
+        choice(
+            name: 'RUN_MODE',
+            choices: ['VISIBLE', 'HEADLESS'],
+            description: 'Choose how Chrome should run'
+        )
+        string(
+            name: 'STARTUP_WAIT_SECONDS',
+            defaultValue: '40',
+            description: 'Seconds to wait after Gaia startup'
+        )
+        string(
+            name: 'SUITE_TIMEOUT_MINUTES',
+            defaultValue: '8',
+            description: 'Max time per suite'
+        )
+    }
 
-set COMMAND_FILE=C:\Gaia\visible_katalon_command.bat
-set STATUS_FILE=C:\Gaia\gaia_visible_status.txt
-set LOG_FILE=C:\Gaia\gaia_visible_console.log
+    environment {
+        KATALON_HOME        = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0'
+        GIT_URL             = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+        GIT_CRED            = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+        REPORTS_DIR         = 'Reports'
+        DISPLAY_WIDTH       = '1920'
+        DISPLAY_HEIGHT      = '1080'
+        VISIBLE_TASK_NAME   = 'GaiaKatalon_Visible'
+        VISIBLE_COMMAND_BAT = 'C:\\Gaia\\visible_katalon_command.bat'
+        VISIBLE_STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
+        VISIBLE_LOG_FILE    = 'C:\\Gaia\\gaia_visible_console.log'
+    }
 
-if exist "%STATUS_FILE%" del /f /q "%STATUS_FILE%"
-if exist "%LOG_FILE%" del /f /q "%LOG_FILE%"
+    stages {
 
-if not exist "%COMMAND_FILE%" (
-    > "%STATUS_FILE%" echo EXIT_CODE=999
-    exit /b 999
-)
+        stage('Start Gaia Backend + Frontend') {
+            steps {
+                script {
+                    forceStopVisibleExecution()
+                }
 
-call "%COMMAND_FILE%" > "%LOG_FILE%" 2>&1
-set EXIT_CODE=%ERRORLEVEL%
+                bat '''
+                    @echo off
+                    schtasks /run /tn "GaiaBackFrontSetup"
+                    exit /b 0
+                '''
 
-> "%STATUS_FILE%" echo EXIT_CODE=%EXIT_CODE%
-exit /b %EXIT_CODE%
+                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
+            }
+        }
+
+        stage('Checkout Repository') {
+            steps {
+                deleteDir()
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/master']],
+                    userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
+                    extensions: [
+                        [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+                    ]
+                ])
+            }
+        }
+
+        stage('Prepare Execution') {
+            steps {
+                script {
+                    bat """
+                        @echo off
+                        if exist "${env.WORKSPACE}\\${env.REPORTS_DIR}" rmdir /s /q "${env.WORKSPACE}\\${env.REPORTS_DIR}"
+                        mkdir "${env.WORKSPACE}\\${env.REPORTS_DIR}"
+                        exit /b 0
+                    """
+
+                    env.PROJECT_PATH = powershell(
+                        returnStdout: true,
+                        script: """
+                            \$prj = Get-ChildItem -Path "${env.WORKSPACE}" -Filter *.prj -Recurse -ErrorAction SilentlyContinue |
+                                   Sort-Object FullName |
+                                   Select-Object -First 1 -ExpandProperty FullName
+                            if (-not \$prj) {
+                                Write-Error "No .prj file found under workspace: ${env.WORKSPACE}"
+                                exit 1
+                            }
+                            Write-Output \$prj
+                        """
+                    ).trim()
+
+                    env.PROJECT_DIR = powershell(
+                        returnStdout: true,
+                        script: 'Split-Path -Path "' + env.PROJECT_PATH + '" -Parent'
+                    ).trim()
+
+                    echo "Project file found: ${env.PROJECT_PATH}"
+                    echo "Project directory: ${env.PROJECT_DIR}"
+                }
+            }
+        }
+
+        stage('Execute Gaia Suites') {
+            steps {
+                script {
+                    def suites = [
+                        [name: 'Help',                   path: 'Test Suites/Help'],
+                        [name: 'AddCorrection',          path: 'Test Suites/AddCorrection'],
+                        [name: 'ComputationSelection',   path: 'Test Suites/Computation Selection'],
+                        [name: 'CorrectedDuplication',   path: 'Test Suites/CorrectedDuplication'],
+                        [name: 'CorrectionDetails',      path: 'Test Suites/CorrectionDetails'],
+                        [name: 'DownloadInvalidRecords', path: 'Test Suites/DownloadInvalidRecords']
+                    ]
+
+                    for (suite in suites) {
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            timeout(time: params.SUITE_TIMEOUT_MINUTES.toInteger(), unit: 'MINUTES') {
+                                runGaiaSuite(suite)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        aborted {
+            script {
+                echo 'Build aborted. Stopping all related processes...'
+                forceStopVisibleExecution()
+            }
+        }
+
+        always {
+            script {
+                forceStopVisibleExecution()
+            }
+
+            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
+            }
+        }
+
+        success {
+            echo 'SUCCESS: Pipeline completed successfully'
+        }
+
+        unstable {
+            echo 'UNSTABLE: Some suites failed, but execution continued'
+        }
+
+        failure {
+            echo 'FAILURE: Pipeline failed'
+        }
+    }
+}
+
+def runGaiaSuite(suite) {
+    def reportDir = "${env.WORKSPACE}\\${env.REPORTS_DIR}\\${suite.name}"
+    def chromeArgs = buildChromeArgs(params.RUN_MODE)
+
+    echo "========================================"
+    echo "Suite Name : ${suite.name}"
+    echo "Suite Path : ${suite.path}"
+    echo "Run Mode   : ${params.RUN_MODE}"
+    echo "Project    : ${env.PROJECT_PATH}"
+    echo "Report Dir : ${reportDir}"
+    echo "========================================"
+
+    forceStopVisibleExecution()
+
+    bat """
+        @echo off
+        if exist "${reportDir}" rmdir /s /q "${reportDir}"
+        mkdir "${reportDir}"
+        exit /b 0
+    """
+
+    if (params.RUN_MODE == 'HEADLESS') {
+        executeKatalon(
+            location: env.KATALON_HOME,
+            executeArgs:
+                "-projectPath=\"${env.PROJECT_PATH}\" " +
+                "-testSuitePath=\"${suite.path}\" " +
+                "-browserType=\"Chrome\" " +
+                "-consoleLog -logLevel=DEBUG " +
+                "-reportFolder=\"${reportDir}\" " +
+                chromeArgs,
+            version: '',
+            x11Display: '',
+            xvfbConfiguration: ''
+        )
+        return
+    }
+
+    def visibleCommandLines = [
+        '@echo off',
+        "cd /d \"${env.PROJECT_DIR}\"",
+        'call "C:\\Gaia\\set_java_17_gaia.bat"',
+        "call \"${env.KATALON_HOME}\\katalonc.exe\" " +
+            "-projectPath=\"${env.PROJECT_PATH}\" " +
+            "-testSuitePath=\"${suite.path}\" " +
+            "-browserType=\"Chrome\" " +
+            "-consoleLog -logLevel=DEBUG " +
+            "-reportFolder=\"${reportDir}\" " +
+            chromeArgs.replace("'", "\""),
+        'exit /b %ERRORLEVEL%'
+    ]
+
+    def visibleCommand = visibleCommandLines.join('\r\n') + '\r\n'
+
+    writeFile file: 'visible_katalon_command.bat', text: visibleCommand
+
+    bat """
+        @echo off
+        copy /Y "${env.WORKSPACE}\\visible_katalon_command.bat" "${env.VISIBLE_COMMAND_BAT}" >nul
+        echo ===== FILE CREATED IN C:\\Gaia =====
+        type "${env.VISIBLE_COMMAND_BAT}"
+        echo ====================================
+        if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}"
+        if exist "${env.VISIBLE_LOG_FILE}" del /f /q "${env.VISIBLE_LOG_FILE}"
+        exit /b 0
+    """
+
+    bat """
+        @echo off
+        schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
+        timeout /t 1 /nobreak >nul
+        schtasks /run /tn "${env.VISIBLE_TASK_NAME}"
+        exit /b 0
+    """
+
+    waitForVisibleSuite(suite.name)
+
+    def exitCode = bat(
+        returnStdout: true,
+        script: """
+            @echo off
+            if not exist "${env.VISIBLE_STATUS_FILE}" (
+                echo 999
+                exit /b 0
+            )
+            for /f "tokens=2 delims==" %%A in ('type "${env.VISIBLE_STATUS_FILE}" ^| findstr /B "EXIT_CODE="') do echo %%A
+            exit /b 0
+        """
+    ).trim()
+
+    echo "Suite ${suite.name} exit code: ${exitCode}"
+
+    if (exitCode != '0') {
+        bat """
+            @echo off
+            if exist "${env.VISIBLE_LOG_FILE}" (
+                echo ===== RUNNER LOG: ${suite.name} =====
+                powershell -NoProfile -Command "Get-Content '${env.VISIBLE_LOG_FILE}' | Select-Object -Last 120"
+            )
+            exit /b 0
+        """
+        error("Suite ${suite.name} failed with exit code ${exitCode}")
+    }
+
+    forceStopVisibleExecution()
+}
+
+def waitForVisibleSuite(String suiteName) {
+    int maxChecks = 240
+
+    for (int i = 0; i < maxChecks; i++) {
+        int found = bat(
+            returnStatus: true,
+            script: """
+                @echo off
+                if exist "${env.VISIBLE_STATUS_FILE}" (
+                    exit /b 0
+                ) else (
+                    exit /b 1
+                )
+            """
+        )
+
+        if (found == 0) {
+            echo "Status file found for suite: ${suiteName}"
+            return
+        }
+
+        sleep(time: 2, unit: 'SECONDS')
+    }
+
+    error("Timeout waiting visible execution for suite ${suiteName}")
+}
+
+def buildChromeArgs(runMode) {
+    if (runMode == 'HEADLESS') {
+        def args = [
+            '--headless=new',
+            "--window-size=${env.DISPLAY_WIDTH},${env.DISPLAY_HEIGHT}",
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+            '--no-sandbox'
+        ]
+        return "--config -webui.chrome.args='${args.join(' ')}'"
+    }
+
+    def args = [
+        "--window-size=${env.DISPLAY_WIDTH},${env.DISPLAY_HEIGHT}",
+        '--start-maximized'
+    ]
+    return "--config -webui.chrome.args='${args.join(' ')}'"
+}
+
+def forceStopVisibleExecution() {
+    bat """
+        @echo off
+
+        schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
+
+        taskkill /FI "WINDOWTITLE eq GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
+        taskkill /FI "WINDOWTITLE eq Administrator: GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
+        taskkill /FI "WINDOWTITLE eq GAIA_FRONT_CMD*" /T /F >nul 2>&1
+        taskkill /FI "WINDOWTITLE eq GAIA_BACK_CMD*" /T /F >nul 2>&1
+        taskkill /FI "WINDOWTITLE eq Administrator: GAIA_BACK_CMD*" /T /F >nul 2>&1
+
+        taskkill /IM chromedriver.exe /T /F >nul 2>&1
+        taskkill /IM chrome.exe /T /F >nul 2>&1
+        taskkill /IM katalonc.exe /T /F >nul 2>&1
+
+        if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}" >nul 2>&1
+        if exist "${env.VISIBLE_LOG_FILE}" del /f /q "${env.VISIBLE_LOG_FILE}" >nul 2>&1
+
+        exit /b 0
+    """
+}
