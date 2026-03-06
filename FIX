@@ -28,14 +28,13 @@ exit /b 0
 
 
 
-
 pipeline {
     agent {
         node {
             // Always use the same Jenkins node
             label 'GI5_SWDCFRNXGI55817'
 
-            // Always use the same workspace to avoid @2, @8 and @tmp
+            // Always use the same workspace
             customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
         }
     }
@@ -94,15 +93,15 @@ pipeline {
         GIT_URL      = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
         GIT_CRED     = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
 
-        // Reports folder inside the fixed workspace
+        // Reports folder
         REPORTS_DIR  = 'Reports'
 
         // Gaia startup task
         GAIA_START_TASK = 'GaiaBackFrontSetup'
 
-        // Visible execution bridge
-        VISIBLE_TASK_NAME   = 'GaiaKatalon_Visible'
-        VISIBLE_COMMAND_BAT = 'C:\\Gaia\\visible_katalon_command.bat'
+        // Visible execution task and status file
+        VISIBLE_TASK_NAME = 'GaiaKatalon_Visible'
+        VISIBLE_RUNNER_BAT = 'C:\\Gaia\\run_katalon_visible_from_jenkins.bat'
         VISIBLE_STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
     }
 
@@ -123,69 +122,33 @@ pipeline {
 
                 bat """
                     @echo off
-                    REM Prepare reports folder inside the fixed workspace
+                    REM Prepare reports folder
 
                     if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
                     mkdir "${env.REPORTS_DIR}"
-                    mkdir "${env.REPORTS_DIR}\\_jenkins_summary"
 
                     exit /b 0
                 """
-
-                script {
-                    writeFile file: "${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
-                    echo "Environment setup completed"
-                }
             }
         }
 
         stage('Start Gaia Backend and Frontend') {
             steps {
-                script {
-                    echo "========================================"
-                    echo "Starting Gaia backend and frontend"
-                    echo "Task Name: ${env.GAIA_START_TASK}"
-                    echo "========================================"
-                }
-
                 bat """
                     @echo off
-                    REM Start Gaia backend and frontend in the correct Windows session
+                    REM Start Gaia backend and frontend
 
                     schtasks /run /tn "${env.GAIA_START_TASK}"
                     exit /b 0
                 """
 
-                script {
-                    echo "Waiting ${params.STARTUP_WAIT_SECONDS}s for Gaia to start..."
-                }
-
                 sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
-
-                script {
-                    echo "Gaia startup wait finished"
-                }
             }
         }
 
         stage('Checkout gaia-portal') {
             steps {
-                script {
-                    echo "========================================"
-                    echo "Cleaning fixed workspace before checkout"
-                    echo "Workspace: ${env.WORKSPACE}"
-                    echo "========================================"
-                }
-
                 deleteDir()
-
-                script {
-                    echo "========================================"
-                    echo "Checking out repository"
-                    echo "Branch: master"
-                    echo "Repo  : ${env.GIT_URL}"
-                    echo "========================================"
-                }
 
                 checkout([
                     $class: 'GitSCM',
@@ -197,20 +160,7 @@ pipeline {
                     ]
                 ])
 
-                bat """
-                    @echo off
-                    REM Recreate reports after checkout
-
-                    if not exist "${env.REPORTS_DIR}" mkdir "${env.REPORTS_DIR}"
-                    if not exist "${env.REPORTS_DIR}\\_jenkins_summary" mkdir "${env.REPORTS_DIR}\\_jenkins_summary"
-
-                    exit /b 0
-                """
-
-                script {
-                    writeFile file: "${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
-                    echo "Checkout completed successfully"
-                }
+                echo "Checkout completed successfully"
             }
         }
 
@@ -245,44 +195,22 @@ pipeline {
 
     post {
         always {
-            script {
-                echo "Archiving reports..."
-            }
-
             archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
 
             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
                 junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
             }
-
-            script {
-                def result = currentBuild.currentResult ?: 'UNKNOWN'
-
-                if (result == 'SUCCESS') {
-                    echo "SUCCESS: All good"
-                } else if (result == 'UNSTABLE') {
-                    echo "UNSTABLE: Finished with test failures"
-                } else if (result == 'ABORTED') {
-                    echo "ABORTED: Build was canceled by user"
-                } else {
-                    echo "FAILURE: Pipeline failed. Check console and reports"
-                }
-            }
         }
 
         aborted {
-            echo 'ABORTED: cancel requested by user. Stopping current visible execution now...'
-
             bat """
                 @echo off
-                REM Stop only the current visible execution
+                REM Stop current visible execution immediately
 
                 schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
                 taskkill /IM katalonc.exe /T /F >nul 2>&1
                 taskkill /IM chrome.exe /T /F >nul 2>&1
                 taskkill /IM chromedriver.exe /T /F >nul 2>&1
-                taskkill /FI "WINDOWTITLE eq GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
-                taskkill /FI "WINDOWTITLE eq Administrator: GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
 
                 exit /b 0
             """
@@ -292,7 +220,7 @@ pipeline {
 
 /**
  * Execute one suite.
- * Visible mode uses Windows Task Scheduler to open Chrome in the correct session.
+ * Visible mode uses Task Scheduler.
  * Headless mode executes directly in Jenkins.
  */
 def runGaiaSuite(Map suite) {
@@ -318,7 +246,7 @@ def runGaiaSuite(Map suite) {
     """
 
     if (params.RUN_MODE == 'HEADLESS') {
-        def chromeArgs = buildChromeArgs('HEADLESS')
+        def chromeArgs = buildChromeArgs()
 
         executeKatalon(
             location: env.KATALON_HOME,
@@ -340,27 +268,23 @@ def runGaiaSuite(Map suite) {
 
     bat """
         @echo off
-        REM Clean only previous visible leftovers
-        REM Do not touch backend or frontend
-        REM Do not do final cleanup after the pipeline
+        REM Clean only current visible leftovers
 
         schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
         taskkill /IM katalonc.exe /T /F >nul 2>&1
         taskkill /IM chrome.exe /T /F >nul 2>&1
         taskkill /IM chromedriver.exe /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
-        taskkill /FI "WINDOWTITLE eq Administrator: GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
 
         if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}" >nul 2>&1
 
         exit /b 0
     """
 
-    createVisibleCommandFile(suite, reportPath)
+    createVisibleRunnerFile(suite, reportPath)
 
     bat """
         @echo off
-        REM Trigger the visible task in the correct Windows session
+        REM Trigger Task Scheduler in the visible session
 
         schtasks /run /tn "${env.VISIBLE_TASK_NAME}"
         exit /b 0
@@ -372,8 +296,6 @@ def runGaiaSuite(Map suite) {
         returnStdout: true,
         script: """
             @echo off
-            REM Read suite result from the visible status file
-
             if not exist "${env.VISIBLE_STATUS_FILE}" (
                 echo 999
                 exit /b 0
@@ -394,35 +316,32 @@ def runGaiaSuite(Map suite) {
 }
 
 /**
- * Create the command file executed by the scheduled task.
+ * Rewrite the same Task Scheduler runner file for each suite.
+ * Only one bat file is used.
  */
-def createVisibleCommandFile(Map suite, String reportPath) {
+def createVisibleRunnerFile(Map suite, String reportPath) {
     bat """
         @echo off
-        REM Recreate the visible command file for the current suite
-
         (
             echo @echo off
             echo setlocal
             echo title GAIA_VISIBLE_RUNNER
             echo cd /d "${env.WORK_DIR}"
             echo call "C:\\Gaia\\set_java_17_gaia.bat"
-            echo call "${env.KATALON_HOME}\\katalonc.exe" -projectPath="${env.PROJECT_PATH}" -testSuitePath="${suite.path}" -browserType="Chrome" -consoleLog -logLevel=DEBUG -reportFolder="${reportPath}"
+            echo "${env.KATALON_HOME}\\katalonc.exe" -projectPath="${env.PROJECT_PATH}" -testSuitePath="${suite.path}" -browserType="Chrome" -consoleLog -logLevel=DEBUG -reportFolder="${reportPath}"
             echo set EXIT_CODE=%%ERRORLEVEL%%
             echo ^> "${env.VISIBLE_STATUS_FILE}" echo EXIT_CODE=%%EXIT_CODE%%
             echo exit /b %%EXIT_CODE%%
-        ) > "${env.VISIBLE_COMMAND_BAT}"
+        ) > "${env.VISIBLE_RUNNER_BAT}"
 
         echo ===== FILE CREATED IN C:\\Gaia =====
-        type "${env.VISIBLE_COMMAND_BAT}"
+        type "${env.VISIBLE_RUNNER_BAT}"
         echo ====================================
-
-        exit /b 0
     """
 }
 
 /**
- * Wait silently until the visible execution writes the status file.
+ * Wait silently until the visible suite writes the status file.
  */
 def waitForVisibleSuite(String suiteName) {
     powershell """
@@ -444,20 +363,16 @@ def waitForVisibleSuite(String suiteName) {
 }
 
 /**
- * Build Chrome arguments for headless execution only.
+ * Build Chrome arguments for headless mode only.
  */
-def buildChromeArgs(runMode) {
-    if (runMode == 'HEADLESS') {
-        def args = [
-            '--headless=new',
-            '--window-size=1920,1080',
-            '--no-sandbox',
-            '--disable-gpu',
-            '--disable-dev-shm-usage'
-        ]
+def buildChromeArgs() {
+    def args = [
+        '--headless=new',
+        '--window-size=1920,1080',
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage'
+    ]
 
-        return "--config -webui.chrome.args='${args.join(' ')}'"
-    }
-
-    return ''
+    return "--config -webui.chrome.args='${args.join(' ')}'"
 }
