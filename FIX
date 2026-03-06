@@ -29,9 +29,16 @@ exit /b 0
 
 
 
-
 pipeline {
-    agent { label 'GI5_SWDCFRNXGI55817' }
+    agent {
+        node {
+            // Always use the same Jenkins node
+            label 'GI5_SWDCFRNXGI55817'
+
+            // Always use the same workspace to avoid @2, @8 and @tmp
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+        }
+    }
 
     options {
         // Add timestamps to every console line
@@ -74,7 +81,7 @@ pipeline {
     }
 
     environment {
-        // Fixed workspace path to avoid @2, @3 and @tmp paths in our execution logic
+        // Fixed workspace path
         WORK_DIR = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
 
         // Fixed project file path
@@ -97,7 +104,6 @@ pipeline {
         VISIBLE_TASK_NAME   = 'GaiaKatalon_Visible'
         VISIBLE_COMMAND_BAT = 'C:\\Gaia\\visible_katalon_command.bat'
         VISIBLE_STATUS_FILE = 'C:\\Gaia\\gaia_visible_status.txt'
-        VISIBLE_LOG_FILE    = 'C:\\Gaia\\gaia_visible_console.log'
     }
 
     stages {
@@ -108,6 +114,7 @@ pipeline {
                     echo "Starting Gaia pipeline"
                     echo "Build Number : ${env.BUILD_NUMBER}"
                     echo "Node         : ${env.NODE_NAME}"
+                    echo "Workspace    : ${env.WORKSPACE}"
                     echo "Run Mode     : ${params.RUN_MODE}"
                     echo "Work Dir     : ${env.WORK_DIR}"
                     echo "Project Path : ${env.PROJECT_PATH}"
@@ -116,19 +123,17 @@ pipeline {
 
                 bat """
                     @echo off
-                    REM Prepare reports folder inside the fixed work directory
+                    REM Prepare reports folder inside the fixed workspace
 
-                    if not exist "${env.WORK_DIR}" mkdir "${env.WORK_DIR}"
-
-                    if exist "${env.WORK_DIR}\\${env.REPORTS_DIR}" rmdir /s /q "${env.WORK_DIR}\\${env.REPORTS_DIR}"
-                    mkdir "${env.WORK_DIR}\\${env.REPORTS_DIR}"
-                    mkdir "${env.WORK_DIR}\\${env.REPORTS_DIR}\\_jenkins_summary"
+                    if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
+                    mkdir "${env.REPORTS_DIR}"
+                    mkdir "${env.REPORTS_DIR}\\_jenkins_summary"
 
                     exit /b 0
                 """
 
                 script {
-                    writeFile file: "${env.WORK_DIR}\\${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
+                    writeFile file: "${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
                     echo "Environment setup completed"
                 }
             }
@@ -165,47 +170,45 @@ pipeline {
 
         stage('Checkout gaia-portal') {
             steps {
-                dir("${env.WORK_DIR}") {
-                    script {
-                        echo "========================================"
-                        echo "Cleaning fixed directory before checkout"
-                        echo "Directory: ${env.WORK_DIR}"
-                        echo "========================================"
-                    }
-
-                    deleteDir()
-
-                    script {
-                        echo "========================================"
-                        echo "Checking out repository"
-                        echo "Branch: master"
-                        echo "Repo  : ${env.GIT_URL}"
-                        echo "========================================"
-                    }
-
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/master']],
-                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
-                        extensions: [
-                            [$class: 'WipeWorkspace'],
-                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-                        ]
-                    ])
+                script {
+                    echo "========================================"
+                    echo "Cleaning fixed workspace before checkout"
+                    echo "Workspace: ${env.WORKSPACE}"
+                    echo "========================================"
                 }
+
+                deleteDir()
+
+                script {
+                    echo "========================================"
+                    echo "Checking out repository"
+                    echo "Branch: master"
+                    echo "Repo  : ${env.GIT_URL}"
+                    echo "========================================"
+                }
+
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/master']],
+                    userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
+                    extensions: [
+                        [$class: 'WipeWorkspace'],
+                        [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+                    ]
+                ])
 
                 bat """
                     @echo off
-                    REM Recreate reports folder after checkout
+                    REM Recreate reports after checkout
 
-                    if not exist "${env.WORK_DIR}\\${env.REPORTS_DIR}" mkdir "${env.WORK_DIR}\\${env.REPORTS_DIR}"
-                    if not exist "${env.WORK_DIR}\\${env.REPORTS_DIR}\\_jenkins_summary" mkdir "${env.WORK_DIR}\\${env.REPORTS_DIR}\\_jenkins_summary"
+                    if not exist "${env.REPORTS_DIR}" mkdir "${env.REPORTS_DIR}"
+                    if not exist "${env.REPORTS_DIR}\\_jenkins_summary" mkdir "${env.REPORTS_DIR}\\_jenkins_summary"
 
                     exit /b 0
                 """
 
                 script {
-                    writeFile file: "${env.WORK_DIR}\\${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
+                    writeFile file: "${env.REPORTS_DIR}\\_jenkins_summary\\build_description.txt", text: ""
                     echo "Checkout completed successfully"
                 }
             }
@@ -246,10 +249,10 @@ pipeline {
                 echo "Archiving reports..."
             }
 
-            archiveArtifacts artifacts: "${env.WORK_DIR}\\Reports\\**\\*", allowEmptyArchive: true, excludes: '**/*.lck'
+            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
 
             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', catchInterruptions: false) {
-                junit allowEmptyResults: true, testResults: "${env.WORK_DIR}\\Reports\\**\\JUnit_Report.xml, ${env.WORK_DIR}\\Reports\\**\\junit*.xml, ${env.WORK_DIR}\\Reports\\**\\TEST-*.xml"
+                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
             }
 
             script {
@@ -272,7 +275,7 @@ pipeline {
 
             bat """
                 @echo off
-                REM Stop only the current visible execution immediately
+                REM Stop only the current visible execution
 
                 schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
                 taskkill /IM katalonc.exe /T /F >nul 2>&1
@@ -349,7 +352,6 @@ def runGaiaSuite(Map suite) {
         taskkill /FI "WINDOWTITLE eq Administrator: GAIA_VISIBLE_RUNNER*" /T /F >nul 2>&1
 
         if exist "${env.VISIBLE_STATUS_FILE}" del /f /q "${env.VISIBLE_STATUS_FILE}" >nul 2>&1
-        if exist "${env.VISIBLE_LOG_FILE}" del /f /q "${env.VISIBLE_LOG_FILE}" >nul 2>&1
 
         exit /b 0
     """
@@ -385,18 +387,6 @@ def runGaiaSuite(Map suite) {
     echo "Visible suite exit code for ${suite.name}: ${exitCode}"
 
     if (exitCode != '0') {
-        bat """
-            @echo off
-            REM Print visible runner log when the suite fails
-
-            if exist "${env.VISIBLE_LOG_FILE}" (
-                echo ===== VISIBLE RUNNER LOG: ${suite.name} =====
-                powershell -NoProfile -Command "Get-Content '${env.VISIBLE_LOG_FILE}' | Select-Object -Last 120"
-            )
-
-            exit /b 0
-        """
-
         error("Suite ${suite.name} failed with exit code ${exitCode}")
     }
 
@@ -405,10 +395,6 @@ def runGaiaSuite(Map suite) {
 
 /**
  * Create the command file executed by the scheduled task.
- * Keep visible mode as simple as possible:
- * no extra Chrome args
- * fixed project path
- * fixed working directory
  */
 def createVisibleCommandFile(Map suite, String reportPath) {
     bat """
@@ -437,7 +423,6 @@ def createVisibleCommandFile(Map suite, String reportPath) {
 
 /**
  * Wait silently until the visible execution writes the status file.
- * Use PowerShell to avoid polluting the Jenkins console with sleep lines.
  */
 def waitForVisibleSuite(String suiteName) {
     powershell """
@@ -476,9 +461,3 @@ def buildChromeArgs(runMode) {
 
     return ''
 }
-
-
-
-
-
-
