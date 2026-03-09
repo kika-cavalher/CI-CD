@@ -837,3 +837,345 @@ public class JiraIntegration {
 		updateJira()
 	}
 }
+
+
+
+
+
+
+
+
+
+
+
+package keywords
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+import java.text.SimpleDateFormat
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import groovy.io.FileType
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+
+class JiraIntegration {
+
+	// =========================================================
+	// CONFIGURATION SECTION
+	// Change everything you need here only
+	// =========================================================
+
+	// Jira authentication
+	String JIRA_TOKEN = "PUT_TOKEN_HERE"
+
+	// Jira project key
+	String PROJECT_KEY = "PROJECT"
+
+	// Epic key (optional)
+	String EPIC_KEY = ""
+
+	// Environment label
+	String ENVIRONMENT = "UAT"
+
+	// Jira labels
+	String LABELS = "automation"
+
+	// Component name
+	String COMPONENT = ""
+
+	// Test Plan behavior
+	boolean FORCE_CREATE_NEW_TEST_PLAN = false
+	String FIXED_TEST_PLAN_KEY = ""
+
+	// File names
+	String REPORT_XML_NAME = "cucumber.xml"
+	String HTML_REPORT_NAME = "eMatchReport.html"
+	String RESULTS_ZIP_NAME = "Results.zip"
+	String EVIDENCE_FOLDER = "Evidences"
+	String EVIDENCE_ZIP_NAME = "Evidences.zip"
+
+	// Transition IDs (optional)
+	String EXECUTION_TRANSITION_ID = "11"
+	String TESTPLAN_TRANSITION_ID = ""
+
+	// Object repository request names
+	String REQ_IMPORT = "Jira Integration/importJunit"
+	String REQ_UPLOAD = "Jira Integration/uploadAttachment"
+	String REQ_UPDATE_EXEC = "Jira Integration/updateJiraTicket"
+	String REQ_CREATE_PLAN = "Jira Integration/Create Test Plan"
+	String REQ_UPDATE_PLAN = "Jira Integration/Update Test Plan"
+	String REQ_GET_ISSUE = "Jira Integration/getIssue"
+	String REQ_TRANSITION = "Jira Integration/transitionIssueStatus"
+
+	// Folder used to store the saved Test Plan keys
+	String TESTPLAN_STORAGE = RunConfiguration.projectDir + "\testplan_keys"
+
+	// =========================================================
+	// INTERNAL METHODS
+	// =========================================================
+
+	String getTimestamp() {
+		return new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date())
+	}
+
+	String getSuiteName() {
+
+		String reportPath = RunConfiguration.getReportFolder()
+		File reportFolder = new File(reportPath)
+
+		if (!reportFolder.exists()) {
+			return "UnknownSuite"
+		}
+
+		return reportFolder.getParentFile().getName()
+	}
+
+	String getExecutionSummary() {
+		return getSuiteName() + " " + getTimestamp()
+	}
+
+	String getTestPlanName() {
+		return getSuiteName() + " Test Plan"
+	}
+
+	File getPlanFile() {
+
+		File dir = new File(TESTPLAN_STORAGE)
+
+		if (!dir.exists()) {
+			dir.mkdirs()
+		}
+
+		return new File(dir, getSuiteName() + ".txt")
+	}
+
+	String readSavedPlanKey() {
+
+		File f = getPlanFile()
+
+		if (!f.exists()) {
+			return ""
+		}
+
+		return f.text.trim()
+	}
+
+	void savePlanKey(String key) {
+
+		if (key == null || key.isEmpty()) {
+			return
+		}
+
+		File f = getPlanFile()
+		f.text = key
+	}
+
+	String zipReports() {
+
+		String path = RunConfiguration.getReportFolder()
+		String zipPath = path + "\" + RESULTS_ZIP_NAME
+
+		def output = new ZipOutputStream(new FileOutputStream(zipPath))
+
+		new File(path).eachFile { file ->
+
+			if (!file.isFile()) return
+			if (file.name.endsWith(".zip")) return
+
+			output.putNextEntry(new ZipEntry(file.name))
+			output << file.bytes
+			output.closeEntry()
+		}
+
+		output.close()
+
+		return zipPath
+	}
+
+	String zipEvidences() {
+
+		String evidencePath = RunConfiguration.getReportFolder() + "\" + EVIDENCE_FOLDER
+		File evidenceFolder = new File(evidencePath)
+
+		if (!evidenceFolder.exists()) return null
+
+		String zipPath = evidencePath + "\" + EVIDENCE_ZIP_NAME
+
+		def output = new ZipOutputStream(new FileOutputStream(zipPath))
+
+		evidenceFolder.eachFileRecurse(FileType.FILES) { file ->
+
+			output.putNextEntry(new ZipEntry(file.name))
+			output << file.bytes
+			output.closeEntry()
+		}
+
+		output.close()
+
+		return zipPath
+	}
+
+	String findXML() {
+
+		File dir = new File(RunConfiguration.getReportFolder())
+
+		def result = null
+
+		dir.eachFileRecurse(FileType.FILES) {
+
+			if (it.name.contains(REPORT_XML_NAME)) {
+				result = it.absolutePath
+			}
+		}
+
+		return result
+	}
+
+	String importResults() {
+
+		String xml = findXML()
+
+		def response = WS.sendRequest(
+			findTestObject(REQ_IMPORT,
+			[
+				("junitFile") : xml,
+				("project") : PROJECT_KEY
+			]
+		))
+
+		def json = new JsonSlurper().parseText(response.getResponseBodyContent())
+
+		return json.testExecIssue.key
+	}
+
+	String createTestPlan() {
+
+		def response = WS.sendRequest(
+			findTestObject(REQ_CREATE_PLAN,
+			[
+				("project") : PROJECT_KEY,
+				("summary") : getTestPlanName(),
+				("labels") : LABELS,
+				("env") : ENVIRONMENT,
+				("epic") : EPIC_KEY
+			]
+		)
+
+		def json = new JsonSlurper().parseText(response.getResponseBodyContent())
+
+		return json.key
+	}
+
+	String getOrCreatePlan() {
+
+		if (!FIXED_TEST_PLAN_KEY.isEmpty()) {
+			return FIXED_TEST_PLAN_KEY
+		}
+
+		if (FORCE_CREATE_NEW_TEST_PLAN) {
+
+			String key = createTestPlan()
+			savePlanKey(key)
+
+			return key
+		}
+
+		String saved = readSavedPlanKey()
+
+		if (!saved.isEmpty()) {
+			return saved
+		}
+
+		String newKey = createTestPlan()
+		savePlanKey(newKey)
+
+		return newKey
+	}
+
+	void linkExecutionToPlan(String plan, String exec) {
+
+		def body = [
+			addTestsToPlan : true,
+			add : [exec]
+		]
+
+		WS.sendRequest(
+			findTestObject(
+				REQ_UPDATE_PLAN,
+				[
+					("testPlanKey") : plan,
+					("jsonBody") : JsonOutput.toJson(body)
+				]
+			)
+		)
+	}
+
+	void upload(String exec, String file) {
+
+		if (file == null) return
+
+		WS.sendRequest(
+			findTestObject(
+				REQ_UPLOAD,
+				[
+					("execID") : exec,
+					("filePath") : file
+				]
+			)
+		)
+	}
+
+	void transition(String issue, String transitionId) {
+
+		if (transitionId == null || transitionId.isEmpty()) return
+
+		WS.sendRequest(
+			findTestObject(
+				REQ_TRANSITION,
+				[
+					("issueID") : issue,
+					("transitionID") : transitionId
+				]
+			)
+		)
+	}
+
+	// =========================================================
+	// MAIN KEYWORD
+	// =========================================================
+
+	@Keyword
+	def jiraImport() {
+
+		KeywordUtil.logInfo("Suite: " + getSuiteName())
+		KeywordUtil.logInfo("Execution summary: " + getExecutionSummary())
+
+		String execution = importResults()
+		String plan = getOrCreatePlan()
+
+		linkExecutionToPlan(plan, execution)
+
+		String zipReport = zipReports()
+		String zipEvidence = zipEvidences()
+
+		upload(execution, zipReport)
+		upload(execution, zipEvidence)
+
+		File html = new File(RunConfiguration.getReportFolder() + "\" + HTML_REPORT_NAME)
+
+		if (html.exists()) {
+			upload(execution, html.absolutePath)
+		}
+
+		transition(execution, EXECUTION_TRANSITION_ID)
+		transition(plan, TESTPLAN_TRANSITION_ID)
+
+		KeywordUtil.logInfo("Execution created: " + execution)
+		KeywordUtil.logInfo("Test Plan used: " + plan)
+	}
+}
