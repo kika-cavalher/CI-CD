@@ -1,1 +1,494 @@
+pipeline {
+    agent {
+        node {
+            label 'GI5_SWDCFRNXGI55817'
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+        }
+    }
 
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        string(
+            name: 'STARTUP_WAIT_SECONDS',
+            defaultValue: '60',
+            description: 'Seconds to wait after Gaia startup'
+        )
+        string(
+            name: 'SUITE_TIMEOUT_MINUTES',
+            defaultValue: '15',
+            description: 'Maximum minutes for each suite'
+        )
+    }
+
+    environment {
+        WORK_DIR          = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+        PROJECT_PATH      = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
+        REPORTS_DIR       = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports'
+        SUMMARY_DIR       = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\PipelineSummary'
+        SUMMARY_FILE      = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\PipelineSummary\\suite_summary.txt'
+        ERROR_FILE        = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\PipelineSummary\\suite_errors.txt'
+
+        GIT_URL           = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+        GIT_CRED          = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+
+        GAIA_START_TASK   = 'GaiaBackFrontSetup'
+        VISIBLE_TASK_NAME = 'GaiaKatalon_Visible'
+
+        CONTROL_DIR       = 'C:\\Gaia'
+        STATUS_FILE       = 'C:\\Gaia\\gaia_visible_status.txt'
+        SUITE_FILE        = 'C:\\Gaia\\gaia_suite_to_run.txt'
+        LIVE_LOG_FILE     = 'C:\\Gaia\\gaia_visible_live.log'
+    }
+
+    stages {
+
+        stage('Checkout Repository') {
+            steps {
+                dir("${env.WORK_DIR}") {
+                    deleteDir()
+
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/master']],
+                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
+                        extensions: [
+                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+                        ]
+                    ])
+                }
+
+                echo 'Checkout completed successfully'
+            }
+        }
+
+        stage('Prepare Reports and Control Files') {
+            steps {
+                script {
+                    echo '========================================'
+                    echo 'Starting Gaia pipeline'
+                    echo "Build Number : ${env.BUILD_NUMBER}"
+                    echo "Node         : ${env.NODE_NAME}"
+                    echo "Workspace    : ${env.WORKSPACE}"
+                    echo "Work Dir     : ${env.WORK_DIR}"
+                    echo "Project Path : ${env.PROJECT_PATH}"
+                    echo "Reports Dir  : ${env.REPORTS_DIR}"
+                    echo 'Run Mode     : VISIBLE'
+                    echo '========================================'
+                }
+
+                bat """
+                    @echo off
+                    rem Create report folders after checkout so they are not deleted later
+                    if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
+                    mkdir "${env.REPORTS_DIR}"
+                    mkdir "${env.SUMMARY_DIR}"
+
+                    rem Create control folder and clear old control files
+                    if not exist "${env.CONTROL_DIR}" mkdir "${env.CONTROL_DIR}"
+                    if exist "${env.STATUS_FILE}" del /f /q "${env.STATUS_FILE}" >nul 2>&1
+                    if exist "${env.SUITE_FILE}" del /f /q "${env.SUITE_FILE}" >nul 2>&1
+                    if exist "${env.LIVE_LOG_FILE}" del /f /q "${env.LIVE_LOG_FILE}" >nul 2>&1
+
+                    rem Create empty summary files
+                    break> "${env.SUMMARY_FILE}"
+                    break> "${env.ERROR_FILE}"
+                """
+            }
+        }
+
+        stage('Validate Paths') {
+            steps {
+                bat """
+                    @echo off
+                    rem Validate all critical paths before execution starts
+                    echo ========================================
+                    echo VALIDATING REQUIRED PATHS
+                    echo ========================================
+                    echo WORK_DIR      = "${env.WORK_DIR}"
+                    echo PROJECT_PATH  = "${env.PROJECT_PATH}"
+                    echo REPORTS_DIR   = "${env.REPORTS_DIR}"
+                    echo SUMMARY_DIR   = "${env.SUMMARY_DIR}"
+                    echo CONTROL_DIR   = "${env.CONTROL_DIR}"
+                    echo STATUS_FILE   = "${env.STATUS_FILE}"
+                    echo SUITE_FILE    = "${env.SUITE_FILE}"
+                    echo LIVE_LOG_FILE = "${env.LIVE_LOG_FILE}"
+                    echo ========================================
+
+                    if not exist "${env.WORK_DIR}" (
+                        echo ERROR: WORK_DIR not found
+                        exit /b 1
+                    )
+
+                    if not exist "${env.PROJECT_PATH}" (
+                        echo ERROR: PROJECT_PATH not found
+                        exit /b 1
+                    )
+
+                    if not exist "${env.REPORTS_DIR}" (
+                        echo ERROR: REPORTS_DIR not found
+                        exit /b 1
+                    )
+
+                    if not exist "${env.SUMMARY_DIR}" (
+                        echo ERROR: SUMMARY_DIR not found
+                        exit /b 1
+                    )
+
+                    if not exist "${env.CONTROL_DIR}" (
+                        echo ERROR: CONTROL_DIR not found
+                        exit /b 1
+                    )
+
+                    echo SUCCESS: All required paths exist
+                """
+            }
+        }
+
+        stage('Start Gaia Backend and Frontend') {
+            steps {
+                echo 'Starting Gaia backend and frontend using scheduled task'
+
+                bat """
+                    @echo off
+                    rem Start backend and frontend task
+                    schtasks /run /tn "${env.GAIA_START_TASK}"
+                    if errorlevel 1 exit /b 1
+                """
+
+                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
+            }
+        }
+
+        stage('Execute Gaia Suites Separately') {
+            steps {
+                script {
+                    def suites = [
+                        [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
+                        [name: 'Help',                   path: 'Test Suites/Help'],
+                        [name: 'AddCorrection',          path: 'Test Suites/AddCorrection'],
+                        [name: 'ComputationSelection',   path: 'Test Suites/Computation Selection'],
+                        [name: 'CorrectedDuplication',   path: 'Test Suites/CorrectedDuplication'],
+                        [name: 'CorrectionDetails',      path: 'Test Suites/CorrectionDetails'],
+                        [name: 'DownloadInvalidRecords', path: 'Test Suites/DownloadInvalidRecords']
+                    ]
+
+                    def failedSuites = []
+
+                    for (suite in suites) {
+                        def exitCode = '999'
+
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            timeout(time: params.SUITE_TIMEOUT_MINUTES.toInteger(), unit: 'MINUTES') {
+                                exitCode = runVisibleSuite(suite)
+                                if (exitCode != '0') {
+                                    error("Suite ${suite.name} failed with exit code ${exitCode}")
+                                }
+                            }
+                        }
+
+                        if (exitCode == '0') {
+                            echo "Suite ${suite.name} marked as PASSED"
+                        } else {
+                            echo "Suite ${suite.name} marked as FAILED"
+                            failedSuites << suite.name
+                        }
+                    }
+
+                    if (failedSuites) {
+                        currentBuild.result = 'UNSTABLE'
+                        echo "Failed suites: ${failedSuites.join(', ')}"
+                    }
+                }
+            }
+        }
+
+        stage('Final Summary') {
+            steps {
+                script {
+                    echo '========================================'
+                    echo 'FINAL PIPELINE SUMMARY'
+                    echo '========================================'
+
+                    if (fileExists(env.SUMMARY_FILE)) {
+                        echo readFile(env.SUMMARY_FILE)
+                    } else {
+                        echo 'Summary file not found'
+                    }
+
+                    echo '========================================'
+                    echo 'ERROR SUMMARY'
+                    echo '========================================'
+
+                    if (fileExists(env.ERROR_FILE)) {
+                        echo readFile(env.ERROR_FILE)
+                    } else {
+                        echo 'Error summary file not found'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Archiving reports...'
+
+            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
+            }
+        }
+
+        success {
+            echo 'SUCCESS: Pipeline completed successfully'
+        }
+
+        unstable {
+            echo 'UNSTABLE: Some suites failed, but execution continued'
+        }
+
+        failure {
+            script {
+                stopAllGaiaProcesses('Build failed')
+            }
+            echo 'FAILURE: Pipeline failed'
+        }
+
+        aborted {
+            script {
+                stopAllGaiaProcesses('Build aborted by user')
+            }
+            echo 'ABORTED: Pipeline canceled by user and all related processes were stopped'
+        }
+    }
+}
+
+def runVisibleSuite(Map suite) {
+    echo '========================================'
+    echo 'Starting suite execution'
+    echo "Suite Name   : ${suite.name}"
+    echo "Suite Path   : ${suite.path}"
+    echo 'Run Mode     : VISIBLE'
+    echo "Project Path : ${env.PROJECT_PATH}"
+    echo "Report Path  : ${env.REPORTS_DIR}"
+    echo "Status File  : ${env.STATUS_FILE}"
+    echo "Suite File   : ${env.SUITE_FILE}"
+    echo "Live Log     : ${env.LIVE_LOG_FILE}"
+    echo '========================================'
+
+    def suiteFolderName = suite.name.replaceAll('[^A-Za-z0-9_-]', '_')
+
+    waitForTaskToBeIdle(env.VISIBLE_TASK_NAME, 120)
+
+    bat """
+        @echo off
+        rem Clean old control files before starting a new suite
+        if not exist "${env.CONTROL_DIR}" mkdir "${env.CONTROL_DIR}"
+        if exist "${env.STATUS_FILE}" del /f /q "${env.STATUS_FILE}" >nul 2>&1
+        if exist "${env.LIVE_LOG_FILE}" del /f /q "${env.LIVE_LOG_FILE}" >nul 2>&1
+
+        rem Write the suite that the scheduled task must execute
+        > "${env.SUITE_FILE}" echo ${suite.path}
+
+        rem Create suite-specific report folder
+        if not exist "${env.REPORTS_DIR}\\${suiteFolderName}" mkdir "${env.REPORTS_DIR}\\${suiteFolderName}"
+    """
+
+    bat """
+        @echo off
+        rem Start the visible scheduled task
+        schtasks /run /tn "${env.VISIBLE_TASK_NAME}"
+        if errorlevel 1 exit /b 1
+    """
+
+    powershell """
+        \$statusFile = "${env.STATUS_FILE}"
+        \$logFile = "${env.LIVE_LOG_FILE}"
+        \$timeoutSeconds = ${params.SUITE_TIMEOUT_MINUTES.toInteger() * 60}
+        \$start = Get-Date
+        \$lastLineCount = 0
+
+        Write-Host "Waiting for suite: ${suite.name}"
+
+        while (\$true) {
+            rem = \$null
+
+            if (Test-Path \$logFile) {
+                \$lines = Get-Content \$logFile -ErrorAction SilentlyContinue
+                if (\$lines.Count -gt \$lastLineCount) {
+                    \$newLines = \$lines[\$lastLineCount..(\$lines.Count - 1)]
+                    foreach (\$line in \$newLines) {
+                        Write-Host \$line
+                    }
+                    \$lastLineCount = \$lines.Count
+                }
+            }
+
+            if (Test-Path \$statusFile) {
+                Write-Host "Status file detected for suite ${suite.name}"
+
+                if (Test-Path \$logFile) {
+                    \$lines = Get-Content \$logFile -ErrorAction SilentlyContinue
+                    if (\$lines.Count -gt \$lastLineCount) {
+                        \$newLines = \$lines[\$lastLineCount..(\$lines.Count - 1)]
+                        foreach (\$line in \$newLines) {
+                            Write-Host \$line
+                        }
+                    }
+                }
+
+                break
+            }
+
+            if (((Get-Date) - \$start).TotalSeconds -ge \$timeoutSeconds) {
+                Write-Error "Timeout waiting for suite ${suite.name}"
+                exit 1
+            }
+
+            Start-Sleep -Seconds 2
+        }
+
+        Get-Content \$statusFile
+    """
+
+    if (!fileExists(env.STATUS_FILE)) {
+        error("Status file was not created for suite ${suite.name}")
+    }
+
+    def rawStatus = readFile(env.STATUS_FILE).trim()
+    echo "Raw suite status: ${rawStatus}"
+
+    def exitCodeLine = rawStatus.readLines().find { it.startsWith('EXIT_CODE=') }
+    def resultLine   = rawStatus.readLines().find { it.startsWith('RESULT=') }
+
+    def exitCode = exitCodeLine ? exitCodeLine.replace('EXIT_CODE=', '').trim() : '999'
+    def result   = resultLine ? resultLine.replace('RESULT=', '').trim() : (exitCode == '0' ? 'PASSED' : 'FAILED')
+
+    bat """
+        @echo off
+        rem Append suite result to final summary file
+        echo ========================================>> "${env.SUMMARY_FILE}"
+        echo Suite Name : ${suite.name}>> "${env.SUMMARY_FILE}"
+        echo Suite Path : ${suite.path}>> "${env.SUMMARY_FILE}"
+        echo Result     : ${result}>> "${env.SUMMARY_FILE}"
+        echo Exit Code  : ${exitCode}>> "${env.SUMMARY_FILE}"
+        echo Report Dir : ${env.REPORTS_DIR}\\${suiteFolderName}>> "${env.SUMMARY_FILE}"
+    """
+
+    powershell """
+        \$errorFile = "${env.ERROR_FILE}"
+        \$logFile = "${env.LIVE_LOG_FILE}"
+
+        Add-Content -Path \$errorFile -Value "========================================"
+        Add-Content -Path \$errorFile -Value "Suite Name : ${suite.name}"
+        Add-Content -Path \$errorFile -Value "Result     : ${result}"
+        Add-Content -Path \$errorFile -Value "Exit Code  : ${exitCode}"
+
+        if (Test-Path \$logFile) {
+            \$patterns = @('ERROR', 'FAILED', 'Exception', 'Caused by:', 'StepFailedException', 'AssertionError')
+            \$matches = @()
+            \$content = Get-Content \$logFile -ErrorAction SilentlyContinue
+
+            foreach (\$line in \$content) {
+                foreach (\$pattern in \$patterns) {
+                    if (\$line -match \$pattern) {
+                        \$matches += \$line
+                        break
+                    }
+                }
+            }
+
+            if (\$matches.Count -gt 0) {
+                Add-Content -Path \$errorFile -Value "Collected Errors:"
+                \$matches | Select-Object -Unique | Select-Object -First 100 | ForEach-Object {
+                    Add-Content -Path \$errorFile -Value \$_
+                }
+            } else {
+                Add-Content -Path \$errorFile -Value "Collected Errors: No explicit error lines found in live log"
+            }
+        } else {
+            Add-Content -Path \$errorFile -Value "Collected Errors: Live log file not found"
+        }
+
+        Add-Content -Path \$errorFile -Value ""
+    """
+
+    waitForTaskToBeIdle(env.VISIBLE_TASK_NAME, 120)
+
+    echo "Suite ${suite.name} finished with result ${result} and exit code ${exitCode}"
+
+    return exitCode
+}
+
+def waitForTaskToBeIdle(String taskName, int timeoutSeconds) {
+    powershell """
+        \$taskName = "${taskName}"
+        \$timeoutSeconds = ${timeoutSeconds}
+        \$start = Get-Date
+
+        Write-Host "Checking scheduled task state for: \$taskName"
+
+        while (\$true) {
+            \$task = Get-ScheduledTask -TaskName \$taskName -ErrorAction SilentlyContinue
+
+            if (-not \$task) {
+                Write-Error "Scheduled task not found: \$taskName"
+                exit 1
+            }
+
+            \$state = [string]\$task.State
+            Write-Host "Task state: \$state"
+
+            if (\$state -ne 'Running') {
+                break
+            }
+
+            if (((Get-Date) - \$start).TotalSeconds -ge \$timeoutSeconds) {
+                Write-Error "Task \$taskName is still running after \$timeoutSeconds seconds"
+                exit 1
+            }
+
+            Start-Sleep -Seconds 2
+        }
+    """
+}
+
+def stopAllGaiaProcesses(String reason) {
+    echo '========================================'
+    echo "Stopping all Gaia related processes"
+    echo "Reason: ${reason}"
+    echo '========================================'
+
+    bat """
+        @echo off
+        rem Try to end the visible scheduled task
+        schtasks /end /tn "${env.VISIBLE_TASK_NAME}" >nul 2>&1
+
+        rem Try to end the startup scheduled task
+        schtasks /end /tn "${env.GAIA_START_TASK}" >nul 2>&1
+
+        rem Kill common Katalon and browser processes used by the run
+        taskkill /f /t /im katalonc.exe >nul 2>&1
+        taskkill /f /t /im KatalonStudio.exe >nul 2>&1
+        taskkill /f /t /im chromedriver.exe >nul 2>&1
+        taskkill /f /t /im chrome.exe >nul 2>&1
+        taskkill /f /t /im msedgedriver.exe >nul 2>&1
+        taskkill /f /t /im msedge.exe >nul 2>&1
+
+        rem Clear control files to avoid stale results on next run
+        if exist "${env.STATUS_FILE}" del /f /q "${env.STATUS_FILE}" >nul 2>&1
+        if exist "${env.SUITE_FILE}" del /f /q "${env.SUITE_FILE}" >nul 2>&1
+        if exist "${env.LIVE_LOG_FILE}" del /f /q "${env.LIVE_LOG_FILE}" >nul 2>&1
+
+        exit /b 0
+    """
+}
