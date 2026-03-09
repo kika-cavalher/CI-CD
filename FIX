@@ -2,7 +2,6 @@ package com.keywords.integrationHandler
 
 import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
-import java.nio.file.Files
 import java.text.SimpleDateFormat
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -20,12 +19,13 @@ public class JiraIntegration {
 
 	/*
 	 * Includes:
-	 * - Gets the latest Katalon execution report folder
-	 * - Imports JUnit/Cucumber result into Jira/Xray
-	 * - Creates or finds Test Plan
+	 * - Gets current Katalon report folder
+	 * - Imports XML results into Jira/Xray
+	 * - Reuses saved Test Plan key if available
+	 * - Creates a new Test Plan only when needed
+	 * - Saves Test Plan key locally for next executions
 	 * - Updates Test Execution information
-	 * - Zips reports and evidences
-	 * - Uploads attachments to Jira
+	 * - Uploads ZIP reports, evidence ZIP and HTML report
 	 * - Updates Jira issue status
 	 */
 
@@ -34,38 +34,39 @@ public class JiraIntegration {
 	// Update all values here
 	// =========================================================
 
-	String PROJECT_KEY                    = 'QA'
-	String BASE_URL                       = 'https://your-jira-url-here'
-	String ACCESS_TOKEN                   = 'your-token-here'
-	String TEST_PLAN_NAME                 = 'Regression Test Plan'
-	String EXECUTION_SUMMARY_PREFIX       = 'Regression Execution'
-	String ENVIRONMENT                    = 'QA'
-	String LABELS                         = 'automation,regression'
-	String DESCRIPTION                    = 'Automated execution imported from Katalon'
-	String COMPONENTS                     = 'QA'
-	String EPIC_KEY                       = 'QA-100'
+	String PROJECT_KEY              = 'QA'
+	String BASE_URL                 = 'https://your-jira-url-here'
+	String ACCESS_TOKEN             = 'your-token-here'
 
-	String XML_FILE_NAME_CONTAINS         = 'cucumber.xml'
-	String HTML_REPORT_FILE_NAME          = 'eMatchReport.html'
-	String REPORT_ZIP_NAME                = 'Results.zip'
-	String EVIDENCE_FOLDER_NAME           = 'Evidences'
-	String EVIDENCE_ZIP_NAME              = 'Evidences.zip'
+	String TEST_PLAN_NAME           = 'Regression Test Plan'
+	String EXECUTION_SUMMARY_PREFIX = 'Regression Execution'
+	String ENVIRONMENT              = 'QA'
+	String LABELS                   = 'automation,regression'
+	String EPIC_KEY                 = 'QA-100'
 
-	String TRANSITION_EXECUTION_ID        = '11'
-	String TRANSITION_TEST_PLAN_ID        = '11'
+	String XML_FILE_NAME_CONTAINS   = 'cucumber.xml'
+	String HTML_REPORT_FILE_NAME    = 'eMatchReport.html'
+	String REPORT_ZIP_NAME          = 'Results.zip'
+	String EVIDENCE_FOLDER_NAME     = 'Evidences'
+	String EVIDENCE_ZIP_NAME        = 'Evidences.zip'
+
+	String TRANSITION_EXECUTION_ID  = '11'
+	String TRANSITION_TEST_PLAN_ID  = '11'
+
+	String TEST_PLAN_FILE_PATH      = RunConfiguration.projectDir + '\\testplan_key.txt'
 
 	// =========================================================
 	// OBJECT REPOSITORY PATHS
 	// Update these paths if needed
 	// =========================================================
 
-	String REQUEST_IMPORT_RESULTS         = 'Jira Integration/import Results'
-	String REQUEST_GET_TEST_PLAN          = 'Jira Integration/Get Test Plan'
-	String REQUEST_CREATE_TEST_PLAN       = 'Jira Integration/Create Test Plan'
-	String REQUEST_UPDATE_TEST_PLAN       = 'Jira Integration/Update Test Plan'
-	String REQUEST_UPDATE_TEST_EXECUTION  = 'Jira Integration/Update Test Execution Name'
-	String REQUEST_UPLOAD_ATTACHMENT      = 'Jira Integration/Evidence attachment'
-	String REQUEST_TRANSITION_STATUS      = 'Jira Integration/Transition Issue Status'
+	String REQUEST_IMPORT_RESULTS        = 'Jira Integration/import Results'
+	String REQUEST_GET_TEST_PLAN         = 'Jira Integration/Get Test Plan'
+	String REQUEST_CREATE_TEST_PLAN      = 'Jira Integration/Create Test Plan'
+	String REQUEST_UPDATE_TEST_PLAN      = 'Jira Integration/Update Test Plan'
+	String REQUEST_UPDATE_TEST_EXECUTION = 'Jira Integration/Update Test Execution Name'
+	String REQUEST_UPLOAD_ATTACHMENT     = 'Jira Integration/Evidence attachment'
+	String REQUEST_TRANSITION_STATUS     = 'Jira Integration/Transition Issue Status'
 
 	// =========================================================
 	// GET METHODS
@@ -93,14 +94,6 @@ public class JiraIntegration {
 
 	def getLabels() {
 		return LABELS
-	}
-
-	def getDescription() {
-		return DESCRIPTION
-	}
-
-	def getComponents() {
-		return COMPONENTS
 	}
 
 	def getEpicKey() {
@@ -142,15 +135,15 @@ public class JiraIntegration {
 	}
 
 	def getEvidenceFolderPath() {
-		String path = getReportPath() + File.separator + EVIDENCE_FOLDER_NAME
-		File folder = new File(path)
+		String evidencePath = getReportPath() + File.separator + EVIDENCE_FOLDER_NAME
+		File evidenceFolder = new File(evidencePath)
 
-		if (!folder.exists() || !folder.isDirectory()) {
-			KeywordUtil.markWarning("Evidence folder was not found: ${folder.absolutePath}")
+		if (!evidenceFolder.exists() || !evidenceFolder.isDirectory()) {
+			KeywordUtil.markWarning("Evidence folder was not found: ${evidenceFolder.absolutePath}")
 			return null
 		}
 
-		return folder.absolutePath
+		return evidenceFolder.absolutePath
 	}
 
 	def getHtmlReportFile(String reportName = HTML_REPORT_FILE_NAME) {
@@ -172,6 +165,51 @@ public class JiraIntegration {
 
 		KeywordUtil.markWarning("HTML report '${reportName}' was not found in: ${reportDir.absolutePath}")
 		return null
+	}
+
+	// =========================================================
+	// TEST PLAN PERSISTENCE
+	// =========================================================
+
+	def getSavedTestPlanKey() {
+		File file = new File(TEST_PLAN_FILE_PATH)
+
+		if (!file.exists()) {
+			return ''
+		}
+
+		String savedKey = file.text?.trim()
+
+		if (savedKey == null || savedKey.isEmpty()) {
+			return ''
+		}
+
+		KeywordUtil.logInfo("Saved Test Plan key found: ${savedKey}")
+		return savedKey
+	}
+
+	def saveTestPlanKey(String testPlanKey) {
+		if (testPlanKey == null || testPlanKey.trim().isEmpty()) {
+			return
+		}
+
+		File file = new File(TEST_PLAN_FILE_PATH)
+		file.write(testPlanKey.trim(), 'UTF-8')
+
+		KeywordUtil.logInfo("Test Plan key saved successfully: ${testPlanKey}")
+	}
+
+	@Keyword
+	def resetTestPlanKey() {
+		File file = new File(TEST_PLAN_FILE_PATH)
+
+		if (!file.exists()) {
+			KeywordUtil.logInfo("Test Plan key file does not exist. Nothing to reset.")
+			return
+		}
+
+		file.write('', 'UTF-8')
+		KeywordUtil.logInfo("Saved Test Plan key was cleared successfully.")
 	}
 
 	// =========================================================
@@ -211,12 +249,12 @@ public class JiraIntegration {
 			return 'ERROR_EXEC_ID_NOT_FOUND'
 		}
 
-		KeywordUtil.logInfo("Test Execution created in Jira: ${execID}")
+		KeywordUtil.logInfo("Test Execution created successfully: ${execID}")
 		return execID
 	}
 
-	def getOrCreateTestPlan() {
-		KeywordUtil.logInfo("Searching for Test Plan: ${getTestPlanName()}")
+	def getTestPlanByName() {
+		KeywordUtil.logInfo("Searching Test Plan by name: ${getTestPlanName()}")
 
 		String escapedSummary = getTestPlanName().replace("[", "\\\\[").replace("]", "\\\\]")
 
@@ -241,13 +279,14 @@ public class JiraIntegration {
 		int total = parsedJson?.total ?: 0
 
 		if (total == 0) {
-			return createTestPlan()
+			KeywordUtil.logInfo("No existing Test Plan found with this name.")
+			return null
 		}
 
 		if (total == 1) {
-			String key = parsedJson.issues[0].key
-			KeywordUtil.logInfo("Existing Test Plan found: ${key}")
-			return key
+			String testPlanKey = parsedJson.issues[0].key
+			KeywordUtil.logInfo("Existing Test Plan found: ${testPlanKey}")
+			return testPlanKey
 		}
 
 		return 'ERROR_MULTIPLE_TEST_PLANS_FOUND'
@@ -276,18 +315,46 @@ public class JiraIntegration {
 		}
 
 		def parsedJson = new JsonSlurper().parseText(body)
-		String key = parsedJson?.key
+		String testPlanKey = parsedJson?.key
 
-		if (key == null || key.trim().isEmpty()) {
+		if (testPlanKey == null || testPlanKey.trim().isEmpty()) {
 			return 'ERROR_TEST_PLAN_KEY_NOT_FOUND'
 		}
 
-		KeywordUtil.logInfo("Test Plan created successfully: ${key}")
-		return key
+		KeywordUtil.logInfo("New Test Plan created successfully: ${testPlanKey}")
+		return testPlanKey
+	}
+
+	def getOrCreateTestPlan() {
+		String savedTestPlanKey = getSavedTestPlanKey()
+
+		if (savedTestPlanKey != '') {
+			KeywordUtil.logInfo("Using saved Test Plan key: ${savedTestPlanKey}")
+			return savedTestPlanKey
+		}
+
+		String existingTestPlanKey = getTestPlanByName()
+
+		if (existingTestPlanKey != null && !existingTestPlanKey.startsWith('ERROR')) {
+			saveTestPlanKey(existingTestPlanKey)
+			return existingTestPlanKey
+		}
+
+		if (existingTestPlanKey != null && existingTestPlanKey.startsWith('ERROR')) {
+			return existingTestPlanKey
+		}
+
+		String newTestPlanKey = createTestPlan()
+
+		if (newTestPlanKey != null && !newTestPlanKey.startsWith('ERROR')) {
+			saveTestPlanKey(newTestPlanKey)
+		}
+
+		return newTestPlanKey
 	}
 
 	def updateTestPlan(String testPlanKey, String execID) {
-		KeywordUtil.logInfo("Adding Test Execution ${execID} into Test Plan ${testPlanKey}...")
+		KeywordUtil.logInfo("Adding Test Execution ${execID} to Test Plan ${testPlanKey}...")
 
 		def jsonBody = [
 			addTestsToPlan: true,
@@ -304,7 +371,7 @@ public class JiraIntegration {
 	}
 
 	def updateJiraTicketInfo(String execID) {
-		KeywordUtil.logInfo("Updating information on Jira issue ${execID}...")
+		KeywordUtil.logInfo("Updating Jira issue information for ${execID}...")
 
 		def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_EXECUTION, [
 			('issueID') : execID,
@@ -318,7 +385,7 @@ public class JiraIntegration {
 	}
 
 	def uploadAttachment(String execID, String filePath) {
-		KeywordUtil.logInfo("Uploading attachment to Jira ${execID}: ${filePath}")
+		KeywordUtil.logInfo("Uploading attachment to ${execID}: ${filePath}")
 
 		def response = WS.sendRequest(findTestObject(REQUEST_UPLOAD_ATTACHMENT, [
 			('token')     : getAccessToken(),
@@ -330,7 +397,7 @@ public class JiraIntegration {
 	}
 
 	def updateIssueStatus(String issueKey, String transitionId) {
-		KeywordUtil.logInfo("Updating Jira status for ${issueKey} with transition ${transitionId}...")
+		KeywordUtil.logInfo("Updating status for ${issueKey} using transition ${transitionId}...")
 
 		def response = WS.sendRequest(findTestObject(REQUEST_TRANSITION_STATUS, [
 			('token')        : getAccessToken(),
@@ -342,17 +409,17 @@ public class JiraIntegration {
 	}
 
 	// =========================================================
-	// ZIP ACTIONS
+	// ZIP METHODS
 	// =========================================================
 
 	def zipReports() {
-		String path = getReportPath()
-		String zippedFile = path + File.separator + REPORT_ZIP_NAME
+		String reportPath = getReportPath()
+		String zippedFile = reportPath + File.separator + REPORT_ZIP_NAME
 
 		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
 		KeywordUtil.logInfo("Creating report ZIP: ${zippedFile}")
 
-		new File(path).eachFile { file ->
+		new File(reportPath).eachFile { file ->
 			if (!file.isFile()) {
 				return
 			}
@@ -412,7 +479,7 @@ public class JiraIntegration {
 					input.close()
 					output.closeEntry()
 				} catch (Exception e) {
-					KeywordUtil.logError("Error while adding file to evidence ZIP: ${file.name} - ${e.message}")
+					KeywordUtil.logError("Error while adding evidence file to ZIP: ${file.name} - ${e.message}")
 				}
 			}
 		}
@@ -430,6 +497,10 @@ public class JiraIntegration {
 	def updateJira() {
 		String results = ''
 
+		// Uncomment the line below if you want to clear the saved Test Plan key
+		// and force the creation of a new Test Plan in the next execution.
+		// resetTestPlanKey()
+
 		KeywordUtil.logInfo("Starting Jira integration flow...")
 
 		String zipReport = zipReports()
@@ -437,7 +508,7 @@ public class JiraIntegration {
 		String execID = importExecutionResults()
 
 		if (execID == null || execID.startsWith('ERROR')) {
-			KeywordUtil.markFailed("Test execution creation failed: ${execID}")
+			KeywordUtil.markFailed("Test Execution creation failed: ${execID}")
 			return
 		}
 
@@ -451,13 +522,13 @@ public class JiraIntegration {
 		if (updateTestPlan(testPlanKey, execID) < 299) {
 			results += "Test Execution ${execID} added to Test Plan ${testPlanKey} successfully.\n"
 		} else {
-			results += "[ERROR] Could not update Test Plan ${testPlanKey}.\n"
+			results += "[ERROR] Could not add Test Execution ${execID} to Test Plan ${testPlanKey}.\n"
 		}
 
 		if (updateJiraTicketInfo(execID) < 299) {
-			results += "Jira ticket ${execID} updated successfully.\n"
+			results += "Jira issue ${execID} updated successfully.\n"
 		} else {
-			results += "[ERROR] Could not update Jira ticket ${execID}.\n"
+			results += "[ERROR] Could not update Jira issue ${execID}.\n"
 		}
 
 		if (zipReport != null && uploadAttachment(execID, zipReport) < 299) {
@@ -489,13 +560,13 @@ public class JiraIntegration {
 		}
 
 		if (updateIssueStatus(execID, TRANSITION_EXECUTION_ID) < 299) {
-			results += "Test Execution ${execID} moved successfully.\n"
+			results += "Test Execution ${execID} status updated successfully.\n"
 		} else {
 			results += "[ERROR] Could not update Test Execution status ${execID}.\n"
 		}
 
 		if (updateIssueStatus(testPlanKey, TRANSITION_TEST_PLAN_ID) < 299) {
-			results += "Test Plan ${testPlanKey} moved successfully.\n"
+			results += "Test Plan ${testPlanKey} status updated successfully.\n"
 		} else {
 			results += "[ERROR] Could not update Test Plan status ${testPlanKey}.\n"
 		}
