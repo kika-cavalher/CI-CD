@@ -1,356 +1,296 @@
-pipeline {
-    agent {
-        node {
-            label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        }
-    }
+package keywords
 
-    options {
-        timestamps()
-        ansiColor('xterm')
-        disableConcurrentBuilds()
-        timeout(time: 90, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
-        skipDefaultCheckout(true)
-    }
+import static com.kms.katalon.core.testdata.TestDataFactory.findTestData
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
-    parameters {
-        string(
-            name: 'STARTUP_WAIT_SECONDS',
-            defaultValue: '120',
-            description: 'Seconds to wait after backend and frontend startup'
-        )
-        string(
-            name: 'SUITE_TIMEOUT_MINUTES',
-            defaultValue: '20',
-            description: 'Maximum minutes for each suite'
-        )
-    }
+import java.nio.file.*
+import java.text.SimpleDateFormat
+import java.util.zip.*
 
-    environment {
-        WORK_DIR        = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        PROJECT_PATH    = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
-        REPORTS_DIR     = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports'
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
 
-        GIT_URL         = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        GIT_CRED        = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+import groovy.io.FileType
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import internal.GlobalVariable as GlobalVariable
 
-        GAIA_START_TASK = 'GaiaBackFrontSetup'
 
-        KATALON_EXE     = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        EXEC_PROFILE    = 'default'
-        BROWSER_TYPE    = 'Chrome'
-    }
+public class JiraIntegration {
+	String testSuiteName
+	def testData = findTestData('Data Files/JIRA')
+	def testDataJira = findTestData('Data Files/Jira Details')
 
-    stages {
+	String baseUrl = testData.getValue('JIRA_API_URL',1)
+	String ACCESS_TOKEN = testData.getValue('ACCESS_TOKEN',1)
+	String project = testData.getValue('PROJ_KEY',1)
+	String reportBasePath = testData.getValue('REPORT_FILE',1)
+	String env = testDataJira.getValue('environment',1)
+	String labels = testDataJira.getValue('labels',1)
+	String epic = testDataJira.getValue('epic',1)
 
-        stage('Validate Base Paths') {
-            steps {
-                bat """
-                    @echo off
-                    echo ========================================
-                    echo VALIDATING BASE PATHS
-                    echo ========================================
 
-                    if not exist "${env.WORK_DIR}" (
-                        echo ERROR: WORK_DIR not found
-                        exit /b 1
-                    )
 
-                    if not exist "${env.KATALON_EXE}" (
-                        echo ERROR: KATALON_EXE not found
-                        exit /b 1
-                    )
+	def setTestSuiteName() {
+		String testSuiteId = GlobalVariable.testSuiteGlobal
+		def testSuite = testSuiteId.replace("Test Suites/", "")
 
-                    echo SUCCESS: Base paths are valid
-                """
-            }
-        }
+		String suffixToRemove = "Jira Integration"
 
-        stage('Start Gaia Backend and Frontend') {
-            steps {
-                script {
-                    echo '========================================'
-                    echo 'Starting Gaia backend and frontend'
-                    echo "Build Number : ${env.BUILD_NUMBER}"
-                    echo "Node         : ${env.NODE_NAME}"
-                    echo "Workspace    : ${env.WORKSPACE}"
-                    echo "Work Dir     : ${env.WORK_DIR}"
-                    echo "Project Path : ${env.PROJECT_PATH}"
-                    echo "Katalon Exe  : ${env.KATALON_EXE}"
-                    echo '========================================'
-                }
+		// Remove suffix
+		if (testSuite.endsWith(suffixToRemove)) {
+			testSuiteName =  testSuite.substring(0, testSuite.length() - suffixToRemove.length()).trim()
+		}
+	}
 
-                bat """
-                    @echo off
-                    rem Start backend and frontend scheduled task
-                    schtasks /run /tn "${env.GAIA_START_TASK}"
-                    if errorlevel 1 exit /b 1
-                """
+	private File getLatestReportDirectory(File reportDir) {
+		return reportDir.listFiles()?.findAll {
+			it.isDirectory()
+		}?.max {
+			it.lastModified()
+		}
+	}
 
-                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
-            }
-        }
+	def getTestSuiteReport() {
+		File reportDir = new File(reportBasePath)
 
-        stage('Checkout Repository') {
-            steps {
-                dir("${env.WORK_DIR}") {
-                    deleteDir()
 
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/master']],
-                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
-                        extensions: [
-                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-                        ]
-                    ])
-                }
+		// Get the last report directory generated
+		File latestReportDir = getLatestReportDirectory(reportDir)
+		if (latestReportDir == null) {
+			KeywordUtil.markFailed("No report folder found in the directory: ${reportDir}")
+			return
+		}
 
-                echo 'Checkout completed successfully'
-            }
-        }
+		File testSuiteDir = new File(latestReportDir,testSuiteName)
 
-        stage('Prepare Reports') {
-            steps {
-                bat """
-                    @echo off
-                    if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
-                    mkdir "${env.REPORTS_DIR}"
-                """
-            }
-        }
+		return testSuiteDir
+	}
 
-        stage('Validate Project Paths') {
-            steps {
-                bat """
-                    @echo off
-                    echo ========================================
-                    echo VALIDATING PROJECT PATHS
-                    echo ========================================
+	def getXmlFile(File testSuiteDir) {
+		if (testSuiteDir.exists() && testSuiteDir.isDirectory()) {
+			String junitXmlPath = null
 
-                    if not exist "${env.PROJECT_PATH}" (
-                        echo ERROR: PROJECT_PATH not found
-                        exit /b 1
-                    )
+			testSuiteDir.eachFileRecurse(FileType.ANY) { file ->
+				KeywordUtil.logInfo("Existing files:" + file.name)
+				if (file.name.contains("cucumber.xml")) {
+					KeywordUtil.logInfo("Cucumber file path: " + file.absolutePath)
+					junitXmlPath = file.absolutePath
+					return
+				}
+			}
+			KeywordUtil.logInfo("Junit report file path"+junitXmlPath)
+			return junitXmlPath
+		} else {
+			KeywordUtil.markFailed("Test Suite directory does not exist: ${testSuiteDir.absolutePath}")
+			return
+		}
+	}
 
-                    if not exist "${env.REPORTS_DIR}" (
-                        echo ERROR: REPORTS_DIR not found
-                        exit /b 1
-                    )
 
-                    echo SUCCESS: Project paths are valid
-                """
-            }
-        }
+	def importResults (String junitXmlPath){
+		def response = WS.sendRequest(findTestObject('Jira Integration/import Results',[('filePath'): junitXmlPath ,('project'):project, ('baseUrl'): baseUrl, ('token'): ACCESS_TOKEN]));
+		def slurper = new JsonSlurper();
 
-        stage('Execute Gaia Suites Separately') {
-            steps {
-                script {
-                    def suites = [
-                        [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
-                        [name: 'Help',                   path: 'Test Suites/Help'],
-                        [name: 'AddCorrection',          path: 'Test Suites/AddCorrection'],
-                        [name: 'ComputationSelection',   path: 'Test Suites/Computation Selection'],
-                        [name: 'CorrectedDuplication',   path: 'Test Suites/CorrectedDuplication'],
-                        [name: 'CorrectionDetails',      path: 'Test Suites/CorrectionDetails'],
-                        [name: 'DownloadInvalidRecords', path: 'Test Suites/DownloadInvalidRecords']
-                    ]
+		int status = WS.getResponseStatusCode(response)
+		KeywordUtil.logInfo("status" +status)
+		def parsedJson = slurper.parseText(response.getResponseBodyContent());
 
-                    def failedSuites = []
 
-                    for (suite in suites) {
-                        def exitCode = 999
+		if (status == 200 || status == 204) {
+			KeywordUtil.logInfo("Importing results..."+parsedJson.toString())
+			def testExecIssue = parsedJson.testExecIssue
+			def testExecKeys = [testExecIssue.key]
+			return testExecKeys
+		}
+		else {
+			return 'ERROR' + status.toString();
+		}
+	}
 
-                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                            timeout(time: params.SUITE_TIMEOUT_MINUTES.toInteger(), unit: 'MINUTES') {
-                                exitCode = runKatalonSuite(suite)
+	def getTestPlanName(String testSuiteName) {
+		def testData = findTestData('Data Files/Test Plan Names')
+		for (def index = 1; index <= testData.getRowNumbers(); index++) {
+			KeywordUtil.logInfo("columns"+testData.columnNames)
+			if (testData.getValue('Test Suite', index) == testSuiteName) {
+				return testData.getValue('Test Plan Name',index)
+			}
+		}
+	}
 
-                                if (exitCode != 0) {
-                                    error("Suite ${suite.name} failed with exit code ${exitCode}")
-                                }
-                            }
-                        }
+	def getTestPlan() {
+		String summary = getTestPlanName(testSuiteName)
 
-                        if (exitCode == 0) {
-                            echo "Suite ${suite.name} marked as PASSED"
-                        } else {
-                            echo "Suite ${suite.name} marked as FAILED"
-                            failedSuites << suite.name
-                        }
-                    }
+		KeywordUtil.logInfo("Test Suite Name: "+summary)
 
-                    echo '========================================'
-                    echo 'FINAL SUITE STATUS'
-                    echo '========================================'
+		String escaped = summary.replace("[", "\\\\[").replace("]", "\\\\]");
 
-                    if (failedSuites) {
-                        echo "Failed suites: ${failedSuites.join(', ')}"
-                        currentBuild.result = 'UNSTABLE'
-                    } else {
-                        echo 'All suites passed'
-                    }
-                }
-            }
-        }
-    }
+		def response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan',[('project'):project,('token'): ACCESS_TOKEN,('summary'): escaped, ('parent'): epic]))
+		def slurper = new JsonSlurper();
 
-    post {
-        always {
-            script {
-                stopGaiaProcesses('Post actions cleanup')
-            }
+		int status = WS.getResponseStatusCode(response)
+		KeywordUtil.logInfo("status" +status)
+		def parsedJson = slurper.parseText(response.getResponseBodyContent());
 
-            echo 'Archiving reports...'
 
-            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+		if (status == 200) {
+			def total = parsedJson.total
+			KeywordUtil.logInfo("test plan with this name founded" +total)
 
-            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
-            }
-        }
+			if (total < 1) {
+				return createTestPlan(summary)
+			}
+			else if(total == 1) {
+				def issues = parsedJson.issues
+				return issues[0].key
+			}
+			else {
+				KeywordUtil.logInfo('Exists 2 or more test plans with the same name')
+			}
+		}
+		else {
+			KeywordUtil.logInfo('ERROR' + status.toString());
+		}
+	}
 
-        success {
-            echo 'SUCCESS: Pipeline completed successfully'
-        }
+	def createTestPlan(String summary) {
+		def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan',[('token'): ACCESS_TOKEN,('env'):env,('project'):project ,('summary'): summary, ('labels'): labels,('epic'):epic]));
+		def slurper = new JsonSlurper();
 
-        unstable {
-            echo 'UNSTABLE: Some suites failed, but execution continued'
-        }
+		int status = WS.getResponseStatusCode(response)
+		KeywordUtil.logInfo("status" +status)
+		def parsedJson = slurper.parseText(response.getResponseBodyContent());
 
-        failure {
-            echo 'FAILURE: Pipeline failed'
-        }
+		if (status == 201) {
+			KeywordUtil.logInfo(parsedJson.toString())
+			return parsedJson.key
+		}
+		else {
+			KeywordUtil.logInfo('ERROR' + status.toString());
+		}
+	}
 
-        aborted {
-            script {
-                stopGaiaProcesses('Build aborted by user')
-            }
-            echo 'ABORTED: Build canceled, tests stopped, startup windows closed'
-        }
-    }
-}
+	def UpdateTestPlan(String testPlanKey, List<String> testExecKeys) {
+		def jsonBody = [
+			addTestsToPlan: true,
+			add: testExecKeys
+		]
 
-def runKatalonSuite(Map suite) {
-    echo '========================================'
-    echo 'Starting suite execution'
-    echo "Suite Name   : ${suite.name}"
-    echo "Suite Path   : ${suite.path}"
-    echo "Project Path : ${env.PROJECT_PATH}"
-    echo "Reports Dir  : ${env.REPORTS_DIR}"
-    echo "Katalon Exe  : ${env.KATALON_EXE}"
-    echo "Browser      : ${env.BROWSER_TYPE}"
-    echo '========================================'
+		def jsonBodyString = JsonOutput.toJson(jsonBody)
 
-    def suiteFolderName = suite.name.replaceAll('[^A-Za-z0-9_-]', '_')
-    def suiteReportDir = "${env.REPORTS_DIR}\\${suiteFolderName}"
+		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan',[('token'): ACCESS_TOKEN,('testPlanKey'):testPlanKey,('jsonBody'): jsonBodyString]));
 
-    def exitCode = bat(
-        returnStatus: true,
-        script: """
-            @echo off
-            echo ========================================
-            echo RUNNING SUITE: ${suite.name}
-            echo SUITE PATH   : ${suite.path}
-            echo BROWSER      : ${env.BROWSER_TYPE}
-            echo PROJECT      : ${env.PROJECT_PATH}
-            echo REPORT DIR   : ${suiteReportDir}
-            echo ========================================
+		int status = WS.getResponseStatusCode(response)
 
-            if not exist "${suiteReportDir}" mkdir "${suiteReportDir}"
+		if (status == 200) {
+			return KeywordUtil.logInfo('Test executions added to the Test Plan!')
+		}
+		else {
+			return 'ERROR' + status.toString()
+		}
+	}
 
-            call "${env.KATALON_EXE}" ^
-            -noSplash ^
-            -runMode=console ^
-            -consoleLog ^
-            -projectPath="${env.PROJECT_PATH}" ^
-            -retry=0 ^
-            -testSuitePath="${suite.path}" ^
-            -browserType="${env.BROWSER_TYPE}" ^
-            -executionProfile="${env.EXEC_PROFILE}" ^
-            -reportFolder="${suiteReportDir}" ^
-            -reportFileName="${suiteFolderName}"
+	def UpdateTestExecution(List<String> testExecKeys) {
+		String timestamp =  new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date());
 
-            exit /b %%ERRORLEVEL%%
-        """
-    )
+		String summary = getTestPlanName(testSuiteName) + ' ' + timestamp
+		String labels_execution = testDataJira.getValue('labels',1)
 
-    echo "Suite ${suite.name} finished with exit code ${exitCode}"
+		KeywordUtil.logInfo('\nUpdating information on Jira issue ' + testExecKeys.get(0) + '.')
 
-    powershell """
-        \$suiteDir = "${suiteReportDir}"
-        Write-Host "Checking generated files in: \$suiteDir"
+		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name',[('issueID'): testExecKeys.get(0),('token'): ACCESS_TOKEN,('summary'):summary,('labels'): labels_execution,('env'):env]));
 
-        if (Test-Path \$suiteDir) {
-            Get-ChildItem -Path \$suiteDir -Recurse -File -ErrorAction SilentlyContinue |
-                Select-Object FullName |
-                ForEach-Object { Write-Host \$_.FullName }
+		int status = WS.getResponseStatusCode(response)
 
-            \$candidateFiles = Get-ChildItem -Path \$suiteDir -Recurse -File -Include *.log,*.txt,*.html,*.xml -ErrorAction SilentlyContinue
+		if (status == 204) {
+			return KeywordUtil.logInfo("Updating Test Execution Information "+status.toString())
+		}
+		else {
+			return 'ERROR' + status.toString()
+		}
+	}
 
-            if (\$candidateFiles) {
-                \$patterns = @('ERROR', 'FAILED', 'Exception', 'Caused by:', 'StepFailedException', 'AssertionError', 'Unable', 'not found', 'timed out')
-                \$matches = @()
 
-                foreach (\$file in \$candidateFiles) {
-                    try {
-                        \$content = Get-Content \$file.FullName -ErrorAction SilentlyContinue
-                        foreach (\$line in \$content) {
-                            foreach (\$pattern in \$patterns) {
-                                if (\$line -match \$pattern) {
-                                    \$matches += "[\$([System.IO.Path]::GetFileName(\$file.FullName))] \$line"
-                                    break
-                                }
-                            }
-                        }
-                    } catch {
-                    }
-                }
+	def zipEvidences(String folderPath) {
+		String zippedFile = folderPath + '\\Evidences.zip'
+		ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zippedFile));
 
-                if (\$matches.Count -gt 0) {
-                    Write-Host "----- POSSIBLE ERROR LINES FOR ${suite.name} -----"
-                    \$matches | Select-Object -Unique | Select-Object -First 80 | ForEach-Object { Write-Host \$_ }
-                    Write-Host "----- END POSSIBLE ERROR LINES FOR ${suite.name} -----"
-                } else {
-                    Write-Host "No explicit error lines found in report files for ${suite.name}"
-                }
-            } else {
-                Write-Host "No candidate report files found for ${suite.name}"
-            }
-        } else {
-            Write-Host "Suite report directory not found for ${suite.name}"
-        }
-    """
+		File folderToZip = new File(folderPath)
 
-    return exitCode
-}
+		File [] subfolders = folderToZip.listFiles().findAll { file -> file.isDirectory() }
 
-def stopGaiaProcesses(String reason) {
-    echo '========================================'
-    echo "Stopping Gaia processes"
-    echo "Reason: ${reason}"
-    echo '========================================'
+		subfolders[0].eachFileRecurse() { file ->
+			KeywordUtil.logInfo("File to be added: "+file)
+			if (file.isDirectory()) {
+				String zipEntryName = file.relativePath(subfolders[0]).toString().replace("\\", "/") + "/"
+				output.putNextEntry(new ZipEntry(zipEntryName))
+				output.closeEntry()
+			}
+			else if (file.isFile()) {
+				if (!file.toString().equalsIgnoreCase(zippedFile)) {
+					output.putNextEntry(new ZipEntry(file.name.toString()))
+					Files.copy(file.toPath(), output);
+					output.closeEntry();
+				}
+			}
+		}
+		output.close();
+		return zippedFile
+	}
 
-    bat """
-        @echo off
-        rem End startup scheduled task if it is still running
-        schtasks /end /tn "${env.GAIA_START_TASK}" >nul 2>&1
 
-        rem Kill Katalon and browser related processes
-        taskkill /f /t /im katalonc.exe >nul 2>&1
-        taskkill /f /t /im KatalonStudio.exe >nul 2>&1
-        taskkill /f /t /im chromedriver.exe >nul 2>&1
-        taskkill /f /t /im chrome.exe >nul 2>&1
+	def addAttachment(File filePath,List<String> execID){
+		def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment',[('token'): ACCESS_TOKEN,('evidences'): filePath, ('execID'):execID.get(0)]));
+		def slurper = new JsonSlurper();
 
-        rem Close command windows opened by backend/frontend startup
-        taskkill /f /fi "WINDOWTITLE eq GAIA_BACK_CMD*" >nul 2>&1
-        taskkill /f /fi "WINDOWTITLE eq GAIA_FRONT_CMD*" >nul 2>&1
+		int status = WS.getResponseStatusCode(response)
+		def parsedJson = slurper.parseText(response.getResponseBodyContent());
 
-        rem Optional fallback for generic command windows
-        taskkill /f /im cmd.exe /fi "WINDOWTITLE eq GAIA_BACK_CMD*" >nul 2>&1
-        taskkill /f /im cmd.exe /fi "WINDOWTITLE eq GAIA_FRONT_CMD*" >nul 2>&1
+		if (status == 200) {
+			return KeywordUtil.logInfo("Adding result.zip..."+parsedJson.toString())
+		}
+		else {
+			return 'ERROR' + status.toString()
+		}
+	}
 
-        exit /b 0
-    """
+	def updateTestExecutionStatus(String execID, String transitionActionId) {
+		def response = WS.sendRequest(findTestObject('Jira Integration/Transition Issue Status', [('token'): ACCESS_TOKEN,('issueID'): execID, ('transitionID'): transitionActionId]));
+		return WS.getResponseStatusCode(response);
+	}
+
+
+	@Keyword
+	def jiraImport() {
+		KeywordUtil.logInfo("Getting the Test Suite Name...")
+		setTestSuiteName()
+		KeywordUtil.logInfo("Getting the Test Suite File Path...")
+		File testSuiteDir = getTestSuiteReport()
+		KeywordUtil.logInfo("Getting the Junit xml file...")
+		String junitXmlPath = getXmlFile(testSuiteDir)
+		KeywordUtil.logInfo("Importing all the tests of the test suite and create a test execution for each...")
+		/* Note: If the test is already create, just create a test execution for the test.*/
+
+		List<String> testExecKeys = importResults(junitXmlPath)
+
+		/*Create or update test plan with the executed tests*/
+		String updateTestPlanInExcelKey = getTestPlan()
+		UpdateTestPlan(updateTestPlanInExcelKey,testExecKeys)
+		KeywordUtil.logInfo("Updating Test Execution Information...")
+		UpdateTestExecution(testExecKeys)
+		KeywordUtil.logInfo("Zip files...")
+		def folderToZip = testSuiteDir.absolutePath
+		KeywordUtil.logInfo("Adding evidences to test execution...")
+		zipEvidences(folderToZip)
+		addAttachment(new File(testSuiteDir.absolutePath.concat("\\evidences.zip")),testExecKeys)
+
+		KeywordUtil.logInfo("Update Test Execution Status (In progress)....")
+
+		updateTestExecutionStatus(testExecKeys.get(0),"11")
+
+		KeywordUtil.logInfo("Update Test Execution Status (In progress)....")
+
+		updateTestExecutionStatus(updateTestPlanInExcelKey,"11")
+	}
 }
