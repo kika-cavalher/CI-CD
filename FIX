@@ -1,8 +1,790 @@
-                        [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
-                        [name: 'Help',                   path: 'Test Suites/Help'],
-                        [name: 'AddCorrection',          path: 'Test Suites/Correction- Add Correction'],
-                        [name: 'ComputationSelection',   path: 'Test Suites/Correction- Computation Selection'],
-                        [name: 'CorrectedDuplication',   path: 'Test Suites/Correction- Corrected Duplication'],
-                        [name: 'CorrectionDetails',      path: 'Test Suites/Correction- Correction Details'],
-                        [name: 'DownloadInvalidRecords', path: 'Test Suites/Correction- Download Invalid Records']
-                    ]
+package keywords
+
+import java.text.SimpleDateFormat
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+import groovy.io.FileType
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+public class JiraIntegration {
+
+    // =========================================================
+    // CONFIGURATION
+    // Change only this section
+    // =========================================================
+
+    // Jira / Xray base URL
+    String BASE_URL = 'https://jira-mtu.d.bb'
+
+    // Auth mode: "Bearer" or "Basic"
+    String AUTH_MODE = 'Bearer'
+
+    // For Bearer mode
+    String ACCESS_TOKEN = 'YOUR_TOKEN_HERE'
+
+    // For Basic mode
+    String USERNAME = ''
+    String PASSWORD = ''
+
+    // Jira project and issue types
+    String PROJECT_KEY = 'L96B2C'
+    String TEST_PLAN_ISSUE_TYPE = 'Test Plan'
+
+    // Optional values
+    String LABELS = 'automate'
+    String ENVIRONMENT = 'UAT'
+
+    // Transition IDs are optional
+    String TRANSITION_EXECUTION_ID = '11'
+    String TRANSITION_TEST_PLAN_ID = ''
+
+    // Report files
+    String XML_FILE_NAME_CONTAINS = 'cucumber.xml'
+    String HTML_REPORT_FILE_NAME = 'eMatchReport.html'
+    String REPORT_ZIP_NAME = 'Results.zip'
+    String EVIDENCE_FOLDER_NAME = 'Evidences'
+    String EVIDENCE_ZIP_NAME = 'Evidences.zip'
+
+    // Xray / Jira endpoints
+    String XRAY_IMPORT_JUNIT_MULTIPART_PATH = '/rest/raven/1.0/import/execution/junit/multipart'
+    String XRAY_ADD_TESTEXEC_TO_TESTPLAN_PATH_TEMPLATE = '/rest/raven/1.0/api/testplan/%s/testexecution'
+
+    String JIRA_SEARCH_PATH = '/rest/api/2/search'
+    String JIRA_CREATE_ISSUE_PATH = '/rest/api/2/issue'
+    String JIRA_UPDATE_ISSUE_PATH_TEMPLATE = '/rest/api/2/issue/%s'
+    String JIRA_ADD_ATTACHMENT_PATH_TEMPLATE = '/rest/api/2/issue/%s/attachments'
+    String JIRA_TRANSITIONS_PATH_TEMPLATE = '/rest/api/2/issue/%s/transitions'
+
+    // Persistence
+    String TEST_PLAN_KEYS_FOLDER = RunConfiguration.projectDir + '\\testplan_keys'
+
+    // Search behavior
+    int TEST_PLAN_SEARCH_MAX_RESULTS = 200
+
+    // =========================================================
+    // MAIN KEYWORD
+    // =========================================================
+
+    @Keyword
+    def jiraImport() {
+        String summaryLog = ''
+
+        // Uncomment the line below if you want to clear the saved Test Plan key
+        // and force a new Test Plan lookup/creation for this suite.
+        // resetTestPlanKey()
+
+        KeywordUtil.logInfo('Starting Jira integration flow...')
+        KeywordUtil.logInfo("Using base URL: ${BASE_URL}")
+        KeywordUtil.logInfo("Using project key: ${PROJECT_KEY}")
+        KeywordUtil.logInfo("Detected Test Suite name: ${getCurrentTestSuiteName()}")
+        KeywordUtil.logInfo("Automatic Test Plan name: ${getTestPlanName()}")
+        KeywordUtil.logInfo("Automatic Execution summary: ${getExecutionSummary()}")
+
+        String zipReport = zipReports()
+        String zipEvidence = zipEvidences()
+        String execKey = importExecutionResults()
+
+        if (isErrorValue(execKey)) {
+            KeywordUtil.markFailed("Test Execution creation failed: ${execKey}")
+            return
+        }
+
+        String testPlanKey = getOrCreateTestPlan()
+
+        if (isErrorValue(testPlanKey)) {
+            KeywordUtil.markFailed("Test Plan could not be found or created: ${testPlanKey}")
+            return
+        }
+
+        int linkStatus = linkTestExecutionToTestPlan(testPlanKey, execKey)
+        if (is2xx(linkStatus)) {
+            summaryLog += "Test Execution ${execKey} linked to Test Plan ${testPlanKey} successfully.\n"
+        } else {
+            summaryLog += "[ERROR] Could not link Test Execution ${execKey} to Test Plan ${testPlanKey}. Status: ${linkStatus}\n"
+        }
+
+        int updateExecStatus = updateTestExecutionIssue(execKey)
+        if (is2xx(updateExecStatus)) {
+            summaryLog += "Test Execution ${execKey} updated successfully.\n"
+        } else {
+            summaryLog += "[ERROR] Could not update Test Execution ${execKey}. Status: ${updateExecStatus}\n"
+        }
+
+        if (zipReport != null) {
+            int uploadZipReportStatus = uploadAttachment(execKey, zipReport)
+            if (is2xx(uploadZipReportStatus)) {
+                summaryLog += "Report ZIP uploaded successfully to ${execKey}.\n"
+            } else {
+                summaryLog += "[ERROR] Could not upload Report ZIP to ${execKey}. Status: ${uploadZipReportStatus}\n"
+            }
+        }
+
+        if (zipEvidence != null) {
+            int uploadZipEvidenceStatus = uploadAttachment(execKey, zipEvidence)
+            if (is2xx(uploadZipEvidenceStatus)) {
+                summaryLog += "Evidence ZIP uploaded successfully to ${execKey}.\n"
+            } else {
+                summaryLog += "[ERROR] Could not upload Evidence ZIP to ${execKey}. Status: ${uploadZipEvidenceStatus}\n"
+            }
+        }
+
+        String htmlReport = getHtmlReportFile()
+        if (htmlReport != null) {
+            int uploadHtmlStatus = uploadAttachment(execKey, htmlReport)
+            if (is2xx(uploadHtmlStatus)) {
+                summaryLog += "HTML report uploaded successfully to ${execKey}.\n"
+            } else {
+                summaryLog += "[ERROR] Could not upload HTML report to ${execKey}. Status: ${uploadHtmlStatus}\n"
+            }
+        }
+
+        if (TRANSITION_EXECUTION_ID?.trim()) {
+            int transitionExecStatus = transitionIssue(execKey, TRANSITION_EXECUTION_ID)
+            if (is2xx(transitionExecStatus)) {
+                summaryLog += "Test Execution ${execKey} transitioned successfully.\n"
+            } else {
+                summaryLog += "[ERROR] Could not transition Test Execution ${execKey}. Status: ${transitionExecStatus}\n"
+            }
+        }
+
+        if (TRANSITION_TEST_PLAN_ID?.trim()) {
+            int transitionPlanStatus = transitionIssue(testPlanKey, TRANSITION_TEST_PLAN_ID)
+            if (is2xx(transitionPlanStatus)) {
+                summaryLog += "Test Plan ${testPlanKey} transitioned successfully.\n"
+            } else {
+                summaryLog += "[ERROR] Could not transition Test Plan ${testPlanKey}. Status: ${transitionPlanStatus}\n"
+            }
+        }
+
+        KeywordUtil.logInfo("Jira integration summary:\n${summaryLog}")
+    }
+
+    // =========================================================
+    // RESET KEYWORD
+    // =========================================================
+
+    @Keyword
+    def resetTestPlanKey() {
+        File file = new File(getSuiteTestPlanFilePath())
+
+        if (!file.exists()) {
+            KeywordUtil.logInfo("No saved Test Plan key file found for suite '${getCurrentTestSuiteName()}'.")
+            return
+        }
+
+        file.write('', 'UTF-8')
+        KeywordUtil.logInfo("Saved Test Plan key cleared for suite '${getCurrentTestSuiteName()}'.")
+    }
+
+    // =========================================================
+    // SUITE / PATH HELPERS
+    // =========================================================
+
+    def getReportPath() {
+        return RunConfiguration.getReportFolder()
+    }
+
+    def getTimestamp() {
+        return new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+    }
+
+    def getCurrentTestSuiteName() {
+        String reportPath = getReportPath()
+
+        if (!reportPath?.trim()) {
+            KeywordUtil.markWarning('Report path is empty. Using fallback suite name.')
+            return 'UnknownTestSuite'
+        }
+
+        File currentReportFolder = new File(reportPath)
+
+        if (!currentReportFolder.exists()) {
+            KeywordUtil.markWarning("Report folder does not exist: ${reportPath}")
+            return 'UnknownTestSuite'
+        }
+
+        File suiteFolder = currentReportFolder.getParentFile()
+
+        if (suiteFolder == null || !suiteFolder.getName()?.trim()) {
+            KeywordUtil.markWarning('Could not detect suite folder from report path. Using fallback suite name.')
+            return 'UnknownTestSuite'
+        }
+
+        String suiteName = suiteFolder.getName().trim()
+
+        KeywordUtil.logInfo("Detected report path: ${reportPath}")
+        KeywordUtil.logInfo("Detected suite folder: ${suiteFolder.absolutePath}")
+        KeywordUtil.logInfo("Current Test Suite name detected: ${suiteName}")
+
+        return suiteName
+    }
+
+    def getSanitizedSuiteName() {
+        return getCurrentTestSuiteName().replaceAll('[\\\\/:*?"<>|]', '_')
+    }
+
+    def getTestPlanName() {
+        return getCurrentTestSuiteName() + ' Test Plan'
+    }
+
+    def getExecutionSummary() {
+        return getCurrentTestSuiteName() + ' ' + getTimestamp()
+    }
+
+    def getSuiteTestPlanFilePath() {
+        File folder = new File(TEST_PLAN_KEYS_FOLDER)
+        if (!folder.exists()) {
+            folder.mkdirs()
+        }
+        return folder.absolutePath + '\\' + getSanitizedSuiteName() + '.txt'
+    }
+
+    def getXmlFilePath() {
+        File reportDir = new File(getReportPath())
+
+        if (!reportDir.exists() || !reportDir.isDirectory()) {
+            KeywordUtil.markFailed("Report folder does not exist: ${reportDir.absolutePath}")
+            return null
+        }
+
+        String xmlPath = null
+
+        reportDir.eachFileRecurse(FileType.FILES) { file ->
+            if (file.name.toLowerCase().contains(XML_FILE_NAME_CONTAINS.toLowerCase())) {
+                xmlPath = file.absolutePath
+            }
+        }
+
+        if (xmlPath == null) {
+            KeywordUtil.markFailed("No XML file containing '${XML_FILE_NAME_CONTAINS}' was found in: ${reportDir.absolutePath}")
+            return null
+        }
+
+        KeywordUtil.logInfo("XML file found: ${xmlPath}")
+        return xmlPath
+    }
+
+    def getEvidenceFolderPath() {
+        String evidencePath = getReportPath() + File.separator + EVIDENCE_FOLDER_NAME
+        File evidenceFolder = new File(evidencePath)
+
+        if (!evidenceFolder.exists() || !evidenceFolder.isDirectory()) {
+            KeywordUtil.markWarning("Evidence folder was not found: ${evidenceFolder.absolutePath}")
+            return null
+        }
+
+        return evidenceFolder.absolutePath
+    }
+
+    def getHtmlReportFile() {
+        File reportDir = new File(getReportPath())
+
+        if (!reportDir.exists() || !reportDir.isDirectory()) {
+            KeywordUtil.markWarning("Report directory does not exist: ${reportDir.absolutePath}")
+            return null
+        }
+
+        File foundFile = reportDir.listFiles()?.find { it.isFile() && it.name.equalsIgnoreCase(HTML_REPORT_FILE_NAME) }
+
+        if (foundFile != null) {
+            KeywordUtil.logInfo("HTML report found: ${foundFile.absolutePath}")
+            return foundFile.absolutePath
+        }
+
+        KeywordUtil.markWarning("HTML report '${HTML_REPORT_FILE_NAME}' was not found in: ${reportDir.absolutePath}")
+        return null
+    }
+
+    // =========================================================
+    // TEST PLAN KEY PERSISTENCE
+    // =========================================================
+
+    def getSavedTestPlanKey() {
+        File file = new File(getSuiteTestPlanFilePath())
+
+        if (!file.exists()) {
+            return ''
+        }
+
+        String savedKey = file.text?.trim()
+
+        if (!savedKey) {
+            return ''
+        }
+
+        KeywordUtil.logInfo("Saved Test Plan key found for suite '${getCurrentTestSuiteName()}': ${savedKey}")
+        return savedKey
+    }
+
+    def saveTestPlanKey(String key) {
+        if (!key?.trim()) {
+            return
+        }
+
+        File file = new File(getSuiteTestPlanFilePath())
+        file.write(key.trim(), 'UTF-8')
+        KeywordUtil.logInfo("Saved Test Plan key stored for suite '${getCurrentTestSuiteName()}': ${key}")
+    }
+
+    // =========================================================
+    // TEST PLAN LOGIC
+    // =========================================================
+
+    def getOrCreateTestPlan() {
+        String savedKey = getSavedTestPlanKey()
+
+        if (savedKey) {
+            KeywordUtil.logInfo("Using saved Test Plan key: ${savedKey}")
+            return savedKey
+        }
+
+        String foundKey = findExistingTestPlanByName()
+
+        if (!isErrorValue(foundKey) && foundKey != null) {
+            saveTestPlanKey(foundKey)
+            return foundKey
+        }
+
+        if (isErrorValue(foundKey)) {
+            return foundKey
+        }
+
+        String createdKey = createTestPlan()
+
+        if (!isErrorValue(createdKey) && createdKey != null) {
+            saveTestPlanKey(createdKey)
+        }
+
+        return createdKey
+    }
+
+    def findExistingTestPlanByName() {
+        String jql = "project = \"${PROJECT_KEY}\" AND issuetype = \"${TEST_PLAN_ISSUE_TYPE}\" ORDER BY created DESC"
+
+        String path = JIRA_SEARCH_PATH +
+                '?jql=' + urlEncode(jql) +
+                '&fields=' + urlEncode('summary') +
+                '&maxResults=' + TEST_PLAN_SEARCH_MAX_RESULTS
+
+        HttpResult result = sendJsonRequest('GET', path, null)
+
+        KeywordUtil.logInfo("Get Test Plan status: ${result.status}")
+        KeywordUtil.logInfo("Get Test Plan response: ${result.body}")
+
+        if (result.status != 200) {
+            return 'ERROR_GET_TEST_PLAN_' + result.status
+        }
+
+        Map parsed = parseJsonSafely(result.body)
+        List issues = parsed?.issues ?: []
+
+        String expectedSummary = getTestPlanName()
+
+        Map matched = issues.find { it?.fields?.summary?.toString()?.trim() == expectedSummary }
+
+        if (matched == null) {
+            KeywordUtil.logInfo("No existing Test Plan found with summary: ${expectedSummary}")
+            return null
+        }
+
+        String key = matched?.key?.toString()
+
+        if (!key) {
+            return 'ERROR_TEST_PLAN_KEY_NOT_FOUND'
+        }
+
+        KeywordUtil.logInfo("Existing Test Plan found: ${key}")
+        return key
+    }
+
+    def createTestPlan() {
+        String summary = getTestPlanName()
+
+        Map body = [
+            fields: [
+                project  : [ key: PROJECT_KEY ],
+                summary  : summary,
+                issuetype: [ name: TEST_PLAN_ISSUE_TYPE ]
+            ]
+        ]
+
+        HttpResult result = sendJsonRequest('POST', JIRA_CREATE_ISSUE_PATH, JsonOutput.toJson(body))
+
+        KeywordUtil.logInfo("Create Test Plan status: ${result.status}")
+        KeywordUtil.logInfo("Create Test Plan response: ${result.body}")
+
+        if (!(result.status in [200, 201])) {
+            return 'ERROR_CREATE_TEST_PLAN_' + result.status
+        }
+
+        Map parsed = parseJsonSafely(result.body)
+        String key = parsed?.key?.toString()
+
+        if (!key) {
+            return 'ERROR_TEST_PLAN_KEY_NOT_FOUND'
+        }
+
+        KeywordUtil.logInfo("New Test Plan created successfully: ${key}")
+        return key
+    }
+
+    def linkTestExecutionToTestPlan(String testPlanKey, String execKey) {
+        String path = String.format(XRAY_ADD_TESTEXEC_TO_TESTPLAN_PATH_TEMPLATE, testPlanKey)
+        String body = JsonOutput.toJson([execKey])
+
+        HttpResult result = sendJsonRequest('POST', path, body)
+        return result.status
+    }
+
+    // =========================================================
+    // EXECUTION IMPORT / UPDATE
+    // =========================================================
+
+    def importExecutionResults() {
+        String xmlFile = getXmlFilePath()
+
+        if (xmlFile == null) {
+            return 'ERROR_XML_NOT_FOUND'
+        }
+
+        String path = XRAY_IMPORT_JUNIT_MULTIPART_PATH + '?projectKey=' + urlEncode(PROJECT_KEY)
+
+        HttpResult result = sendMultipartFileRequest(path, 'file', new File(xmlFile), [:], false)
+
+        KeywordUtil.logInfo("Import results status: ${result.status}")
+        KeywordUtil.logInfo("Import results response: ${result.body}")
+
+        if (!(result.status in [200, 204])) {
+            return 'ERROR_IMPORT_EXECUTION_' + result.status
+        }
+
+        Map parsed = parseJsonSafely(result.body)
+        String execKey = parsed?.testExecIssue?.key?.toString()
+
+        if (!execKey) {
+            return 'ERROR_EXEC_ID_NOT_FOUND'
+        }
+
+        KeywordUtil.logInfo("Test Execution created successfully: ${execKey}")
+        return execKey
+    }
+
+    def updateTestExecutionIssue(String execKey) {
+        Map fields = [
+            summary: getExecutionSummary()
+        ]
+
+        List<String> labelsList = parseLabels()
+        if (!labelsList.isEmpty()) {
+            fields.labels = labelsList
+        }
+
+        String path = String.format(JIRA_UPDATE_ISSUE_PATH_TEMPLATE, execKey)
+        Map body = [ fields: fields ]
+
+        HttpResult result = sendJsonRequest('PUT', path, JsonOutput.toJson(body))
+        return result.status
+    }
+
+    // =========================================================
+    // ATTACHMENTS / TRANSITIONS
+    // =========================================================
+
+    def uploadAttachment(String issueKey, String filePath) {
+        String path = String.format(JIRA_ADD_ATTACHMENT_PATH_TEMPLATE, issueKey)
+        HttpResult result = sendMultipartFileRequest(path, 'file', new File(filePath), [:], true)
+        return result.status
+    }
+
+    def transitionIssue(String issueKey, String transitionId) {
+        String path = String.format(JIRA_TRANSITIONS_PATH_TEMPLATE, issueKey)
+        Map body = [ transition: [ id: transitionId ] ]
+        HttpResult result = sendJsonRequest('POST', path, JsonOutput.toJson(body))
+        return result.status
+    }
+
+    // =========================================================
+    // ZIP
+    // =========================================================
+
+    def isFileAllowedInZip(File file, String zipFileName) {
+        if (file == null || !file.isFile()) {
+            return false
+        }
+
+        String fileNameLower = file.name.toLowerCase()
+
+        if (fileNameLower.endsWith('.lck')) {
+            return false
+        }
+
+        if (fileNameLower.endsWith('.zip')) {
+            return false
+        }
+
+        if (file.name.equalsIgnoreCase(zipFileName)) {
+            return false
+        }
+
+        return true
+    }
+
+    def zipReports() {
+        String reportPath = getReportPath()
+        String zippedFile = reportPath + File.separator + REPORT_ZIP_NAME
+
+        ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zippedFile))
+        KeywordUtil.logInfo("Creating report ZIP: ${zippedFile}")
+
+        new File(reportPath).eachFile { file ->
+            if (!isFileAllowedInZip(file, REPORT_ZIP_NAME)) {
+                KeywordUtil.logInfo("Skipping file from report ZIP: ${file.name}")
+                return
+            }
+
+            try {
+                output.putNextEntry(new ZipEntry(file.name))
+                KeywordUtil.logInfo("Adding report file to ZIP: ${file.name}")
+
+                FileInputStream input = new FileInputStream(file)
+                byte[] buffer = new byte[8192]
+                int bytesRead
+
+                while ((bytesRead = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, bytesRead)
+                }
+
+                input.close()
+                output.closeEntry()
+            } catch (Exception e) {
+                KeywordUtil.markWarning("Could not add file to report ZIP: ${file.name} - ${e.message}")
+            }
+        }
+
+        output.close()
+        KeywordUtil.logInfo("Report ZIP created successfully: ${zippedFile}")
+        return zippedFile
+    }
+
+    def zipEvidences() {
+        String evidencePath = getEvidenceFolderPath()
+
+        if (evidencePath == null) {
+            return null
+        }
+
+        String zippedFile = evidencePath + File.separator + EVIDENCE_ZIP_NAME
+        ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zippedFile))
+        KeywordUtil.logInfo("Creating evidence ZIP: ${zippedFile}")
+
+        File root = new File(evidencePath)
+
+        root.eachFileRecurse(FileType.FILES) { file ->
+            if (!isFileAllowedInZip(file, EVIDENCE_ZIP_NAME)) {
+                KeywordUtil.logInfo("Skipping file from evidence ZIP: ${file.name}")
+                return
+            }
+
+            try {
+                String relativePath = root.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+                output.putNextEntry(new ZipEntry(relativePath))
+                KeywordUtil.logInfo("Adding evidence file to ZIP: ${relativePath}")
+
+                FileInputStream input = new FileInputStream(file)
+                byte[] buffer = new byte[8192]
+                int bytesRead
+
+                while ((bytesRead = input.read(buffer)) != -1) {
+                    output.write(buffer, 0, bytesRead)
+                }
+
+                input.close()
+                output.closeEntry()
+            } catch (Exception e) {
+                KeywordUtil.markWarning("Could not add file to evidence ZIP: ${file.name} - ${e.message}")
+            }
+        }
+
+        output.close()
+        KeywordUtil.logInfo("Evidence ZIP created successfully: ${zippedFile}")
+        return zippedFile
+    }
+
+    // =========================================================
+    // HTTP HELPERS
+    // =========================================================
+
+    def sendJsonRequest(String method, String path, String jsonBody) {
+        HttpURLConnection connection = null
+
+        try {
+            URL url = new URL(BASE_URL + path)
+            connection = (HttpURLConnection) url.openConnection()
+            connection.setRequestMethod(method)
+            connection.setDoInput(true)
+            connection.setConnectTimeout(60000)
+            connection.setReadTimeout(120000)
+            connection.setRequestProperty('Accept', 'application/json')
+            connection.setRequestProperty('Content-Type', 'application/json')
+            applyAuthHeader(connection)
+
+            if (jsonBody != null) {
+                connection.setDoOutput(true)
+                connection.outputStream.withWriter('UTF-8') { it << jsonBody }
+            }
+
+            int status = connection.responseCode
+            String body = readResponseBody(connection)
+
+            return new HttpResult(status: status, body: body)
+        } catch (Exception e) {
+            return new HttpResult(status: 0, body: "HTTP_ERROR: ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    def sendMultipartFileRequest(String path, String partName, File file, Map<String, String> extraFields, boolean jiraAttachmentMode) {
+        HttpURLConnection connection = null
+        String boundary = '----KATALON-' + UUID.randomUUID().toString()
+
+        try {
+            URL url = new URL(BASE_URL + path)
+            connection = (HttpURLConnection) url.openConnection()
+            connection.setRequestMethod('POST')
+            connection.setDoInput(true)
+            connection.setDoOutput(true)
+            connection.setConnectTimeout(60000)
+            connection.setReadTimeout(180000)
+            connection.setRequestProperty('Accept', 'application/json')
+            connection.setRequestProperty('Content-Type', 'multipart/form-data; boundary=' + boundary)
+            applyAuthHeader(connection)
+
+            if (jiraAttachmentMode) {
+                connection.setRequestProperty('X-Atlassian-Token', 'no-check')
+            }
+
+            OutputStream output = connection.outputStream
+            byte[] lineBreak = '\r\n'.getBytes(StandardCharsets.UTF_8)
+
+            extraFields.each { key, value ->
+                output.write(("--${boundary}\r\n").getBytes(StandardCharsets.UTF_8))
+                output.write(("Content-Disposition: form-data; name=\"${key}\"\r\n\r\n").getBytes(StandardCharsets.UTF_8))
+                output.write((value ?: '').getBytes(StandardCharsets.UTF_8))
+                output.write(lineBreak)
+            }
+
+            output.write(("--${boundary}\r\n").getBytes(StandardCharsets.UTF_8))
+            output.write(("Content-Disposition: form-data; name=\"${partName}\"; filename=\"${file.name}\"\r\n").getBytes(StandardCharsets.UTF_8))
+            output.write(("Content-Type: application/octet-stream\r\n\r\n").getBytes(StandardCharsets.UTF_8))
+
+            FileInputStream input = new FileInputStream(file)
+            byte[] buffer = new byte[8192]
+            int bytesRead
+
+            while ((bytesRead = input.read(buffer)) != -1) {
+                output.write(buffer, 0, bytesRead)
+            }
+
+            input.close()
+            output.write(lineBreak)
+            output.write(("--${boundary}--\r\n").getBytes(StandardCharsets.UTF_8))
+            output.flush()
+            output.close()
+
+            int status = connection.responseCode
+            String body = readResponseBody(connection)
+
+            return new HttpResult(status: status, body: body)
+        } catch (Exception e) {
+            return new HttpResult(status: 0, body: "HTTP_MULTIPART_ERROR: ${e.message}")
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
+    def applyAuthHeader(HttpURLConnection connection) {
+        if (AUTH_MODE.equalsIgnoreCase('Bearer')) {
+            connection.setRequestProperty('Authorization', 'Bearer ' + ACCESS_TOKEN)
+            return
+        }
+
+        if (AUTH_MODE.equalsIgnoreCase('Basic')) {
+            String raw = USERNAME + ':' + PASSWORD
+            String encoded = raw.bytes.encodeBase64().toString()
+            connection.setRequestProperty('Authorization', 'Basic ' + encoded)
+            return
+        }
+    }
+
+    def readResponseBody(HttpURLConnection connection) {
+        try {
+            InputStream stream = (connection.responseCode >= 200 && connection.responseCode < 400)
+                    ? connection.inputStream
+                    : connection.errorStream
+
+            if (stream == null) {
+                return ''
+            }
+
+            return stream.getText('UTF-8')
+        } catch (Exception e) {
+            return ''
+        }
+    }
+
+    def parseJsonSafely(String text) {
+        if (!text?.trim()) {
+            return [:]
+        }
+
+        try {
+            return new JsonSlurper().parseText(text)
+        } catch (Exception e) {
+            KeywordUtil.markWarning("Could not parse JSON response: ${e.message}")
+            return [:]
+        }
+    }
+
+    def parseLabels() {
+        if (!LABELS?.trim()) {
+            return []
+        }
+
+        return LABELS
+                .split(',')
+                .collect { it.trim() }
+                .findAll { it }
+    }
+
+    def urlEncode(String value) {
+        return URLEncoder.encode(value ?: '', 'UTF-8')
+    }
+
+    def is2xx(int status) {
+        return status >= 200 && status < 300
+    }
+
+    def isErrorValue(String value) {
+        return value == null || value.startsWith('ERROR')
+    }
+
+    // =========================================================
+    // SMALL RESULT HOLDER
+    // =========================================================
+
+    static class HttpResult {
+        int status
+        String body
+    }
+}
