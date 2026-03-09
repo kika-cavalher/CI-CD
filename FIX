@@ -1,782 +1,505 @@
 package com.keywords.integrationHandler
-import static com.kms.katalon.core.testdata.TestDataFactory.*
+
 import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
 import java.nio.file.Files
-import java.nio.file.Paths
-import java.nio.file.Path
-import java.nio.file.StandardCopyOption
-import java.nio.channels.FileChannel
-import java.nio.file.StandardOpenOption
 import java.text.SimpleDateFormat
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
-import org.apache.poi.xssf.usermodel.XSSFRow
-import org.apache.poi.xssf.usermodel.XSSFSheet
-import org.apache.poi.xssf.usermodel.XSSFWorkbook
-
 import com.kms.katalon.core.annotation.Keyword
 import com.kms.katalon.core.configuration.RunConfiguration
-import com.kms.katalon.core.testdata.TestData
 import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
-import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
 
+import groovy.io.FileType
+import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
-
 
 public class JiraIntegration {
 
 	/*
 	 * Includes:
-	 * - Gets from JiraInput test data
-	 * - Import JUnit (to create test execution)
-	 * - Upload of evidences and reports to Jira ticket
-	 * - Update of test execution information
-	 * - Move Test to the correct folder on X-Ray, based on Katalon folder structure
+	 * - Gets the latest Katalon execution report folder
+	 * - Imports JUnit/Cucumber result into Jira/Xray
+	 * - Creates or finds Test Plan
+	 * - Updates Test Execution information
+	 * - Zips reports and evidences
+	 * - Uploads attachments to Jira
+	 * - Updates Jira issue status
 	 */
 
+	// =========================================================
+	// CONFIGURATION
+	// Update all values here
+	// =========================================================
 
-	//GETS
+	String PROJECT_KEY                    = 'QA'
+	String BASE_URL                       = 'https://your-jira-url-here'
+	String ACCESS_TOKEN                   = 'your-token-here'
+	String TEST_PLAN_NAME                 = 'Regression Test Plan'
+	String EXECUTION_SUMMARY_PREFIX       = 'Regression Execution'
+	String ENVIRONMENT                    = 'QA'
+	String LABELS                         = 'automation,regression'
+	String DESCRIPTION                    = 'Automated execution imported from Katalon'
+	String COMPONENTS                     = 'QA'
+	String EPIC_KEY                       = 'QA-100'
+
+	String XML_FILE_NAME_CONTAINS         = 'cucumber.xml'
+	String HTML_REPORT_FILE_NAME          = 'eMatchReport.html'
+	String REPORT_ZIP_NAME                = 'Results.zip'
+	String EVIDENCE_FOLDER_NAME           = 'Evidences'
+	String EVIDENCE_ZIP_NAME              = 'Evidences.zip'
+
+	String TRANSITION_EXECUTION_ID        = '11'
+	String TRANSITION_TEST_PLAN_ID        = '11'
+
+	// =========================================================
+	// OBJECT REPOSITORY PATHS
+	// Update these paths if needed
+	// =========================================================
+
+	String REQUEST_IMPORT_RESULTS         = 'Jira Integration/import Results'
+	String REQUEST_GET_TEST_PLAN          = 'Jira Integration/Get Test Plan'
+	String REQUEST_CREATE_TEST_PLAN       = 'Jira Integration/Create Test Plan'
+	String REQUEST_UPDATE_TEST_PLAN       = 'Jira Integration/Update Test Plan'
+	String REQUEST_UPDATE_TEST_EXECUTION  = 'Jira Integration/Update Test Execution Name'
+	String REQUEST_UPLOAD_ATTACHMENT      = 'Jira Integration/Evidence attachment'
+	String REQUEST_TRANSITION_STATUS      = 'Jira Integration/Transition Issue Status'
+
+	// =========================================================
+	// GET METHODS
+	// =========================================================
+
 	def getReportPath() {
-
-		//Reads the file created on ExecutionSet, to get the report folder from last Test Suite
-		FileInputStream fis = new FileInputStream(RunConfiguration.projectDir + '\\LastRun.xlsx');
-		XSSFWorkbook wb = new XSSFWorkbook(fis);
-		XSSFSheet sheet =  wb.getSheetAt(0);
-		XSSFRow row = sheet.getRow(0);
-		String result = row.getCell(0).stringCellValue;
-		wb.close();
-		fis.close();
-
-		//Returns the path of last test suite execution
-		return result;
+		return RunConfiguration.getReportFolder()
 	}
 
 	def getProject() {
-		//Gets test data as input
-		TestData td = findTestData('JiraInputs');
-		//Will search for the keyword "PROJECT" and return the referent result
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('PROJECT') } +1 , 1);
+		return PROJECT_KEY
 	}
 
-	def getSummaryName() {
-		String timestamp =  new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date());
-		Calendar cal = setTime(timestamp);
-
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('SUMMARY') } +1 , 1) + ' ' + timestamp;
+	def getBaseUrl() {
+		return BASE_URL
 	}
 
-	def getStartDate() {
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('START DATE') } +1 , 1);
+	def getAccessToken() {
+		return ACCESS_TOKEN
 	}
 
-	def getEndDate() {
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('END DATE') } +1 , 1);
-	}
-
-	def getTestPlan() {
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('TEST PLAN') } +1 , 1);
-	}
-
-	def getDescription() {
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('DESCRIPTION') } +1 , 1);
+	def getEnvironment() {
+		return ENVIRONMENT
 	}
 
 	def getLabels() {
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('LABELS') } +1 , 1);
+		return LABELS
+	}
+
+	def getDescription() {
+		return DESCRIPTION
 	}
 
 	def getComponents() {
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('COMPONENTS') } +1 , 1);
+		return COMPONENTS
 	}
 
-	def getEnv() {
-		TestData td = findTestData('JiraInputs');
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('ENV') } +1 , 1);
+	def getEpicKey() {
+		return EPIC_KEY
 	}
 
-	def getProject(TestData td) {
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('PROJECT') } +1 , 1);
+	def getTestPlanName() {
+		return TEST_PLAN_NAME
 	}
 
-	def getSummaryName(TestData td) {
-		String timestamp =  new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date());
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('SUMMARY') } +1 , 1) + ' ' + timestamp;
+	def getExecutionSummary() {
+		String timestamp = new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date())
+		return EXECUTION_SUMMARY_PREFIX + ' ' + timestamp
 	}
 
-	def getStartDate(TestData td){
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('START DATE') } +1 , 1);
-	}
+	def getXmlFilePath() {
+		File reportDir = new File(getReportPath())
 
-	def getEndDate(TestData td) {
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('END DATE') } +1 , 1);
-	}
-
-	def getTestPlan(TestData td) {
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('TEST PLAN') } +1 , 1);
-	}
-
-	def getDescription(TestData td) {
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('DESCRIPTION') } +1 , 1);
-	}
-
-	def getLabels(TestData td) {
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('LABELS') } +1 , 1);
-	}
-
-	def getComponents(TestData td) {
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('COMPONENTS') } +1 , 1);
-	}
-
-	def getEnv(TestData td) {
-		return td.getValue(td.getColumnNames().findIndexOf { it.toString().equals('ENV') } +1 , 1);
-	}
-
-	/*
-	 * Import JUnit to Jira
-	 * Will create a new Test Execution, returns the ticket ID or error message
-	 *
-	 */
-
-	def importExecutionResults() {
-		println 'Importing JUnit_Report.xml file to Jira...';
-		def response = WS.sendRequest(findTestObject('Jira Integration/importJunit',[('junitFile'): getReportPath() + '\\JUnit_Report.xml' , ('project'): getProject()]));
-		def slurper = new JsonSlurper();
-		def parsedJson = slurper.parseText(response.getResponseBodyContent());
-		int status = WS.getResponseStatusCode(response)
-
-		if (status == 200 || status == 204) {
-			String execID = parsedJson.testExecIssue.key
-			println "✅ Test Execution created in Jira: ${execID}"
-			KeywordUtil.logInfo("✅ Jira Execution ID: ${execID}")
-			return execID
-		} else {
-			return 'ERROR' + status.toString();
-		}
-	}
-
-	def importExecutionResults(TestData td) {
-		println 'Importing JUnit_Report.xml file to Jira...';
-		def response = WS.sendRequest(findTestObject('Jira Integration/importJunit',[('junitFile'): getReportPath() + '\\JUnit_Report.xml' , ('project'): getProject(td)]));
-		def slurper = new JsonSlurper();
-		def parsedJson = slurper.parseText(response.getResponseBodyContent());
-		int status = WS.getResponseStatusCode(response)
-
-		if (status == 200 || status == 204) {
-			String execID = parsedJson.testExecIssue.key
-			println "✅ Test Execution created in Jira: ${execID}"
-			KeywordUtil.logInfo("✅ Jira Execution ID: ${execID}")
-			return execID
-		} else {
-			return 'ERROR' + status.toString();
-		}
-	}
-
-	//Will upload a file to specific test execution (execID)
-	def uploadAttachment(String execID, String file) {
-		println 'Uploading ' + file + ' to Jira ' + execID + '.';
-		def response = WS.sendRequest(findTestObject('Jira Integration/uploadAttachment', [('execID'): execID, ('filePath'): file]));
-		return WS.getResponseStatusCode(response);
-	}
-
-	//Will update the information in the test execution
-	def updateJiraTicketInfo(String execID) {
-		println '\nUpdating information on Jira issue ' + execID + '.';
-		def response = WS.sendRequest(findTestObject('Jira Integration/updateJiraTicket', [('issueID'): execID,
-			('summary'): getSummaryName(),
-			('env'): getEnv(),
-			('testPlan'): getTestPlan(),
-			('label'): getLabels(),
-			('endDate'): getEndDate(),
-			('description'): getDescription(),
-			('component'): getComponents()]));
-
-		return WS.getResponseStatusCode(response);
-	}
-
-	// Zip the reports created by Katalon
-	def zipReports() {
-		String path = getReportPath()
-		String zippedFile = path + File.separator + 'Results.zip'
-
-		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
-		KeywordUtil.logInfo("ZipOutputStream created for: " + zippedFile)
-
-		new File(path).eachFile { file ->
-			if (!file.isFile()) {
-				return // Skip directories
-			}
-
-			if (!file.toString().equalsIgnoreCase(zippedFile)) {
-				// Create ZIP entry for each file
-				output.putNextEntry(new ZipEntry(file.name))
-				KeywordUtil.logInfo("Adding file to ZIP: " + file.name)
-
-				// Read the file and write its content to the ZIP output stream
-				def zipInput = new FileInputStream(file)
-				byte[] buffer = new byte[1024]
-				int bytesRead
-				while ((bytesRead = zipInput.read(buffer)) != -1) {
-					output.write(buffer, 0, bytesRead)
-				}
-
-				// Close the current entry
-				output.closeEntry()
-				zipInput.close()
-			}
-		}
-		output.close()
-
-		KeywordUtil.logInfo("ZIP file created successfully: " + zippedFile)
-		return zippedFile
-	}
-
-	// Zip Evidences taken during the execution
-	def zipEvidences() {
-		String path = getReportPath() + File.separator + 'Evidences'
-		String zippedFile = path + File.separator + 'Evidences.zip'
-
-		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
-		KeywordUtil.logInfo("ZipOutputStream created for: " + zippedFile)
-
-		new File(path).eachFile { file ->
-			if (!file.isFile()) {
-				return // Skip directories
-			}
-
-			if (!file.toString().equalsIgnoreCase(zippedFile)) {
-				try {
-					// Create a ZIP entry for each file
-					output.putNextEntry(new ZipEntry(file.name))
-					KeywordUtil.logInfo("Adding file to ZIP: " + file.name)
-
-					// Read the file and write its content to the ZIP output stream
-					def zipInput = new FileInputStream(file)
-					byte[] buffer = new byte[1024]
-					int bytesRead
-					while ((bytesRead = zipInput.read(buffer)) != -1) {
-						output.write(buffer, 0, bytesRead)
-					}
-
-					// Close the current ZIP entry
-					output.closeEntry()
-					zipInput.close()
-				} catch (IOException e) {
-					KeywordUtil.logError("Error processing file: " + file.name + " - " + e.message)
-				}
-			}
-		}
-		output.close()
-
-		KeywordUtil.logInfo("ZIP file created successfully: " + zippedFile)
-		return zippedFile
-	}
-
-	def updateJiraTicketInfo(String execID, TestData td) {
-		println '\nUpdating information on Jira issue ' + execID + '.';
-		def response = WS.sendRequest(findTestObject('Jira Integration/updateJiraTicket', [('issueID'): execID,
-			('summary'): getSummaryName(td),
-			('env'): getEnv(td),
-			('testPlan'): getTestPlan(td),
-			('label'): getLabels(td),
-			('endDate'): getEndDate(td),
-			('description'): getDescription(td),
-			('component'): getComponents(td)]));
-
-		return WS.getResponseStatusCode(response);
-	}
-
-	/*
-	 * Add Tests to the correct Folder
-	 * Change Test Status
-	 * Change Tests Names
-	 */
-
-	//Update Test Path on X-Ray
-	def updateTestCasePath(String execIDTestCase,  String summaryName) {
-		if (summaryName.startsWith('Test Cases')) {
-			println 'Updating X-Ray folder for ' + execIDTestCase + '.';
-			String Paths = "";
-			List<String> splited = summaryName.split("/");
-			List<String> projectFolder=System.getProperty("user.dir").toString().split("\\\\")
-			splited[splited.indexOf('Test Cases')]=projectFolder[projectFolder.size()-1]
-			for (int i = 0; i < splited.size()-1; i++) {
-				Paths +=  splited[i] + "/";
-			}
-			println("Moving to Path: " + Paths);
-			def response = WS.sendRequest(findTestObject('Jira Integration/updateRepositoryPath', [('issueID'): execIDTestCase, ('repPath'): Paths]));
-			return WS.getResponseStatusCode(response);
-		}
-		else return 200;
-	}
-
-	//Update Test Name (Summary)
-	def updateSummaryTestCase(String execIDTestCase, String summaryName) {
-		println 'Updating Test Summary...';
-		List<String> summaryTxt = summaryName.split("/");
-		String changedSummaryName = summaryTxt[summaryTxt.count { }-1];
-		String pathName;
-		for (int i = 0; i < summaryTxt.size()-1; i++) {
-			pathName +=  summaryTxt[i] + "/";
-		}
-		def response = WS.sendRequest(findTestObject('Jira Integration/updateSummary', [('issueID'): execIDTestCase, ('summary'): changedSummaryName]));
-
-		return WS.getResponseStatusCode(response);
-	}
-
-	//Update Test Execution Status
-	def updateTestExecutionStatus(String execID) {
-		println 'Changing status of Test Execution ' + execID + ' to In Progress.';
-		String transitionActionId = "11" //In progress
-		def response = WS.sendRequest(findTestObject('Jira Integration/transitionIssueStatus', [('issueID'): execID, ('transitionID'): transitionActionId]));
-
-		return WS.getResponseStatusCode(response);
-	}
-
-	//Update Test Status
-	def updateTestCaseStatusInUse(String execIDTestCase) {
-		println 'Changing status of Test ' + execIDTestCase + ' to In Use.';
-		String transitionStatusInUse = "21" //In Use
-		def response = WS.sendRequest(findTestObject('Jira Integration/transitionIssueStatus', [('issueID'): execIDTestCase, ('transitionID'): transitionStatusInUse]));
-
-		return WS.getResponseStatusCode(response);
-	}
-
-	def updateTestCaseStatusApproved(String execIDTestCase) {
-		println 'Changing status of Test ' + execIDTestCase + ' to Approved.';
-		String transitionStatusApproved = "11"
-		def response = WS.sendRequest(findTestObject('Jira Integration/transitionIssueStatus', [('issueID'): execIDTestCase, ('transitionID'): transitionStatusApproved]));
-		return WS.getResponseStatusCode(response);
-	}
-
-	//Get the keys of imported Tests
-	List<String> importTestCaseKey(String execID) {
-		println 'Getting Tests of Test Execution ' + execID + '.';
-		def response = WS.sendRequest(findTestObject('Jira Integration/getIssue',[('issueID'):execID]));
-		def slurper = new JsonSlurper();
-		def parsedJson = slurper.parseText(response.getResponseBodyContent());
-
-		int status = WS.getResponseStatusCode(response);
-
-		return parsedJson.fields.customfield_12513.testKey;
-	}
-
-	/**
-	 * Finds the first report file in the Katalon report folder
-	 * that matches the given file extension (e.g. ".html" or ".pdf").
-	 *
-	 * @param ext File extension to search for (default ".html")
-	 * @return The absolute path of the first matching file, or null if not found
-	 */
-	def getReportFile(String report = "eMatchReport.html") {
-		String path = getReportPath()
-
-		// ✅ Ensure trailing slash/backslash
-		if (!path.endsWith(File.separator)) {
-			path = path + File.separator
-		}
-
-		File reportDir = new File(path)
-
-		if (!reportDir.exists()) {
-			KeywordUtil.markWarning("⚠️ Report directory does not exist: ${reportDir.absolutePath}")
+		if (!reportDir.exists() || !reportDir.isDirectory()) {
+			KeywordUtil.markFailed("Report folder does not exist: ${reportDir.absolutePath}")
 			return null
 		}
 
-		File foundFile = reportDir.listFiles().find {
-			it.isFile() && it.name.equalsIgnoreCase(report)
+		String xmlPath = null
+
+		reportDir.eachFileRecurse(FileType.FILES) { file ->
+			if (file.name.toLowerCase().contains(XML_FILE_NAME_CONTAINS.toLowerCase())) {
+				xmlPath = file.absolutePath
+			}
 		}
 
-		if (foundFile) {
-			KeywordUtil.logInfo("✅ Found report: ${foundFile.absolutePath}")
+		if (xmlPath == null) {
+			KeywordUtil.markFailed("No XML file containing '${XML_FILE_NAME_CONTAINS}' was found in: ${reportDir.absolutePath}")
+			return null
+		}
+
+		KeywordUtil.logInfo("XML file found: ${xmlPath}")
+		return xmlPath
+	}
+
+	def getEvidenceFolderPath() {
+		String path = getReportPath() + File.separator + EVIDENCE_FOLDER_NAME
+		File folder = new File(path)
+
+		if (!folder.exists() || !folder.isDirectory()) {
+			KeywordUtil.markWarning("Evidence folder was not found: ${folder.absolutePath}")
+			return null
+		}
+
+		return folder.absolutePath
+	}
+
+	def getHtmlReportFile(String reportName = HTML_REPORT_FILE_NAME) {
+		File reportDir = new File(getReportPath())
+
+		if (!reportDir.exists() || !reportDir.isDirectory()) {
+			KeywordUtil.markWarning("Report directory does not exist: ${reportDir.absolutePath}")
+			return null
+		}
+
+		File foundFile = reportDir.listFiles()?.find {
+			it.isFile() && it.name.equalsIgnoreCase(reportName)
+		}
+
+		if (foundFile != null) {
+			KeywordUtil.logInfo("HTML report found: ${foundFile.absolutePath}")
 			return foundFile.absolutePath
-		} else {
-			KeywordUtil.markWarning("⚠️ Report '${report}' not found in: ${reportDir.absolutePath}")
-			return null
 		}
-	}
 
-	private File findReportRecursive(File dir, String filenameLower) {
-		dir.eachFile { f ->
-			if (f.isFile() && f.name.toLowerCase() == filenameLower) {
-				return f
-			}
-		}
-		dir.eachFile { f ->
-			if (f.isDirectory()) {
-				File result = findReportRecursive(f, filenameLower)
-				if (result != null) return result
-			}
-		}
+		KeywordUtil.markWarning("HTML report '${reportName}' was not found in: ${reportDir.absolutePath}")
 		return null
 	}
 
-	// ---------------------------------------
-	// Helper method to detect locked files
-	// ---------------------------------------
-	def isFileLocked(File file) {
-		try {
-			def raf = new RandomAccessFile(file, "rw")
-			raf.close()
-			return false
-		} catch (IOException e) {
-			return true
+	// =========================================================
+	// JIRA / XRAY ACTIONS
+	// =========================================================
+
+	def importExecutionResults() {
+		String xmlFile = getXmlFilePath()
+
+		if (xmlFile == null) {
+			return 'ERROR_XML_NOT_FOUND'
 		}
+
+		KeywordUtil.logInfo("Importing XML results into Jira...")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_IMPORT_RESULTS, [
+			('filePath') : xmlFile,
+			('project')  : getProject(),
+			('baseUrl')  : getBaseUrl(),
+			('token')    : getAccessToken()
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Import results status: ${status}")
+		KeywordUtil.logInfo("Import results response: ${body}")
+
+		if (!(status in [200, 204])) {
+			return 'ERROR_' + status.toString()
+		}
+
+		def parsedJson = new JsonSlurper().parseText(body)
+		String execID = parsedJson?.testExecIssue?.key
+
+		if (execID == null || execID.trim().isEmpty()) {
+			return 'ERROR_EXEC_ID_NOT_FOUND'
+		}
+
+		KeywordUtil.logInfo("Test Execution created in Jira: ${execID}")
+		return execID
 	}
 
-	/*
-	 * Actual Keyword to be called in the Import Test Case to Jira, it can be without inputs, if you have only one input file.
-	 * Can use a Test Data as input, if you have more than one input file.
-	 * Needs to be called in a test suite after the test suite that needs to be imported to Jira.
-	 */
+	def getOrCreateTestPlan() {
+		KeywordUtil.logInfo("Searching for Test Plan: ${getTestPlanName()}")
 
-	@Keyword
-	def updateJira(TestData td) {
-		String results = ''; //To accumulate possible errors
-		println 'Zipping Katalon Reports...';
-		String zipReport = zipReports();
-		println 'Zipping Evidences...';
-		String zipEv = zipEvidences();
-		println 'Creating test execution...';
-		String execID = importExecutionResults(td); // Upload Junit and get ticket ID to be used for next actions
-		Thread.sleep(3000)
-		List<String> TestCasesIds  = importTestCaseKey(execID); //Gets list of Tests from a Test Execution
+		String escapedSummary = getTestPlanName().replace("[", "\\\\[").replace("]", "\\\\]")
 
-		//Checks if JUnit import was successful
-		if (!execID.contains('ERROR')) {
-			println 'JUnit report was imported successfully. New test execution ' + execID + ' created JIRA!'
+		def response = WS.sendRequest(findTestObject(REQUEST_GET_TEST_PLAN, [
+			('project') : getProject(),
+			('token')   : getAccessToken(),
+			('summary') : escapedSummary,
+			('parent')  : getEpicKey()
+		]))
 
-			//Checks if updates to Jira ticket were done successfully, if response code status with 2, means success
-			if (updateJiraTicketInfo(execID, td) < 299) results += 'Jira ticket ' + execID + ' successfully updated.\n'
-			else results += '[ERROR] Could not update Jira ticket ' + execID + '.\n'
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
 
-			//Checks if upload of reports to Jira ticket were done successfully, if response code status with 2, means success
-			if (uploadAttachment(execID, zipReport) < 299) results += 'Reports successfully uploaded to ' + execID + '.\n'
-			else results += '[ERROR] Could not upload the reports on Jira ' + execID + '.\n'
+		KeywordUtil.logInfo("Get Test Plan status: ${status}")
+		KeywordUtil.logInfo("Get Test Plan response: ${body}")
 
-			//Checks if  upload of evidences to Jira ticket were done successfully, if response code status with 2, means success
-			if (uploadAttachment(execID, zipEv) < 299) results += 'Reports successfully uploaded to ' + execID + '.\n'
-			else results += '[ERROR] Could not upload the reports on Jira ' + execID + '.\n'
+		if (status != 200) {
+			return 'ERROR_' + status.toString()
+		}
 
-			// 🔹 Attach eMatchReport.html to Jira Execution and log clearly
-			try {
-				String htmlReport = getReportFile("eMatchReport.html")
+		def parsedJson = new JsonSlurper().parseText(body)
+		int total = parsedJson?.total ?: 0
 
-				if (htmlReport != null) {
-					KeywordUtil.logInfo("📌 Uploading eMatchReport.html to Execution Ticket: ${execID}")
-					int uploadStatus = uploadAttachment(execID, htmlReport)
+		if (total == 0) {
+			return createTestPlan()
+		}
 
-					if (uploadStatus < 299) {
-						KeywordUtil.logInfo("✅ eMatchReport.html successfully uploaded to Jira Execution ${execID}")
-						results += "HTML dashboard successfully uploaded to ${execID}.\n"
-					} else {
-						KeywordUtil.markWarning("⚠️ Failed to upload eMatchReport.html to Jira Execution ${execID} (status ${uploadStatus})")
-						results += "[ERROR] Could not upload HTML dashboard to Jira ${execID}.\n"
-					}
-				} else {
-					KeywordUtil.markWarning("⚠️ eMatchReport.html was not found in the report folder.")
+		if (total == 1) {
+			String key = parsedJson.issues[0].key
+			KeywordUtil.logInfo("Existing Test Plan found: ${key}")
+			return key
+		}
+
+		return 'ERROR_MULTIPLE_TEST_PLANS_FOUND'
+	}
+
+	def createTestPlan() {
+		KeywordUtil.logInfo("Creating new Test Plan...")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_CREATE_TEST_PLAN, [
+			('token')   : getAccessToken(),
+			('env')     : getEnvironment(),
+			('project') : getProject(),
+			('summary') : getTestPlanName(),
+			('labels')  : getLabels(),
+			('epic')    : getEpicKey()
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Create Test Plan status: ${status}")
+		KeywordUtil.logInfo("Create Test Plan response: ${body}")
+
+		if (status != 201) {
+			return 'ERROR_' + status.toString()
+		}
+
+		def parsedJson = new JsonSlurper().parseText(body)
+		String key = parsedJson?.key
+
+		if (key == null || key.trim().isEmpty()) {
+			return 'ERROR_TEST_PLAN_KEY_NOT_FOUND'
+		}
+
+		KeywordUtil.logInfo("Test Plan created successfully: ${key}")
+		return key
+	}
+
+	def updateTestPlan(String testPlanKey, String execID) {
+		KeywordUtil.logInfo("Adding Test Execution ${execID} into Test Plan ${testPlanKey}...")
+
+		def jsonBody = [
+			addTestsToPlan: true,
+			add           : [execID]
+		]
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_PLAN, [
+			('token')       : getAccessToken(),
+			('testPlanKey') : testPlanKey,
+			('jsonBody')    : JsonOutput.toJson(jsonBody)
+		]))
+
+		return WS.getResponseStatusCode(response)
+	}
+
+	def updateJiraTicketInfo(String execID) {
+		KeywordUtil.logInfo("Updating information on Jira issue ${execID}...")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_EXECUTION, [
+			('issueID') : execID,
+			('token')   : getAccessToken(),
+			('summary') : getExecutionSummary(),
+			('labels')  : getLabels(),
+			('env')     : getEnvironment()
+		]))
+
+		return WS.getResponseStatusCode(response)
+	}
+
+	def uploadAttachment(String execID, String filePath) {
+		KeywordUtil.logInfo("Uploading attachment to Jira ${execID}: ${filePath}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPLOAD_ATTACHMENT, [
+			('token')     : getAccessToken(),
+			('evidences') : new File(filePath),
+			('execID')    : execID
+		]))
+
+		return WS.getResponseStatusCode(response)
+	}
+
+	def updateIssueStatus(String issueKey, String transitionId) {
+		KeywordUtil.logInfo("Updating Jira status for ${issueKey} with transition ${transitionId}...")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_TRANSITION_STATUS, [
+			('token')        : getAccessToken(),
+			('issueID')      : issueKey,
+			('transitionID') : transitionId
+		]))
+
+		return WS.getResponseStatusCode(response)
+	}
+
+	// =========================================================
+	// ZIP ACTIONS
+	// =========================================================
+
+	def zipReports() {
+		String path = getReportPath()
+		String zippedFile = path + File.separator + REPORT_ZIP_NAME
+
+		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
+		KeywordUtil.logInfo("Creating report ZIP: ${zippedFile}")
+
+		new File(path).eachFile { file ->
+			if (!file.isFile()) {
+				return
+			}
+
+			if (!file.absolutePath.equalsIgnoreCase(zippedFile)) {
+				output.putNextEntry(new ZipEntry(file.name))
+				KeywordUtil.logInfo("Adding report file to ZIP: ${file.name}")
+
+				def input = new FileInputStream(file)
+				byte[] buffer = new byte[1024]
+				int bytesRead
+
+				while ((bytesRead = input.read(buffer)) != -1) {
+					output.write(buffer, 0, bytesRead)
 				}
-			} catch (Exception e) {
-				KeywordUtil.markWarning("⚠️ Exception while uploading eMatchReport.html to Jira ${execID}: ${e.message}")
+
+				input.close()
+				output.closeEntry()
 			}
+		}
 
-			for (execIDTestCase in TestCasesIds) {
-
-				def  response = WS.sendRequestAndVerify(findTestObject('Jira Integration/getIssue',[('issueID'):execIDTestCase]))
-				def slurper = new JsonSlurper();
-				Map parsedJson = slurper.parseText(response.getResponseBodyContent()).fields;
-				String summaryName = parsedJson.summary
-				String statusId = parsedJson.status.id;
-
-				if(updateTestCaseStatusApproved(execIDTestCase) < 299) results += 'Test Case status successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test Case status on Jira ' + execIDTestCase + '.\n'
-
-				if(updateTestCaseStatusInUse(execIDTestCase) < 299) results += 'Test Case status successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test Case status on Jira ' + execIDTestCase + '.\n'
-
-				if(updateTestExecutionStatus(execID) < 299) results += 'Test Execution status successfuly updated in ' + execID + '.\n'
-				else results += 'Test Execution already In Progress status ' + execID + '.\n'
-
-				if(updateSummaryTestCase(execIDTestCase, summaryName) < 299) results += 'Test Cases name successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test Cases name on Jira ' + execIDTestCase + '.\n'
-
-				if(updateTestCasePath(execIDTestCase, summaryName) < 299) results += 'Test Case Path status successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test RepositoryPath status on Jira ' + execIDTestCase + '.\n'
-			}
-		} else KeywordUtil.markFailed('[ERROR]Test execution creation has failed with code ' + execID + '.')
+		output.close()
+		KeywordUtil.logInfo("Report ZIP created successfully: ${zippedFile}")
+		return zippedFile
 	}
+
+	def zipEvidences() {
+		String evidencePath = getEvidenceFolderPath()
+
+		if (evidencePath == null) {
+			return null
+		}
+
+		String zippedFile = evidencePath + File.separator + EVIDENCE_ZIP_NAME
+
+		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
+		KeywordUtil.logInfo("Creating evidence ZIP: ${zippedFile}")
+
+		new File(evidencePath).eachFile { file ->
+			if (!file.isFile()) {
+				return
+			}
+
+			if (!file.absolutePath.equalsIgnoreCase(zippedFile)) {
+				try {
+					output.putNextEntry(new ZipEntry(file.name))
+					KeywordUtil.logInfo("Adding evidence file to ZIP: ${file.name}")
+
+					def input = new FileInputStream(file)
+					byte[] buffer = new byte[1024]
+					int bytesRead
+
+					while ((bytesRead = input.read(buffer)) != -1) {
+						output.write(buffer, 0, bytesRead)
+					}
+
+					input.close()
+					output.closeEntry()
+				} catch (Exception e) {
+					KeywordUtil.logError("Error while adding file to evidence ZIP: ${file.name} - ${e.message}")
+				}
+			}
+		}
+
+		output.close()
+		KeywordUtil.logInfo("Evidence ZIP created successfully: ${zippedFile}")
+		return zippedFile
+	}
+
+	// =========================================================
+	// MAIN KEYWORD
+	// =========================================================
 
 	@Keyword
 	def updateJira() {
-		String results = ''; //To accumulate possible errors
-		println 'Zipping Katalon Reports...';
-		String zipReport = zipReports();
-		println 'Zipping Evidences...';
-		String zipEv = zipEvidences();
-		println 'Creating test execution...';
-		String execID = importExecutionResults(); // Upload Junit and get ticket ID to be used for next actions
-		List<String> TestCasesIds  = importTestCaseKey(execID); //Gets list of Tests from a Test Execution
+		String results = ''
 
-		//Checks if JUnit import was successful
-		if (!execID.contains('ERROR')) {
-			println 'JUnit report was imported successfully. New test execution ' + execID + ' created JIRA!'
+		KeywordUtil.logInfo("Starting Jira integration flow...")
 
-			//Checks if updates to Jira ticket were done successfully, if response code status with 2, means success
-			if (updateJiraTicketInfo(execID) < 299) results += 'Jira ticket ' + execID + ' successfully updated.\n'
-			else results += '[ERROR] Could not update Jira ticket ' + execID + '.\n'
+		String zipReport = zipReports()
+		String zipEvidence = zipEvidences()
+		String execID = importExecutionResults()
 
-			//Checks if upload of reports to Jira ticket were done successfully, if response code status with 2, means success
-			if (uploadAttachment(execID, zipReport) < 299) results += 'Reports successfully uploaded to ' + execID + '.\n'
-			else results += '[ERROR] Could not upload the reports on Jira ' + execID + '.\n'
-
-			//Checks if  upload of evidences to Jira ticket were done successfully, if response code status with 2, means success
-			if (uploadAttachment(execID, zipEv) < 299) results += 'Reports successfully uploaded to ' + execID + '.\n'
-			else results += '[ERROR] Could not upload the reports on Jira ' + execID + '.\n'
-
-			// 🔹 Attach eMatchReport.html to Jira Execution and log clearly
-			try {
-				String htmlReport = getReportFile("eMatchReport.html")
-
-				if (htmlReport != null) {
-					KeywordUtil.logInfo("📌 Uploading eMatchReport.html to Execution Ticket: ${execID}")
-					int uploadStatus = uploadAttachment(execID, htmlReport)
-
-					if (uploadStatus < 299) {
-						KeywordUtil.logInfo("✅ eMatchReport.html successfully uploaded to Jira Execution ${execID}")
-						results += "HTML dashboard successfully uploaded to ${execID}.\n"
-					} else {
-						KeywordUtil.markWarning("⚠️ Failed to upload eMatchReport.html to Jira Execution ${execID} (status ${uploadStatus})")
-						results += "[ERROR] Could not upload HTML dashboard to Jira ${execID}.\n"
-					}
-				} else {
-					KeywordUtil.markWarning("⚠️ eMatchReport.html was not found in the report folder.")
-				}
-			} catch (Exception e) {
-				KeywordUtil.markWarning("⚠️ Exception while uploading eMatchReport.html to Jira ${execID}: ${e.message}")
-			}
-
-			for (execIDTestCase in TestCasesIds) {
-
-				def  response = WS.sendRequestAndVerify(findTestObject('Jira Integration/getIssue',[('issueID'):execIDTestCase]))
-				def slurper = new JsonSlurper();
-				Map parsedJson = slurper.parseText(response.getResponseBodyContent()).fields;
-				String summaryName = parsedJson.summary
-				String statusId = parsedJson.status.id;
-
-				if(updateTestCaseStatusApproved(execIDTestCase) < 299) results += 'Test Case status successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test Case status on Jira ' + execIDTestCase + '.\n'
-
-				if(updateTestCaseStatusInUse(execIDTestCase) < 299) results += 'Test Case status successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test Case status on Jira ' + execIDTestCase + '.\n'
-
-				if(updateTestExecutionStatus(execID) < 299) results += 'Test Execution status successfuly updated in ' + execID + '.\n'
-				else results += 'Test Execution already In Progress status ' + execID + '.\n'
-
-				if(updateSummaryTestCase(execIDTestCase, summaryName) < 299) results += 'Test Cases name successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test Cases name on Jira ' + execIDTestCase + '.\n'
-
-				if(updateTestCasePath(execIDTestCase, summaryName) < 299) results += 'Test Case Path status successfuly updated in ' + execIDTestCase + '.\n'
-				else results += '[ERROR] Could not update Test RepositoryPath status on Jira ' + execIDTestCase + '.\n'
-			}
-		} else KeywordUtil.markFailed('[ERROR]Test execution creation has failed with code ' + execID + '.')
-	}
-}
-
-
-
-
-package com.keywords.integrationHandler
-import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
-
-import com.kms.katalon.core.annotation.Keyword
-import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
-
-import groovy.json.JsonSlurper
-
-
-public class XRayManagement {
-
-	@Keyword
-	def xRayManagement() {
-		String b= System.getProperty("user.dir")
-
-		File folderName = new File(b)
-		def  response = WS.sendRequestAndVerify(findTestObject('Jira Integration/getAll'))
-		def slurper = new JsonSlurper();
-		Map parsedJson = slurper.parseText(response.getResponseBodyContent());
-		def folders=parsedJson.folders
-		Map jiraFolder;
-
-		for (folder in folders) {
-			if (folder.name.equals(folderName.getName())) {
-				jiraFolder=folder
-				System.out.println("finish");
-			}
+		if (execID == null || execID.startsWith('ERROR')) {
+			KeywordUtil.markFailed("Test execution creation failed: ${execID}")
+			return
 		}
 
-		if (jiraFolder!=null) {
-			List<String> deep = new ArrayList<String>() //folders ids
-			List<String> deepNames = new ArrayList<String>()//folder names
-			deepNames.add(jiraFolder.name)
-			deep.add(jiraFolder.id)
-			deepNames=getAllJiraFolderNames(jiraFolder,deepNames)
-			deep=getAllJiraFolderIds(jiraFolder,deep)
-			b= System.getProperty("user.dir").concat("/Test Cases")
-			File folder1 = new File(b)
-			runAllChildDirAndUpdate(folder1,deep,deepNames)
+		String testPlanKey = getOrCreateTestPlan()
+
+		if (testPlanKey == null || testPlanKey.startsWith('ERROR')) {
+			KeywordUtil.markFailed("Test Plan could not be created or found: ${testPlanKey}")
+			return
+		}
+
+		if (updateTestPlan(testPlanKey, execID) < 299) {
+			results += "Test Execution ${execID} added to Test Plan ${testPlanKey} successfully.\n"
 		} else {
-			String id =httpReq(folderName.getName(),"-1".toString()) //o id vem do  return parsedJson.id; por isso que a funcao está separada
-			List<String> deep = new ArrayList<String>(); //folders ids
-			List<String> deepNames = new ArrayList<String>(); //folder names
-			deepNames.add(folderName.getName())
-			deep.add(id)
-			b= System.getProperty("user.dir").concat("/Test Cases")
-			File folder1 = new File(b)
-			runAllChildDir(folder1,deep,deepNames)
+			results += "[ERROR] Could not update Test Plan ${testPlanKey}.\n"
 		}
-	}
 
-
-	public List<String> getAllJiraFolderIds(Map folder,List<String>deep){
-		for(subFolder in folder.folders) {
-			deep.add(subFolder.id)
-			getAllJiraFolderNames(subFolder,deep)
+		if (updateJiraTicketInfo(execID) < 299) {
+			results += "Jira ticket ${execID} updated successfully.\n"
+		} else {
+			results += "[ERROR] Could not update Jira ticket ${execID}.\n"
 		}
-		return deep
-	}
 
-	public List<String> getAllJiraFolderNames(Map folder,List<String>deepNames){
-		for(subFolder in folder.folders) {
-			deepNames.add(subFolder.name)
-			getAllJiraFolderNames(subFolder,deepNames)
+		if (zipReport != null && uploadAttachment(execID, zipReport) < 299) {
+			results += "Report ZIP uploaded successfully to ${execID}.\n"
+		} else {
+			results += "[ERROR] Could not upload report ZIP to ${execID}.\n"
 		}
-		return deepNames
-	}
 
-	public void runAllChildDirAndUpdate(File dir,List<String> deep,List<String> deepNames) {
+		if (zipEvidence != null && uploadAttachment(execID, zipEvidence) < 299) {
+			results += "Evidence ZIP uploaded successfully to ${execID}.\n"
+		} else {
+			results += "[ERROR] Could not upload evidence ZIP to ${execID}.\n"
+		}
+
 		try {
-			File[] files = dir.listFiles();
-			for (File file : files) {
-				if(files.length>0) {
-					if (file.isDirectory()&&!file.getName().contains(".")) {
-						if(deepNames.asList().indexOf(file.getName())==-1) {
-							System.out.println("directory:" + file.getName());
-							String parentName=file.parentFile.getName()
-							if(parentName.equals("Test Cases")) {
-								deep.add( httpReq(file.getName(),deep[0].toString()))
-								deepNames.add(file.getName())
-							}else {
-								deep.add( httpReq(file.getName(),deep[deepNames.asList().indexOf(file.parentFile.getName())].toString()))
-								deepNames.add(file.getName())
-							}
-						}
-						runAllChildDirAndUpdate(file,deep,deepNames);
-					}
+			String htmlReport = getHtmlReportFile()
+
+			if (htmlReport != null) {
+				int htmlUploadStatus = uploadAttachment(execID, htmlReport)
+
+				if (htmlUploadStatus < 299) {
+					results += "HTML report uploaded successfully to ${execID}.\n"
+				} else {
+					results += "[ERROR] Could not upload HTML report to ${execID}.\n"
 				}
 			}
-		} catch (IOException e) {
-			e.printStackTrace();
+		} catch (Exception e) {
+			KeywordUtil.markWarning("Exception while uploading HTML report: ${e.message}")
 		}
-	}
 
-
-	public void runAllChildDir(File dir,List<String> deep,List<String> deepNames) {
-		try {
-			File[] files = dir.listFiles();
-			for (File file : files) {
-				if(files.length>0) {
-					if (file.isDirectory()&&!file.getName().contains(".")) {
-						System.out.println("directory:" + file.getName());
-						String parentName=file.parentFile.getName()
-						if(parentName.equals("Test Cases")) {
-							deep.add( httpReq(file.getName(),deep[0].toString()))
-							deepNames.add(file.getName())
-						}else {
-							deep.add( httpReq(file.getName(),deep[deepNames.asList().indexOf(file.parentFile.getName())].toString()))
-							deepNames.add(file.getName())
-						}
-						runAllChildDir(file,deep,deepNames);
-					}
-				}
-			}
-		} catch (IOException e) {
-			e.printStackTrace();
+		if (updateIssueStatus(execID, TRANSITION_EXECUTION_ID) < 299) {
+			results += "Test Execution ${execID} moved successfully.\n"
+		} else {
+			results += "[ERROR] Could not update Test Execution status ${execID}.\n"
 		}
-	}
 
-
-	public String httpReq(String name,String id) {
-		if(id.equals("-1")) {
-			def  response = WS.sendRequestAndVerify(findTestObject('Jira Integration/create folder level 1',[('name'):name]))
-			def slurper = new JsonSlurper();
-			def parsedJson = slurper.parseText(response.getResponseBodyContent());
-			def status = WS.getResponseStatusCode(response)
-			if (status == 200 || status == 204) return parsedJson.id;
-			else return 'ERROR' + status.toString();
+		if (updateIssueStatus(testPlanKey, TRANSITION_TEST_PLAN_ID) < 299) {
+			results += "Test Plan ${testPlanKey} moved successfully.\n"
+		} else {
+			results += "[ERROR] Could not update Test Plan status ${testPlanKey}.\n"
 		}
-		else {
-			def  response = WS.sendRequestAndVerify(findTestObject('Jira Integration/create subFolder',[('id'):id,('name'):name]))
-			def slurper = new JsonSlurper();
-			def parsedJson = slurper.parseText(response.getResponseBodyContent());
-			def status = WS.getResponseStatusCode(response)
-			if (status == 200 || status == 204) return parsedJson.id;
-			else return 'ERROR' + status.toString();
-		}
-	}
-}
 
-
-
-package com.keywords.integrationHandler
-import org.apache.poi.xssf.usermodel.XSSFRow
-import org.apache.poi.xssf.usermodel.XSSFSheet
-import org.apache.poi.xssf.usermodel.XSSFWorkbook
-
-import com.kms.katalon.core.annotation.Keyword
-import com.kms.katalon.core.configuration.RunConfiguration
-
-
-
-class ExecutionSet {
-
-	/*
-	 * This keyword needs to be called in the beginning of first test case of a test suite
-	 * Will create a folder called "Evidences" inside the Katalon Report folder
-	 * All evidences of a test suite must be saved inside the following: RunConfiguration.getReportFolder() + "\\Evidences"
-	 * Having the above, all the evidences can be zipped and attached to Jira by updateJira() Keyword
-	 */
-
-	@Keyword
-	def setExecutionPath() {
-
-		//Creating Evidence path inside the current Report folder
-		String path = RunConfiguration.getReportFolder();
-		String evidencePath = path.concat("\\Evidences");
-		File evidence = new File(evidencePath);
-		if (!evidence.exists()) evidence.mkdir();
-
-		//Creating output report file to communicate to Import Suite
-		File rep = new File(RunConfiguration.projectDir.concat("\\LastRun.xlsx") );
-		if (!rep.exists()) rep.createNewFile();
-
-		//Initiate workbooks and instances to write outputs
-		XSSFWorkbook wbReport = new XSSFWorkbook();
-		XSSFSheet sheet = wbReport.createSheet();
-		XSSFRow row = sheet.createRow(0);
-		row.createCell(0).setCellValue(RunConfiguration.getReportFolder());
-
-		//Writing to output file
-		FileOutputStream fos = new FileOutputStream(rep);
-		wbReport.write(fos);
-		fos.close();
+		KeywordUtil.logInfo("Jira integration summary:\n${results}")
 	}
 }
