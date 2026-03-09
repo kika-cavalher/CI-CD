@@ -1,837 +1,808 @@
+package keywords
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+import org.apache.poi.xssf.usermodel.XSSFRow
+import org.apache.poi.xssf.usermodel.XSSFSheet
+import org.apache.poi.xssf.usermodel.XSSFWorkbook
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+
+import groovy.io.FileType
 import groovy.json.JsonOutput
-import groovy.json.JsonSlurperClassic
-
-pipeline {
-    agent {
-        node {
-            label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        }
-    }
-
-    options {
-        timestamps()
-        ansiColor('xterm')
-        disableConcurrentBuilds()
-        timeout(time: 90, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
-        skipDefaultCheckout(true)
-    }
-
-    parameters {
-        string(
-            name: 'STARTUP_WAIT_SECONDS',
-            defaultValue: '120',
-            description: 'Seconds to wait after backend and frontend startup'
-        )
-        string(
-            name: 'SUITE_TIMEOUT_MINUTES',
-            defaultValue: '20',
-            description: 'Maximum minutes for each suite'
-        )
-    }
-
-    environment {
-        WORK_DIR            = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        PROJECT_PATH        = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
-        REPORTS_DIR         = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports'
-        LOGS_DIR            = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\_logs'
-        RESULTS_JSON        = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\suite-results.json'
-        DASHBOARD_HTML      = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\index.html'
-
-        GIT_URL             = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        GIT_CRED            = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-
-        GAIA_START_TASK     = 'GaiaBackFrontSetup'
-
-        KATALON_EXE         = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        EXEC_PROFILE        = 'default'
-        BROWSER_TYPE        = 'Chrome'
-
-        CURRENT_SUITE_NAME  = ''
-    }
-
-    stages {
-
-        stage('✨ Validate Base Paths') {
-            steps {
-                bat """
-                    @echo off
-                    echo ============================================================
-                    echo VALIDATING BASE PATHS
-                    echo ============================================================
-
-                    if not exist "${env.WORK_DIR}" (
-                        echo ERROR: WORK_DIR not found
-                        exit /b 1
-                    )
-
-                    if not exist "${env.KATALON_EXE}" (
-                        echo ERROR: KATALON_EXE not found
-                        exit /b 1
-                    )
-
-                    echo SUCCESS: Base paths are valid
-                    echo ============================================================
-                """
-            }
-        }
-
-        stage('🚀 Start Gaia Backend and Frontend') {
-            steps {
-                bat """
-                    @echo off
-                    echo ============================================================
-                    echo STARTING BACKEND AND FRONTEND
-                    echo ============================================================
-                    schtasks /run /tn "${env.GAIA_START_TASK}"
-                    if errorlevel 1 exit /b 1
-                """
-                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
-            }
-        }
-
-        stage('📥 Checkout Repository') {
-            steps {
-                dir("${env.WORK_DIR}") {
-                    deleteDir()
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/master']],
-                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
-                        extensions: [
-                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-                        ]
-                    ])
-                }
-
-                echo '============================================================'
-                echo 'CHECKOUT COMPLETED'
-                echo '============================================================'
-            }
-        }
-
-        stage('🧹 Prepare Reports Folder') {
-            steps {
-                bat """
-                    @echo off
-                    if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
-                    mkdir "${env.REPORTS_DIR}"
-                    mkdir "${env.LOGS_DIR}"
-                """
-                script {
-                    saveSuiteResults([:])
-                }
-            }
-        }
-
-        stage('🧪 Execute Test Suites') {
-            steps {
-                script {
-                    getTestSuites().each { suite ->
-                        stage("Suite • ${suite.name}") {
-                            executeSuite(this, suite, params.SUITE_TIMEOUT_MINUTES.toInteger())
-                        }
-                    }
-                }
-            }
-        }
-
-        stage('📊 Build Last Report') {
-            steps {
-                script {
-                    buildLastReportDashboard(this)
-                    updateBuildDescription(this)
-                }
-            }
-        }
-    }
-
-    post {
-        aborted {
-            script {
-                if (env.CURRENT_SUITE_NAME?.trim()) {
-                    collectLatestKatalonReport(this, env.CURRENT_SUITE_NAME)
-                    updateSuiteResultAfterAbort(this, env.CURRENT_SUITE_NAME)
-                }
-
-                buildLastReportDashboard(this)
-                stopGaiaProcesses(this, 'Build aborted by user')
-                updateBuildDescription(this)
-            }
-
-            echo '============================================================'
-            echo 'ABORTED: BUILD CANCELED AND PROCESSES CLOSED'
-            echo '============================================================'
-        }
-
-        always {
-            script {
-                buildLastReportDashboard(this)
-                cleanupTimestampReportFolders(this)
-                stopGaiaProcesses(this, 'Post actions cleanup')
-                updateBuildDescription(this)
-            }
-
-            archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true, excludes: '**/*.lck'
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/JUnit*.xml, Reports/**/TEST-*.xml'
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                publishHTML(target: [
-                    allowMissing: true,
-                    alwaysLinkToLastBuild: true,
-                    keepAll: true,
-                    reportDir: 'Reports',
-                    reportFiles: 'index.html',
-                    reportName: 'Last Report'
-                ])
-            }
-        }
-
-        success {
-            echo '============================================================'
-            echo 'SUCCESS: PIPELINE COMPLETED'
-            echo '============================================================'
-        }
-
-        unstable {
-            echo '============================================================'
-            echo 'UNSTABLE: SOME SUITES FAILED'
-            echo '============================================================'
-        }
-
-        failure {
-            echo '============================================================'
-            echo 'FAILURE: PIPELINE FAILED'
-            echo '============================================================'
-        }
-    }
-}
-
-def getTestSuites() {
-    return [
-        [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
-        [name: 'Help',                   path: 'Test Suites/Help'],
-        [name: 'AddCorrection',          path: 'Test Suites/Correction- Add Correction'],
-        [name: 'ComputationSelection',   path: 'Test Suites/Correction- Computation Selection'],
-        [name: 'CorrectedDuplication',   path: 'Test Suites/Correction- Corrected Duplication'],
-        [name: 'CorrectionDetails',      path: 'Test Suites/Correction- Correction Details'],
-        [name: 'DownloadInvalidRecords', path: 'Test Suites/Correction- Download Invalid Records']
-    ]
-}
-
-def executeSuite(scriptRef, Map suite, int timeoutMinutes) {
-    scriptRef.env.CURRENT_SUITE_NAME = suite.name
-
-    scriptRef.catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-        def exitCode = 999
-        def consoleLog = "${scriptRef.env.LOGS_DIR}\\${suite.name}.log"
-
-        try {
-            scriptRef.echo '╔════════════════════════════════════════════════════════════╗'
-            scriptRef.echo "║ STARTING SUITE: ${suite.name}".padRight(60) + '║'
-            scriptRef.echo "║ PATH: ${suite.path}".padRight(60) + '║'
-            scriptRef.echo "║ TIMEOUT: ${timeoutMinutes} min".padRight(60) + '║'
-            scriptRef.echo '╚════════════════════════════════════════════════════════════╝'
-
-            scriptRef.timeout(time: timeoutMinutes, unit: 'MINUTES') {
-                exitCode = runKatalonSuite(scriptRef, suite.name, suite.path, consoleLog)
-            }
-        } finally {
-            collectLatestKatalonReport(scriptRef, suite.name)
-            recordSuiteResult(scriptRef, suite.name, suite.path, exitCode, consoleLog)
-            cleanupTimestampReportFolders(scriptRef)
-
-            printSuiteCaseSummary(scriptRef, suite.name)
-
-            def results = loadSuiteResults(scriptRef)
-            def current = results[suite.name] ?: [:]
-            scriptRef.echo '------------------------------------------------------------'
-            scriptRef.echo "FINAL SUITE STATUS: ${suite.name} -> ${current.status ?: (exitCode == 0 ? 'PASSED' : 'FAILED')}"
-            scriptRef.echo '------------------------------------------------------------'
-
-            printExecutionSummary(scriptRef)
-        }
-
-        if (exitCode != 0) {
-            def results = loadSuiteResults(scriptRef)
-            def err = results[suite.name]?.error ?: ''
-
-            scriptRef.echo '------------------------------------------------------------'
-            scriptRef.echo "SUITE FAILED: ${suite.name}"
-            scriptRef.echo "Exit code: ${exitCode}"
-            if (err?.trim()) {
-                scriptRef.echo 'Error summary:'
-                scriptRef.echo err
-            } else {
-                scriptRef.echo 'No extracted error lines found'
-            }
-            scriptRef.echo '------------------------------------------------------------'
-
-            scriptRef.error("Suite ${suite.name} failed with exit code ${exitCode}")
-        } else {
-            scriptRef.echo '------------------------------------------------------------'
-            scriptRef.echo "SUITE PASSED: ${suite.name}"
-            scriptRef.echo '------------------------------------------------------------'
-        }
-    }
-}
-
-def runKatalonSuite(scriptRef, String suiteName, String suitePath, String consoleLog) {
-    def exitCode = scriptRef.bat(
-        returnStatus: true,
-        script: """
-            @echo off
-            if exist "${consoleLog}" del /f /q "${consoleLog}" >nul 2>&1
-
-            call "${scriptRef.env.KATALON_EXE}" ^
-            -noSplash ^
-            -runMode=console ^
-            -consoleLog ^
-            -projectPath="${scriptRef.env.PROJECT_PATH}" ^
-            -retry=0 ^
-            -testSuitePath="${suitePath}" ^
-            -browserType="${scriptRef.env.BROWSER_TYPE}" ^
-            -executionProfile="${scriptRef.env.EXEC_PROFILE}" ^
-            -reportFolder="${scriptRef.env.REPORTS_DIR}" ^
-            -reportFileName="${suiteName}" > "${consoleLog}" 2>&1
-
-            exit /b %%ERRORLEVEL%%
-        """
-    )
-
-    scriptRef.echo "Finished ${suiteName} with exit code ${exitCode}"
-    return exitCode
-}
-
-def collectLatestKatalonReport(scriptRef, String suiteName) {
-    scriptRef.powershell """
-        \$reportsRoot = "${scriptRef.env.REPORTS_DIR}"
-        \$suiteName = "${suiteName}"
-        \$stableDir = Join-Path \$reportsRoot \$suiteName
-
-        \$timestampFolders = Get-ChildItem -Path \$reportsRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { \$_.Name -match '^\\d{8}_\\d{6}\$' } |
-            Sort-Object LastWriteTime -Descending
-
-        if (-not \$timestampFolders) {
-            Write-Host "No timestamp report folder found for suite \$suiteName"
-            exit 0
-        }
-
-        \$latestFolder = \$timestampFolders[0]
-
-        if (Test-Path \$stableDir) {
-            Remove-Item -Path \$stableDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-
-        New-Item -ItemType Directory -Path \$stableDir -Force | Out-Null
-
-        robocopy "\$([string]\$latestFolder.FullName)" "\$stableDir" /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-
-        if (\$LASTEXITCODE -gt 7) {
-            Write-Host "WARNING: Robocopy failed while collecting report for suite \$suiteName"
-            exit 0
-        }
-
-        Write-Host "Stable report ready for suite \$suiteName"
-    """
-}
-
-def recordSuiteResult(scriptRef, String suiteName, String suitePath, int exitCode, String consoleLog) {
-    def results = loadSuiteResults(scriptRef)
-    def htmlFile = findMainHtmlReport(scriptRef, "${scriptRef.env.REPORTS_DIR}\\${suiteName}")
-    def junitFile = findFirstRelativeFile(scriptRef, "${scriptRef.env.REPORTS_DIR}\\${suiteName}", 'JUnit_Report.xml')
-    def errorText = extractImportantErrors(scriptRef, consoleLog, 18)
-    def caseSummary = extractJUnitSummary(scriptRef, "${scriptRef.env.REPORTS_DIR}\\${suiteName}")
-
-    results[suiteName] = [
-        name      : suiteName,
-        path      : suitePath,
-        exitCode  : exitCode,
-        status    : exitCode == 0 ? 'PASSED' : 'FAILED',
-        html      : htmlFile,
-        junit     : junitFile,
-        error     : errorText,
-        executed  : caseSummary.executed,
-        passed    : caseSummary.passed,
-        failed    : caseSummary.failed,
-        skipped   : caseSummary.skipped,
-        failItems : caseSummary.failItems
-    ]
-
-    saveSuiteResults(scriptRef, results)
-}
-
-def updateSuiteResultAfterAbort(scriptRef, String suiteName) {
-    def results = loadSuiteResults(scriptRef)
-    def htmlFile = findMainHtmlReport(scriptRef, "${scriptRef.env.REPORTS_DIR}\\${suiteName}")
-    def existing = results[suiteName] instanceof Map ? results[suiteName] : [:]
-
-    existing.putAll([
-        name    : suiteName,
-        status  : 'ABORTED',
-        exitCode: 130,
-        html    : htmlFile
-    ])
-
-    results[suiteName] = existing
-    saveSuiteResults(scriptRef, results)
-}
-
-def extractJUnitSummary(scriptRef, String suiteDir) {
-    def raw = scriptRef.powershell(
-        returnStdout: true,
-        script: """
-            \$suiteDir = "${suiteDir}"
-
-            \$result = @{
-                executed = 0
-                passed   = 0
-                failed   = 0
-                skipped  = 0
-                failItems = @()
-            }
-
-            if (-not (Test-Path \$suiteDir)) {
-                \$result | ConvertTo-Json -Depth 5
-                exit 0
-            }
-
-            \$junit = Get-ChildItem -Path \$suiteDir -Recurse -File -Include 'JUnit_Report.xml','junit*.xml','JUnit*.xml','TEST-*.xml' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not \$junit) {
-                \$result | ConvertTo-Json -Depth 5
-                exit 0
-            }
-
-            [xml]\$xml = Get-Content \$junit.FullName -Raw -ErrorAction SilentlyContinue
-
-            \$testcases = @(\$xml.SelectNodes('//testcase'))
-            \$failedCases = @(\$xml.SelectNodes('//testcase[failure or error]'))
-            \$skippedCases = @(\$xml.SelectNodes('//testcase[skipped]'))
-
-            \$result.executed = \$testcases.Count
-            \$result.failed = \$failedCases.Count
-            \$result.skipped = \$skippedCases.Count
-            \$result.passed = [Math]::Max(0, \$result.executed - \$result.failed - \$result.skipped)
-
-            foreach (\$tc in \$failedCases | Select-Object -First 5) {
-                \$msg = ''
-                if (\$tc.failure) {
-                    \$msg = [string]\$tc.failure.message
-                    if ([string]::IsNullOrWhiteSpace(\$msg)) { \$msg = [string]\$tc.failure.'#text' }
-                } elseif (\$tc.error) {
-                    \$msg = [string]\$tc.error.message
-                    if ([string]::IsNullOrWhiteSpace(\$msg)) { \$msg = [string]\$tc.error.'#text' }
-                }
-
-                \$result.failItems += @{
-                    name = [string]\$tc.name
-                    reason = [string]\$msg
-                }
-            }
-
-            \$result | ConvertTo-Json -Depth 6
-        """
-    ).trim()
-
-    if (!raw) {
-        return [executed:0, passed:0, failed:0, skipped:0, failItems:[]]
-    }
-
-    def parsed = new JsonSlurperClassic().parseText(raw)
-    if (!(parsed.failItems instanceof List)) {
-        parsed.failItems = parsed.failItems ? [parsed.failItems] : []
-    }
-    return parsed
-}
-
-def loadSuiteResults(scriptRef) {
-    if (!scriptRef.fileExists(scriptRef.env.RESULTS_JSON)) {
-        return [:]
-    }
-
-    def txt = scriptRef.readFile(scriptRef.env.RESULTS_JSON).trim()
-    if (!txt) {
-        return [:]
-    }
-
-    return new JsonSlurperClassic().parseText(txt) as Map
-}
-
-def saveSuiteResults(scriptRef, Map results) {
-    scriptRef.writeFile file: scriptRef.env.RESULTS_JSON, text: JsonOutput.prettyPrint(JsonOutput.toJson(results ?: [:]))
-}
-
-def findMainHtmlReport(scriptRef, String baseDir) {
-    return scriptRef.powershell(
-        returnStdout: true,
-        script: """
-            \$baseDir = "${baseDir}"
-            if (-not (Test-Path \$baseDir)) {
-                exit 0
-            }
-
-            \$preferred = Get-ChildItem -Path \$baseDir -Recurse -File -Include 'report.html','index.html' -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-
-            if (-not \$preferred) {
-                \$preferred = Get-ChildItem -Path \$baseDir -Recurse -File -Include *.html -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-            }
-
-            if (\$preferred) {
-                \$root = "${scriptRef.env.REPORTS_DIR}\\"
-                \$full = [string]\$preferred.FullName
-                if (\$full.StartsWith(\$root)) {
-                    \$rel = \$full.Substring(\$root.Length)
-                    Write-Output \$rel.Replace('\\\\','/')
-                }
-            }
-        """
-    ).trim()
-}
-
-def findFirstRelativeFile(scriptRef, String baseDir, String pattern) {
-    return scriptRef.powershell(
-        returnStdout: true,
-        script: """
-            \$baseDir = "${baseDir}"
-            if (-not (Test-Path \$baseDir)) {
-                exit 0
-            }
-
-            \$file = Get-ChildItem -Path \$baseDir -Recurse -File -Include "${pattern}" -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-
-            if (\$file) {
-                \$root = "${scriptRef.env.REPORTS_DIR}\\"
-                \$full = [string]\$file.FullName
-                if (\$full.StartsWith(\$root)) {
-                    \$rel = \$full.Substring(\$root.Length)
-                    Write-Output \$rel.Replace('\\\\','/')
-                }
-            }
-        """
-    ).trim()
-}
-
-def extractImportantErrors(scriptRef, String consoleLog, int maxLines) {
-    return scriptRef.powershell(
-        returnStdout: true,
-        script: """
-            \$log = "${consoleLog}"
-            if (-not (Test-Path \$log)) {
-                exit 0
-            }
-
-            \$patterns = @(
-                'ERROR',
-                'FAILED',
-                'StepFailedException',
-                'AssertionError',
-                'Caused by:',
-                'not found',
-                'timed out',
-                'InvalidConsoleArgumentException',
-                'Unable',
-                'Exception'
-            )
-
-            \$matches = @()
-            Get-Content \$log -ErrorAction SilentlyContinue | ForEach-Object {
-                \$line = [string]\$_
-                foreach (\$p in \$patterns) {
-                    if (\$line -match \$p) {
-                        \$matches += \$line.Trim()
-                        break
-                    }
-                }
-            }
-
-            \$matches | Select-Object -Unique | Select-Object -First ${maxLines}
-        """
-    ).trim()
-}
-
-def printExecutionSummary(scriptRef) {
-    def results = loadSuiteResults(scriptRef)
-    def passed  = results.values().count { it.status == 'PASSED' }
-    def failed  = results.values().count { it.status == 'FAILED' }
-    def aborted = results.values().count { it.status == 'ABORTED' }
-    def total   = results.size()
-
-    scriptRef.echo '╔════════════════════════════════════════════════════════════╗'
-    scriptRef.echo "║ EXECUTION SUMMARY".padRight(60) + '║'
-    scriptRef.echo "║ Passed : ${passed}".padRight(60) + '║'
-    scriptRef.echo "║ Failed : ${failed}".padRight(60) + '║'
-    scriptRef.echo "║ Aborted: ${aborted}".padRight(60) + '║'
-    scriptRef.echo "║ Executed: ${total}".padRight(60) + '║'
-    scriptRef.echo '╠════════════════════════════════════════════════════════════╣'
-
-    getTestSuites().each { suite ->
-        if (results[suite.name]) {
-            def r = results[suite.name]
-            scriptRef.echo "• ${r.name} | ${r.status} | exit ${r.exitCode}"
-        }
-    }
-
-    scriptRef.echo '╚════════════════════════════════════════════════════════════╝'
-}
-
-def printSuiteCaseSummary(scriptRef, String suiteName) {
-    def results = loadSuiteResults(scriptRef)
-    def r = results[suiteName]
-    if (!r) {
-        return
-    }
-
-    scriptRef.echo '╔════════════════════════════════════════════════════════════╗'
-    scriptRef.echo "║ TEST CASE SUMMARY: ${suiteName}".padRight(60) + '║'
-    scriptRef.echo "║ Executed: ${r.executed ?: 0}".padRight(60) + '║'
-    scriptRef.echo "║ Passed  : ${r.passed ?: 0}".padRight(60) + '║'
-    scriptRef.echo "║ Failed  : ${r.failed ?: 0}".padRight(60) + '║'
-    scriptRef.echo "║ Skipped : ${r.skipped ?: 0}".padRight(60) + '║'
-    scriptRef.echo '╠════════════════════════════════════════════════════════════╣'
-
-    if ((r.failItems ?: []).size() > 0) {
-        r.failItems.each { item ->
-            scriptRef.echo "FAIL: ${item.name ?: 'Unknown test case'}"
-            if (item.reason) {
-                scriptRef.echo "↪ ${item.reason}"
-            }
-        }
-    } else {
-        scriptRef.echo 'All visible test cases passed or no failed cases were found in JUnit'
-    }
-
-    scriptRef.echo '╚════════════════════════════════════════════════════════════╝'
-}
-
-def buildLastReportDashboard(scriptRef) {
-    def results = loadSuiteResults(scriptRef)
-    def passed  = results.values().count { it.status == 'PASSED' }
-    def failed  = results.values().count { it.status == 'FAILED' }
-    def aborted = results.values().count { it.status == 'ABORTED' }
-    def total   = results.size()
-
-    def linksList = getTestSuites().collect { suite ->
-        def r = results[suite.name]
-        if (r?.html) {
-            return "<li><a href='${escapeHtml(r.html)}' target='_blank'>${escapeHtml(suite.name)} report</a></li>"
-        }
-        return "<li>${escapeHtml(suite.name)} report not available</li>"
-    }.join('\n')
-
-    def cards = getTestSuites().collect { suite ->
-        def r = results[suite.name]
-
-        if (!r) {
-            return """
-                <div class="card pending">
-                    <div class="title">${escapeHtml(suite.name)}</div>
-                    <div class="status">NOT EXECUTED</div>
-                </div>
-            """
-        }
-
-        def css = r.status == 'PASSED' ? 'passed' : (r.status == 'FAILED' ? 'failed' : 'aborted')
-        def linkHtml = r.html ? "<a class='link' href='${escapeHtml(r.html)}' target='_blank'>Open suite report</a>" : "<span class='muted'>No HTML report</span>"
-
-        def failItemsHtml = ''
-        if ((r.failItems ?: []).size() > 0) {
-            failItemsHtml = "<ul>" + r.failItems.collect { item ->
-                "<li><b>${escapeHtml(item.name ?: 'Unknown')}</b><br>${escapeHtml(item.reason ?: '')}</li>"
-            }.join('') + "</ul>"
-        } else {
-            failItemsHtml = "<div class='muted'>No failed test cases</div>"
-        }
-
-        return """
-            <div class="card ${css}">
-                <div class="title">${escapeHtml(r.name)}</div>
-                <div class="path">${escapeHtml(r.path ?: '')}</div>
-                <div class="status">${escapeHtml(r.status)} | exit ${escapeHtml(String.valueOf(r.exitCode))}</div>
-                <div class="status">Executed: ${escapeHtml(String.valueOf(r.executed ?: 0))} | Passed: ${escapeHtml(String.valueOf(r.passed ?: 0))} | Failed: ${escapeHtml(String.valueOf(r.failed ?: 0))} | Skipped: ${escapeHtml(String.valueOf(r.skipped ?: 0))}</div>
-                <div class="report">${linkHtml}</div>
-                <div class="error-block">
-                    ${r.status == 'PASSED' ? "<div class='muted'>Suite passed</div>" : failItemsHtml}
-                </div>
-            </div>
-        """
-    }.join('\n')
-
-    def passWidth  = total ? (passed  * 100.0 / total) : 0
-    def failWidth  = total ? (failed  * 100.0 / total) : 0
-    def abortWidth = total ? (aborted * 100.0 / total) : 0
-
-    def html = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Last Report</title>
-<style>
-body { font-family: Arial, sans-serif; background:#f5f7fb; margin:0; padding:24px; color:#0f172a; }
-h1 { margin:0 0 8px 0; font-size:28px; }
-h2 { margin-top:24px; }
-.sub { color:#475569; margin-bottom:20px; }
-.grid { display:grid; grid-template-columns: repeat(4, minmax(180px,1fr)); gap:16px; margin-bottom:24px; }
-.metric { background:white; border-radius:16px; padding:18px; box-shadow:0 2px 10px rgba(0,0,0,0.06); }
-.metric .n { font-size:30px; font-weight:700; margin-top:8px; }
-.bar-wrap { background:#e2e8f0; height:16px; border-radius:999px; overflow:hidden; margin-top:16px; }
-.bar-pass { background:#22c55e; height:16px; float:left; }
-.bar-fail { background:#ef4444; height:16px; float:left; }
-.bar-abort { background:#f59e0b; height:16px; float:left; }
-.cards { display:grid; grid-template-columns: repeat(2, minmax(320px,1fr)); gap:16px; }
-.card { background:white; border-radius:16px; padding:18px; box-shadow:0 2px 10px rgba(0,0,0,0.06); border-left:8px solid #cbd5e1; }
-.card.passed { border-left-color:#22c55e; }
-.card.failed { border-left-color:#ef4444; }
-.card.aborted { border-left-color:#f59e0b; }
-.card.pending { border-left-color:#94a3b8; }
-.title { font-size:20px; font-weight:700; margin-bottom:6px; }
-.path, .status, .report { margin-bottom:10px; color:#334155; }
-.link { color:#2563eb; text-decoration:none; font-weight:600; }
-.link:hover { text-decoration:underline; }
-pre, ul { white-space:pre-wrap; word-break:break-word; background:#0f172a; color:#e2e8f0; padding:12px; border-radius:12px; font-size:12px; }
-.muted { color:#64748b; }
-.links-box { background:white; border-radius:16px; padding:18px; box-shadow:0 2px 10px rgba(0,0,0,0.06); margin-bottom:24px; }
-@media (max-width: 1100px) {
-  .grid { grid-template-columns: repeat(2, minmax(180px,1fr)); }
-  .cards { grid-template-columns: 1fr; }
-}
-</style>
-</head>
-<body>
-    <h1>Last Report</h1>
-    <div class="sub">Build #${escapeHtml(scriptRef.env.BUILD_NUMBER)} | Gaia Corrections</div>
-
-    <div class="grid">
-        <div class="metric"><div>Total Executed</div><div class="n">${total}</div></div>
-        <div class="metric"><div>Passed</div><div class="n">${passed}</div></div>
-        <div class="metric"><div>Failed</div><div class="n">${failed}</div></div>
-        <div class="metric"><div>Aborted</div><div class="n">${aborted}</div></div>
-    </div>
-
-    <div class="metric" style="margin-bottom:24px;">
-        <div style="font-weight:700;">Execution Distribution</div>
-        <div class="bar-wrap">
-            <div class="bar-pass" style="width:${passWidth}%"></div>
-            <div class="bar-fail" style="width:${failWidth}%"></div>
-            <div class="bar-abort" style="width:${abortWidth}%"></div>
-        </div>
-    </div>
-
-    <div class="links-box">
-        <h2>Suite Reports</h2>
-        <ul>${linksList}</ul>
-    </div>
-
-    <div class="cards">
-        ${cards}
-    </div>
-</body>
-</html>
-"""
-    scriptRef.writeFile file: scriptRef.env.DASHBOARD_HTML, text: html
-}
-
-def updateBuildDescription(scriptRef) {
-    def results = loadSuiteResults(scriptRef)
-
-    def links = getTestSuites().collect { suite ->
-        def r = results[suite.name]
-        if (r?.html) {
-            return "• <a href='artifact/Reports/${r.html}'>${suite.name}</a>"
-        }
-        return "• ${suite.name}"
-    }.join('<br/>')
-
-    scriptRef.currentBuild.description = """
-📊 <a href='artifact/Reports/index.html'>Last Report</a><br/>
-📁 Suite Reports<br/>
-${links}
-"""
-}
-
-def escapeHtml(String value) {
-    if (value == null) {
-        return ''
-    }
-    return value
-        .replace('&', '&amp;')
-        .replace('<', '&lt;')
-        .replace('>', '&gt;')
-        .replace('"', '&quot;')
-        .replace("'", '&#39;')
-}
-
-def cleanupTimestampReportFolders(scriptRef) {
-    scriptRef.powershell """
-        \$reportsRoot = "${scriptRef.env.REPORTS_DIR}"
-
-        if (-not (Test-Path \$reportsRoot)) {
-            exit 0
-        }
-
-        Get-ChildItem -Path \$reportsRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { \$_.Name -match '^\\d{8}_\\d{6}\$' } |
-            ForEach-Object {
-                Remove-Item -Path \$_.FullName -Recurse -Force -ErrorAction SilentlyContinue
-            }
-    """
-}
-
-def stopGaiaProcesses(scriptRef, String reason) {
-    scriptRef.echo "Stopping Gaia processes | ${reason}"
-
-    scriptRef.bat """
-        @echo off
-        schtasks /end /tn "${scriptRef.env.GAIA_START_TASK}" >nul 2>&1
-
-        taskkill /f /t /im katalonc.exe >nul 2>&1
-        taskkill /f /t /im KatalonStudio.exe >nul 2>&1
-        taskkill /f /t /im chromedriver.exe >nul 2>&1
-        taskkill /f /t /im chrome.exe >nul 2>&1
-
-        taskkill /f /t /im notepad.exe >nul 2>&1
-
-        taskkill /f /fi "IMAGENAME eq cmd.exe" /fi "WINDOWTITLE eq GAIA_BACK_CMD*" >nul 2>&1
-        taskkill /f /fi "IMAGENAME eq cmd.exe" /fi "WINDOWTITLE eq GAIA_FRONT_CMD*" >nul 2>&1
-
-        exit /b 0
-    """
-
-    scriptRef.powershell """
-        \$patterns = @(
-            'gaia-web_portal_back',
-            'spring-boot:run',
-            'webportal_react',
-            'cross-env NODE_ENV=development',
-            'localhost:4200',
-            'gaia-start-back.bat',
-            'gaia-start-front.bat',
-            'GAIA_BACK_CMD',
-            'GAIA_FRONT_CMD'
-        )
-
-        \$procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            \$cmd = [string]\$_.CommandLine
-            if ([string]::IsNullOrWhiteSpace(\$cmd)) { return \$false }
-            foreach (\$p in \$patterns) {
-                if (\$cmd -like "*\$p*") { return \$true }
-            }
-            return \$false
-        }
-
-        foreach (\$proc in \$procs) {
-            try {
-                Stop-Process -Id \$proc.ProcessId -Force -ErrorAction SilentlyContinue
-            } catch {
-            }
-        }
-    """
+import groovy.json.JsonSlurper
+
+public class JiraIntegration {
+
+	// =========================================================
+	// REQUIRED
+	// =========================================================
+
+	String JIRA_TOKEN                          = ''
+	String PROJECT_KEY                         = 'L96B2C'
+	String EPIC_KEY                            = 'L96B2C-8234'
+
+	// =========================================================
+	// OPTIONAL
+	// =========================================================
+
+	String ENVIRONMENT                         = 'REC'
+	String LABELS                              = 'automate'
+	String MANUAL_TEST_PLAN_KEY                = ''
+
+	boolean FORCE_CREATE_NEW_TEST_PLAN         = false
+	boolean RESET_SAVED_TEST_PLAN_KEY          = false
+
+	String TEST_PLAN_SUFFIX                    = ' Test Plan'
+	String TEST_EXECUTION_TRANSITION_ID        = '11'
+	String TEST_PLAN_TRANSITION_ID             = ''
+
+	String PRIMARY_XML_FILE_NAME               = 'JUnit_Report.xml'
+	String SECONDARY_XML_FILE_NAME             = 'cucumber.xml'
+	String HTML_REPORT_NAME                    = 'eMatchReport.html'
+	String REPORT_ZIP_NAME                     = 'Results.zip'
+	String EVIDENCE_FOLDER_NAME                = 'Evidences'
+	String EVIDENCE_ZIP_NAME                   = 'Evidences.zip'
+	String TEST_PLAN_KEYS_FOLDER               = RunConfiguration.projectDir + '\\TestPlanKeys'
+
+	// =========================================================
+	// OBJECT REPOSITORY REQUESTS
+	// =========================================================
+
+	String REQUEST_IMPORT_RESULTS              = 'Jira Integration/import Results'
+	String REQUEST_GET_TEST_PLAN               = 'Jira Integration/Get Test Plan'
+	String REQUEST_CREATE_TEST_PLAN            = 'Jira Integration/Create Test Plan'
+	String REQUEST_UPDATE_TEST_PLAN            = 'Jira Integration/Update Test Plan'
+	String REQUEST_UPDATE_TEST_EXECUTION       = 'Jira Integration/Update Test Execution Name'
+	String REQUEST_UPLOAD_ATTACHMENT           = 'Jira Integration/Evidence attachment'
+	String REQUEST_TRANSITION_STATUS           = 'Jira Integration/Transition Issue Status'
+
+	// =========================================================
+	// HELPERS
+	// =========================================================
+
+	String maskToken(String token) {
+		if (token == null || token.trim().isEmpty()) {
+			return 'EMPTY'
+		}
+
+		if (token.length() <= 10) {
+			return '***'
+		}
+
+		return token.take(6) + '...' + token.takeRight(4)
+	}
+
+	String getTimestamp() {
+		return new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date())
+	}
+
+	boolean isTimestampFolderName(String name) {
+		if (name == null) {
+			return false
+		}
+
+		return name ==~ /\d{8,}_\d{4,}/ || name ==~ /\d{8,}/
+	}
+
+	// =========================================================
+	// REPORT PATH
+	// =========================================================
+
+	String readLastRunPath() {
+		try {
+			File file = new File(RunConfiguration.projectDir + '\\LastRun.xlsx')
+
+			if (!file.exists()) {
+				return null
+			}
+
+			FileInputStream fis = new FileInputStream(file)
+			XSSFWorkbook wb = new XSSFWorkbook(fis)
+			XSSFSheet sheet = wb.getSheetAt(0)
+			XSSFRow row = sheet.getRow(0)
+			String result = row?.getCell(0)?.stringCellValue
+
+			wb.close()
+			fis.close()
+
+			return result?.trim()
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Could not read LastRun.xlsx: ${e.message}")
+			return null
+		}
+	}
+
+	boolean directoryContainsUsefulFiles(File dir) {
+		if (dir == null || !dir.exists() || !dir.isDirectory()) {
+			return false
+		}
+
+		boolean found = false
+
+		dir.eachFileRecurse(FileType.FILES) { file ->
+			String name = file.name.toLowerCase()
+
+			if (name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME.toLowerCase())
+				|| name.contains(SECONDARY_XML_FILE_NAME.toLowerCase())
+				|| name.endsWith('.html')
+				|| name.equalsIgnoreCase('execution.log')
+				|| name.equalsIgnoreCase('junit_report.xml')
+				|| name.equalsIgnoreCase('cucumber.xml')) {
+				found = true
+			}
+		}
+
+		return found
+	}
+
+	File findLatestUsefulDirectory(File rootDir) {
+		if (rootDir == null || !rootDir.exists() || !rootDir.isDirectory()) {
+			return null
+		}
+
+		List<File> candidates = []
+
+		if (directoryContainsUsefulFiles(rootDir)) {
+			candidates.add(rootDir)
+		}
+
+		rootDir.eachFileRecurse(FileType.DIRECTORIES) { dir ->
+			if (directoryContainsUsefulFiles(dir)) {
+				candidates.add(dir)
+			}
+		}
+
+		if (candidates.isEmpty()) {
+			return null
+		}
+
+		return candidates.max { it.lastModified() }
+	}
+
+	String getResolvedReportPath() {
+		List<String> candidatePaths = []
+
+		try {
+			String runConfigPath = RunConfiguration.getReportFolder()
+
+			if (runConfigPath != null && !runConfigPath.trim().isEmpty()) {
+				candidatePaths.add(runConfigPath.trim())
+			}
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Could not use RunConfiguration.getReportFolder(): ${e.message}")
+		}
+
+		String lastRunPath = readLastRunPath()
+
+		if (lastRunPath != null && !lastRunPath.trim().isEmpty()) {
+			candidatePaths.add(lastRunPath)
+		}
+
+		candidatePaths.add(RunConfiguration.projectDir + '\\Reports')
+		candidatePaths.add(System.getProperty('user.dir') + '\\Reports')
+
+		for (String path : candidatePaths) {
+			if (path == null || path.trim().isEmpty()) {
+				continue
+			}
+
+			File root = new File(path)
+
+			if (!root.exists()) {
+				continue
+			}
+
+			if (directoryContainsUsefulFiles(root)) {
+				KeywordUtil.logInfo("Using report folder: ${root.absolutePath}")
+				return root.absolutePath
+			}
+
+			File latest = findLatestUsefulDirectory(root)
+
+			if (latest != null) {
+				KeywordUtil.logInfo("Using nested report folder: ${latest.absolutePath}")
+				return latest.absolutePath
+			}
+		}
+
+		KeywordUtil.markFailed("No valid report folder found.")
+		return null
+	}
+
+	// =========================================================
+	// SUITE NAME
+	// =========================================================
+
+	String getCurrentSuiteName() {
+		String reportPath = getResolvedReportPath()
+
+		if (reportPath == null || reportPath.trim().isEmpty()) {
+			return 'UnknownTestSuite'
+		}
+
+		File pointer = new File(reportPath)
+
+		while (pointer != null) {
+			String folderName = pointer.getName()
+
+			if (folderName != null
+				&& !folderName.equalsIgnoreCase('Reports')
+				&& !folderName.equalsIgnoreCase('logs')
+				&& !folderName.equalsIgnoreCase('videos')
+				&& !folderName.equalsIgnoreCase('cucumber_report')
+				&& !folderName.equalsIgnoreCase('PreLoad')
+				&& !isTimestampFolderName(folderName)) {
+				return folderName
+			}
+
+			pointer = pointer.getParentFile()
+		}
+
+		return 'UnknownTestSuite'
+	}
+
+	String getSanitizedSuiteName() {
+		return getCurrentSuiteName().replaceAll('[\\\\/:*?"<>|]', '_')
+	}
+
+	String getSummaryName() {
+		return getCurrentSuiteName() + ' ' + getTimestamp()
+	}
+
+	String getTestPlanName() {
+		return getCurrentSuiteName() + TEST_PLAN_SUFFIX
+	}
+
+	// =========================================================
+	// TEST PLAN KEY FILE
+	// =========================================================
+
+	String getSuiteTestPlanFilePath() {
+		File folder = new File(TEST_PLAN_KEYS_FOLDER)
+
+		if (!folder.exists()) {
+			folder.mkdirs()
+		}
+
+		return folder.absolutePath + '\\' + getSanitizedSuiteName() + '.txt'
+	}
+
+	String getSavedTestPlanKey() {
+		File file = new File(getSuiteTestPlanFilePath())
+
+		if (!file.exists()) {
+			return ''
+		}
+
+		String key = file.text?.trim()
+
+		if (key == null || key.isEmpty()) {
+			return ''
+		}
+
+		KeywordUtil.logInfo("Saved Test Plan key found for suite '${getCurrentSuiteName()}': ${key}")
+		return key
+	}
+
+	void saveTestPlanKey(String testPlanKey) {
+		if (testPlanKey == null || testPlanKey.trim().isEmpty()) {
+			return
+		}
+
+		File file = new File(getSuiteTestPlanFilePath())
+		file.write(testPlanKey.trim(), 'UTF-8')
+
+		KeywordUtil.logInfo("Saved Test Plan key '${testPlanKey}' for suite '${getCurrentSuiteName()}'.")
+	}
+
+	@Keyword
+	def resetTestPlanKey() {
+		File file = new File(getSuiteTestPlanFilePath())
+
+		if (!file.exists()) {
+			KeywordUtil.logInfo("No saved Test Plan key file found for this suite.")
+			return
+		}
+
+		file.write('', 'UTF-8')
+		KeywordUtil.logInfo("Saved Test Plan key cleared for suite '${getCurrentSuiteName()}'.")
+	}
+
+	// =========================================================
+	// REPORT FILES
+	// =========================================================
+
+	String getXmlFilePath() {
+		String reportPath = getResolvedReportPath()
+
+		if (reportPath == null || reportPath.trim().isEmpty()) {
+			return null
+		}
+
+		File reportDir = new File(reportPath)
+		String xmlPath = null
+
+		reportDir.eachFileRecurse(FileType.FILES) { file ->
+			if (file.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME)) {
+				xmlPath = file.absolutePath
+			}
+		}
+
+		if (xmlPath == null) {
+			reportDir.eachFileRecurse(FileType.FILES) { file ->
+				if (file.name.toLowerCase().contains(SECONDARY_XML_FILE_NAME.toLowerCase())) {
+					xmlPath = file.absolutePath
+				}
+			}
+		}
+
+		if (xmlPath == null) {
+			KeywordUtil.markFailed("No XML file found inside report directory: ${reportDir.absolutePath}")
+			return null
+		}
+
+		KeywordUtil.logInfo("XML file found: ${xmlPath}")
+		return xmlPath
+	}
+
+	String getHtmlReportFilePath() {
+		String reportPath = getResolvedReportPath()
+
+		if (reportPath == null || reportPath.trim().isEmpty()) {
+			return null
+		}
+
+		File reportDir = new File(reportPath)
+
+		File exact = null
+		File fallback = null
+
+		reportDir.eachFileRecurse(FileType.FILES) { file ->
+			if (file.name.equalsIgnoreCase(HTML_REPORT_NAME)) {
+				exact = file
+			}
+
+			if (fallback == null
+				&& file.name.toLowerCase().endsWith('.html')
+				&& !file.name.toLowerCase().contains('preload')) {
+				fallback = file
+			}
+		}
+
+		if (exact != null) {
+			KeywordUtil.logInfo("HTML report found by configured name: ${exact.absolutePath}")
+			return exact.absolutePath
+		}
+
+		if (fallback != null) {
+			KeywordUtil.logInfo("HTML report found by fallback search: ${fallback.absolutePath}")
+			return fallback.absolutePath
+		}
+
+		KeywordUtil.logInfo("No HTML report found.")
+		return null
+	}
+
+	boolean isFileAllowedInZip(File file, String zipFileName) {
+		if (file == null || !file.isFile()) {
+			return false
+		}
+
+		String lowerName = file.name.toLowerCase()
+
+		if (lowerName.endsWith('.lck')) {
+			return false
+		}
+
+		if (lowerName.endsWith('.zip')) {
+			return false
+		}
+
+		if (file.name.equalsIgnoreCase(zipFileName)) {
+			return false
+		}
+
+		return true
+	}
+
+	String zipReports() {
+		String reportPath = getResolvedReportPath()
+
+		if (reportPath == null || reportPath.trim().isEmpty()) {
+			return null
+		}
+
+		String zippedFile = reportPath + File.separator + REPORT_ZIP_NAME
+		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
+
+		new File(reportPath).eachFile { file ->
+			if (!isFileAllowedInZip(file, REPORT_ZIP_NAME)) {
+				return
+			}
+
+			try {
+				output.putNextEntry(new ZipEntry(file.name))
+
+				def zipInput = new FileInputStream(file)
+				byte[] buffer = new byte[1024]
+				int bytesRead
+
+				while ((bytesRead = zipInput.read(buffer)) != -1) {
+					output.write(buffer, 0, bytesRead)
+				}
+
+				output.closeEntry()
+				zipInput.close()
+				KeywordUtil.logInfo("Added report file to ZIP: ${file.name}")
+			} catch (Exception e) {
+				KeywordUtil.markWarning("Could not add file to report ZIP: ${file.name} - ${e.message}")
+			}
+		}
+
+		output.close()
+		KeywordUtil.logInfo("Report ZIP created successfully: ${zippedFile}")
+		return zippedFile
+	}
+
+	String zipEvidences() {
+		String reportPath = getResolvedReportPath()
+
+		if (reportPath == null || reportPath.trim().isEmpty()) {
+			return null
+		}
+
+		String evidencePath = reportPath + File.separator + EVIDENCE_FOLDER_NAME
+		File evidenceFolder = new File(evidencePath)
+
+		if (!evidenceFolder.exists() || !evidenceFolder.isDirectory()) {
+			KeywordUtil.logInfo("Evidence folder not found: ${evidenceFolder.absolutePath}")
+			return null
+		}
+
+		String zippedFile = evidencePath + File.separator + EVIDENCE_ZIP_NAME
+		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
+
+		evidenceFolder.eachFileRecurse(FileType.FILES) { file ->
+			if (!isFileAllowedInZip(file, EVIDENCE_ZIP_NAME)) {
+				return
+			}
+
+			try {
+				String relativePath = evidenceFolder.toPath().relativize(file.toPath()).toString().replace("\\", "/")
+
+				output.putNextEntry(new ZipEntry(relativePath))
+
+				def zipInput = new FileInputStream(file)
+				byte[] buffer = new byte[1024]
+				int bytesRead
+
+				while ((bytesRead = zipInput.read(buffer)) != -1) {
+					output.write(buffer, 0, bytesRead)
+				}
+
+				output.closeEntry()
+				zipInput.close()
+				KeywordUtil.logInfo("Added evidence file to ZIP: ${relativePath}")
+			} catch (Exception e) {
+				KeywordUtil.markWarning("Could not add evidence file to ZIP: ${file.name} - ${e.message}")
+			}
+		}
+
+		output.close()
+		KeywordUtil.logInfo("Evidence ZIP created successfully: ${zippedFile}")
+		return zippedFile
+	}
+
+	// =========================================================
+	// JIRA REQUESTS
+	// =========================================================
+
+	String importResults(String junitXmlPath) {
+		KeywordUtil.logInfo("Importing execution results...")
+		KeywordUtil.logInfo("Using Jira token: ${maskToken(JIRA_TOKEN)}")
+		KeywordUtil.logInfo("Using Jira project: ${PROJECT_KEY}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_IMPORT_RESULTS, [
+			('filePath') : junitXmlPath,
+			('project')  : PROJECT_KEY,
+			('token')    : JIRA_TOKEN
+		]))
+
+		def slurper = new JsonSlurper()
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Import results status: ${status}")
+		KeywordUtil.logInfo("Import results response: ${body}")
+
+		if (!(status == 200 || status == 204)) {
+			return 'ERROR' + status.toString()
+		}
+
+		def parsedJson = slurper.parseText(body)
+		String key = parsedJson?.testExecIssue?.key
+
+		if (key == null || key.trim().isEmpty()) {
+			return 'ERROR_EXEC_ID_NOT_FOUND'
+		}
+
+		KeywordUtil.logInfo("Test Execution created: ${key}")
+		return key
+	}
+
+	String getExistingTestPlan() {
+		KeywordUtil.logInfo("Searching existing Test Plan by suite name...")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_GET_TEST_PLAN, [
+			('project') : PROJECT_KEY,
+			('summary') : getTestPlanName(),
+			('token')   : JIRA_TOKEN
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Get Test Plan status: ${status}")
+		KeywordUtil.logInfo("Get Test Plan response: ${body}")
+
+		if (status != 200) {
+			return ''
+		}
+
+		def parsedJson = new JsonSlurper().parseText(body)
+		int total = parsedJson?.total ?: 0
+
+		if (total < 1) {
+			KeywordUtil.logInfo("No existing Test Plan found.")
+			return ''
+		}
+
+		def issues = parsedJson?.issues ?: []
+
+		if (issues.isEmpty()) {
+			KeywordUtil.logInfo("No issues returned for existing Test Plan search.")
+			return ''
+		}
+
+		String key = issues[0]?.key
+		KeywordUtil.logInfo("Existing Test Plan found: ${key}")
+		return key == null ? '' : key.trim()
+	}
+
+	String createTestPlan(String summary) {
+		KeywordUtil.logInfo("Creating Test Plan: ${summary}")
+		KeywordUtil.logInfo("Using Epic key: ${EPIC_KEY}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_CREATE_TEST_PLAN, [
+			('token')   : JIRA_TOKEN,
+			('project') : PROJECT_KEY,
+			('summary') : summary,
+			('epic')    : EPIC_KEY
+		]))
+
+		def slurper = new JsonSlurper()
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Create Test Plan status: ${status}")
+		KeywordUtil.logInfo("Create Test Plan response: ${body}")
+
+		if (!(status == 200 || status == 201)) {
+			return 'ERROR' + status.toString()
+		}
+
+		def parsedJson = slurper.parseText(body)
+		String key = parsedJson?.key
+
+		if (key == null || key.trim().isEmpty()) {
+			return 'ERROR_TEST_PLAN_KEY_NOT_FOUND'
+		}
+
+		KeywordUtil.logInfo("Test Plan created: ${key}")
+		return key
+	}
+
+	String getOrCreateTestPlan() {
+		if (MANUAL_TEST_PLAN_KEY != null && !MANUAL_TEST_PLAN_KEY.trim().isEmpty()) {
+			KeywordUtil.logInfo("Using manual Test Plan key: ${MANUAL_TEST_PLAN_KEY}")
+			return MANUAL_TEST_PLAN_KEY.trim()
+		}
+
+		if (RESET_SAVED_TEST_PLAN_KEY) {
+			resetTestPlanKey()
+		}
+
+		if (FORCE_CREATE_NEW_TEST_PLAN) {
+			KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled.")
+
+			String newKey = createTestPlan(getTestPlanName())
+
+			if (newKey != null && !newKey.contains('ERROR')) {
+				saveTestPlanKey(newKey)
+			}
+
+			return newKey
+		}
+
+		String savedKey = getSavedTestPlanKey()
+
+		if (savedKey != null && !savedKey.trim().isEmpty()) {
+			KeywordUtil.logInfo("Using saved Test Plan key: ${savedKey}")
+			return savedKey
+		}
+
+		String existingKey = getExistingTestPlan()
+
+		if (existingKey != null && !existingKey.trim().isEmpty()) {
+			saveTestPlanKey(existingKey)
+			return existingKey
+		}
+
+		String newKey = createTestPlan(getTestPlanName())
+
+		if (newKey != null && !newKey.contains('ERROR')) {
+			saveTestPlanKey(newKey)
+		}
+
+		return newKey
+	}
+
+	int updateTestPlan(String testPlanKey, List<String> testExecKeys) {
+		KeywordUtil.logInfo("Associating Test Execution to Test Plan...")
+		KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+		KeywordUtil.logInfo("Execution keys: ${testExecKeys}")
+
+		def jsonBody = [
+			addTestsToPlan: true,
+			add           : testExecKeys
+		]
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_PLAN, [
+			('token')       : JIRA_TOKEN,
+			('testPlanKey') : testPlanKey,
+			('jsonBody')    : JsonOutput.toJson(jsonBody)
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		KeywordUtil.logInfo("Update Test Plan status: ${status}")
+		KeywordUtil.logInfo("Update Test Plan response: ${response.getResponseBodyContent()}")
+
+		return status
+	}
+
+	int updateTestExecution(String execID) {
+		KeywordUtil.logInfo("Updating Test Execution fields...")
+		KeywordUtil.logInfo("Execution key: ${execID}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_EXECUTION, [
+			('issueID') : execID,
+			('token')   : JIRA_TOKEN,
+			('summary') : getSummaryName(),
+			('env')     : ENVIRONMENT,
+			('labels')  : LABELS
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		KeywordUtil.logInfo("Update Test Execution status: ${status}")
+		KeywordUtil.logInfo("Update Test Execution response: ${response.getResponseBodyContent()}")
+
+		return status
+	}
+
+	int uploadAttachment(String execID, String filePath) {
+		if (filePath == null || filePath.trim().isEmpty()) {
+			KeywordUtil.logInfo("Skipping empty attachment path.")
+			return 0
+		}
+
+		KeywordUtil.logInfo("Uploading attachment to ${execID}: ${filePath}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPLOAD_ATTACHMENT, [
+			('token')     : JIRA_TOKEN,
+			('evidences') : new File(filePath),
+			('execID')    : execID
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		KeywordUtil.logInfo("Upload attachment status: ${status}")
+		KeywordUtil.logInfo("Upload attachment response: ${response.getResponseBodyContent()}")
+
+		return status
+	}
+
+	int updateIssueStatus(String issueKey, String transitionId) {
+		if (transitionId == null || transitionId.trim().isEmpty()) {
+			KeywordUtil.logInfo("No transition ID configured for issue ${issueKey}.")
+			return 200
+		}
+
+		KeywordUtil.logInfo("Updating issue status for ${issueKey} with transition ${transitionId}...")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_TRANSITION_STATUS, [
+			('token')        : JIRA_TOKEN,
+			('issueID')      : issueKey,
+			('transitionID') : transitionId
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		KeywordUtil.logInfo("Transition status response code: ${status}")
+		KeywordUtil.logInfo("Transition response body: ${response.getResponseBodyContent()}")
+
+		return status
+	}
+
+	// =========================================================
+	// MAIN KEYWORD
+	// =========================================================
+
+	@Keyword
+	def jiraImport() {
+		KeywordUtil.logInfo("==============================================")
+		KeywordUtil.logInfo("Starting Jira import flow 🚀")
+		KeywordUtil.logInfo("Suite name: ${getCurrentSuiteName()}")
+		KeywordUtil.logInfo("Report path: ${getResolvedReportPath()}")
+		KeywordUtil.logInfo("Test Plan name: ${getTestPlanName()}")
+		KeywordUtil.logInfo("Execution summary: ${getSummaryName()}")
+		KeywordUtil.logInfo("Using Jira token: ${maskToken(JIRA_TOKEN)}")
+		KeywordUtil.logInfo("==============================================")
+
+		String xmlFile = getXmlFilePath()
+
+		if (xmlFile == null || xmlFile.trim().isEmpty()) {
+			KeywordUtil.markFailed("No XML file found for Jira import.")
+			return
+		}
+
+		String zipReport = zipReports()
+		String zipEvidence = zipEvidences()
+		String htmlReport = getHtmlReportFilePath()
+
+		String execID = importResults(xmlFile)
+
+		if (execID == null || execID.contains('ERROR')) {
+			KeywordUtil.markFailed("Test Execution creation failed: ${execID}")
+			return
+		}
+
+		String testPlanKey = getOrCreateTestPlan()
+
+		if (testPlanKey == null || testPlanKey.contains('ERROR')) {
+			KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+			return
+		}
+
+		int updatePlanStatus = updateTestPlan(testPlanKey, [execID])
+		int updateExecutionStatus = updateTestExecution(execID)
+
+		int uploadResultsStatus = uploadAttachment(execID, zipReport)
+		int uploadEvidenceStatus = uploadAttachment(execID, zipEvidence)
+		int uploadHtmlStatus = uploadAttachment(execID, htmlReport)
+
+		int transitionExecutionStatus = updateIssueStatus(execID, TEST_EXECUTION_TRANSITION_ID)
+		int transitionPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
+
+		KeywordUtil.logInfo("==============================================")
+		KeywordUtil.logInfo("Jira import finished ✅")
+		KeywordUtil.logInfo("Execution key: ${execID}")
+		KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+		KeywordUtil.logInfo("Update Test Plan status: ${updatePlanStatus}")
+		KeywordUtil.logInfo("Update Test Execution status: ${updateExecutionStatus}")
+		KeywordUtil.logInfo("Upload Results.zip status: ${uploadResultsStatus}")
+		KeywordUtil.logInfo("Upload Evidences.zip status: ${uploadEvidenceStatus}")
+		KeywordUtil.logInfo("Upload HTML report status: ${uploadHtmlStatus}")
+		KeywordUtil.logInfo("Transition Execution status: ${transitionExecutionStatus}")
+		KeywordUtil.logInfo("Transition Test Plan status: ${transitionPlanStatus}")
+		KeywordUtil.logInfo("==============================================")
+	}
 }
