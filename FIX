@@ -1,1 +1,336 @@
+        pipeline {
+    agent {
+        node {
+            label 'GI5_SWDCFRNXGI55817'
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+        }
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        string(
+            name: 'STARTUP_WAIT_SECONDS',
+            defaultValue: '90',
+            description: 'Seconds to wait after backend and frontend startup'
+        )
+        string(
+            name: 'SUITE_TIMEOUT_MINUTES',
+            defaultValue: '20',
+            description: 'Maximum minutes for each suite'
+        )
+    }
+
+    environment {
+        WORK_DIR        = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+        PROJECT_PATH    = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
+        REPORTS_DIR     = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports'
+
+        GIT_URL         = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+        GIT_CRED        = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+
+        GAIA_START_TASK = 'GaiaBackFrontSetup'
+
         KATALON_EXE     = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+        EXEC_PROFILE    = 'default'
+        BROWSER_TYPE    = 'Chrome'
+    }
+
+    stages {
+
+        stage('Validate Base Paths') {
+            steps {
+                bat """
+                    @echo off
+                    echo ========================================
+                    echo VALIDATING BASE PATHS
+                    echo ========================================
+
+                    if not exist "${env.WORK_DIR}" (
+                        echo ERROR: WORK_DIR not found
+                        exit /b 1
+                    )
+
+                    if not exist "${env.KATALON_EXE}" (
+                        echo ERROR: KATALON_EXE not found
+                        exit /b 1
+                    )
+
+                    echo SUCCESS: Base paths are valid
+                """
+            }
+        }
+
+        stage('Start Gaia Backend and Frontend') {
+            steps {
+                script {
+                    echo '========================================'
+                    echo 'Starting Gaia backend and frontend'
+                    echo "Build Number : ${env.BUILD_NUMBER}"
+                    echo "Node         : ${env.NODE_NAME}"
+                    echo "Workspace    : ${env.WORKSPACE}"
+                    echo "Work Dir     : ${env.WORK_DIR}"
+                    echo '========================================'
+                }
+
+                bat """
+                    @echo off
+                    rem Start backend and frontend
+                    schtasks /run /tn "${env.GAIA_START_TASK}"
+                    if errorlevel 1 exit /b 1
+                """
+
+                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
+            }
+        }
+
+        stage('Checkout Repository') {
+            steps {
+                dir("${env.WORK_DIR}") {
+                    deleteDir()
+
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/master']],
+                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
+                        extensions: [
+                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+                        ]
+                    ])
+                }
+
+                echo 'Checkout completed successfully'
+            }
+        }
+
+        stage('Prepare Reports') {
+            steps {
+                bat """
+                    @echo off
+                    if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
+                    mkdir "${env.REPORTS_DIR}"
+                """
+            }
+        }
+
+        stage('Validate Project Paths') {
+            steps {
+                bat """
+                    @echo off
+                    echo ========================================
+                    echo VALIDATING PROJECT PATHS
+                    echo ========================================
+
+                    if not exist "${env.PROJECT_PATH}" (
+                        echo ERROR: PROJECT_PATH not found
+                        exit /b 1
+                    )
+
+                    if not exist "${env.REPORTS_DIR}" (
+                        echo ERROR: REPORTS_DIR not found
+                        exit /b 1
+                    )
+
+                    echo SUCCESS: Project paths are valid
+                """
+            }
+        }
+
+        stage('Execute Gaia Suites Separately') {
+            steps {
+                script {
+                    def suites = [
+                        [name: 'PreLoad',                path: 'Test Suites/PreLoad'],
+                        [name: 'Help',                   path: 'Test Suites/Help'],
+                        [name: 'AddCorrection',          path: 'Test Suites/AddCorrection'],
+                        [name: 'ComputationSelection',   path: 'Test Suites/Computation Selection'],
+                        [name: 'CorrectedDuplication',   path: 'Test Suites/CorrectedDuplication'],
+                        [name: 'CorrectionDetails',      path: 'Test Suites/CorrectionDetails'],
+                        [name: 'DownloadInvalidRecords', path: 'Test Suites/DownloadInvalidRecords']
+                    ]
+
+                    def failedSuites = []
+
+                    for (suite in suites) {
+                        def exitCode = 999
+
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                            timeout(time: params.SUITE_TIMEOUT_MINUTES.toInteger(), unit: 'MINUTES') {
+                                exitCode = runKatalonSuite(suite)
+                                if (exitCode != 0) {
+                                    error("Suite ${suite.name} failed with exit code ${exitCode}")
+                                }
+                            }
+                        }
+
+                        if (exitCode == 0) {
+                            echo "Suite ${suite.name} marked as PASSED"
+                        } else {
+                            echo "Suite ${suite.name} marked as FAILED"
+                            failedSuites << suite.name
+                        }
+                    }
+
+                    echo '========================================'
+                    echo 'FINAL SUITE STATUS'
+                    echo '========================================'
+
+                    if (failedSuites) {
+                        echo "Failed suites: ${failedSuites.join(', ')}"
+                        currentBuild.result = 'UNSTABLE'
+                    } else {
+                        echo 'All suites passed'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                closeGaiaStartupWindows()
+            }
+
+            echo 'Archiving reports...'
+
+            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true, excludes: '**/*.lck'
+
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/TEST-*.xml'
+            }
+        }
+
+        success {
+            echo 'SUCCESS: Pipeline completed successfully'
+        }
+
+        unstable {
+            echo 'UNSTABLE: Some suites failed, but execution continued'
+        }
+
+        failure {
+            echo 'FAILURE: Pipeline failed'
+        }
+
+        aborted {
+            echo 'ABORTED: Pipeline canceled by user'
+        }
+    }
+}
+
+def runKatalonSuite(Map suite) {
+    echo '========================================'
+    echo 'Starting suite execution'
+    echo "Suite Name   : ${suite.name}"
+    echo "Suite Path   : ${suite.path}"
+    echo "Project Path : ${env.PROJECT_PATH}"
+    echo "Reports Dir  : ${env.REPORTS_DIR}"
+    echo "Katalon Exe  : ${env.KATALON_EXE}"
+    echo "Browser      : ${env.BROWSER_TYPE}"
+    echo '========================================'
+
+    def suiteFolderName = suite.name.replaceAll('[^A-Za-z0-9_-]', '_')
+    def suiteReportDir = "${env.REPORTS_DIR}\\${suiteFolderName}"
+
+    def exitCode = bat(
+        returnStatus: true,
+        script: """
+            @echo off
+            echo ========================================
+            echo RUNNING SUITE: ${suite.name}
+            echo SUITE PATH   : ${suite.path}
+            echo BROWSER      : ${env.BROWSER_TYPE}
+            echo PROJECT      : ${env.PROJECT_PATH}
+            echo REPORT DIR   : ${suiteReportDir}
+            echo ========================================
+
+            if not exist "${suiteReportDir}" mkdir "${suiteReportDir}"
+
+            call "${env.KATALON_EXE}" ^
+            -noSplash ^
+            -runMode=console ^
+            -consoleLog ^
+            -projectPath="${env.PROJECT_PATH}" ^
+            -retry=0 ^
+            -testSuitePath="${suite.path}" ^
+            -browserType="${env.BROWSER_TYPE}" ^
+            -executionProfile="${env.EXEC_PROFILE}" ^
+            -reportFolder="${suiteReportDir}" ^
+            -reportFileName="${suiteFolderName}"
+
+            exit /b %%ERRORLEVEL%%
+        """
+    )
+
+    echo "Suite ${suite.name} finished with exit code ${exitCode}"
+
+    powershell """
+        \$suiteDir = "${suiteReportDir}"
+        Write-Host "Checking generated files in: \$suiteDir"
+
+        if (Test-Path \$suiteDir) {
+            Get-ChildItem -Path \$suiteDir -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object FullName |
+                ForEach-Object { Write-Host \$_.FullName }
+
+            \$candidateFiles = Get-ChildItem -Path \$suiteDir -Recurse -File -Include *.log,*.txt,*.html,*.xml -ErrorAction SilentlyContinue
+
+            if (\$candidateFiles) {
+                \$patterns = @('ERROR', 'FAILED', 'Exception', 'Caused by:', 'StepFailedException', 'AssertionError', 'Unable', 'not found', 'timed out')
+                \$matches = @()
+
+                foreach (\$file in \$candidateFiles) {
+                    try {
+                        \$content = Get-Content \$file.FullName -ErrorAction SilentlyContinue
+                        foreach (\$line in \$content) {
+                            foreach (\$pattern in \$patterns) {
+                                if (\$line -match \$pattern) {
+                                    \$matches += "[\$([System.IO.Path]::GetFileName(\$file.FullName))] \$line"
+                                    break
+                                }
+                            }
+                        }
+                    } catch {
+                    }
+                }
+
+                if (\$matches.Count -gt 0) {
+                    Write-Host "----- POSSIBLE ERROR LINES FOR ${suite.name} -----"
+                    \$matches | Select-Object -Unique | Select-Object -First 80 | ForEach-Object { Write-Host \$_ }
+                    Write-Host "----- END POSSIBLE ERROR LINES FOR ${suite.name} -----"
+                } else {
+                    Write-Host "No explicit error lines found in report files for ${suite.name}"
+                }
+            } else {
+                Write-Host "No candidate report files found for ${suite.name}"
+            }
+        } else {
+            Write-Host "Suite report directory not found for ${suite.name}"
+        }
+    """
+
+    return exitCode
+}
+
+def closeGaiaStartupWindows() {
+    bat """
+        @echo off
+        rem Close windows opened by backend/frontend startup
+        taskkill /f /fi "WINDOWTITLE eq GAIA_BACK_CMD*" >nul 2>&1
+        taskkill /f /fi "WINDOWTITLE eq GAIA_FRONT_CMD*" >nul 2>&1
+
+        rem Fallback by process image name if titles were not enough
+        taskkill /f /im cmd.exe /fi "WINDOWTITLE eq GAIA_BACK_CMD*" >nul 2>&1
+        taskkill /f /im cmd.exe /fi "WINDOWTITLE eq GAIA_FRONT_CMD*" >nul 2>&1
+
+        exit /b 0
+    """
+}
