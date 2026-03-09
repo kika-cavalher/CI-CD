@@ -1,11 +1,11 @@
 package keywords
 
-import static com.kms.katalon.core.testdata.TestDataFactory.findTestData
 import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
-import java.nio.file.*
+import java.nio.file.Files
 import java.text.SimpleDateFormat
-import java.util.zip.*
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 import com.kms.katalon.core.annotation.Keyword
 import com.kms.katalon.core.util.KeywordUtil
@@ -14,283 +14,424 @@ import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
 import groovy.io.FileType
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
-import internal.GlobalVariable as GlobalVariable
-
 
 public class JiraIntegration {
-	String testSuiteName
-	def testData = findTestData('Data Files/JIRA')
-	def testDataJira = findTestData('Data Files/Jira Details')
 
-	String baseUrl = testData.getValue('JIRA_API_URL',1)
-	String ACCESS_TOKEN = testData.getValue('ACCESS_TOKEN',1)
-	String project = testData.getValue('PROJ_KEY',1)
-	String reportBasePath = testData.getValue('REPORT_FILE',1)
-	String env = testDataJira.getValue('environment',1)
-	String labels = testDataJira.getValue('labels',1)
-	String epic = testDataJira.getValue('epic',1)
+    // =========================================================
+    // CONFIGURATION
+    // Update all values here
+    // =========================================================
 
+    String BASE_URL                     = 'https://your-jira-url-here'
+    String ACCESS_TOKEN                 = 'your-token-here'
+    String PROJECT_KEY                  = 'QA'
+    String REPORT_BASE_PATH             = 'C:\\KatalonReports'
+    String TEST_SUITE_NAME              = 'Regression'
+    String TEST_PLAN_NAME               = 'Regression Test Plan'
+    String ENVIRONMENT                  = 'QA'
+    String LABELS                       = 'automation,regression'
+    String EPIC_KEY                     = 'QA-100'
+    String TRANSITION_ID                = '11'
+    String XML_FILE_NAME_CONTAINS       = 'cucumber.xml'
+    String EVIDENCE_FOLDER_NAME_CONTAINS = 'evidence'
+    String ZIP_FILE_NAME                = 'Evidences.zip'
 
+    // =========================================================
+    // OBJECT REPOSITORY PATHS
+    // Update these paths if your objects have different names
+    // =========================================================
 
-	def setTestSuiteName() {
-		String testSuiteId = GlobalVariable.testSuiteGlobal
-		def testSuite = testSuiteId.replace("Test Suites/", "")
+    String REQUEST_IMPORT_RESULTS        = 'Jira Integration/import Results'
+    String REQUEST_GET_TEST_PLAN         = 'Jira Integration/Get Test Plan'
+    String REQUEST_CREATE_TEST_PLAN      = 'Jira Integration/Create Test Plan'
+    String REQUEST_UPDATE_TEST_PLAN      = 'Jira Integration/Update Test Plan'
+    String REQUEST_UPDATE_TEST_EXECUTION = 'Jira Integration/Update Test Execution Name'
+    String REQUEST_ADD_ATTACHMENT        = 'Jira Integration/Evidence attachment'
+    String REQUEST_TRANSITION_STATUS     = 'Jira Integration/Transition Issue Status'
 
-		String suffixToRemove = "Jira Integration"
+    // =========================================================
+    // HELPER METHODS
+    // =========================================================
 
-		// Remove suffix
-		if (testSuite.endsWith(suffixToRemove)) {
-			testSuiteName =  testSuite.substring(0, testSuite.length() - suffixToRemove.length()).trim()
-		}
-	}
+    private File getLatestReportDirectory() {
+        File reportDir = new File(REPORT_BASE_PATH)
 
-	private File getLatestReportDirectory(File reportDir) {
-		return reportDir.listFiles()?.findAll {
-			it.isDirectory()
-		}?.max {
-			it.lastModified()
-		}
-	}
+        if (!reportDir.exists() || !reportDir.isDirectory()) {
+            KeywordUtil.markFailed("Report base folder does not exist or is invalid: ${REPORT_BASE_PATH}")
+            return null
+        }
 
-	def getTestSuiteReport() {
-		File reportDir = new File(reportBasePath)
+        File latestDir = reportDir.listFiles()
+                ?.findAll { it.isDirectory() }
+                ?.max { it.lastModified() }
 
+        if (latestDir == null) {
+            KeywordUtil.markFailed("No report subfolder was found in: ${REPORT_BASE_PATH}")
+            return null
+        }
 
-		// Get the last report directory generated
-		File latestReportDir = getLatestReportDirectory(reportDir)
-		if (latestReportDir == null) {
-			KeywordUtil.markFailed("No report folder found in the directory: ${reportDir}")
-			return
-		}
+        KeywordUtil.logInfo("Latest report folder found: ${latestDir.absolutePath}")
+        return latestDir
+    }
 
-		File testSuiteDir = new File(latestReportDir,testSuiteName)
+    private File getTestSuiteReportDirectory() {
+        File latestReportDir = getLatestReportDirectory()
+        if (latestReportDir == null) {
+            return null
+        }
 
-		return testSuiteDir
-	}
+        File testSuiteDir = new File(latestReportDir, TEST_SUITE_NAME)
 
-	def getXmlFile(File testSuiteDir) {
-		if (testSuiteDir.exists() && testSuiteDir.isDirectory()) {
-			String junitXmlPath = null
+        if (!testSuiteDir.exists() || !testSuiteDir.isDirectory()) {
+            KeywordUtil.markFailed("Test suite folder was not found: ${testSuiteDir.absolutePath}")
+            return null
+        }
 
-			testSuiteDir.eachFileRecurse(FileType.ANY) { file ->
-				KeywordUtil.logInfo("Existing files:" + file.name)
-				if (file.name.contains("cucumber.xml")) {
-					KeywordUtil.logInfo("Cucumber file path: " + file.absolutePath)
-					junitXmlPath = file.absolutePath
-					return
-				}
-			}
-			KeywordUtil.logInfo("Junit report file path"+junitXmlPath)
-			return junitXmlPath
-		} else {
-			KeywordUtil.markFailed("Test Suite directory does not exist: ${testSuiteDir.absolutePath}")
-			return
-		}
-	}
+        KeywordUtil.logInfo("Test suite folder found: ${testSuiteDir.absolutePath}")
+        return testSuiteDir
+    }
 
+    private String getXmlFilePath(File testSuiteDir) {
+        if (testSuiteDir == null || !testSuiteDir.exists()) {
+            KeywordUtil.markFailed("Test suite directory is null or does not exist.")
+            return null
+        }
 
-	def importResults (String junitXmlPath){
-		def response = WS.sendRequest(findTestObject('Jira Integration/import Results',[('filePath'): junitXmlPath ,('project'):project, ('baseUrl'): baseUrl, ('token'): ACCESS_TOKEN]));
-		def slurper = new JsonSlurper();
+        String xmlPath = null
 
-		int status = WS.getResponseStatusCode(response)
-		KeywordUtil.logInfo("status" +status)
-		def parsedJson = slurper.parseText(response.getResponseBodyContent());
+        testSuiteDir.eachFileRecurse(FileType.FILES) { file ->
+            KeywordUtil.logInfo("Found file: ${file.absolutePath}")
 
+            if (file.name.toLowerCase().contains(XML_FILE_NAME_CONTAINS.toLowerCase())) {
+                xmlPath = file.absolutePath
+            }
+        }
 
-		if (status == 200 || status == 204) {
-			KeywordUtil.logInfo("Importing results..."+parsedJson.toString())
-			def testExecIssue = parsedJson.testExecIssue
-			def testExecKeys = [testExecIssue.key]
-			return testExecKeys
-		}
-		else {
-			return 'ERROR' + status.toString();
-		}
-	}
+        if (xmlPath == null) {
+            KeywordUtil.markFailed("No XML file containing '${XML_FILE_NAME_CONTAINS}' was found in: ${testSuiteDir.absolutePath}")
+            return null
+        }
 
-	def getTestPlanName(String testSuiteName) {
-		def testData = findTestData('Data Files/Test Plan Names')
-		for (def index = 1; index <= testData.getRowNumbers(); index++) {
-			KeywordUtil.logInfo("columns"+testData.columnNames)
-			if (testData.getValue('Test Suite', index) == testSuiteName) {
-				return testData.getValue('Test Plan Name',index)
-			}
-		}
-	}
+        KeywordUtil.logInfo("XML file found: ${xmlPath}")
+        return xmlPath
+    }
 
-	def getTestPlan() {
-		String summary = getTestPlanName(testSuiteName)
+    private List<String> importResults(String xmlPath) {
+        if (xmlPath == null || xmlPath.trim().isEmpty()) {
+            KeywordUtil.markFailed("XML path is empty.")
+            return null
+        }
 
-		KeywordUtil.logInfo("Test Suite Name: "+summary)
+        def response = WS.sendRequest(findTestObject(REQUEST_IMPORT_RESULTS, [
+            ('filePath') : xmlPath,
+            ('project')  : PROJECT_KEY,
+            ('baseUrl')  : BASE_URL,
+            ('token')    : ACCESS_TOKEN
+        ]))
 
-		String escaped = summary.replace("[", "\\\\[").replace("]", "\\\\]");
+        int status = WS.getResponseStatusCode(response)
+        String body = response.getResponseBodyContent()
 
-		def response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan',[('project'):project,('token'): ACCESS_TOKEN,('summary'): escaped, ('parent'): epic]))
-		def slurper = new JsonSlurper();
+        KeywordUtil.logInfo("Import Results status: ${status}")
+        KeywordUtil.logInfo("Import Results response: ${body}")
 
-		int status = WS.getResponseStatusCode(response)
-		KeywordUtil.logInfo("status" +status)
-		def parsedJson = slurper.parseText(response.getResponseBodyContent());
+        if (!(status in [200, 204])) {
+            KeywordUtil.markFailed("Failed to import results into Jira. Status: ${status}")
+            return null
+        }
 
+        def parsedJson = new JsonSlurper().parseText(body)
 
-		if (status == 200) {
-			def total = parsedJson.total
-			KeywordUtil.logInfo("test plan with this name founded" +total)
+        if (parsedJson?.testExecIssue?.key == null) {
+            KeywordUtil.markFailed("Response did not return testExecIssue.key")
+            return null
+        }
 
-			if (total < 1) {
-				return createTestPlan(summary)
-			}
-			else if(total == 1) {
-				def issues = parsedJson.issues
-				return issues[0].key
-			}
-			else {
-				KeywordUtil.logInfo('Exists 2 or more test plans with the same name')
-			}
-		}
-		else {
-			KeywordUtil.logInfo('ERROR' + status.toString());
-		}
-	}
+        List<String> testExecKeys = [parsedJson.testExecIssue.key.toString()]
+        KeywordUtil.logInfo("Created Test Execution key: ${testExecKeys}")
+        return testExecKeys
+    }
 
-	def createTestPlan(String summary) {
-		def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan',[('token'): ACCESS_TOKEN,('env'):env,('project'):project ,('summary'): summary, ('labels'): labels,('epic'):epic]));
-		def slurper = new JsonSlurper();
+    private String getOrCreateTestPlan() {
+        if (TEST_PLAN_NAME == null || TEST_PLAN_NAME.trim().isEmpty()) {
+            KeywordUtil.markFailed("TEST_PLAN_NAME is empty.")
+            return null
+        }
 
-		int status = WS.getResponseStatusCode(response)
-		KeywordUtil.logInfo("status" +status)
-		def parsedJson = slurper.parseText(response.getResponseBodyContent());
+        String escapedSummary = TEST_PLAN_NAME.replace("[", "\\\\[").replace("]", "\\\\]")
 
-		if (status == 201) {
-			KeywordUtil.logInfo(parsedJson.toString())
-			return parsedJson.key
-		}
-		else {
-			KeywordUtil.logInfo('ERROR' + status.toString());
-		}
-	}
+        def response = WS.sendRequest(findTestObject(REQUEST_GET_TEST_PLAN, [
+            ('project') : PROJECT_KEY,
+            ('token')   : ACCESS_TOKEN,
+            ('summary') : escapedSummary,
+            ('parent')  : EPIC_KEY
+        ]))
 
-	def UpdateTestPlan(String testPlanKey, List<String> testExecKeys) {
-		def jsonBody = [
-			addTestsToPlan: true,
-			add: testExecKeys
-		]
+        int status = WS.getResponseStatusCode(response)
+        String body = response.getResponseBodyContent()
 
-		def jsonBodyString = JsonOutput.toJson(jsonBody)
+        KeywordUtil.logInfo("Get Test Plan status: ${status}")
+        KeywordUtil.logInfo("Get Test Plan response: ${body}")
 
-		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan',[('token'): ACCESS_TOKEN,('testPlanKey'):testPlanKey,('jsonBody'): jsonBodyString]));
+        if (status != 200) {
+            KeywordUtil.markFailed("Failed to search for Test Plan. Status: ${status}")
+            return null
+        }
 
-		int status = WS.getResponseStatusCode(response)
+        def parsedJson = new JsonSlurper().parseText(body)
+        int total = parsedJson?.total ?: 0
 
-		if (status == 200) {
-			return KeywordUtil.logInfo('Test executions added to the Test Plan!')
-		}
-		else {
-			return 'ERROR' + status.toString()
-		}
-	}
+        KeywordUtil.logInfo("Number of Test Plans found: ${total}")
 
-	def UpdateTestExecution(List<String> testExecKeys) {
-		String timestamp =  new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date());
+        if (total == 0) {
+            return createTestPlan()
+        }
 
-		String summary = getTestPlanName(testSuiteName) + ' ' + timestamp
-		String labels_execution = testDataJira.getValue('labels',1)
+        if (total == 1) {
+            String key = parsedJson.issues[0].key
+            KeywordUtil.logInfo("Existing Test Plan found: ${key}")
+            return key
+        }
 
-		KeywordUtil.logInfo('\nUpdating information on Jira issue ' + testExecKeys.get(0) + '.')
+        KeywordUtil.markFailed("Multiple Test Plans were found with the same name: ${TEST_PLAN_NAME}")
+        return null
+    }
 
-		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name',[('issueID'): testExecKeys.get(0),('token'): ACCESS_TOKEN,('summary'):summary,('labels'): labels_execution,('env'):env]));
+    private String createTestPlan() {
+        def response = WS.sendRequest(findTestObject(REQUEST_CREATE_TEST_PLAN, [
+            ('token')   : ACCESS_TOKEN,
+            ('env')     : ENVIRONMENT,
+            ('project') : PROJECT_KEY,
+            ('summary') : TEST_PLAN_NAME,
+            ('labels')  : LABELS,
+            ('epic')    : EPIC_KEY
+        ]))
 
-		int status = WS.getResponseStatusCode(response)
+        int status = WS.getResponseStatusCode(response)
+        String body = response.getResponseBodyContent()
 
-		if (status == 204) {
-			return KeywordUtil.logInfo("Updating Test Execution Information "+status.toString())
-		}
-		else {
-			return 'ERROR' + status.toString()
-		}
-	}
+        KeywordUtil.logInfo("Create Test Plan status: ${status}")
+        KeywordUtil.logInfo("Create Test Plan response: ${body}")
 
+        if (status != 201) {
+            KeywordUtil.markFailed("Failed to create Test Plan. Status: ${status}")
+            return null
+        }
 
-	def zipEvidences(String folderPath) {
-		String zippedFile = folderPath + '\\Evidences.zip'
-		ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zippedFile));
+        def parsedJson = new JsonSlurper().parseText(body)
+        String key = parsedJson?.key
 
-		File folderToZip = new File(folderPath)
+        if (key == null) {
+            KeywordUtil.markFailed("Test Plan creation response did not return key.")
+            return null
+        }
 
-		File [] subfolders = folderToZip.listFiles().findAll { file -> file.isDirectory() }
+        KeywordUtil.logInfo("Created Test Plan key: ${key}")
+        return key
+    }
 
-		subfolders[0].eachFileRecurse() { file ->
-			KeywordUtil.logInfo("File to be added: "+file)
-			if (file.isDirectory()) {
-				String zipEntryName = file.relativePath(subfolders[0]).toString().replace("\\", "/") + "/"
-				output.putNextEntry(new ZipEntry(zipEntryName))
-				output.closeEntry()
-			}
-			else if (file.isFile()) {
-				if (!file.toString().equalsIgnoreCase(zippedFile)) {
-					output.putNextEntry(new ZipEntry(file.name.toString()))
-					Files.copy(file.toPath(), output);
-					output.closeEntry();
-				}
-			}
-		}
-		output.close();
-		return zippedFile
-	}
+    private boolean updateTestPlan(String testPlanKey, List<String> testExecKeys) {
+        if (testPlanKey == null || testExecKeys == null || testExecKeys.isEmpty()) {
+            KeywordUtil.markFailed("Cannot update Test Plan because required data is missing.")
+            return false
+        }
 
+        def jsonBody = [
+            addTestsToPlan: true,
+            add           : testExecKeys
+        ]
 
-	def addAttachment(File filePath,List<String> execID){
-		def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment',[('token'): ACCESS_TOKEN,('evidences'): filePath, ('execID'):execID.get(0)]));
-		def slurper = new JsonSlurper();
+        String jsonBodyString = JsonOutput.toJson(jsonBody)
 
-		int status = WS.getResponseStatusCode(response)
-		def parsedJson = slurper.parseText(response.getResponseBodyContent());
+        def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_PLAN, [
+            ('token')       : ACCESS_TOKEN,
+            ('testPlanKey') : testPlanKey,
+            ('jsonBody')    : jsonBodyString
+        ]))
 
-		if (status == 200) {
-			return KeywordUtil.logInfo("Adding result.zip..."+parsedJson.toString())
-		}
-		else {
-			return 'ERROR' + status.toString()
-		}
-	}
+        int status = WS.getResponseStatusCode(response)
+        KeywordUtil.logInfo("Update Test Plan status: ${status}")
 
-	def updateTestExecutionStatus(String execID, String transitionActionId) {
-		def response = WS.sendRequest(findTestObject('Jira Integration/Transition Issue Status', [('token'): ACCESS_TOKEN,('issueID'): execID, ('transitionID'): transitionActionId]));
-		return WS.getResponseStatusCode(response);
-	}
+        if (status != 200) {
+            KeywordUtil.markFailed("Failed to update Test Plan. Status: ${status}")
+            return false
+        }
 
+        KeywordUtil.logInfo("Test Execution was added to Test Plan successfully.")
+        return true
+    }
 
-	@Keyword
-	def jiraImport() {
-		KeywordUtil.logInfo("Getting the Test Suite Name...")
-		setTestSuiteName()
-		KeywordUtil.logInfo("Getting the Test Suite File Path...")
-		File testSuiteDir = getTestSuiteReport()
-		KeywordUtil.logInfo("Getting the Junit xml file...")
-		String junitXmlPath = getXmlFile(testSuiteDir)
-		KeywordUtil.logInfo("Importing all the tests of the test suite and create a test execution for each...")
-		/* Note: If the test is already create, just create a test execution for the test.*/
+    private boolean updateTestExecution(List<String> testExecKeys) {
+        if (testExecKeys == null || testExecKeys.isEmpty()) {
+            KeywordUtil.markFailed("Test Execution list is empty.")
+            return false
+        }
 
-		List<String> testExecKeys = importResults(junitXmlPath)
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH.mm.ss").format(new Date())
+        String summary = "${TEST_PLAN_NAME} ${timestamp}"
 
-		/*Create or update test plan with the executed tests*/
-		String updateTestPlanInExcelKey = getTestPlan()
-		UpdateTestPlan(updateTestPlanInExcelKey,testExecKeys)
-		KeywordUtil.logInfo("Updating Test Execution Information...")
-		UpdateTestExecution(testExecKeys)
-		KeywordUtil.logInfo("Zip files...")
-		def folderToZip = testSuiteDir.absolutePath
-		KeywordUtil.logInfo("Adding evidences to test execution...")
-		zipEvidences(folderToZip)
-		addAttachment(new File(testSuiteDir.absolutePath.concat("\\evidences.zip")),testExecKeys)
+        def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_EXECUTION, [
+            ('issueID') : testExecKeys[0],
+            ('token')   : ACCESS_TOKEN,
+            ('summary') : summary,
+            ('labels')  : LABELS,
+            ('env')     : ENVIRONMENT
+        ]))
 
-		KeywordUtil.logInfo("Update Test Execution Status (In progress)....")
+        int status = WS.getResponseStatusCode(response)
+        String body = response.getResponseBodyContent()
 
-		updateTestExecutionStatus(testExecKeys.get(0),"11")
+        KeywordUtil.logInfo("Update Test Execution status: ${status}")
+        KeywordUtil.logInfo("Update Test Execution response: ${body}")
 
-		KeywordUtil.logInfo("Update Test Execution Status (In progress)....")
+        if (status != 204) {
+            KeywordUtil.markFailed("Failed to update Test Execution. Status: ${status}")
+            return false
+        }
 
-		updateTestExecutionStatus(updateTestPlanInExcelKey,"11")
-	}
+        KeywordUtil.logInfo("Test Execution updated successfully.")
+        return true
+    }
+
+    private File zipEvidences(File testSuiteDir) {
+        if (testSuiteDir == null || !testSuiteDir.exists()) {
+            KeywordUtil.markFailed("Test suite folder does not exist for zip creation.")
+            return null
+        }
+
+        File evidencesFolder = testSuiteDir.listFiles()?.find { file ->
+            file.isDirectory() && file.name.toLowerCase().contains(EVIDENCE_FOLDER_NAME_CONTAINS.toLowerCase())
+        }
+
+        if (evidencesFolder == null) {
+            KeywordUtil.markFailed("No evidence folder was found inside: ${testSuiteDir.absolutePath}")
+            return null
+        }
+
+        File zipFile = new File(testSuiteDir, ZIP_FILE_NAME)
+        ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zipFile))
+
+        evidencesFolder.eachFileRecurse(FileType.FILES) { file ->
+            String relativePath = evidencesFolder.toPath().relativize(file.toPath()).toString().replace("\\", "/")
+            KeywordUtil.logInfo("Adding file to zip: ${relativePath}")
+            output.putNextEntry(new ZipEntry(relativePath))
+            Files.copy(file.toPath(), output)
+            output.closeEntry()
+        }
+
+        output.close()
+
+        KeywordUtil.logInfo("Zip file created successfully: ${zipFile.absolutePath}")
+        return zipFile
+    }
+
+    private boolean addAttachment(File zipFile, List<String> execIds) {
+        if (zipFile == null || !zipFile.exists()) {
+            KeywordUtil.markFailed("Zip file was not found for attachment.")
+            return false
+        }
+
+        if (execIds == null || execIds.isEmpty()) {
+            KeywordUtil.markFailed("Execution ID list is empty for attachment.")
+            return false
+        }
+
+        def response = WS.sendRequest(findTestObject(REQUEST_ADD_ATTACHMENT, [
+            ('token')     : ACCESS_TOKEN,
+            ('evidences') : zipFile,
+            ('execID')    : execIds[0]
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = response.getResponseBodyContent()
+
+        KeywordUtil.logInfo("Add Attachment status: ${status}")
+        KeywordUtil.logInfo("Add Attachment response: ${body}")
+
+        if (status != 200) {
+            KeywordUtil.markFailed("Failed to attach evidence zip. Status: ${status}")
+            return false
+        }
+
+        KeywordUtil.logInfo("Evidence zip attached successfully.")
+        return true
+    }
+
+    private boolean updateIssueStatus(String issueKey) {
+        if (issueKey == null || issueKey.trim().isEmpty()) {
+            KeywordUtil.markFailed("Issue key is empty for status transition.")
+            return false
+        }
+
+        def response = WS.sendRequest(findTestObject(REQUEST_TRANSITION_STATUS, [
+            ('token')        : ACCESS_TOKEN,
+            ('issueID')      : issueKey,
+            ('transitionID') : TRANSITION_ID
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = response.getResponseBodyContent()
+
+        KeywordUtil.logInfo("Transition status for ${issueKey}: ${status}")
+        KeywordUtil.logInfo("Transition response for ${issueKey}: ${body}")
+
+        if (!(status in [200, 204])) {
+            KeywordUtil.markFailed("Failed to transition issue ${issueKey}. Status: ${status}")
+            return false
+        }
+
+        KeywordUtil.logInfo("Issue ${issueKey} status updated successfully.")
+        return true
+    }
+
+    // =========================================================
+    // MAIN FLOW
+    // =========================================================
+
+    @Keyword
+    def jiraImport() {
+        KeywordUtil.logInfo("Starting Jira integration...")
+
+        File testSuiteDir = getTestSuiteReportDirectory()
+        if (testSuiteDir == null) {
+            return
+        }
+
+        String xmlPath = getXmlFilePath(testSuiteDir)
+        if (xmlPath == null) {
+            return
+        }
+
+        List<String> testExecKeys = importResults(xmlPath)
+        if (testExecKeys == null || testExecKeys.isEmpty()) {
+            return
+        }
+
+        String testPlanKey = getOrCreateTestPlan()
+        if (testPlanKey == null) {
+            return
+        }
+
+        if (!updateTestPlan(testPlanKey, testExecKeys)) {
+            return
+        }
+
+        if (!updateTestExecution(testExecKeys)) {
+            return
+        }
+
+        File zipFile = zipEvidences(testSuiteDir)
+        if (zipFile == null) {
+            return
+        }
+
+        if (!addAttachment(zipFile, testExecKeys)) {
+            return
+        }
+
+        updateIssueStatus(testExecKeys[0])
+        updateIssueStatus(testPlanKey)
+
+        KeywordUtil.logInfo("Jira integration finished successfully.")
+    }
 }
