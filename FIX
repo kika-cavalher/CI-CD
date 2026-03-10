@@ -1,1 +1,1334 @@
+package keywords
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.text.SimpleDateFormat
+import java.util.Base64
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+import javax.xml.parsers.DocumentBuilderFactory
+
+import org.apache.poi.xssf.usermodel.XSSFRow
+import org.apache.poi.xssf.usermodel.XSSFSheet
+import org.apache.poi.xssf.usermodel.XSSFWorkbook
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+import org.w3c.dom.NodeList
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+
+import groovy.io.FileType
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+public class JiraIntegration {
+
+	// =========================================================
+	// REQUIRED CONFIGURATION
+	// =========================================================
+
+	String JIRA_TOKEN                    = ''
+	String PROJECT_KEY                   = 'L96B2C'
+	String EPIC_KEY                      = 'L96B2C-8234'
+
+	// =========================================================
+	// OPTIONAL CONFIGURATION
+	// =========================================================
+
+	String ENVIRONMENT                   = 'REC'
+	String LABELS                        = 'automate'
+	String MANUAL_TEST_PLAN_KEY          = ''
+
+	boolean FORCE_CREATE_NEW_TEST_PLAN   = false
+	boolean RESET_SAVED_TEST_PLAN_KEY    = false
+
+	String TEST_PLAN_SUFFIX              = ' Test Plan'
+	String TEST_EXECUTION_TRANSITION_ID  = '11'
+	String TEST_PLAN_TRANSITION_ID       = ''
+
+	String PRIMARY_XML_FILE_NAME         = 'JUnit_Report.xml'
+	String SECONDARY_XML_FILE_NAME       = 'cucumber.xml'
+	String GAIA_REPORT_FILE_NAME         = 'gaiaReport.html'
+	String REPORT_ZIP_NAME               = 'Results.zip'
+	String EVIDENCE_FOLDER_NAME          = 'Evidences'
+	String EVIDENCE_ZIP_NAME             = 'Evidences.zip'
+	String TEST_PLAN_KEYS_FOLDER         = RunConfiguration.projectDir + '\\TestPlanKeys'
+
+	// =========================================================
+	// OBJECT REPOSITORY REQUESTS
+	// =========================================================
+
+	String REQUEST_IMPORT_RESULTS        = 'Jira Integration/import Results'
+	String REQUEST_GET_TEST_PLAN         = 'Jira Integration/Get Test Plan'
+	String REQUEST_CREATE_TEST_PLAN      = 'Jira Integration/Create Test Plan'
+	String REQUEST_UPDATE_TEST_PLAN      = 'Jira Integration/Update Test Plan'
+	String REQUEST_UPDATE_TEST_EXECUTION = 'Jira Integration/Update Test Execution Name'
+	String REQUEST_UPLOAD_ATTACHMENT     = 'Jira Integration/Evidence attachment'
+	String REQUEST_TRANSITION_STATUS     = 'Jira Integration/Transition Issue Status'
+
+	// =========================================================
+	// GENERAL HELPERS
+	// =========================================================
+
+	String nowExecution() {
+		return new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+	}
+
+	boolean isBlank(String value) {
+		return value == null || value.trim().isEmpty()
+	}
+
+	String maskToken(String token) {
+		if (isBlank(token)) {
+			return 'EMPTY'
+		}
+
+		if (token.length() <= 10) {
+			return '***'
+		}
+
+		return token.take(6) + '...' + token.takeRight(4)
+	}
+
+	void logSection(String message) {
+		KeywordUtil.logInfo('==================================================')
+		KeywordUtil.logInfo(message)
+		KeywordUtil.logInfo('==================================================')
+	}
+
+	String safeHtml(String value) {
+		if (value == null) {
+			return ''
+		}
+
+		return value
+			.replace('&', '&amp;')
+			.replace('<', '&lt;')
+			.replace('>', '&gt;')
+			.replace('"', '&quot;')
+			.replace("'", '&#39;')
+	}
+
+	boolean isTimestampFolderName(String name) {
+		if (name == null) {
+			return false
+		}
+
+		return name ==~ /\\d{8,}_\\d{4,}/ || name ==~ /\\d{8,}/
+	}
+
+	String formatUiDate(Date date) {
+		if (date == null) {
+			return ''
+		}
+
+		return new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy', Locale.ENGLISH).format(date)
+	}
+
+	String formatDurationSeconds(BigDecimal secondsValue) {
+		if (secondsValue == null) {
+			return '0ms'
+		}
+
+		long totalMs = (secondsValue * 1000).longValue()
+		long hours = totalMs / 3600000
+		long minutes = (totalMs % 3600000) / 60000
+		long seconds = (totalMs % 60000) / 1000
+		long millis = totalMs % 1000
+
+		String result = ''
+
+		if (hours > 0) {
+			result += hours + 'h '
+		}
+
+		if (minutes > 0 || hours > 0) {
+			result += minutes + 'm '
+		}
+
+		if (seconds > 0 || minutes > 0 || hours > 0) {
+			result += seconds + 's '
+		}
+
+		result += millis + 'ms'
+
+		return result.trim()
+	}
+
+	String guessMimeType(File file) {
+		String lower = file.name.toLowerCase()
+
+		if (lower.endsWith('.png')) return 'image/png'
+		if (lower.endsWith('.jpg')) return 'image/jpeg'
+		if (lower.endsWith('.jpeg')) return 'image/jpeg'
+		if (lower.endsWith('.gif')) return 'image/gif'
+		if (lower.endsWith('.webp')) return 'image/webp'
+
+		return 'application/octet-stream'
+	}
+
+	String toDataUri(File file) {
+		try {
+			byte[] bytes = Files.readAllBytes(file.toPath())
+			String base64 = Base64.encoder.encodeToString(bytes)
+			String mime = guessMimeType(file)
+			return "data:${mime};base64,${base64}"
+		} catch (Exception e) {
+			KeywordUtil.markWarning("Could not convert image to base64: ${file.name} - ${e.message}")
+			return ''
+		}
+	}
+
+	String normalizeSuiteName(String value) {
+		if (isBlank(value)) {
+			return 'UnknownTestSuite'
+		}
+
+		String cleaned = value.trim()
+		cleaned = cleaned.replaceAll('(?i)^test suites[/\\\\]', '')
+		cleaned = cleaned.replaceAll('(?i)^test suite[/\\\\]', '')
+		cleaned = cleaned.replaceAll('(?i)jira integration$', '')
+		cleaned = cleaned.trim()
+
+		if (cleaned.contains('\\')) {
+			cleaned = cleaned.tokenize('\\')[-1]
+		}
+
+		if (cleaned.contains('/')) {
+			cleaned = cleaned.tokenize('/')[-1]
+		}
+
+		return cleaned.trim()
+	}
+
+	// =========================================================
+	// REPORT PATH RESOLUTION
+	// =========================================================
+
+	String readLastRunPath() {
+		try {
+			File file = new File(RunConfiguration.projectDir + '\\LastRun.xlsx')
+
+			if (!file.exists()) {
+				return null
+			}
+
+			FileInputStream fis = new FileInputStream(file)
+			XSSFWorkbook wb = new XSSFWorkbook(fis)
+			XSSFSheet sheet = wb.getSheetAt(0)
+			XSSFRow row = sheet.getRow(0)
+			String result = row?.getCell(0)?.stringCellValue
+
+			wb.close()
+			fis.close()
+
+			return result?.trim()
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Could not read LastRun.xlsx: ${e.message}")
+			return null
+		}
+	}
+
+	boolean directoryContainsUsefulFiles(File dir) {
+		if (dir == null || !dir.exists() || !dir.isDirectory()) {
+			return false
+		}
+
+		boolean found = false
+
+		dir.eachFileRecurse(FileType.FILES) { file ->
+			String name = file.name.toLowerCase()
+
+			if (name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME.toLowerCase())
+				|| name.contains(SECONDARY_XML_FILE_NAME.toLowerCase())
+				|| name.endsWith('.html')
+				|| name.equalsIgnoreCase('execution.log')
+				|| name.equalsIgnoreCase('junit_report.xml')
+				|| name.equalsIgnoreCase('cucumber.xml')) {
+				found = true
+			}
+		}
+
+		return found
+	}
+
+	File findLatestUsefulDirectory(File rootDir) {
+		if (rootDir == null || !rootDir.exists() || !rootDir.isDirectory()) {
+			return null
+		}
+
+		List<File> candidates = []
+
+		if (directoryContainsUsefulFiles(rootDir)) {
+			candidates.add(rootDir)
+		}
+
+		rootDir.eachFileRecurse(FileType.DIRECTORIES) { dir ->
+			if (directoryContainsUsefulFiles(dir)) {
+				candidates.add(dir)
+			}
+		}
+
+		if (candidates.isEmpty()) {
+			return null
+		}
+
+		return candidates.max { it.lastModified() }
+	}
+
+	String getResolvedReportPath() {
+		List<String> candidatePaths = []
+
+		try {
+			String runConfigPath = RunConfiguration.getReportFolder()
+
+			if (!isBlank(runConfigPath)) {
+				candidatePaths.add(runConfigPath.trim())
+			}
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Could not read RunConfiguration report folder: ${e.message}")
+		}
+
+		String lastRunPath = readLastRunPath()
+
+		if (!isBlank(lastRunPath)) {
+			candidatePaths.add(lastRunPath)
+		}
+
+		candidatePaths.add(RunConfiguration.projectDir + '\\Reports')
+		candidatePaths.add(System.getProperty('user.dir') + '\\Reports')
+
+		for (String path : candidatePaths) {
+			if (isBlank(path)) {
+				continue
+			}
+
+			File root = new File(path)
+
+			if (!root.exists()) {
+				continue
+			}
+
+			if (directoryContainsUsefulFiles(root)) {
+				KeywordUtil.logInfo("Using report folder: ${root.absolutePath}")
+				return root.absolutePath
+			}
+
+			File latest = findLatestUsefulDirectory(root)
+
+			if (latest != null) {
+				KeywordUtil.logInfo("Using nested report folder: ${latest.absolutePath}")
+				return latest.absolutePath
+			}
+		}
+
+		KeywordUtil.markFailed('No valid report folder found.')
+		return null
+	}
+
+	// =========================================================
+	// SUITE NAME RESOLUTION
+	// =========================================================
+
+	String getCurrentSuiteName() {
+		String reportPath = getResolvedReportPath()
+
+		if (isBlank(reportPath)) {
+			return 'UnknownTestSuite'
+		}
+
+		File current = new File(reportPath)
+
+		while (current != null) {
+			String folderName = current.getName()
+
+			if (!isBlank(folderName)
+				&& !folderName.equalsIgnoreCase('Reports')
+				&& !folderName.equalsIgnoreCase('logs')
+				&& !folderName.equalsIgnoreCase('videos')
+				&& !folderName.equalsIgnoreCase('cucumber_report')
+				&& !folderName.equalsIgnoreCase('PreLoad')
+				&& !isTimestampFolderName(folderName)) {
+				return normalizeSuiteName(folderName)
+			}
+
+			current = current.getParentFile()
+		}
+
+		return 'UnknownTestSuite'
+	}
+
+	String getSanitizedSuiteName() {
+		return getCurrentSuiteName().replaceAll('[\\\\/:*?"<>|]', '_')
+	}
+
+	String getExecutionSummary() {
+		return getCurrentSuiteName() + ' ' + nowExecution()
+	}
+
+	String getTestPlanName() {
+		return getCurrentSuiteName() + TEST_PLAN_SUFFIX
+	}
+
+	// =========================================================
+	// SAVED TEST PLAN KEY
+	// =========================================================
+
+	String getSuiteTestPlanFilePath() {
+		File folder = new File(TEST_PLAN_KEYS_FOLDER)
+
+		if (!folder.exists()) {
+			folder.mkdirs()
+		}
+
+		return folder.absolutePath + '\\' + getSanitizedSuiteName() + '.txt'
+	}
+
+	String getSavedTestPlanKey() {
+		File file = new File(getSuiteTestPlanFilePath())
+
+		if (!file.exists()) {
+			return ''
+		}
+
+		String key = file.text?.trim()
+
+		if (isBlank(key)) {
+			return ''
+		}
+
+		KeywordUtil.logInfo("Saved Test Plan key found: ${key}")
+		return key
+	}
+
+	void saveTestPlanKey(String testPlanKey) {
+		if (isBlank(testPlanKey)) {
+			return
+		}
+
+		File file = new File(getSuiteTestPlanFilePath())
+		file.write(testPlanKey.trim(), 'UTF-8')
+
+		KeywordUtil.logInfo("Saved Test Plan key for suite '${getCurrentSuiteName()}': ${testPlanKey}")
+	}
+
+	@Keyword
+	def resetTestPlanKey() {
+		File file = new File(getSuiteTestPlanFilePath())
+
+		if (!file.exists()) {
+			KeywordUtil.logInfo('No saved Test Plan key file found for this suite.')
+			return
+		}
+
+		file.write('', 'UTF-8')
+		KeywordUtil.logInfo("Saved Test Plan key cleared for suite '${getCurrentSuiteName()}'.")
+	}
+
+	// =========================================================
+	// REPORT FILES
+	// =========================================================
+
+	String getXmlFilePath() {
+		String reportPath = getResolvedReportPath()
+
+		if (isBlank(reportPath)) {
+			return null
+		}
+
+		File reportDir = new File(reportPath)
+		String xmlPath = null
+
+		reportDir.eachFileRecurse(FileType.FILES) { file ->
+			if (file.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME)) {
+				xmlPath = file.absolutePath
+			}
+		}
+
+		if (xmlPath == null) {
+			reportDir.eachFileRecurse(FileType.FILES) { file ->
+				if (file.name.toLowerCase().contains(SECONDARY_XML_FILE_NAME.toLowerCase())) {
+					xmlPath = file.absolutePath
+				}
+			}
+		}
+
+		if (xmlPath == null) {
+			KeywordUtil.markFailed("No XML file found inside report directory: ${reportDir.absolutePath}")
+			return null
+		}
+
+		KeywordUtil.logInfo("XML file found: ${xmlPath}")
+		return xmlPath
+	}
+
+	boolean isFileAllowedInZip(File file, String zipFileName) {
+		if (file == null || !file.isFile()) {
+			return false
+		}
+
+		String lowerName = file.name.toLowerCase()
+
+		if (lowerName.endsWith('.lck')) {
+			return false
+		}
+
+		if (lowerName.endsWith('.zip')) {
+			return false
+		}
+
+		if (file.name.equalsIgnoreCase(zipFileName)) {
+			return false
+		}
+
+		if (file.name.equalsIgnoreCase(GAIA_REPORT_FILE_NAME)) {
+			return false
+		}
+
+		return true
+	}
+
+	String zipReports() {
+		String reportPath = getResolvedReportPath()
+
+		if (isBlank(reportPath)) {
+			return null
+		}
+
+		String zippedFile = reportPath + File.separator + REPORT_ZIP_NAME
+		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
+
+		new File(reportPath).eachFile { file ->
+			if (!isFileAllowedInZip(file, REPORT_ZIP_NAME)) {
+				return
+			}
+
+			try {
+				output.putNextEntry(new ZipEntry(file.name))
+
+				def zipInput = new FileInputStream(file)
+				byte[] buffer = new byte[1024]
+				int bytesRead
+
+				while ((bytesRead = zipInput.read(buffer)) != -1) {
+					output.write(buffer, 0, bytesRead)
+				}
+
+				output.closeEntry()
+				zipInput.close()
+
+				KeywordUtil.logInfo("Added report file to ZIP: ${file.name}")
+			} catch (Exception e) {
+				KeywordUtil.markWarning("Could not add report file to ZIP: ${file.name} - ${e.message}")
+			}
+		}
+
+		output.close()
+		KeywordUtil.logInfo("Report ZIP created successfully: ${zippedFile}")
+		return zippedFile
+	}
+
+	String zipEvidences() {
+		String reportPath = getResolvedReportPath()
+
+		if (isBlank(reportPath)) {
+			return null
+		}
+
+		String evidencePath = reportPath + File.separator + EVIDENCE_FOLDER_NAME
+		File evidenceFolder = new File(evidencePath)
+
+		if (!evidenceFolder.exists() || !evidenceFolder.isDirectory()) {
+			KeywordUtil.logInfo("Evidence folder not found: ${evidenceFolder.absolutePath}")
+			return null
+		}
+
+		String zippedFile = evidencePath + File.separator + EVIDENCE_ZIP_NAME
+		def output = new ZipOutputStream(new FileOutputStream(zippedFile))
+
+		evidenceFolder.eachFileRecurse(FileType.FILES) { file ->
+			if (!isFileAllowedInZip(file, EVIDENCE_ZIP_NAME)) {
+				return
+			}
+
+			try {
+				String relativePath = evidenceFolder.toPath().relativize(file.toPath()).toString().replace("\\", "/")
+
+				output.putNextEntry(new ZipEntry(relativePath))
+
+				def zipInput = new FileInputStream(file)
+				byte[] buffer = new byte[1024]
+				int bytesRead
+
+				while ((bytesRead = zipInput.read(buffer)) != -1) {
+					output.write(buffer, 0, bytesRead)
+				}
+
+				output.closeEntry()
+				zipInput.close()
+
+				KeywordUtil.logInfo("Added evidence file to ZIP: ${relativePath}")
+			} catch (Exception e) {
+				KeywordUtil.markWarning("Could not add evidence file to ZIP: ${file.name} - ${e.message}")
+			}
+		}
+
+		output.close()
+		KeywordUtil.logInfo("Evidence ZIP created successfully: ${zippedFile}")
+		return zippedFile
+	}
+
+	// =========================================================
+	// XML PARSING
+	// =========================================================
+
+	Document parseXmlDocument(String xmlFilePath) {
+		DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance()
+		factory.setNamespaceAware(false)
+		factory.setIgnoringComments(true)
+		factory.setIgnoringElementContentWhitespace(true)
+
+		def builder = factory.newDocumentBuilder()
+		Document document = builder.parse(new File(xmlFilePath))
+		document.getDocumentElement().normalize()
+
+		return document
+	}
+
+	String getAttribute(Element element, String name) {
+		if (element == null || !element.hasAttribute(name)) {
+			return ''
+		}
+		return element.getAttribute(name)
+	}
+
+	List<Element> getTestCaseElements(Document document) {
+		List<Element> items = []
+		NodeList nodes = document.getElementsByTagName('testcase')
+
+		for (int i = 0; i < nodes.getLength(); i++) {
+			def node = nodes.item(i)
+			if (node instanceof Element) {
+				items.add((Element) node)
+			}
+		}
+
+		return items
+	}
+
+	List<File> getFailureImages() {
+		List<File> images = []
+		String reportPath = getResolvedReportPath()
+
+		if (isBlank(reportPath)) {
+			return images
+		}
+
+		File reportDir = new File(reportPath)
+
+		reportDir.eachFileRecurse(FileType.FILES) { file ->
+			String lower = file.name.toLowerCase()
+
+			if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')) {
+				images.add(file)
+			}
+		}
+
+		images.sort { a, b -> a.lastModified() <=> b.lastModified() }
+		return images
+	}
+
+	Map parseSuiteData(String xmlFilePath) {
+		Document document = parseXmlDocument(xmlFilePath)
+
+		String suiteName = getCurrentSuiteName()
+
+		BigDecimal suiteTime = 0
+		List<Map> failedTests = []
+		List<Map> passedTests = []
+		List<File> failureImages = getFailureImages()
+		int imageIndex = 0
+
+		List<Element> testCases = getTestCaseElements(document)
+
+		for (Element tc : testCases) {
+			String className = getAttribute(tc, 'classname')
+			String testName = getAttribute(tc, 'name')
+
+			BigDecimal timeSeconds = 0
+			try {
+				timeSeconds = new BigDecimal(getAttribute(tc, 'time') ?: '0')
+			} catch (Exception ignored) {
+				timeSeconds = 0
+			}
+
+			suiteTime += timeSeconds
+
+			NodeList failureNodes = tc.getElementsByTagName('failure')
+			NodeList errorNodes = tc.getElementsByTagName('error')
+			NodeList skippedNodes = tc.getElementsByTagName('skipped')
+
+			boolean failed = failureNodes.getLength() > 0 || errorNodes.getLength() > 0
+			boolean skipped = skippedNodes.getLength() > 0
+
+			String failureMessage = ''
+			String stackTrace = ''
+			String imageData = ''
+
+			if (failed) {
+				Element node = failureNodes.getLength() > 0 ? (Element) failureNodes.item(0) : (Element) errorNodes.item(0)
+				failureMessage = getAttribute(node, 'message')
+				stackTrace = node.getTextContent() ?: ''
+
+				if (imageIndex < failureImages.size()) {
+					imageData = toDataUri(failureImages[imageIndex])
+					imageIndex++
+				}
+			}
+
+			Map item = [
+				className      : className,
+				testName       : testName,
+				timeSeconds    : timeSeconds,
+				failureMessage : failureMessage,
+				stackTrace     : stackTrace,
+				imageData      : imageData,
+				skipped        : skipped
+			]
+
+			if (failed) {
+				failedTests.add(item)
+			} else if (!skipped) {
+				passedTests.add(item)
+			}
+		}
+
+		Date nowDate = new Date()
+
+		return [
+			suiteName   : suiteName,
+			startText   : formatUiDate(nowDate),
+			endText     : formatUiDate(nowDate),
+			suiteTime   : suiteTime,
+			executed    : failedTests.size() + passedTests.size(),
+			passed      : passedTests.size(),
+			failed      : failedTests.size(),
+			skipped     : 0,
+			failedTests : failedTests,
+			passedTests : passedTests
+		]
+	}
+
+	// =========================================================
+	// HTML REPORT
+	// =========================================================
+
+	String buildFailureCard(Map item) {
+		StringBuilder card = new StringBuilder()
+
+		card.append('<div class="failed-test">')
+		card.append('<div class="failed-left-line"></div>')
+		card.append('<div class="failed-content">')
+
+		card.append('<div class="test-path">')
+		card.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+		card.append('</div>')
+
+		card.append('<div class="mandatory-failure">Mandatory failure</div>')
+
+		if (!isBlank(item.failureMessage as String)) {
+			card.append('<div class="message-line">')
+			card.append(safeHtml(item.failureMessage as String))
+			card.append('</div>')
+		}
+
+		card.append('<div class="duration-line">Duration: ')
+		card.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+		card.append('</div>')
+
+		card.append('<details class="details-block">')
+		card.append('<summary>See full error log</summary>')
+		card.append('<pre>')
+		card.append(safeHtml(item.stackTrace as String))
+		card.append('</pre>')
+		card.append('</details>')
+
+		if (!isBlank(item.imageData as String)) {
+			card.append('<div class="image-wrap">')
+			card.append('<img src="')
+			card.append(item.imageData as String)
+			card.append('" alt="Failure evidence" class="failure-image"/>')
+			card.append('</div>')
+		}
+
+		card.append('</div>')
+		card.append('</div>')
+
+		return card.toString()
+	}
+
+	String buildPassedCard(Map item) {
+		StringBuilder card = new StringBuilder()
+
+		card.append('<div class="passed-test">')
+		card.append('<div class="passed-left-line"></div>')
+		card.append('<div class="passed-content">')
+
+		card.append('<div class="test-path">')
+		card.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+		card.append('</div>')
+
+		card.append('<div class="message-line">Test Passed</div>')
+
+		card.append('<div class="duration-line">Duration: ')
+		card.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+		card.append('</div>')
+
+		card.append('</div>')
+		card.append('</div>')
+
+		return card.toString()
+	}
+
+	String buildGaiaReportHtml(Map suiteData) {
+		StringBuilder failedHtml = new StringBuilder()
+		StringBuilder passedHtml = new StringBuilder()
+
+		for (Map item : suiteData.failedTests as List<Map>) {
+			failedHtml.append(buildFailureCard(item))
+		}
+
+		for (Map item : suiteData.passedTests as List<Map>) {
+			passedHtml.append(buildPassedCard(item))
+		}
+
+		String avgDuration = '0ms'
+
+		if ((suiteData.executed as Integer) > 0) {
+			BigDecimal avg = (suiteData.suiteTime as BigDecimal) / (suiteData.executed as Integer)
+			avgDuration = formatDurationSeconds(avg)
+		}
+
+		return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Windows Test Execution Report - Gaia</title>
+<style>
+body {
+	font-family: Arial, Helvetica, sans-serif;
+	margin: 0;
+	padding: 20px 30px;
+	background: #ffffff;
+	color: #222222;
+}
+.header-title {
+	font-size: 23px;
+	font-weight: bold;
+	margin-bottom: 18px;
+}
+.summary-table {
+	width: 100%;
+	border-collapse: collapse;
+	margin-bottom: 26px;
+}
+.summary-table td {
+	vertical-align: top;
+	padding-right: 28px;
+}
+.summary-label {
+	font-size: 10px;
+	color: #777777;
+	text-transform: uppercase;
+	margin-bottom: 6px;
+}
+.summary-value {
+	font-size: 18px;
+	font-weight: bold;
+}
+.summary-value.small {
+	font-size: 12px;
+	font-weight: normal;
+	line-height: 1.4;
+}
+.section-title {
+	font-size: 16px;
+	font-weight: bold;
+	margin: 22px 0 14px 0;
+}
+.failed-label {
+	color: #b91c1c;
+}
+.passed-label {
+	color: #166534;
+}
+.failed-test, .passed-test {
+	display: flex;
+	align-items: stretch;
+	margin-bottom: 20px;
+}
+.failed-left-line {
+	width: 3px;
+	background: #d32f2f;
+	margin-right: 12px;
+	border-radius: 2px;
+}
+.passed-left-line {
+	width: 3px;
+	background: #2e7d32;
+	margin-right: 12px;
+	border-radius: 2px;
+}
+.failed-content, .passed-content {
+	flex: 1;
+}
+.test-path {
+	font-size: 13px;
+	font-weight: bold;
+	margin-bottom: 6px;
+}
+.mandatory-failure {
+	font-size: 12px;
+	color: #666666;
+	margin-bottom: 6px;
+}
+.message-line {
+	font-size: 12px;
+	margin-bottom: 6px;
+}
+.duration-line {
+	font-size: 12px;
+	color: #666666;
+	margin-bottom: 8px;
+}
+.details-block summary {
+	cursor: pointer;
+	font-size: 12px;
+	font-weight: normal;
+	color: #111111;
+	margin-bottom: 10px;
+}
+.details-block pre {
+	white-space: pre-wrap;
+	font-size: 11px;
+	line-height: 1.35;
+	margin: 10px 0 12px 0;
+	background: #ffffff;
+	border: none;
+	padding: 0;
+	color: #333333;
+}
+.image-wrap {
+	margin-top: 8px;
+}
+.failure-image {
+	max-width: 320px;
+	border: 1px solid #dddddd;
+}
+.empty-passed {
+	font-size: 12px;
+	color: #777777;
+}
+</style>
+</head>
+<body>
+
+<div class="header-title">Windows Test Execution Report - Gaia</div>
+
+<table class="summary-table">
+	<tr>
+		<td>
+			<div class="summary-label">Suite</div>
+			<div class="summary-value small">${safeHtml(suiteData.suiteName as String)}</div>
+		</td>
+		<td>
+			<div class="summary-label">Start</div>
+			<div class="summary-value small">${safeHtml(suiteData.startText as String)}</div>
+		</td>
+		<td>
+			<div class="summary-label">End</div>
+			<div class="summary-value small">${safeHtml(suiteData.endText as String)}</div>
+		</td>
+		<td>
+			<div class="summary-label">Suite Duration</div>
+			<div class="summary-value small">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
+		</td>
+		<td>
+			<div class="summary-label">Executed</div>
+			<div class="summary-value small">${suiteData.executed}</div>
+		</td>
+		<td>
+			<div class="summary-label">Passed</div>
+			<div class="summary-value small">${suiteData.passed}</div>
+		</td>
+		<td>
+			<div class="summary-label">Failed</div>
+			<div class="summary-value small">${suiteData.failed}</div>
+		</td>
+		<td>
+			<div class="summary-label">Skipped</div>
+			<div class="summary-value small">${suiteData.skipped}</div>
+		</td>
+		<td>
+			<div class="summary-label">Avg/Test</div>
+			<div class="summary-value small">${safeHtml(avgDuration)}</div>
+		</td>
+	</tr>
+</table>
+
+<div class="section-title failed-label">✘ Failed (${suiteData.failed})</div>
+${failedHtml.toString()}
+
+<div class="section-title passed-label">☑ Passed (${suiteData.passed})</div>
+${passedHtml.toString().trim().isEmpty() ? '<div class="empty-passed">No passed tests.</div>' : passedHtml.toString()}
+
+</body>
+</html>
+"""
+	}
+
+	String buildGaiaReport() {
+		String xmlPath = getXmlFilePath()
+
+		if (isBlank(xmlPath)) {
+			KeywordUtil.logInfo('Gaia HTML report was not created because XML file was not found.')
+			return null
+		}
+
+		String reportPath = getResolvedReportPath()
+
+		if (isBlank(reportPath)) {
+			KeywordUtil.logInfo('Gaia HTML report was not created because report folder was not found.')
+			return null
+		}
+
+		Map suiteData = parseSuiteData(xmlPath)
+		String html = buildGaiaReportHtml(suiteData)
+
+		File htmlFile = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
+		htmlFile.write(html, 'UTF-8')
+
+		KeywordUtil.logInfo("Gaia HTML report created successfully: ${htmlFile.absolutePath}")
+		return htmlFile.absolutePath
+	}
+
+	// =========================================================
+	// JIRA COMMUNICATION
+	// =========================================================
+
+	String importResults(String junitXmlPath) {
+		KeywordUtil.logInfo("Importing execution results using token ${maskToken(JIRA_TOKEN)}")
+		KeywordUtil.logInfo("Using Jira project: ${PROJECT_KEY}")
+		KeywordUtil.logInfo("Using XML file: ${junitXmlPath}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_IMPORT_RESULTS, [
+			('filePath') : junitXmlPath,
+			('project')  : PROJECT_KEY,
+			('token')    : JIRA_TOKEN
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Import Results status: ${status}")
+		KeywordUtil.logInfo("Import Results response: ${body}")
+
+		if (!(status == 200 || status == 204)) {
+			return 'ERROR' + status.toString()
+		}
+
+		def parsedJson = new JsonSlurper().parseText(body)
+		String execKey = parsedJson?.testExecIssue?.key
+
+		if (isBlank(execKey)) {
+			return 'ERROR_EXEC_ID_NOT_FOUND'
+		}
+
+		KeywordUtil.logInfo("Test Execution created successfully: ${execKey}")
+		return execKey
+	}
+
+	String getExistingTestPlan() {
+		KeywordUtil.logInfo("Searching existing Test Plan with summary: ${getTestPlanName()}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_GET_TEST_PLAN, [
+			('project') : PROJECT_KEY,
+			('summary') : getTestPlanName(),
+			('token')   : JIRA_TOKEN
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Get Test Plan status: ${status}")
+		KeywordUtil.logInfo("Get Test Plan response: ${body}")
+
+		if (status != 200) {
+			return ''
+		}
+
+		def parsedJson = new JsonSlurper().parseText(body)
+		int total = parsedJson?.total ?: 0
+
+		if (total < 1) {
+			return ''
+		}
+
+		def issues = parsedJson?.issues ?: []
+
+		if (issues.isEmpty()) {
+			return ''
+		}
+
+		String key = issues[0]?.key ?: ''
+
+		if (!isBlank(key)) {
+			KeywordUtil.logInfo("Existing Test Plan found: ${key}")
+		}
+
+		return key
+	}
+
+	String createTestPlan(String summary) {
+		KeywordUtil.logInfo("Creating new Test Plan with summary: ${summary}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_CREATE_TEST_PLAN, [
+			('token')   : JIRA_TOKEN,
+			('project') : PROJECT_KEY,
+			('summary') : summary,
+			('epic')    : EPIC_KEY
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Create Test Plan status: ${status}")
+		KeywordUtil.logInfo("Create Test Plan response: ${body}")
+
+		if (!(status == 200 || status == 201)) {
+			return 'ERROR' + status.toString()
+		}
+
+		def parsedJson = new JsonSlurper().parseText(body)
+		String testPlanKey = parsedJson?.key ?: ''
+
+		if (isBlank(testPlanKey)) {
+			return 'ERROR_TEST_PLAN_KEY_NOT_FOUND'
+		}
+
+		KeywordUtil.logInfo("Test Plan created successfully: ${testPlanKey}")
+		return testPlanKey
+	}
+
+	String getOrCreateTestPlan() {
+		if (!isBlank(MANUAL_TEST_PLAN_KEY)) {
+			KeywordUtil.logInfo("Using manual Test Plan key: ${MANUAL_TEST_PLAN_KEY}")
+			return MANUAL_TEST_PLAN_KEY.trim()
+		}
+
+		if (RESET_SAVED_TEST_PLAN_KEY) {
+			resetTestPlanKey()
+		}
+
+		if (FORCE_CREATE_NEW_TEST_PLAN) {
+			String forcedKey = createTestPlan(getTestPlanName())
+
+			if (!isBlank(forcedKey) && !forcedKey.contains('ERROR')) {
+				saveTestPlanKey(forcedKey)
+			}
+
+			return forcedKey
+		}
+
+		String savedKey = getSavedTestPlanKey()
+
+		if (!isBlank(savedKey)) {
+			KeywordUtil.logInfo("Using saved Test Plan key: ${savedKey}")
+			return savedKey
+		}
+
+		String existingKey = getExistingTestPlan()
+
+		if (!isBlank(existingKey)) {
+			saveTestPlanKey(existingKey)
+			return existingKey
+		}
+
+		String newKey = createTestPlan(getTestPlanName())
+
+		if (!isBlank(newKey) && !newKey.contains('ERROR')) {
+			saveTestPlanKey(newKey)
+		}
+
+		return newKey
+	}
+
+	int updateTestPlan(String testPlanKey, List<String> testExecKeys) {
+		KeywordUtil.logInfo("Associating execution ${testExecKeys} to Test Plan ${testPlanKey}")
+
+		def jsonBody = [
+			addTestsToPlan: true,
+			add           : testExecKeys
+		]
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_PLAN, [
+			('token')       : JIRA_TOKEN,
+			('testPlanKey') : testPlanKey,
+			('jsonBody')    : JsonOutput.toJson(jsonBody)
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Update Test Plan status: ${status}")
+		KeywordUtil.logInfo("Update Test Plan response: ${body}")
+
+		return status
+	}
+
+	int updateTestExecution(String execID) {
+		KeywordUtil.logInfo("Updating Test Execution info for ${execID}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPDATE_TEST_EXECUTION, [
+			('issueID') : execID,
+			('token')   : JIRA_TOKEN,
+			('summary') : getExecutionSummary(),
+			('env')     : ENVIRONMENT,
+			('labels')  : LABELS
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Update Test Execution status: ${status}")
+		KeywordUtil.logInfo("Update Test Execution response: ${body}")
+
+		return status
+	}
+
+	int uploadAttachment(String issueKey, String filePath) {
+		if (isBlank(filePath)) {
+			KeywordUtil.logInfo('Skipping attachment upload because file path is empty.')
+			return 0
+		}
+
+		File file = new File(filePath)
+
+		if (!file.exists() || file.length() <= 0) {
+			KeywordUtil.logInfo("Skipping attachment upload because file does not exist or is empty: ${filePath}")
+			return 0
+		}
+
+		KeywordUtil.logInfo("Uploading attachment to execution ${issueKey}: ${filePath}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_UPLOAD_ATTACHMENT, [
+			('token')     : JIRA_TOKEN,
+			('evidences') : file,
+			('execID')    : issueKey
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Upload attachment status: ${status}")
+		KeywordUtil.logInfo("Upload attachment response: ${body}")
+
+		return status
+	}
+
+	int updateIssueStatus(String issueKey, String transitionId) {
+		if (isBlank(transitionId)) {
+			KeywordUtil.logInfo("No transition configured for issue ${issueKey}")
+			return 200
+		}
+
+		KeywordUtil.logInfo("Updating issue status for ${issueKey} with transition ${transitionId}")
+
+		def response = WS.sendRequest(findTestObject(REQUEST_TRANSITION_STATUS, [
+			('token')        : JIRA_TOKEN,
+			('issueID')      : issueKey,
+			('transitionID') : transitionId
+		]))
+
+		int status = WS.getResponseStatusCode(response)
+		String body = response.getResponseBodyContent()
+
+		KeywordUtil.logInfo("Transition status response code: ${status}")
+		KeywordUtil.logInfo("Transition response body: ${body}")
+
+		return status
+	}
+
+	// =========================================================
+	// MAIN FLOW
+	// =========================================================
+
+	@Keyword
+	def jiraImport() {
+		logSection('Starting Jira import flow')
+
+		KeywordUtil.logInfo("Suite name: ${getCurrentSuiteName()}")
+		KeywordUtil.logInfo("Execution summary: ${getExecutionSummary()}")
+		KeywordUtil.logInfo("Test Plan name: ${getTestPlanName()}")
+		KeywordUtil.logInfo("Using token: ${maskToken(JIRA_TOKEN)}")
+		KeywordUtil.logInfo("Project key: ${PROJECT_KEY}")
+		KeywordUtil.logInfo("Epic key: ${EPIC_KEY}")
+		KeywordUtil.logInfo("Report path: ${getResolvedReportPath()}")
+
+		String xmlFile = getXmlFilePath()
+
+		if (isBlank(xmlFile)) {
+			KeywordUtil.markFailed('No XML file found for Jira import.')
+			return
+		}
+
+		String gaiaReportFile = buildGaiaReport()
+		String zipReport = zipReports()
+		String zipEvidence = zipEvidences()
+
+		String execID = importResults(xmlFile)
+
+		if (isBlank(execID) || execID.contains('ERROR')) {
+			KeywordUtil.markFailed("Test Execution creation failed: ${execID}")
+			return
+		}
+
+		String testPlanKey = getOrCreateTestPlan()
+
+		if (isBlank(testPlanKey) || testPlanKey.contains('ERROR')) {
+			KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+			return
+		}
+
+		int updatePlanStatus = updateTestPlan(testPlanKey, [execID])
+		int updateExecutionStatus = updateTestExecution(execID)
+
+		int uploadExecGaiaReportStatus = uploadAttachment(execID, gaiaReportFile)
+		int uploadExecResultsStatus = uploadAttachment(execID, zipReport)
+		int uploadExecEvidenceStatus = uploadAttachment(execID, zipEvidence)
+
+		int transitionExecutionStatus = updateIssueStatus(execID, TEST_EXECUTION_TRANSITION_ID)
+		int transitionPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
+
+		logSection('Jira import finished')
+
+		KeywordUtil.logInfo("Execution key: ${execID}")
+		KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+		KeywordUtil.logInfo("Gaia report attachment status: ${uploadExecGaiaReportStatus}")
+		KeywordUtil.logInfo("Results.zip attachment status: ${uploadExecResultsStatus}")
+		KeywordUtil.logInfo("Evidences.zip attachment status: ${uploadExecEvidenceStatus}")
+		KeywordUtil.logInfo("Update Test Plan status: ${updatePlanStatus}")
+		KeywordUtil.logInfo("Update Test Execution status: ${updateExecutionStatus}")
+		KeywordUtil.logInfo("Transition Execution status: ${transitionExecutionStatus}")
+		KeywordUtil.logInfo("Transition Test Plan status: ${transitionPlanStatus}")
+	}
+}
