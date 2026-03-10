@@ -1,6 +1,7 @@
-package com.keywords.integrationHandler
+package keywords
 
 import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -18,9 +19,15 @@ import java.text.SimpleDateFormat
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
+import javax.xml.parsers.DocumentBuilderFactory
+
 import org.apache.poi.xssf.usermodel.XSSFRow
 import org.apache.poi.xssf.usermodel.XSSFSheet
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+import org.w3c.dom.Node
+import org.w3c.dom.NodeList
 
 import com.kms.katalon.core.annotation.Keyword
 import com.kms.katalon.core.configuration.RunConfiguration
@@ -29,7 +36,6 @@ import com.kms.katalon.core.util.KeywordUtil
 import groovy.io.FileType
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
-import groovy.xml.XmlSlurper
 
 class JiraIntegration {
 
@@ -38,7 +44,7 @@ class JiraIntegration {
 	// =========================================================
 
 	String BASE_URL                    = 'https://jira-mut.d.bbg'
-	String JIRA_TOKEN                  = 'PUT_YOUR_TOKEN_HERE'
+	String JIRA_TOKEN                  = 'PUT_YOUR_JIRA_TOKEN_HERE'
 	String PROJECT_KEY                 = 'L96B2C'
 	String EPIC_KEY                    = 'L96B2C-8234'
 
@@ -54,15 +60,15 @@ class JiraIntegration {
 	boolean RESET_SAVED_TEST_PLAN_KEY  = false
 
 	String TEST_PLAN_SUFFIX            = ' Test Plan'
-	String TEST_EXECUTION_SUFFIX       = ' Test Execution'
-
 	String EXECUTION_TRANSITION_ID     = '11'
 	String TEST_PLAN_TRANSITION_ID     = '11'
 
 	String PRIMARY_XML_FILE_NAME       = 'JUnit_Report.xml'
 	String SECONDARY_XML_FILE_NAME     = 'cucumber.xml'
 	String GAIA_REPORT_FILE_NAME       = 'gaiaReport.html'
+	String REPORT_ZIP_NAME             = 'Results.zip'
 	String EVIDENCE_FOLDER_NAME        = 'Evidences'
+	String EVIDENCE_ZIP_NAME           = 'Evidences.zip'
 	String TEST_PLAN_KEYS_FOLDER       = RunConfiguration.projectDir + File.separator + 'TestPlanKeys'
 	String EPIC_LINK_FIELD_ID          = 'customfield_10006'
 
@@ -101,10 +107,28 @@ class JiraIntegration {
 		return safe(value).replaceAll('[\\\\/:*?"<>|]', '_').trim()
 	}
 
+	boolean isTimestampFolderName(String name) {
+		if (isBlank(name)) return false
+		return name ==~ /\d{8}_\d{6}/ || name ==~ /\d{14}/
+	}
+
+	boolean isMetaFolderName(String name) {
+		if (isBlank(name)) return true
+
+		String n = name.trim()
+		if (n.equalsIgnoreCase('Reports')) return true
+		if (n.equalsIgnoreCase('logs')) return true
+		if (n.equalsIgnoreCase('videos')) return true
+		if (n.equalsIgnoreCase('cucumber_report')) return true
+		if (n.equalsIgnoreCase('PreLoad')) return true
+		if (n.equalsIgnoreCase(EVIDENCE_FOLDER_NAME)) return true
+		if (isTimestampFolderName(n)) return true
+
+		return false
+	}
+
 	String formatDurationSeconds(BigDecimal totalSeconds) {
-		if (totalSeconds == null) {
-			return '0m 0s'
-		}
+		if (totalSeconds == null) return '0m 0s'
 
 		long millis = (totalSeconds * 1000).longValue()
 		long hours = (long) (millis / 3600000)
@@ -112,28 +136,14 @@ class JiraIntegration {
 		long seconds = (long) ((millis % 60000) / 1000)
 		long ms = (long) (millis % 1000)
 
-		if (hours > 0) {
-			return "${hours}h ${minutes}m ${seconds}s ${ms}ms"
-		}
-		if (minutes > 0) {
-			return "${minutes}m ${seconds}s ${ms}ms"
-		}
+		if (hours > 0) return "${hours}h ${minutes}m ${seconds}s ${ms}ms"
+		if (minutes > 0) return "${minutes}m ${seconds}s ${ms}ms"
 		return "${seconds}s ${ms}ms"
 	}
 
-	boolean isSuccessStatus(int status) {
-		return status == 200 || status == 201 || status == 204
-	}
-
-	// =========================================================
-	// REPORT PATH / SUITE NAME
-	// =========================================================
-
-	String getReportPath() {
+	String readLastRunExcelPath() {
 		File file = new File(RunConfiguration.projectDir + File.separator + 'LastRun.xlsx')
-		if (!file.exists()) {
-			return ''
-		}
+		if (!file.exists()) return ''
 
 		FileInputStream fis = null
 		XSSFWorkbook wb = null
@@ -143,161 +153,178 @@ class JiraIntegration {
 			wb = new XSSFWorkbook(fis)
 			XSSFSheet sheet = wb.getSheetAt(0)
 			XSSFRow row = sheet.getRow(0)
-
-			if (row == null || row.getCell(0) == null) {
-				return ''
-			}
-
+			if (row == null || row.getCell(0) == null) return ''
 			return safe(row.getCell(0).stringCellValue)
+		} catch (Exception ignored) {
+			return ''
 		} finally {
 			try { if (wb != null) wb.close() } catch (Exception ignored) {}
 			try { if (fis != null) fis.close() } catch (Exception ignored) {}
 		}
 	}
 
-	boolean isTimestampFolderName(String name) {
-		if (isBlank(name)) {
-			return false
-		}
+	boolean folderLooksLikeLeafReport(File folder) {
+		if (folder == null || !folder.exists() || !folder.isDirectory()) return false
 
-		return name ==~ /\d{8}_\d{6}/ || name ==~ /\d{14}/
+		File[] files = folder.listFiles()
+		if (files == null) return false
+
+		boolean hasExecutionProperties = files.find { it.isFile() && it.name.equalsIgnoreCase('execution.properties') } != null
+		boolean hasXml = files.find { it.isFile() && (it.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME) || it.name.equalsIgnoreCase(SECONDARY_XML_FILE_NAME)) } != null
+		boolean hasCucumberFolder = files.find { it.isDirectory() && it.name.equalsIgnoreCase('cucumber_report') } != null
+
+		return hasExecutionProperties || hasXml || hasCucumberFolder
 	}
 
-	String getResolvedReportPath() {
-		String reportPath = getReportPath()
-		if (isBlank(reportPath)) {
-			return ''
+	void collectLeafReportFolders(File start, List<File> result) {
+		if (start == null || !start.exists() || !start.isDirectory()) return
+
+		if (folderLooksLikeLeafReport(start)) {
+			result.add(start)
 		}
 
-		File reportFolder = new File(reportPath)
-		if (reportFolder.exists()) {
-			return reportFolder.absolutePath
-		}
+		File[] children = start.listFiles()
+		if (children == null) return
 
-		return reportPath
+		children.findAll { it.isDirectory() }.each { File child ->
+			collectLeafReportFolders(child, result)
+		}
 	}
 
-	String resolveSuiteNameFromFolder(File folder) {
-		File current = folder
+	String getReportPath() {
+		List<File> candidates = []
 
-		while (current != null && isTimestampFolderName(current.getName())) {
-			current = current.getParentFile()
+		try {
+			String currentRunFolder = safe(RunConfiguration.getReportFolder())
+			if (!isBlank(currentRunFolder)) {
+				File current = new File(currentRunFolder)
+				if (current.exists()) {
+					if (folderLooksLikeLeafReport(current)) {
+						candidates.add(current)
+					} else {
+						collectLeafReportFolders(current, candidates)
+					}
+				}
+			}
+		} catch (Exception ignored) {}
+
+		String lastRunFromExcel = readLastRunExcelPath()
+		if (!isBlank(lastRunFromExcel)) {
+			File lastRun = new File(lastRunFromExcel)
+			if (lastRun.exists()) {
+				if (folderLooksLikeLeafReport(lastRun)) {
+					candidates.add(lastRun)
+				} else {
+					collectLeafReportFolders(lastRun, candidates)
+				}
+			}
 		}
 
-		if (current == null) {
-			return ''
+		File reportsRoot = new File(RunConfiguration.projectDir + File.separator + 'Reports')
+		if (reportsRoot.exists()) {
+			collectLeafReportFolders(reportsRoot, candidates)
 		}
 
-		return safe(current.getName())
+		candidates = candidates.findAll { it != null && it.exists() }.unique { it.absolutePath }
+		if (candidates.isEmpty()) return ''
+
+		candidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
+
+		return candidates[0].absolutePath
+	}
+
+	String extractSuiteNameFromReportPath(String reportPath) {
+		if (isBlank(reportPath)) return ''
+
+		String normalized = reportPath.replace('/', File.separator).replace('\\', File.separator)
+		List<String> parts = normalized.split(java.util.regex.Pattern.quote(File.separator)).findAll { !isBlank(it) }
+
+		for (int i = parts.size() - 1; i >= 0; i--) {
+			String name = safe(parts[i])
+			if (!isMetaFolderName(name)) {
+				return name
+			}
+		}
+
+		return ''
 	}
 
 	String getCurrentSuiteName() {
-		String reportPath = getResolvedReportPath()
-		if (isBlank(reportPath)) {
-			return ''
-		}
-
-		File current = new File(reportPath)
-		if (!current.exists()) {
-			return ''
-		}
-
-		return resolveSuiteNameFromFolder(current)
-	}
-
-	String getIssueBaseName() {
-		String suiteName = getCurrentSuiteName()
-		return isBlank(suiteName) ? 'Unnamed Suite' : suiteName
-	}
-
-	String getExecutionBaseName() {
-		return getIssueBaseName() + TEST_EXECUTION_SUFFIX
+		return extractSuiteNameFromReportPath(getReportPath())
 	}
 
 	String getExecutionSummary() {
-		return getExecutionBaseName() + ' ' + nowExecution()
+		return getCurrentSuiteName() + ' ' + nowExecution()
 	}
 
 	String getTestPlanName() {
-		return getIssueBaseName() + TEST_PLAN_SUFFIX
-	}
-
-	String getExecutionReportUploadName() {
-		return sanitizeFileName(getExecutionBaseName() + ' Report.html')
-	}
-
-	String getExecutionResultsZipFileName() {
-		return sanitizeFileName(getExecutionBaseName() + ' Results.zip')
-	}
-
-	String getExecutionEvidencesZipFileName() {
-		return sanitizeFileName(getExecutionBaseName() + ' Evidences.zip')
+		return getCurrentSuiteName() + TEST_PLAN_SUFFIX
 	}
 
 	// =========================================================
-	// TEST PLAN KEY CACHE
+	// TEST PLAN CACHE
 	// =========================================================
 
 	String getSuiteTestPlanFilePath() {
 		File folder = new File(TEST_PLAN_KEYS_FOLDER)
-		if (!folder.exists()) {
-			folder.mkdirs()
-		}
-
-		return folder.absolutePath + File.separator + sanitizeFileName(getIssueBaseName()) + '.txt'
+		if (!folder.exists()) folder.mkdirs()
+		return folder.absolutePath + File.separator + sanitizeFileName(getCurrentSuiteName()) + '.txt'
 	}
 
 	void saveTestPlanKey(String key) {
-		if (isBlank(key)) {
-			return
-		}
-
-		File file = new File(getSuiteTestPlanFilePath())
-		file.write(key.trim(), 'UTF-8')
+		if (isBlank(key)) return
+		new File(getSuiteTestPlanFilePath()).write(key.trim(), 'UTF-8')
 	}
 
 	String readSavedTestPlanKey() {
 		File file = new File(getSuiteTestPlanFilePath())
-		if (!file.exists()) {
-			return ''
-		}
-
-		return file.getText('UTF-8').trim()
+		if (!file.exists()) return ''
+		return safe(file.getText('UTF-8')).trim()
 	}
 
 	void resetSavedTestPlanKey() {
 		File file = new File(getSuiteTestPlanFilePath())
-		if (file.exists()) {
-			file.delete()
-		}
+		if (file.exists()) file.delete()
 	}
 
 	// =========================================================
-	// XML / IMAGES / REPORT DATA
+	// XML / DOM HELPERS
 	// =========================================================
 
-	String getXmlFilePath() {
-		String reportPath = getResolvedReportPath()
-		if (isBlank(reportPath)) {
-			return ''
+	Document parseXmlFile(String xmlPath) {
+		DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance()
+		factory.setNamespaceAware(false)
+		factory.setIgnoringComments(true)
+		factory.setIgnoringElementContentWhitespace(true)
+		return factory.newDocumentBuilder().parse(new File(xmlPath))
+	}
+
+	Element findFirstChildElement(Element parent, List<String> names) {
+		NodeList children = parent.getChildNodes()
+		for (int i = 0; i < children.getLength(); i++) {
+			Node node = children.item(i)
+			if (node instanceof Element) {
+				String nodeName = safe(node.getNodeName())
+				if (names.any { it.equalsIgnoreCase(nodeName) }) {
+					return (Element) node
+				}
+			}
 		}
+		return null
+	}
+
+	String getXmlFilePath() {
+		String reportPath = getReportPath()
+		if (isBlank(reportPath)) return ''
 
 		File folder = new File(reportPath)
-		if (!folder.exists()) {
-			return ''
-		}
+		if (!folder.exists()) return ''
 
 		String found = ''
 
 		folder.eachFileRecurse(FileType.FILES) { File file ->
-			if (!isBlank(found)) {
-				return
-			}
-
-			if (
-				file.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME) ||
-				file.name.equalsIgnoreCase(SECONDARY_XML_FILE_NAME)
-			) {
+			if (!isBlank(found)) return
+			if (file.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME) || file.name.equalsIgnoreCase(SECONDARY_XML_FILE_NAME)) {
 				found = file.absolutePath
 			}
 		}
@@ -306,31 +333,18 @@ class JiraIntegration {
 	}
 
 	List<File> getFailureEvidenceImages() {
-		String reportPath = getResolvedReportPath()
-		if (isBlank(reportPath)) {
-			return []
-		}
+		String reportPath = getReportPath()
+		if (isBlank(reportPath)) return []
 
 		File folder = new File(reportPath)
-		if (!folder.exists()) {
-			return []
-		}
+		if (!folder.exists()) return []
 
 		List<File> images = []
 
 		folder.eachFileRecurse(FileType.FILES) { File file ->
-			String name = file.name.toLowerCase()
-
-			if (
-				name.endsWith('.png') ||
-				name.endsWith('.jpg') ||
-				name.endsWith('.jpeg')
-			) {
-				if (
-					!name.contains('navbar') &&
-					!name.contains('homepage') &&
-					!name.contains('logo')
-				) {
+			String lower = file.name.toLowerCase()
+			if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+				if (!lower.contains('navbar') && !lower.contains('homepage') && !lower.contains('logo')) {
 					images.add(file)
 				}
 			}
@@ -341,144 +355,144 @@ class JiraIntegration {
 	}
 
 	String fileToBase64DataUri(File file) {
-		if (file == null || !file.exists()) {
-			return ''
-		}
+		if (file == null || !file.exists()) return ''
 
 		String mime = 'image/png'
 		String lower = file.name.toLowerCase()
-
 		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
 			mime = 'image/jpeg'
 		}
 
 		byte[] bytes = Files.readAllBytes(file.toPath())
 		String base64 = bytes.encodeBase64().toString()
-
 		return "data:${mime};base64,${base64}"
 	}
 
-	String getShortErrorLog(String stackTrace) {
-		if (isBlank(stackTrace)) {
-			return ''
-		}
-
-		List<String> lines = stackTrace.readLines()
-			.collect { it?.trim() }
-			.findAll { !isBlank(it) }
-
+	String getShortErrorLog(String stackTrace, String failureMessage, String testName) {
 		List<String> selected = []
 
-		for (String line : lines) {
-			String lower = line.toLowerCase()
+		if (!isBlank(failureMessage)) {
+			selected.add(failureMessage.trim())
+		}
 
-			if (
-				lower.contains('exception') ||
-				lower.contains('error') ||
-				lower.contains('caused by') ||
-				lower.contains('timed out') ||
-				lower.contains('not found') ||
-				lower.contains('not clickable') ||
-				lower.contains('unable') ||
-				lower.contains('failed')
-			) {
-				selected.add(line)
-			}
+		if (!isBlank(testName)) {
+			selected.add(testName.trim())
+		}
 
-			if (selected.size() >= 3) {
-				break
+		if (!isBlank(stackTrace)) {
+			List<String> lines = stackTrace.readLines()
+				.collect { it?.trim() }
+				.findAll { !isBlank(it) }
+
+			for (String line : lines) {
+				String lower = line.toLowerCase()
+				if (
+					lower.contains('exception')
+					|| lower.contains('error')
+					|| lower.contains('caused by')
+					|| lower.contains('timed out')
+					|| lower.contains('not found')
+					|| lower.contains('not clickable')
+					|| lower.contains('unable')
+					|| lower.contains('line ')
+				) {
+					if (!selected.contains(line)) {
+						selected.add(line)
+					}
+				}
+				if (selected.size() >= 3) break
 			}
 		}
 
-		if (selected.isEmpty()) {
-			selected = lines.take(3)
+		if (selected.isEmpty() && !isBlank(stackTrace)) {
+			selected.addAll(stackTrace.readLines().collect { it?.trim() }.findAll { !isBlank(it) }.take(3))
 		}
 
-		return selected.join('\n')
+		return selected.take(3).join('\n')
 	}
 
 	Map parseSuiteData(String xmlPath) {
-		def xml = new XmlSlurper(false, false).parse(new File(xmlPath))
+		Document doc = parseXmlFile(xmlPath)
+		doc.getDocumentElement().normalize()
 
-		List suiteNodes = []
-		if (xml.name() == 'testsuite') {
-			suiteNodes.add(xml)
-		} else {
-			suiteNodes.addAll(xml.testsuite)
-		}
+		NodeList testcases = doc.getElementsByTagName('testcase')
 
 		BigDecimal totalTime = 0
-		List<Map> failedTests = []
-		List<Map> passedTests = []
-
 		int executed = 0
 		int failed = 0
 		int skipped = 0
 
+		List<Map> failedTests = []
+		List<Map> passedTests = []
+
 		List<File> evidenceImages = getFailureEvidenceImages()
 		int evidenceIndex = 0
 
-		suiteNodes.each { suite ->
-			suite.testcase.each { tc ->
-				executed++
+		for (int i = 0; i < testcases.getLength(); i++) {
+			Element tc = (Element) testcases.item(i)
 
-				String className = safe(tc.@classname?.text())
-				String testName = safe(tc.@name?.text())
+			executed++
 
-				BigDecimal timeSeconds = 0
-				try {
-					timeSeconds = new BigDecimal(safe(tc.@time?.text() ?: '0'))
-				} catch (Exception ignored) {
-					timeSeconds = 0
+			String className = safe(tc.getAttribute('classname'))
+			String testName = safe(tc.getAttribute('name'))
+
+			BigDecimal timeSeconds = 0
+			try {
+				timeSeconds = new BigDecimal(safe(tc.getAttribute('time')))
+			} catch (Exception ignored) {
+				timeSeconds = 0
+			}
+
+			totalTime = totalTime + timeSeconds
+
+			Element failureElement = findFirstChildElement(tc, ['failure', 'error'])
+			Element skippedElement = findFirstChildElement(tc, ['skipped'])
+
+			if (skippedElement != null) {
+				skipped++
+				continue
+			}
+
+			if (failureElement != null) {
+				failed++
+
+				String failureMessage = safe(failureElement.getAttribute('message'))
+				String stackTrace = safe(failureElement.getTextContent())
+
+				File imageFile = null
+				if (evidenceIndex < evidenceImages.size()) {
+					imageFile = evidenceImages[evidenceIndex]
+					evidenceIndex++
 				}
 
-				totalTime = totalTime + timeSeconds
-
-				boolean hasFailure = tc.failure.size() > 0 || tc.error.size() > 0
-				boolean hasSkipped = tc.skipped.size() > 0
-
-				if (hasSkipped) {
-					skipped++
-				}
-
-				if (hasFailure) {
-					failed++
-
-					def failNode = tc.failure.size() > 0 ? tc.failure[0] : tc.error[0]
-					String message = safe(failNode.@message?.text())
-					String stackTrace = safe(failNode.text())
-
-					File imageFile = null
-					if (evidenceIndex < evidenceImages.size()) {
-						imageFile = evidenceImages[evidenceIndex]
-						evidenceIndex++
-					}
-
-					failedTests.add([
-						className     : className,
-						testName      : testName,
-						failureMessage: message,
-						stackTrace    : stackTrace,
-						timeSeconds   : timeSeconds,
-						imageData     : imageFile != null ? fileToBase64DataUri(imageFile) : ''
-					])
-				} else if (!hasSkipped) {
-					passedTests.add([
-						className   : className,
-						testName    : testName,
-						timeSeconds : timeSeconds
-					])
-				}
+				failedTests.add([
+					className      : className,
+					testName       : testName,
+					failureMessage : failureMessage,
+					stackTrace     : stackTrace,
+					timeSeconds    : timeSeconds,
+					imageData      : imageFile != null ? fileToBase64DataUri(imageFile) : '',
+					shortLog       : getShortErrorLog(stackTrace, failureMessage, testName)
+				])
+			} else {
+				passedTests.add([
+					className    : className,
+					testName     : testName,
+					timeSeconds  : timeSeconds
+				])
 			}
 		}
 
 		int passed = executed - failed - skipped
-		if (passed < 0) {
-			passed = 0
+		if (passed < 0) passed = 0
+
+		String suiteDisplay = getCurrentSuiteName()
+		if (!isBlank(suiteDisplay)) {
+			suiteDisplay = 'Test Suites/' + suiteDisplay
 		}
 
 		return [
-			suiteName   : getIssueBaseName(),
+			suiteName   : suiteDisplay,
 			startText   : new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy').format(new Date()),
 			endText     : new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy').format(new Date()),
 			suiteTime   : totalTime,
@@ -496,18 +510,15 @@ class JiraIntegration {
 	// =========================================================
 
 	String buildFailedCaseHtml(Map item) {
-		String shortLog = getShortErrorLog(item.stackTrace as String)
-
 		return """
-		<div class="case failure">
-			<div class="case-title">${safeHtml((item.className ?: '') + '/' + (item.testName ?: ''))}</div>
+		<div class="case failed">
+			<div class="case-title">${safeHtml(safe(item.className) + '/' + safe(item.testName))}</div>
 			<div class="case-line">❗ Mandatory failure</div>
-			${isBlank(item.failureMessage) ? '' : '<div class="case-line">' + safeHtml(item.failureMessage) + '</div>'}
+			${isBlank(item.shortLog) ? '' : '<pre class="short-log">' + safeHtml(item.shortLog) + '</pre>'}
 			<div class="case-line">⏱ Duration: ${safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal))}</div>
-			${isBlank(shortLog) ? '' : '<pre class="short-log">' + safeHtml(shortLog) + '</pre>'}
 			<details class="details">
 				<summary>🔎 See full error log</summary>
-				<pre class="full-log">${safeHtml(item.stackTrace as String)}</pre>
+				<pre class="full-log">${safeHtml(item.stackTrace)}</pre>
 			</details>
 			${isBlank(item.imageData) ? '' : '<img class="evidence" src="' + item.imageData + '" alt="Failure evidence" />'}
 		</div>
@@ -516,8 +527,8 @@ class JiraIntegration {
 
 	String buildPassedCaseHtml(Map item) {
 		return """
-		<div class="case success">
-			<div class="case-title">${safeHtml((item.className ?: '') + '/' + (item.testName ?: ''))}</div>
+		<div class="case passed">
+			<div class="case-title">${safeHtml(safe(item.className) + '/' + safe(item.testName))}</div>
 			<div class="case-line">✅ Test Passed</div>
 			<div class="case-line">⏱ Duration: ${safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal))}</div>
 		</div>
@@ -548,25 +559,25 @@ class JiraIntegration {
 		}
 		h1 {
 			font-size: 18px;
-			margin: 0 0 20px 0;
 			font-weight: 700;
+			margin: 0 0 20px 0;
 		}
-		.top-grid {
+		.header-grid {
 			display: grid;
-			grid-template-columns: 2.3fr 1fr 1fr 1fr 0.8fr 0.8fr 0.8fr 0.8fr 1fr;
+			grid-template-columns: 2.2fr 1fr 1fr 1fr 0.7fr 0.7fr 0.7fr 0.7fr 1fr;
 			column-gap: 16px;
-			row-gap: 10px;
-			margin-bottom: 24px;
+			row-gap: 12px;
+			margin-bottom: 28px;
 		}
-		.box-label {
+		.metric-label {
 			font-size: 10px;
-			color: #7b7b7b;
+			color: #6b7280;
 			text-transform: uppercase;
 			margin-bottom: 4px;
 		}
-		.box-value {
+		.metric-value {
 			font-size: 12px;
-			line-height: 1.4;
+			line-height: 1.45;
 			word-break: break-word;
 		}
 		.section-title {
@@ -574,31 +585,28 @@ class JiraIntegration {
 			font-weight: 700;
 			margin: 20px 0 12px 0;
 		}
-		.section-title.failed {
-			color: #b91c1c;
-		}
-		.section-title.passed {
-			color: #166534;
-		}
+		.section-title.failed { color: #b91c1c; }
+		.section-title.passed { color: #166534; }
+
 		.case {
 			padding-left: 12px;
-			margin-bottom: 22px;
+			margin-bottom: 24px;
 		}
-		.case.failure {
+		.case.failed {
 			border-left: 3px solid #d32f2f;
 		}
-		.case.success {
+		.case.passed {
 			border-left: 3px solid #2e7d32;
 		}
 		.case-title {
 			font-size: 13px;
 			font-weight: 700;
-			margin-bottom: 5px;
+			margin-bottom: 6px;
 		}
 		.case-line {
 			font-size: 12px;
 			line-height: 1.45;
-			margin-bottom: 3px;
+			margin-bottom: 4px;
 		}
 		.short-log {
 			font-size: 11px;
@@ -637,49 +645,49 @@ class JiraIntegration {
 		}
 		.empty {
 			font-size: 12px;
-			color: #666666;
+			color: #6b7280;
 		}
 	</style>
 </head>
 <body>
 	<h1>Windows Test Execution Report - Gaia</h1>
 
-	<div class="top-grid">
+	<div class="header-grid">
 		<div>
-			<div class="box-label">Suite</div>
-			<div class="box-value">${safeHtml(suiteData.suiteName)}</div>
+			<div class="metric-label">Suite</div>
+			<div class="metric-value">${safeHtml(suiteData.suiteName)}</div>
 		</div>
 		<div>
-			<div class="box-label">Start</div>
-			<div class="box-value">${safeHtml(suiteData.startText)}</div>
+			<div class="metric-label">Start</div>
+			<div class="metric-value">${safeHtml(suiteData.startText)}</div>
 		</div>
 		<div>
-			<div class="box-label">End</div>
-			<div class="box-value">${safeHtml(suiteData.endText)}</div>
+			<div class="metric-label">End</div>
+			<div class="metric-value">${safeHtml(suiteData.endText)}</div>
 		</div>
 		<div>
-			<div class="box-label">Suite Duration</div>
-			<div class="box-value">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
+			<div class="metric-label">Suite Duration</div>
+			<div class="metric-value">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
 		</div>
 		<div>
-			<div class="box-label">Executed</div>
-			<div class="box-value">${suiteData.executed}</div>
+			<div class="metric-label">Executed</div>
+			<div class="metric-value">${suiteData.executed}</div>
 		</div>
 		<div>
-			<div class="box-label">Passed</div>
-			<div class="box-value">${suiteData.passed}</div>
+			<div class="metric-label">Passed</div>
+			<div class="metric-value">${suiteData.passed}</div>
 		</div>
 		<div>
-			<div class="box-label">Failed</div>
-			<div class="box-value">${suiteData.failed}</div>
+			<div class="metric-label">Failed</div>
+			<div class="metric-value">${suiteData.failed}</div>
 		</div>
 		<div>
-			<div class="box-label">Skipped</div>
-			<div class="box-value">${suiteData.skipped}</div>
+			<div class="metric-label">Skipped</div>
+			<div class="metric-value">${suiteData.skipped}</div>
 		</div>
 		<div>
-			<div class="box-label">Avg/Test</div>
-			<div class="box-value">${safeHtml(formatDurationSeconds(avgTime))}</div>
+			<div class="metric-label">Avg/Test</div>
+			<div class="metric-value">${safeHtml(formatDurationSeconds(avgTime))}</div>
 		</div>
 	</div>
 
@@ -699,7 +707,7 @@ class JiraIntegration {
 			return ''
 		}
 
-		String reportPath = getResolvedReportPath()
+		String reportPath = getReportPath()
 		if (isBlank(reportPath)) {
 			KeywordUtil.logInfo('Gaia report was not created because report folder was not found.')
 			return ''
@@ -708,28 +716,24 @@ class JiraIntegration {
 		Map suiteData = parseSuiteData(xmlPath)
 		String html = buildGaiaReportHtml(suiteData)
 
-		File output = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
-		output.write(html, 'UTF-8')
+		File reportFile = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
+		reportFile.write(html, 'UTF-8')
 
-		KeywordUtil.logInfo('Gaia report created: ' + output.absolutePath)
-		return output.absolutePath
+		KeywordUtil.logInfo('Gaia report created: ' + reportFile.absolutePath)
+		return reportFile.absolutePath
 	}
 
 	// =========================================================
-	// FILE READY / COPY / ZIP
+	// FILE READY / SAFE COPY / ZIP
 	// =========================================================
 
-	boolean waitUntilFileReady(String filePath, int maxAttempts = 12, int sleepMillis = 500) {
-		if (isBlank(filePath)) {
-			return false
-		}
+	boolean waitUntilFileReady(String filePath, int attempts = 20, int sleepMillis = 500) {
+		if (isBlank(filePath)) return false
 
 		File file = new File(filePath)
-		if (!file.exists()) {
-			return false
-		}
+		if (!file.exists()) return false
 
-		for (int i = 0; i < maxAttempts; i++) {
+		for (int i = 0; i < attempts; i++) {
 			RandomAccessFile raf = null
 			try {
 				raf = new RandomAccessFile(file, 'r')
@@ -739,81 +743,44 @@ class JiraIntegration {
 			} finally {
 				try { if (raf != null) raf.close() } catch (Exception ignored) {}
 			}
-
 			Thread.sleep(sleepMillis)
 		}
-
 		return false
 	}
 
-	String createSafeUploadCopy(String originalFilePath, String preferredName) {
-		if (isBlank(originalFilePath)) {
-			return ''
-		}
+	String createSafeUploadCopy(String originalFilePath, String targetFileName) {
+		if (isBlank(originalFilePath)) return ''
 
 		File original = new File(originalFilePath)
-		if (!original.exists() || original.length() == 0) {
-			return ''
-		}
+		if (!original.exists() || original.length() == 0) return ''
 
-		waitUntilFileReady(original.absolutePath, 12, 500)
+		waitUntilFileReady(original.absolutePath, 20, 500)
 
-		File reportFolder = new File(getResolvedReportPath())
-		if (!reportFolder.exists()) {
-			return ''
-		}
+		File tmpFolder = new File(getReportPath() + File.separator + '_jira_upload_tmp')
+		if (!tmpFolder.exists()) tmpFolder.mkdirs()
 
-		File tmpFolder = new File(reportFolder, '_jira_upload_tmp')
-		if (!tmpFolder.exists()) {
-			tmpFolder.mkdirs()
-		}
-
-		String finalName = isBlank(preferredName) ? original.name : preferredName
-		File copied = new File(tmpFolder, sanitizeFileName(finalName))
-
-		if (copied.exists()) {
-			copied.delete()
-		}
+		File copied = new File(tmpFolder, targetFileName)
+		if (copied.exists()) copied.delete()
 
 		Files.copy(original.toPath(), copied.toPath(), StandardCopyOption.REPLACE_EXISTING)
-		waitUntilFileReady(copied.absolutePath, 12, 500)
+		waitUntilFileReady(copied.absolutePath, 20, 500)
 
 		return copied.absolutePath
 	}
 
 	String zipReports() {
-		String reportPath = getResolvedReportPath()
-		if (isBlank(reportPath)) {
-			return ''
-		}
+		String reportPath = getReportPath()
+		if (isBlank(reportPath)) return ''
 
-		File reportFolder = new File(reportPath)
-		if (!reportFolder.exists()) {
-			return ''
-		}
-
-		File zipFile = new File(reportFolder, getExecutionResultsZipFileName())
-		if (zipFile.exists()) {
-			zipFile.delete()
-		}
+		File zipFile = new File(reportPath + File.separator + REPORT_ZIP_NAME)
+		if (zipFile.exists()) zipFile.delete()
 
 		ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zipFile))
 		try {
-			reportFolder.eachFile { File file ->
-				if (!file.isFile()) {
-					return
-				}
-
-				if (file.name.equalsIgnoreCase(zipFile.name)) {
-					return
-				}
-
-				if (file.name.equalsIgnoreCase(GAIA_REPORT_FILE_NAME)) {
-					return
-				}
-
+			new File(reportPath).eachFile { File file ->
+				if (!file.isFile()) return
+				if (file.name.equalsIgnoreCase(REPORT_ZIP_NAME)) return
 				output.putNextEntry(new ZipEntry(file.name))
-
 				FileInputStream input = new FileInputStream(file)
 				try {
 					byte[] buffer = new byte[4096]
@@ -824,7 +791,6 @@ class JiraIntegration {
 				} finally {
 					input.close()
 				}
-
 				output.closeEntry()
 			}
 		} finally {
@@ -835,29 +801,19 @@ class JiraIntegration {
 	}
 
 	String zipEvidences() {
-		String reportPath = getResolvedReportPath()
-		if (isBlank(reportPath)) {
-			return ''
-		}
+		String reportPath = getReportPath()
+		if (isBlank(reportPath)) return ''
 
-		File reportFolder = new File(reportPath)
-		File evidenceFolder = new File(reportFolder, EVIDENCE_FOLDER_NAME)
+		File evidenceFolder = new File(reportPath + File.separator + EVIDENCE_FOLDER_NAME)
+		if (!evidenceFolder.exists()) return ''
 
-		if (!evidenceFolder.exists()) {
-			return ''
-		}
-
-		File zipFile = new File(reportFolder, getExecutionEvidencesZipFileName())
-		if (zipFile.exists()) {
-			zipFile.delete()
-		}
+		File zipFile = new File(evidenceFolder.absolutePath + File.separator + EVIDENCE_ZIP_NAME)
+		if (zipFile.exists()) zipFile.delete()
 
 		ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zipFile))
 		try {
 			evidenceFolder.eachFileRecurse(FileType.FILES) { File file ->
-				if (file.name.toLowerCase().endsWith('.zip')) {
-					return
-				}
+				if (file.name.equalsIgnoreCase(EVIDENCE_ZIP_NAME)) return
 
 				String relativeName = evidenceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
 				output.putNextEntry(new ZipEntry(relativeName))
@@ -886,51 +842,40 @@ class JiraIntegration {
 	// HTTP HELPERS
 	// =========================================================
 
-	String readResponseText(HttpURLConnection connection, int status) {
+	Map readResponse(HttpURLConnection connection) {
+		int status = connection.getResponseCode()
+
 		InputStream stream = null
-		BufferedReader br = null
-
 		try {
-			try {
-				stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream()
-			} catch (Exception ignored) {
-				stream = null
-			}
+			stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream()
+		} catch (Exception ignored) {}
 
-			if (stream == null) {
-				return ''
-			}
-
-			br = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))
+		String raw = ''
+		if (stream != null) {
+			BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))
 			StringBuilder sb = new StringBuilder()
 			String line
-
-			while ((line = br.readLine()) != null) {
+			while ((line = reader.readLine()) != null) {
 				sb.append(line)
 			}
-
-			return sb.toString()
-		} finally {
-			try { if (br != null) br.close() } catch (Exception ignored) {}
-			try { if (stream != null) stream.close() } catch (Exception ignored) {}
+			reader.close()
+			raw = sb.toString()
 		}
+
+		def body = null
+		if (!isBlank(raw)) {
+			try {
+				body = new JsonSlurper().parseText(raw)
+			} catch (Exception ignored) {
+				body = raw
+			}
+		}
+
+		return [status: status, raw: raw, body: body]
 	}
 
-	Map parseJsonSafe(String responseText) {
-		if (isBlank(responseText)) {
-			return [parsed: null, raw: '']
-		}
-
-		try {
-			return [parsed: new JsonSlurper().parseText(responseText), raw: responseText]
-		} catch (Exception ignored) {
-			return [parsed: responseText, raw: responseText]
-		}
-	}
-
-	Map httpJson(String method, String endpoint, Map body = null, Map<String, String> extraHeaders = [:]) {
+	Map httpJson(String method, String endpoint, Object body = null, Map headers = [:]) {
 		HttpURLConnection connection = null
-
 		try {
 			URL url = new URL(BASE_URL + endpoint)
 			connection = (HttpURLConnection) url.openConnection()
@@ -940,33 +885,26 @@ class JiraIntegration {
 			connection.setRequestProperty('Content-Type', 'application/json')
 			connection.setDoInput(true)
 
-			extraHeaders.each { k, v ->
-				connection.setRequestProperty(k, v)
+			headers.each { k, v ->
+				connection.setRequestProperty(k.toString(), v.toString())
 			}
 
 			if (body != null) {
 				connection.setDoOutput(true)
-				byte[] data = JsonOutput.toJson(body).getBytes(StandardCharsets.UTF_8)
+				byte[] bytes = JsonOutput.toJson(body).getBytes(StandardCharsets.UTF_8)
 				OutputStream os = connection.getOutputStream()
-				try {
-					os.write(data)
-					os.flush()
-				} finally {
-					os.close()
-				}
+				os.write(bytes)
+				os.flush()
+				os.close()
 			}
 
-			int status = connection.getResponseCode()
-			String responseText = readResponseText(connection, status)
-			Map parsed = parseJsonSafe(responseText)
-
-			return [status: status, body: parsed.parsed, raw: parsed.raw]
+			return readResponse(connection)
 		} finally {
 			try { if (connection != null) connection.disconnect() } catch (Exception ignored) {}
 		}
 	}
 
-	Map httpMultipart(String method, String endpoint, File file, String formFieldName = 'file', Map<String, String> extraHeaders = [:]) {
+	Map httpMultipart(String method, String endpoint, File file, String formFieldName = 'file', Map headers = [:]) {
 		HttpURLConnection connection = null
 		String boundary = '----KATALON-JIRA-' + System.currentTimeMillis()
 
@@ -978,62 +916,47 @@ class JiraIntegration {
 			connection.setRequestProperty('Accept', 'application/json')
 			connection.setRequestProperty('X-Atlassian-Token', 'no-check')
 			connection.setRequestProperty('Content-Type', 'multipart/form-data; boundary=' + boundary)
-			connection.setDoOutput(true)
 			connection.setDoInput(true)
+			connection.setDoOutput(true)
 
-			extraHeaders.each { k, v ->
-				connection.setRequestProperty(k, v)
+			headers.each { k, v ->
+				connection.setRequestProperty(k.toString(), v.toString())
 			}
 
 			OutputStream os = connection.getOutputStream()
-			try {
-				String header = ''
-				header += '--' + boundary + '\r\n'
-				header += 'Content-Disposition: form-data; name="' + formFieldName + '"; filename="' + file.getName() + '"\r\n'
-				header += 'Content-Type: application/octet-stream\r\n\r\n'
 
-				os.write(header.getBytes(StandardCharsets.UTF_8))
-				Files.copy(file.toPath(), os)
-				os.write('\r\n'.getBytes(StandardCharsets.UTF_8))
-				os.write(('--' + boundary + '--\r\n').getBytes(StandardCharsets.UTF_8))
-				os.flush()
-			} finally {
-				os.close()
-			}
+			String header = ''
+			header += '--' + boundary + '\r\n'
+			header += 'Content-Disposition: form-data; name="' + formFieldName + '"; filename="' + file.name + '"\r\n'
+			header += 'Content-Type: application/octet-stream\r\n\r\n'
+			os.write(header.getBytes(StandardCharsets.UTF_8))
+			Files.copy(file.toPath(), os)
+			os.write('\r\n'.getBytes(StandardCharsets.UTF_8))
+			os.write(('--' + boundary + '--\r\n').getBytes(StandardCharsets.UTF_8))
+			os.flush()
+			os.close()
 
-			int status = connection.getResponseCode()
-			String responseText = readResponseText(connection, status)
-			Map parsed = parseJsonSafe(responseText)
-
-			return [status: status, body: parsed.parsed, raw: parsed.raw]
+			return readResponse(connection)
 		} finally {
 			try { if (connection != null) connection.disconnect() } catch (Exception ignored) {}
 		}
 	}
 
 	// =========================================================
-	// JIRA / XRAY METHODS
+	// JIRA / XRAY
 	// =========================================================
 
-	String extractExecutionKeyFromImportResponse(def body) {
-		String key = safe(body?.testExecIssue?.key)
-		if (!isBlank(key)) {
-			return key
-		}
-
-		key = safe(body?.key)
-		if (!isBlank(key)) {
-			return key
-		}
-
-		return ''
+	boolean issueExists(String issueKey) {
+		if (isBlank(issueKey)) return false
+		Map response = httpJson('GET', '/rest/api/2/issue/' + issueKey)
+		return response.status == 200
 	}
 
 	String importExecutionResults(String xmlPath) {
+		if (isBlank(xmlPath)) return 'ERROR_XML_NOT_FOUND'
+
 		File xmlFile = new File(xmlPath)
-		if (!xmlFile.exists()) {
-			return 'ERROR_XML_NOT_FOUND'
-		}
+		if (!xmlFile.exists()) return 'ERROR_XML_NOT_FOUND'
 
 		Map response = httpMultipart(
 			'POST',
@@ -1045,76 +968,39 @@ class JiraIntegration {
 		KeywordUtil.logInfo('Import results status: ' + response.status)
 		KeywordUtil.logInfo('Import results response: ' + response.raw)
 
-		if (isSuccessStatus(response.status)) {
-			String key = extractExecutionKeyFromImportResponse(response.body)
-			return isBlank(key) ? '' : key
+		if (response.status == 200 || response.status == 201 || response.status == 204) {
+			return safe(response.body?.testExecIssue?.key)
 		}
 
 		return 'ERROR' + response.status
 	}
 
 	int updateExecutionIssue(String issueKey, String summary) {
-		Map fields = [
-			summary     : summary,
-			labels      : isBlank(LABELS) ? [] : LABELS.split(',').collect { it.trim() }.findAll { !isBlank(it) },
-			environment : ENVIRONMENT
+		Map payload = [
+			fields: [
+				summary     : summary,
+				labels      : isBlank(LABELS) ? [] : LABELS.split(',').collect { it.trim() }.findAll { !isBlank(it) },
+				environment : ENVIRONMENT
+			]
 		]
 
-		if (!isBlank(EPIC_KEY)) {
-			fields[EPIC_LINK_FIELD_ID] = EPIC_KEY
-		}
-
-		Map response = httpJson('PUT', '/rest/api/2/issue/' + issueKey, [fields: fields])
-
+		Map response = httpJson('PUT', '/rest/api/2/issue/' + issueKey, payload)
 		KeywordUtil.logInfo('Update Test Execution status: ' + response.status)
 		KeywordUtil.logInfo('Update Test Execution response: ' + response.raw)
-
 		return response.status
 	}
 
-	boolean issueExists(String issueKey) {
-		if (isBlank(issueKey)) {
-			return false
-		}
-
-		Map response = httpJson('GET', '/rest/api/2/issue/' + issueKey)
-		return response.status == 200
-	}
-
-	boolean sameEpic(def issueFields) {
-		if (isBlank(EPIC_KEY)) {
-			return true
-		}
-
-		String currentEpic = safe(issueFields?."${EPIC_LINK_FIELD_ID}")
-		return currentEpic.equalsIgnoreCase(EPIC_KEY)
-	}
-
 	String findExistingTestPlanKeyByName(String summary) {
-		if (isBlank(summary)) {
-			return ''
-		}
-
-		String escapedSummaryForJql = summary.replace('\\', '\\\\').replace('"', '\\"')
-		String jql = 'project = "' + PROJECT_KEY + '" AND issuetype = "Test Plan" AND summary ~ "\\"' + escapedSummaryForJql + '\\"" ORDER BY created DESC'
-		String fields = 'summary,' + EPIC_LINK_FIELD_ID
-		String endpoint = '/rest/api/2/search?jql=' + URLEncoder.encode(jql, 'UTF-8') + '&fields=' + URLEncoder.encode(fields, 'UTF-8')
+		String jql = 'project = "' + PROJECT_KEY + '" AND issuetype = "Test Plan" AND summary ~ "\\"' + summary.replace('"', '\\"') + '\\"" ORDER BY created DESC'
+		String endpoint = '/rest/api/2/search?jql=' + URLEncoder.encode(jql, 'UTF-8') + '&fields=summary'
 
 		Map response = httpJson('GET', endpoint)
-
-		KeywordUtil.logInfo('Find existing Test Plan status: ' + response.status)
-		KeywordUtil.logInfo('Find existing Test Plan response: ' + response.raw)
-
-		if (response.status != 200) {
-			return ''
-		}
+		if (response.status != 200) return ''
 
 		List issues = response.body?.issues ?: []
-
 		for (def issue : issues) {
 			String issueSummary = safe(issue?.fields?.summary)
-
-			if (issueSummary.equalsIgnoreCase(summary) && sameEpic(issue?.fields)) {
+			if (issueSummary.equalsIgnoreCase(summary)) {
 				return safe(issue?.key)
 			}
 		}
@@ -1124,9 +1010,9 @@ class JiraIntegration {
 
 	String createTestPlan(String summary) {
 		Map fields = [
-			project  : [key: PROJECT_KEY],
-			summary  : summary,
-			issuetype: [name: 'Test Plan']
+			project   : [key: PROJECT_KEY],
+			summary   : summary,
+			issuetype : [name: 'Test Plan']
 		]
 
 		if (!isBlank(LABELS)) {
@@ -1159,24 +1045,23 @@ class JiraIntegration {
 		}
 
 		if (!FORCE_CREATE_NEW_TEST_PLAN) {
-			String savedKey = readSavedTestPlanKey()
-			if (!isBlank(savedKey) && issueExists(savedKey)) {
-				return savedKey
+			String saved = readSavedTestPlanKey()
+			if (!isBlank(saved) && issueExists(saved)) {
+				return saved
 			}
 
-			String existingByName = findExistingTestPlanKeyByName(getTestPlanName())
-			if (!isBlank(existingByName)) {
-				saveTestPlanKey(existingByName)
-				return existingByName
+			String existing = findExistingTestPlanKeyByName(getTestPlanName())
+			if (!isBlank(existing)) {
+				saveTestPlanKey(existing)
+				return existing
 			}
 		}
 
-		String createdKey = createTestPlan(getTestPlanName())
-		if (!isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
-			saveTestPlanKey(createdKey)
+		String created = createTestPlan(getTestPlanName())
+		if (!isBlank(created) && !created.startsWith('ERROR')) {
+			saveTestPlanKey(created)
 		}
-
-		return createdKey
+		return created
 	}
 
 	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
@@ -1186,43 +1071,39 @@ class JiraIntegration {
 			[executionKey]
 		)
 
-		KeywordUtil.logInfo('Add Execution to Test Plan status: ' + response.status)
-		KeywordUtil.logInfo('Add Execution to Test Plan response: ' + response.raw)
-
+		KeywordUtil.logInfo('Update Test Plan status: ' + response.status)
+		KeywordUtil.logInfo('Update Test Plan response: ' + response.raw)
 		return response.status
 	}
 
 	int updateIssueStatus(String issueKey, String transitionId) {
-		if (isBlank(issueKey) || isBlank(transitionId)) {
-			return 0
-		}
+		if (isBlank(issueKey) || isBlank(transitionId)) return 0
 
-		Map response = httpJson(
-			'POST',
-			'/rest/api/2/issue/' + issueKey + '/transitions',
-			[transition: [id: transitionId]]
-		)
+		Map payload = [
+			transition: [
+				id: transitionId
+			]
+		]
 
+		Map response = httpJson('POST', '/rest/api/2/issue/' + issueKey + '/transitions', payload)
 		KeywordUtil.logInfo('Transition status response code: ' + response.status)
 		KeywordUtil.logInfo('Transition response body: ' + response.raw)
-
 		return response.status
 	}
 
-	int uploadAttachment(String issueKey, String filePath, String uploadName = '') {
-		if (isBlank(filePath)) {
+	int uploadAttachment(String issueKey, String originalFilePath) {
+		if (isBlank(issueKey) || isBlank(originalFilePath)) {
+			KeywordUtil.logInfo('Skipping attachment upload because file path is empty.')
 			return 0
 		}
 
-		File originalFile = new File(filePath)
-		if (!originalFile.exists() || originalFile.length() == 0) {
-			KeywordUtil.logInfo('Skipping attachment upload because file path is empty, missing or zero bytes.')
+		File original = new File(originalFilePath)
+		if (!original.exists() || original.length() == 0) {
+			KeywordUtil.logInfo('Skipping attachment upload because file does not exist or is empty.')
 			return 0
 		}
 
-		String preferredName = isBlank(uploadName) ? originalFile.name : uploadName
-		String safeCopyPath = createSafeUploadCopy(originalFile.absolutePath, preferredName)
-
+		String safeCopyPath = createSafeUploadCopy(original.absolutePath, original.name)
 		if (isBlank(safeCopyPath)) {
 			KeywordUtil.logInfo('Skipping attachment upload because safe copy could not be created.')
 			return 0
@@ -1251,19 +1132,19 @@ class JiraIntegration {
 	def jiraImport() {
 		logSeparator('Starting Jira import flow')
 
-		String reportPath = getResolvedReportPath()
+		String reportFolder = getReportPath()
 		String suiteName = getCurrentSuiteName()
 
-		KeywordUtil.logInfo('Using report folder: ' + reportPath)
+		KeywordUtil.logInfo('Using report folder: ' + reportFolder)
 		KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
 
-		if (isBlank(reportPath)) {
+		if (isBlank(reportFolder)) {
 			KeywordUtil.markFailed('Report folder could not be resolved.')
 			return
 		}
 
 		if (isBlank(suiteName)) {
-			KeywordUtil.markFailed('Suite name could not be resolved from report folder.')
+			KeywordUtil.markFailed('Suite name could not be resolved from report path.')
 			return
 		}
 
@@ -1273,21 +1154,21 @@ class JiraIntegration {
 		KeywordUtil.logInfo('Execution title used: ' + executionSummary)
 		KeywordUtil.logInfo('Test Plan title used: ' + testPlanName)
 
-		String xmlFile = getXmlFilePath()
-		if (isBlank(xmlFile)) {
-			KeywordUtil.markFailed('XML file was not found for Jira import.')
+		String xmlPath = getXmlFilePath()
+		if (isBlank(xmlPath)) {
+			KeywordUtil.markFailed('XML file could not be found.')
 			return
 		}
 
-		KeywordUtil.logInfo('XML file found: ' + xmlFile)
+		KeywordUtil.logInfo('XML file found: ' + xmlPath)
 
 		String gaiaReportPath = buildGaiaReport()
 		String reportZipPath = zipReports()
 		String evidenceZipPath = zipEvidences()
 
-		String executionKey = importExecutionResults(xmlFile)
+		String executionKey = importExecutionResults(xmlPath)
 		if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
-			KeywordUtil.markFailed('Test Execution could not be created: ' + executionKey)
+			KeywordUtil.markFailed('Test Execution could not be created or resolved: ' + executionKey)
 			return
 		}
 
@@ -1301,23 +1182,9 @@ class JiraIntegration {
 
 		int updateTestPlanStatus = addExecutionToTestPlan(testPlanKey, executionKey)
 
-		int gaiaReportAttachmentStatus = uploadAttachment(
-			executionKey,
-			gaiaReportPath,
-			getExecutionReportUploadName()
-		)
-
-		int resultsAttachmentStatus = uploadAttachment(
-			executionKey,
-			reportZipPath,
-			getExecutionResultsZipFileName()
-		)
-
-		int evidencesAttachmentStatus = uploadAttachment(
-			executionKey,
-			evidenceZipPath,
-			getExecutionEvidencesZipFileName()
-		)
+		int gaiaReportAttachmentStatus = uploadAttachment(executionKey, gaiaReportPath)
+		int resultsAttachmentStatus = uploadAttachment(executionKey, reportZipPath)
+		int evidencesAttachmentStatus = uploadAttachment(executionKey, evidenceZipPath)
 
 		int transitionExecutionStatus = updateIssueStatus(executionKey, EXECUTION_TRANSITION_ID)
 		int transitionTestPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
@@ -1325,17 +1192,20 @@ class JiraIntegration {
 		logSeparator('Jira import finished')
 
 		KeywordUtil.logInfo('Execution key: ' + executionKey)
-		KeywordUtil.logInfo('Using report folder: ' + reportPath)
-		KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
 		KeywordUtil.logInfo('Execution title used: ' + executionSummary)
 		KeywordUtil.logInfo('Test Plan key: ' + testPlanKey)
 		KeywordUtil.logInfo('Test Plan title used: ' + testPlanName)
 		KeywordUtil.logInfo('Gaia report attachment status: ' + gaiaReportAttachmentStatus)
 		KeywordUtil.logInfo('Results.zip attachment status: ' + resultsAttachmentStatus)
 		KeywordUtil.logInfo('Evidences.zip attachment status: ' + evidencesAttachmentStatus)
-		KeywordUtil.logInfo('Add Execution to Test Plan status: ' + updateTestPlanStatus)
+		KeywordUtil.logInfo('Update Test Plan status: ' + updateTestPlanStatus)
 		KeywordUtil.logInfo('Update Test Execution status: ' + updateExecutionStatus)
 		KeywordUtil.logInfo('Transition Execution status: ' + transitionExecutionStatus)
 		KeywordUtil.logInfo('Transition Test Plan status: ' + transitionTestPlanStatus)
+	}
+
+	@Keyword
+	def updateJira() {
+		jiraImport()
 	}
 }
