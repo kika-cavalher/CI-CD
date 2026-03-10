@@ -1,1 +1,490 @@
+@Keyword
+def jiraImport() {
+	logSection('Starting Jira import flow')
 
+	KeywordUtil.logInfo("Suite name: ${getCurrentSuiteName()}")
+	KeywordUtil.logInfo("Execution summary: ${getExecutionSummary()}")
+	KeywordUtil.logInfo("Test Plan name: ${getTestPlanName()}")
+	KeywordUtil.logInfo("Using token: ${maskToken(JIRA_TOKEN)}")
+	KeywordUtil.logInfo("Project key: ${PROJECT_KEY}")
+	KeywordUtil.logInfo("Epic key: ${EPIC_KEY}")
+	KeywordUtil.logInfo("Report path: ${getResolvedReportPath()}")
+
+	String xmlFile = getXmlFilePath()
+
+	if (isBlank(xmlFile)) {
+		KeywordUtil.markFailed('No XML file found for Jira import.')
+		return
+	}
+
+	String gaiaReportFile = buildGaiaReport()
+	String zipReport = zipReports()
+	String zipEvidence = zipEvidences()
+
+	String execID = importResults(xmlFile)
+
+	if (isBlank(execID) || execID.contains('ERROR')) {
+		KeywordUtil.markFailed("Test Execution creation failed: ${execID}")
+		return
+	}
+
+	String testPlanKey = getOrCreateTestPlan()
+
+	if (isBlank(testPlanKey) || testPlanKey.contains('ERROR')) {
+		KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+		return
+	}
+
+	int updatePlanStatus = updateTestPlan(testPlanKey, [execID])
+	int updateExecutionStatus = updateTestExecution(execID)
+
+	int uploadExecGaiaReportStatus = uploadAttachment(execID, gaiaReportFile)
+	int uploadExecResultsStatus = uploadAttachment(execID, zipReport)
+	int uploadExecEvidenceStatus = uploadAttachment(execID, zipEvidence)
+
+	int transitionExecutionStatus = updateIssueStatus(execID, TEST_EXECUTION_TRANSITION_ID)
+	int transitionPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
+
+	logSection('Jira import finished')
+
+	KeywordUtil.logInfo("Execution key: ${execID}")
+	KeywordUtil.logInfo("Execution title used: ${getExecutionSummary()}")
+	KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+	KeywordUtil.logInfo("Test Plan title used: ${getTestPlanName()}")
+	KeywordUtil.logInfo("Gaia report attachment status: ${uploadExecGaiaReportStatus}")
+	KeywordUtil.logInfo("Results.zip attachment status: ${uploadExecResultsStatus}")
+	KeywordUtil.logInfo("Evidences.zip attachment status: ${uploadExecEvidenceStatus}")
+	KeywordUtil.logInfo("Update Test Plan status: ${updatePlanStatus}")
+	KeywordUtil.logInfo("Update Test Execution status: ${updateExecutionStatus}")
+	KeywordUtil.logInfo("Transition Execution status: ${transitionExecutionStatus}")
+	KeywordUtil.logInfo("Transition Test Plan status: ${transitionPlanStatus}")
+}
+
+
+
+
+
+
+// =========================================================
+// HTML REPORT
+// =========================================================
+
+String buildFailureCard(Map item) {
+	StringBuilder card = new StringBuilder()
+
+	card.append('<div class="case-block failed">')
+	card.append('<div class="case-title">')
+	card.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+	card.append('</div>')
+
+	card.append('<div class="case-line">')
+	card.append('<span class="icon">❗</span> Mandatory failure')
+	card.append('</div>')
+
+	if (!isBlank(item.failureMessage as String)) {
+		card.append('<div class="case-line error-message">')
+		card.append(safeHtml(item.failureMessage as String))
+		card.append('</div>')
+	}
+
+	card.append('<div class="case-line duration">')
+	card.append('Duration: ')
+	card.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+	card.append('</div>')
+
+	card.append('<details class="details-block">')
+	card.append('<summary>See full error log</summary>')
+	card.append('<pre>')
+	card.append(safeHtml(item.stackTrace as String))
+	card.append('</pre>')
+	card.append('</details>')
+
+	if (!isBlank(item.imageData as String)) {
+		card.append('<div class="image-wrap">')
+		card.append('<img src="')
+		card.append(item.imageData as String)
+		card.append('" alt="Failure evidence" class="failure-image"/>')
+		card.append('</div>')
+	}
+
+	card.append('</div>')
+
+	return card.toString()
+}
+
+String buildPassedCard(Map item) {
+	StringBuilder card = new StringBuilder()
+
+	card.append('<div class="case-block passed">')
+	card.append('<div class="case-title">')
+	card.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+	card.append('</div>')
+
+	card.append('<div class="case-line">')
+	card.append('<span class="icon">✔</span> Test Passed')
+	card.append('</div>')
+
+	card.append('<div class="case-line duration">')
+	card.append('Duration: ')
+	card.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+	card.append('</div>')
+
+	card.append('</div>')
+
+	return card.toString()
+}
+
+String buildGaiaReportHtml(Map suiteData) {
+	StringBuilder failedHtml = new StringBuilder()
+	StringBuilder passedHtml = new StringBuilder()
+
+	for (Map item : suiteData.failedTests as List<Map>) {
+		failedHtml.append(buildFailureCard(item))
+	}
+
+	for (Map item : suiteData.passedTests as List<Map>) {
+		passedHtml.append(buildPassedCard(item))
+	}
+
+	String avgDuration = '0ms'
+	if ((suiteData.executed as Integer) > 0) {
+		BigDecimal avg = (suiteData.suiteTime as BigDecimal) / (suiteData.executed as Integer)
+		avgDuration = formatDurationSeconds(avg)
+	}
+
+	return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Windows Test Execution Report — Gaia</title>
+<style>
+	body {
+		font-family: Arial, Helvetica, sans-serif;
+		margin: 0;
+		padding: 24px 28px;
+		background: #ffffff;
+		color: #222222;
+	}
+
+	h1 {
+		font-size: 20px;
+		margin: 0 0 18px 0;
+		font-weight: 700;
+	}
+
+	table.summary {
+		width: 100%;
+		border-collapse: collapse;
+		margin-bottom: 24px;
+	}
+
+	table.summary td {
+		padding: 0 18px 0 0;
+		vertical-align: top;
+	}
+
+	.label {
+		font-size: 10px;
+		text-transform: uppercase;
+		color: #777777;
+		margin-bottom: 6px;
+	}
+
+	.value {
+		font-size: 12px;
+		line-height: 1.35;
+		font-weight: 400;
+	}
+
+	.section-title {
+		font-size: 16px;
+		font-weight: 700;
+		margin: 18px 0 12px 0;
+	}
+
+	.section-title.failed {
+		color: #b91c1c;
+	}
+
+	.section-title.passed {
+		color: #166534;
+	}
+
+	.case-block {
+		padding: 0 0 0 12px;
+		margin: 0 0 24px 0;
+	}
+
+	.case-block.failed {
+		border-left: 3px solid #cf2e2e;
+	}
+
+	.case-block.passed {
+		border-left: 3px solid #2e7d32;
+	}
+
+	.case-title {
+		font-size: 13px;
+		font-weight: 700;
+		margin-bottom: 6px;
+	}
+
+	.case-line {
+		font-size: 12px;
+		margin-bottom: 4px;
+		color: #222222;
+	}
+
+	.case-line.duration {
+		color: #666666;
+	}
+
+	.error-message {
+		color: #333333;
+	}
+
+	.details-block {
+		margin-top: 8px;
+	}
+
+	.details-block summary {
+		cursor: pointer;
+		font-size: 12px;
+		color: #111111;
+	}
+
+	.details-block pre {
+		white-space: pre-wrap;
+		font-size: 11px;
+		line-height: 1.35;
+		margin-top: 10px;
+		color: #333333;
+		background: #ffffff;
+		border: none;
+		padding: 0;
+	}
+
+	.image-wrap {
+		margin-top: 12px;
+	}
+
+	.failure-image {
+		max-width: 320px;
+		border: 1px solid #d9d9d9;
+	}
+
+	.empty-text {
+		font-size: 12px;
+		color: #777777;
+	}
+</style>
+</head>
+<body>
+
+<h1>Windows Test Execution Report — Gaia</h1>
+
+<table class="summary">
+	<tr>
+		<td>
+			<div class="label">Suite</div>
+			<div class="value">${safeHtml(suiteData.suiteName as String)}</div>
+		</td>
+		<td>
+			<div class="label">Start</div>
+			<div class="value">${safeHtml(suiteData.startText as String)}</div>
+		</td>
+		<td>
+			<div class="label">End</div>
+			<div class="value">${safeHtml(suiteData.endText as String)}</div>
+		</td>
+		<td>
+			<div class="label">Suite Duration</div>
+			<div class="value">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
+		</td>
+		<td>
+			<div class="label">Executed</div>
+			<div class="value">${suiteData.executed}</div>
+		</td>
+		<td>
+			<div class="label">Passed</div>
+			<div class="value">${suiteData.passed}</div>
+		</td>
+		<td>
+			<div class="label">Failed</div>
+			<div class="value">${suiteData.failed}</div>
+		</td>
+		<td>
+			<div class="label">Skipped</div>
+			<div class="value">${suiteData.skipped}</div>
+		</td>
+		<td>
+			<div class="label">Avg/Test</div>
+			<div class="value">${safeHtml(avgDuration)}</div>
+		</td>
+	</tr>
+</table>
+
+<div class="section-title failed">✘ Failed (${suiteData.failed})</div>
+${failedHtml.toString()}
+
+<div class="section-title passed">☑ Passed (${suiteData.passed})</div>
+${passedHtml.toString().trim().isEmpty() ? '<div class="empty-text">No passed tests.</div>' : passedHtml.toString()}
+
+</body>
+</html>
+"""
+}
+
+String buildGaiaReport() {
+	String xmlPath = getXmlFilePath()
+
+	if (isBlank(xmlPath)) {
+		KeywordUtil.logInfo('Gaia HTML report was not created because XML file was not found.')
+		return null
+	}
+
+	String reportPath = getResolvedReportPath()
+
+	if (isBlank(reportPath)) {
+		KeywordUtil.logInfo('Gaia HTML report was not created because report folder was not found.')
+		return null
+	}
+
+	Map suiteData = parseSuiteData(xmlPath)
+	String html = buildGaiaReportHtml(suiteData)
+
+	File htmlFile = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
+	htmlFile.write(html, 'UTF-8')
+
+	KeywordUtil.logInfo("Gaia HTML report created successfully: ${htmlFile.absolutePath}")
+	return htmlFile.absolutePath
+}
+
+
+
+
+
+
+
+
+// =========================================================
+// SUITE NAME RESOLUTION
+// =========================================================
+
+boolean isIgnorableFolderName(String folderName) {
+	if (isBlank(folderName)) {
+		return true
+	}
+
+	String name = folderName.trim()
+
+	if (name.equalsIgnoreCase('Reports')) return true
+	if (name.equalsIgnoreCase('logs')) return true
+	if (name.equalsIgnoreCase('videos')) return true
+	if (name.equalsIgnoreCase('cucumber_report')) return true
+	if (name.equalsIgnoreCase('PreLoad')) return true
+	if (name.equalsIgnoreCase(EVIDENCE_FOLDER_NAME)) return true
+	if (isTimestampFolderName(name)) return true
+
+	return false
+}
+
+String extractSuiteNameFromReportPath(String reportPath) {
+	if (isBlank(reportPath)) {
+		return ''
+	}
+
+	File current = new File(reportPath)
+
+	// If current path already points to the suite folder, use it
+	if (current.exists() && current.isDirectory() && !isIgnorableFolderName(current.getName())) {
+		return normalizeSuiteName(current.getName())
+	}
+
+	// Walk up parents looking for the first valid suite folder
+	File walker = current
+	while (walker != null) {
+		if (!isIgnorableFolderName(walker.getName())) {
+			return normalizeSuiteName(walker.getName())
+		}
+		walker = walker.getParentFile()
+	}
+
+	return ''
+}
+
+String extractSuiteNameFromTimestampFolder(String reportPath) {
+	if (isBlank(reportPath)) {
+		return ''
+	}
+
+	File root = new File(reportPath)
+
+	if (!root.exists() || !root.isDirectory()) {
+		return ''
+	}
+
+	// Common case:
+	// Reports\20260310_084240\Correction- Add Correction
+	if (isTimestampFolderName(root.getName())) {
+		List<File> candidates = root.listFiles()?.findAll {
+			it.isDirectory() && !isIgnorableFolderName(it.getName())
+		} ?: []
+
+		if (!candidates.isEmpty()) {
+			File best = candidates.max { it.lastModified() }
+			return normalizeSuiteName(best.getName())
+		}
+	}
+
+	return ''
+}
+
+String getCurrentSuiteName() {
+	// 1) First try the report path itself
+	String reportPath = getResolvedReportPath()
+
+	if (!isBlank(reportPath)) {
+		String suiteFromTimestampRoot = extractSuiteNameFromTimestampFolder(reportPath)
+		if (!isBlank(suiteFromTimestampRoot)) {
+			KeywordUtil.logInfo("Suite name detected from timestamp folder child: ${suiteFromTimestampRoot}")
+			return suiteFromTimestampRoot
+		}
+
+		String suiteFromPath = extractSuiteNameFromReportPath(reportPath)
+		if (!isBlank(suiteFromPath)) {
+			KeywordUtil.logInfo("Suite name detected from report path: ${suiteFromPath}")
+			return suiteFromPath
+		}
+	}
+
+	// 2) Fallback from LastRun.xlsx path
+	String lastRunPath = readLastRunPath()
+	if (!isBlank(lastRunPath)) {
+		String suiteFromLastRunTimestampRoot = extractSuiteNameFromTimestampFolder(lastRunPath)
+		if (!isBlank(suiteFromLastRunTimestampRoot)) {
+			KeywordUtil.logInfo("Suite name detected from LastRun timestamp folder child: ${suiteFromLastRunTimestampRoot}")
+			return suiteFromLastRunTimestampRoot
+		}
+
+		String suiteFromLastRun = extractSuiteNameFromReportPath(lastRunPath)
+		if (!isBlank(suiteFromLastRun)) {
+			KeywordUtil.logInfo("Suite name detected from LastRun path: ${suiteFromLastRun}")
+			return suiteFromLastRun
+		}
+	}
+
+	return 'UnknownTestSuite'
+}
+
+String getSanitizedSuiteName() {
+	return getCurrentSuiteName().replaceAll('[\\\\/:*?"<>|]', '_')
+}
+
+String getExecutionSummary() {
+	return getCurrentSuiteName() + ' ' + nowExecution()
+}
+
+String getTestPlanName() {
+	return getCurrentSuiteName() + TEST_PLAN_SUFFIX
+}
