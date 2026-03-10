@@ -1,17 +1,10 @@
-
 package keywords
-
-import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.io.RandomAccessFile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 
 import org.apache.poi.xssf.usermodel.XSSFRow
 import org.apache.poi.xssf.usermodel.XSSFSheet
@@ -20,14 +13,14 @@ import org.apache.poi.xssf.usermodel.XSSFWorkbook
 import com.kms.katalon.core.annotation.Keyword
 import com.kms.katalon.core.configuration.RunConfiguration
 import com.kms.katalon.core.util.KeywordUtil
-import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
 
 import groovy.io.FileType
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurper
-import groovy.util.XmlSlurper
+import jiraIntegration.JiraExecutionPublisher
+import jiraIntegration.JiraGaiaReportBuilder
+import jiraIntegration.JiraGateway
+import jiraIntegration.JiraTestPlanManager
 
-public class JiraIntegration {
+class JiraIntegration {
 
 	// ============================================================
 	// REQUIRED CONFIGURATION
@@ -42,20 +35,20 @@ public class JiraIntegration {
 	// OPTIONAL CONFIGURATION
 	// ============================================================
 
-	String ENVIRONMENT              = 'REC'
-	String LABELS                   = 'automate'
-	String MANUAL_TEST_PLAN_KEY     = ''
+	String ENVIRONMENT                 = 'REC'
+	String LABELS                      = 'automate'
+	String MANUAL_TEST_PLAN_KEY        = ''
 
 	boolean FORCE_CREATE_NEW_TEST_PLAN = false
 	boolean RESET_SAVED_TEST_PLAN_KEY  = false
 
-	String TEST_PLAN_SUFFIX         = ' Test Plan'
-	String PRIMARY_XML_FILE_NAME    = 'cucumber.xml'
-	String SECONDARY_XML_FILE_NAME  = 'JUnit_Report.xml'
-	String GAIA_REPORT_FILE_NAME    = 'gaiaReport.html'
-	String RESULT_ZIP_NAME          = 'Results.zip'
-	String EVIDENCE_FOLDER_NAME     = 'Evidences'
-	String EVIDENCE_ZIP_NAME        = 'Evidences.zip'
+	String TEST_PLAN_SUFFIX            = ' Test Plan'
+	String PRIMARY_XML_FILE_NAME       = 'cucumber.xml'
+	String SECONDARY_XML_FILE_NAME     = 'JUnit_Report.xml'
+	String GAIA_REPORT_FILE_NAME       = 'gaiaReport.html'
+	String RESULT_ZIP_NAME             = 'Results.zip'
+	String EVIDENCE_FOLDER_NAME        = 'Evidences'
+	String EVIDENCE_ZIP_NAME           = 'Evidences.zip'
 
 	// ============================================================
 	// BASIC HELPERS
@@ -178,10 +171,10 @@ public class JiraIntegration {
 		List<File> candidates = []
 
 		reportsRoot.eachFileRecurse(FileType.DIRECTORIES) { File dir ->
-			if (dir.listFiles()?.find { it.isFile() && it.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME) }) {
-				candidates << dir
-			}
-			if (dir.listFiles()?.find { it.isDirectory() && it.name.equalsIgnoreCase('cucumber_report') }) {
+			boolean hasPrimaryXml = dir.listFiles()?.find { it.isFile() && it.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME) } != null
+			boolean hasSecondaryXml = dir.listFiles()?.find { it.isFile() && it.name.equalsIgnoreCase(SECONDARY_XML_FILE_NAME) } != null
+
+			if (hasPrimaryXml || hasSecondaryXml) {
 				candidates << dir
 			}
 		}
@@ -359,31 +352,229 @@ public class JiraIntegration {
 	}
 
 	// ============================================================
-	// HTML REPORT
+	// MAIN FLOW
 	// ============================================================
+
+	@Keyword
+	def jiraImport() {
+		return jiraImport('')
+	}
+
+	@Keyword
+	def jiraImport(String epicKeyOverride) {
+		if (!isBlank(epicKeyOverride)) {
+			EPIC_KEY = safe(epicKeyOverride)
+		}
+
+		JiraGateway gateway = new JiraGateway(this)
+		JiraTestPlanManager testPlanManager = new JiraTestPlanManager(this, gateway)
+		JiraGaiaReportBuilder reportBuilder = new JiraGaiaReportBuilder(this)
+		JiraExecutionPublisher executionPublisher = new JiraExecutionPublisher(this, gateway)
+
+		gateway.validateRequiredConfiguration()
+
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("Starting Jira import flow")
+		KeywordUtil.logInfo("============================================================")
+
+		String reportFolder = getResolvedReportFolder()
+		if (isBlank(reportFolder)) {
+			KeywordUtil.markFailed("Report folder could not be resolved.")
+			return
+		}
+
+		KeywordUtil.logInfo("Using report folder: ${reportFolder}")
+
+		String suiteName = getCurrentSuiteName()
+		if (isBlank(suiteName)) {
+			KeywordUtil.markFailed("Suite name could not be resolved from report path.")
+			return
+		}
+
+		KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
+
+		String executionSummary = getExecutionSummary()
+		String testPlanSummary = getTestPlanName()
+
+		KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+		KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+
+		String xmlPath = findXmlFile(reportFolder)
+		if (isBlank(xmlPath)) {
+			KeywordUtil.markFailed("JUnit or Cucumber XML file was not found in report folder.")
+			return
+		}
+
+		KeywordUtil.logInfo("XML file found: ${xmlPath}")
+
+		String gaiaReportPath = reportBuilder.createGaiaHtmlReport(reportFolder, suiteName, xmlPath)
+		if (isBlank(gaiaReportPath)) {
+			KeywordUtil.markWarning("Gaia report could not be created.")
+		} else {
+			KeywordUtil.logInfo("Gaia report created: ${gaiaReportPath}")
+		}
+
+		String testPlanKey = testPlanManager.getOrCreateTestPlanKey()
+		if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
+			KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+			return
+		}
+
+		Map executionResult = executionPublisher.publishExecution(xmlPath, executionSummary, testPlanKey)
+
+		String executionKey = safe(executionResult.executionKey)
+		if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+			KeywordUtil.markFailed("Execution import failed: ${executionKey}")
+			return
+		}
+
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("Jira import finished")
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("Execution key: ${executionKey}")
+		KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+		KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+		KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+		KeywordUtil.logInfo("Gaia report attachment status: ${executionResult.gaiaReportStatus}")
+		KeywordUtil.logInfo("Evidences.zip attachment status: ${executionResult.evidencesStatus}")
+		KeywordUtil.logInfo("Results.zip attachment status: ${executionResult.resultsStatus}")
+		KeywordUtil.logInfo("Add execution to Test Plan status: ${executionResult.addExecutionStatus}")
+		KeywordUtil.logInfo("Update Test Execution status: ${executionResult.updateExecutionStatus}")
+
+		return executionKey
+	}
+}
+
+
+
+
+
+package jiraIntegration
+
+import com.kms.katalon.core.util.KeywordUtil
+import keywords.JiraIntegration
+
+class JiraTestPlanManager {
+
+	JiraIntegration owner
+	JiraGateway gateway
+
+	JiraTestPlanManager(JiraIntegration owner, JiraGateway gateway) {
+		this.owner = owner
+		this.gateway = gateway
+	}
+
+	String findExistingTestPlanKey(String summary) {
+		if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
+			KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
+			return ''
+		}
+
+		if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
+			KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
+			return owner.MANUAL_TEST_PLAN_KEY
+		}
+
+		String savedKey = owner.readSavedSuiteTestPlanKey()
+		if (!owner.isBlank(savedKey)) {
+			KeywordUtil.logInfo("Using saved Test Plan key for suite ${owner.getCurrentSuiteName()}: ${savedKey}")
+			return savedKey
+		}
+
+		List issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
+
+		if (!(issues instanceof List) || issues.isEmpty()) {
+			KeywordUtil.logInfo("No existing Test Plan found for summary: ${summary}")
+			return ''
+		}
+
+		String expected = owner.normalizeTitle(summary)
+
+		def exactMatch = issues.find { issue ->
+			owner.normalizeTitle(issue?.fields?.summary) == expected
+		}
+
+		if (exactMatch != null) {
+			String foundKey = owner.safe(exactMatch.key)
+			if (!owner.isBlank(foundKey)) {
+				owner.saveSuiteTestPlanKey(foundKey)
+				KeywordUtil.logInfo("Existing Test Plan found by exact summary: ${foundKey}")
+				return foundKey
+			}
+		}
+
+		String firstKey = owner.safe(issues[0]?.key)
+		if (!owner.isBlank(firstKey)) {
+			owner.saveSuiteTestPlanKey(firstKey)
+			KeywordUtil.logInfo("Existing Test Plan found by first result fallback: ${firstKey}")
+			return firstKey
+		}
+
+		return ''
+	}
+
+	String getOrCreateTestPlanKey() {
+		String summary = owner.getTestPlanName()
+
+		String existingKey = findExistingTestPlanKey(summary)
+		if (!owner.isBlank(existingKey)) {
+			KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
+			return existingKey
+		}
+
+		String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
+		if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+			owner.saveSuiteTestPlanKey(createdKey)
+			KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
+		}
+
+		return createdKey
+	}
+}
+
+
+
+
+
+package jiraIntegration
+
+import java.io.File
+import java.util.Date
+
+import groovy.json.JsonOutput
+import groovy.util.XmlSlurper
+import keywords.JiraIntegration
+
+class JiraGaiaReportBuilder {
+
+	JiraIntegration owner
+
+	JiraGaiaReportBuilder(JiraIntegration owner) {
+		this.owner = owner
+	}
 
 	List<Map> parseXmlCases(String xmlPath) {
 		List<Map> result = []
 
-		if (isBlank(xmlPath) || !new File(xmlPath).exists()) {
+		if (owner.isBlank(xmlPath) || !new File(xmlPath).exists()) {
 			return result
 		}
 
 		def xml = new XmlSlurper().parse(new File(xmlPath))
 		List testcaseNodes = []
 
-		if (safe(xml.name()) == 'testsuite') {
+		if (owner.safe(xml.name()) == 'testsuite') {
 			testcaseNodes.addAll(xml.testcase)
-		} else if (safe(xml.name()) == 'testsuites') {
+		} else if (owner.safe(xml.name()) == 'testsuites') {
 			xml.testsuite.each { suite ->
 				testcaseNodes.addAll(suite.testcase)
 			}
 		}
 
 		testcaseNodes.each { tc ->
-			String classname = safe(tc.@classname)
-			String name = safe(tc.@name)
-			long durationMs = toMillis(tc.@time)
+			String classname = owner.safe(tc.@classname)
+			String name = owner.safe(tc.@name)
+			long durationMs = owner.toMillis(tc.@time)
 
 			def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
 			def errorNode = tc.error?.size() > 0 ? tc.error[0] : null
@@ -396,27 +587,27 @@ public class JiraIntegration {
 			String details = ''
 
 			if (failureNode != null) {
-				message = safe(failureNode.@message)
-				details = safe(failureNode.text())
+				message = owner.safe(failureNode.@message)
+				details = owner.safe(failureNode.text())
 			} else if (errorNode != null) {
-				message = safe(errorNode.@message)
-				details = safe(errorNode.text())
+				message = owner.safe(errorNode.@message)
+				details = owner.safe(errorNode.text())
 			}
 
 			String displayName = ''
-			if (!isBlank(classname) && !isBlank(name)) {
+			if (!owner.isBlank(classname) && !owner.isBlank(name)) {
 				displayName = classname + '/' + name
 			} else {
-				displayName = !isBlank(name) ? name : classname
+				displayName = !owner.isBlank(name) ? name : classname
 			}
 
 			result << [
-				name       : displayName,
-				shortName  : !isBlank(name) ? name : displayName,
-				durationMs : durationMs,
-				status     : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
-				message    : message,
-				details    : details
+				name      : displayName,
+				shortName : !owner.isBlank(name) ? name : displayName,
+				durationMs: durationMs,
+				status    : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
+				message   : message,
+				details   : details
 			]
 		}
 
@@ -426,13 +617,13 @@ public class JiraIntegration {
 	List<String> getFailureSummaryLines(String message, String details) {
 		List<String> lines = []
 
-		if (!isBlank(message)) {
-			lines << safe(message)
+		if (!owner.isBlank(message)) {
+			lines << owner.safe(message)
 		}
 
-		safe(details).readLines().each { String raw ->
-			String line = safe(raw)
-			if (isBlank(line)) return
+		owner.safe(details).readLines().each { String raw ->
+			String line = owner.safe(raw)
+			if (owner.isBlank(line)) return
 			if (line.startsWith('at ')) return
 			if (line.startsWith('Caused by: at ')) return
 			if (line.contains('com.kms.katalon') && line.length() > 120) return
@@ -440,12 +631,12 @@ public class JiraIntegration {
 			lines << line
 		}
 
-		lines = lines.collect { it.replaceAll(/\s+/, ' ').trim() }.findAll { !isBlank(it) }.unique()
+		lines = lines.collect { it.replaceAll(/\s+/, ' ').trim() }.findAll { !owner.isBlank(it) }.unique()
 
-		if (lines.isEmpty() && !isBlank(details)) {
-			lines = safe(details).readLines()
-				.collect { safe(it) }
-				.findAll { !isBlank(it) }
+		if (lines.isEmpty() && !owner.isBlank(details)) {
+			lines = owner.safe(details).readLines()
+				.collect { owner.safe(it) }
+				.findAll { !owner.isBlank(it) }
 				.take(3)
 		}
 
@@ -455,17 +646,14 @@ public class JiraIntegration {
 	String buildHeaderCard(String label, String value) {
 		return """
 			<div class="stat-card">
-				<div class="stat-label">${htmlEscape(label)}</div>
-				<div class="stat-value">${htmlEscape(value)}</div>
+				<div class="stat-label">${owner.htmlEscape(label)}</div>
+				<div class="stat-value">${owner.htmlEscape(value)}</div>
 			</div>
 		"""
 	}
 
-	String createGaiaHtmlReport() {
-		String reportFolder = getResolvedReportFolder()
-		String xmlPath = findXmlFile(reportFolder)
-
-		if (isBlank(reportFolder) || isBlank(xmlPath)) {
+	String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
+		if (owner.isBlank(reportFolder) || owner.isBlank(xmlPath)) {
 			return ''
 		}
 
@@ -474,7 +662,7 @@ public class JiraIntegration {
 		List<Map> passedCases = cases.findAll { it.status == 'passed' }
 		List<Map> skippedCases = cases.findAll { it.status == 'skipped' }
 
-		List<File> failureImages = collectFailureImages(reportFolder)
+		List<File> failureImages = owner.collectFailureImages(reportFolder)
 
 		int imageIndex = 0
 		failedCases.each { Map item ->
@@ -492,10 +680,10 @@ public class JiraIntegration {
 		Date endDate = new Date(new File(reportFolder).lastModified())
 		Date startDate = new Date(endDate.time - totalDurationMs)
 		int executed = cases.size()
-		String avgTest = executed > 0 ? formatDurationMillis((long) (totalDurationMs / executed)) : '0m 0s 0ms'
+		String avgTest = executed > 0 ? owner.formatDurationMillis((long) (totalDurationMs / executed)) : '0m 0s 0ms'
 
 		File baseDir = new File(reportFolder)
-		File htmlFile = new File(reportFolder + File.separator + GAIA_REPORT_FILE_NAME)
+		File htmlFile = new File(reportFolder + File.separator + owner.GAIA_REPORT_FILE_NAME)
 
 		StringBuilder html = new StringBuilder()
 		html.append('<!DOCTYPE html>\n')
@@ -519,7 +707,7 @@ public class JiraIntegration {
 	}
 	.header-grid {
 		display: grid;
-		grid-template-columns: repeat(7, minmax(120px, 1fr));
+		grid-template-columns: repeat(8, minmax(110px, 1fr));
 		gap: 10px;
 		margin-bottom: 26px;
 	}
@@ -623,13 +811,14 @@ public class JiraIntegration {
 		html.append('<body>\n')
 		html.append('<h1>Windows Test Execution Report | Gaia</h1>\n')
 		html.append('<div class="header-grid">\n')
-		html.append(buildHeaderCard('Suite', getCurrentSuiteName()))
-		html.append(buildHeaderCard('Start', formatHeaderDate(startDate)))
-		html.append(buildHeaderCard('End', formatHeaderDate(endDate)))
-		html.append(buildHeaderCard('Suite Duration', formatDurationMillis(totalDurationMs)))
+		html.append(buildHeaderCard('Suite', suiteName))
+		html.append(buildHeaderCard('Start', owner.formatHeaderDate(startDate)))
+		html.append(buildHeaderCard('End', owner.formatHeaderDate(endDate)))
+		html.append(buildHeaderCard('Suite Duration', owner.formatDurationMillis(totalDurationMs)))
 		html.append(buildHeaderCard('Executed', String.valueOf(executed)))
 		html.append(buildHeaderCard('Passed', String.valueOf(passedCases.size())))
 		html.append(buildHeaderCard('Failed', String.valueOf(failedCases.size())))
+		html.append(buildHeaderCard('Avg/Test', avgTest))
 		html.append('</div>\n')
 
 		html.append("<div class=\"section-title failed\">✘ Failed (${failedCases.size()})</div>\n")
@@ -637,26 +826,26 @@ public class JiraIntegration {
 			html.append('<div class="empty-text">No failed tests.</div>\n')
 		} else {
 			failedCases.each { Map item ->
-				List<String> summaryLines = getFailureSummaryLines(safe(item.message), safe(item.details))
+				List<String> summaryLines = getFailureSummaryLines(owner.safe(item.message), owner.safe(item.details))
 				html.append('<div class="case-card failed">\n')
-				html.append("<div class=\"case-title\">${htmlEscape(item.name)}</div>\n")
-				html.append("<div class=\"case-meta\">Duration: ${htmlEscape(formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+				html.append("<div class=\"case-title\">${owner.htmlEscape(item.name)}</div>\n")
+				html.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
 
 				summaryLines.each { String line ->
-					html.append("<div class=\"failure-line\">${htmlEscape(line)}</div>\n")
+					html.append("<div class=\"failure-line\">${owner.htmlEscape(line)}</div>\n")
 				}
 
 				html.append('<div class="details-wrap">\n')
 				html.append('<details>\n')
 				html.append('<summary>See full error log</summary>\n')
-				html.append("<pre>${htmlEscape(safe(item.details))}</pre>\n")
+				html.append("<pre>${owner.htmlEscape(owner.safe(item.details))}</pre>\n")
 				html.append('</details>\n')
 				html.append('</div>\n')
 
 				File image = item.image as File
 				if (image != null && image.exists()) {
-					String imgSrc = relativeUri(baseDir, image)
-					html.append("<img class=\"failure-image\" src=\"${htmlEscape(imgSrc)}\" alt=\"Failure evidence\">\n")
+					String imgSrc = owner.relativeUri(baseDir, image)
+					html.append("<img class=\"failure-image\" src=\"${owner.htmlEscape(imgSrc)}\" alt=\"Failure evidence\">\n")
 				}
 
 				html.append('</div>\n')
@@ -669,9 +858,9 @@ public class JiraIntegration {
 		} else {
 			passedCases.each { Map item ->
 				html.append('<div class="case-card passed">\n')
-				html.append("<div class=\"case-title\">${htmlEscape(item.name)}</div>\n")
+				html.append("<div class=\"case-title\">${owner.htmlEscape(item.name)}</div>\n")
 				html.append("<div class=\"case-meta\">Test Passed</div>\n")
-				html.append("<div class=\"case-meta\">Duration: ${htmlEscape(formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+				html.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
 				html.append('</div>\n')
 			}
 		}
@@ -680,8 +869,8 @@ public class JiraIntegration {
 			html.append("<div class=\"section-title\">Skipped (${skippedCases.size()})</div>\n")
 			skippedCases.each { Map item ->
 				html.append('<div class="case-card">\n')
-				html.append("<div class=\"case-title\">${htmlEscape(item.name)}</div>\n")
-				html.append("<div class=\"case-meta\">Duration: ${htmlEscape(formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+				html.append("<div class=\"case-title\">${owner.htmlEscape(item.name)}</div>\n")
+				html.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
 				html.append('</div>\n')
 			}
 		}
@@ -692,14 +881,36 @@ public class JiraIntegration {
 		htmlFile.setText(html.toString(), 'UTF-8')
 		return htmlFile.absolutePath
 	}
+}
 
-	String getGaiaReportFilePath() {
-		return getResolvedReportFolder() + File.separator + GAIA_REPORT_FILE_NAME
+
+
+
+package jiraIntegration
+
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+import com.kms.katalon.core.util.KeywordUtil
+import keywords.JiraIntegration
+
+class JiraExecutionPublisher {
+
+	JiraIntegration owner
+	JiraGateway gateway
+
+	JiraExecutionPublisher(JiraIntegration owner, JiraGateway gateway) {
+		this.owner = owner
+		this.gateway = gateway
 	}
 
-	// ============================================================
-	// REPORT ZIPS AND EXECUTION ATTACHMENTS
-	// ============================================================
+	String getGaiaReportFilePath() {
+		return owner.getResolvedReportFolder() + File.separator + owner.GAIA_REPORT_FILE_NAME
+	}
 
 	boolean isLockedOrUnreadable(File file) {
 		if (file == null || !file.exists() || !file.isFile()) {
@@ -718,13 +929,13 @@ public class JiraIntegration {
 	}
 
 	boolean shouldSkipReportEntry(File file) {
-		String name = safe(file?.name).toLowerCase()
+		String name = owner.safe(file?.name).toLowerCase()
 
-		if (isBlank(name)) return true
-		if (name == safe(RESULT_ZIP_NAME).toLowerCase()) return true
-		if (name == safe(EVIDENCE_ZIP_NAME).toLowerCase()) return true
-		if (name == safe(GAIA_REPORT_FILE_NAME).toLowerCase()) return true
-		if (name == safe(EVIDENCE_FOLDER_NAME).toLowerCase()) return true
+		if (owner.isBlank(name)) return true
+		if (name == owner.safe(owner.RESULT_ZIP_NAME).toLowerCase()) return true
+		if (name == owner.safe(owner.EVIDENCE_ZIP_NAME).toLowerCase()) return true
+		if (name == owner.safe(owner.GAIA_REPORT_FILE_NAME).toLowerCase()) return true
+		if (name == owner.safe(owner.EVIDENCE_FOLDER_NAME).toLowerCase()) return true
 		if (name == 'videos') return true
 		if (name == 'requests') return true
 		if (name.endsWith('.lck')) return true
@@ -734,10 +945,10 @@ public class JiraIntegration {
 	}
 
 	boolean shouldSkipEvidenceEntry(File file) {
-		String name = safe(file?.name).toLowerCase()
+		String name = owner.safe(file?.name).toLowerCase()
 
-		if (isBlank(name)) return true
-		if (name == safe(EVIDENCE_ZIP_NAME).toLowerCase()) return true
+		if (owner.isBlank(name)) return true
+		if (name == owner.safe(owner.EVIDENCE_ZIP_NAME).toLowerCase()) return true
 		if (name.endsWith('.lck')) return true
 		if (name.endsWith('.lock')) return true
 
@@ -765,7 +976,7 @@ public class JiraIntegration {
 		}
 
 		String relativePath = rootFolder.toURI().relativize(currentFile.toURI()).getPath()
-		if (isBlank(relativePath)) {
+		if (owner.isBlank(relativePath)) {
 			return
 		}
 
@@ -792,7 +1003,7 @@ public class JiraIntegration {
 	}
 
 	String zipReports() {
-		String reportFolder = getResolvedReportFolder()
+		String reportFolder = owner.getResolvedReportFolder()
 		File sourceFolder = new File(reportFolder)
 
 		if (!sourceFolder.exists() || !sourceFolder.isDirectory()) {
@@ -800,7 +1011,7 @@ public class JiraIntegration {
 			return ''
 		}
 
-		String zipPath = reportFolder + File.separator + RESULT_ZIP_NAME
+		String zipPath = reportFolder + File.separator + owner.RESULT_ZIP_NAME
 		File zipFile = new File(zipPath)
 		if (zipFile.exists()) {
 			zipFile.delete()
@@ -827,7 +1038,7 @@ public class JiraIntegration {
 	}
 
 	String zipEvidences() {
-		String evidenceFolderPath = getResolvedReportFolder() + File.separator + EVIDENCE_FOLDER_NAME
+		String evidenceFolderPath = owner.getResolvedReportFolder() + File.separator + owner.EVIDENCE_FOLDER_NAME
 		File sourceFolder = new File(evidenceFolderPath)
 
 		if (!sourceFolder.exists() || !sourceFolder.isDirectory()) {
@@ -841,7 +1052,7 @@ public class JiraIntegration {
 			return ''
 		}
 
-		String zipPath = evidenceFolderPath + File.separator + EVIDENCE_ZIP_NAME
+		String zipPath = evidenceFolderPath + File.separator + owner.EVIDENCE_ZIP_NAME
 		File zipFile = new File(zipPath)
 		if (zipFile.exists()) {
 			zipFile.delete()
@@ -866,32 +1077,32 @@ public class JiraIntegration {
 
 	Map uploadExecutionAttachments(String executionKey) {
 		Map result = [
-			gaiaReport: 0,
-			evidences : 0,
-			results   : 0
+			gaiaReportStatus: 0,
+			evidencesStatus : 0,
+			resultsStatus   : 0
 		]
 
 		String gaiaReportPath = getGaiaReportFilePath()
 		String evidencesZipPath = zipEvidences()
 		String resultsZipPath = zipReports()
 
-		if (!isBlank(gaiaReportPath) && new File(gaiaReportPath).exists()) {
+		if (!owner.isBlank(gaiaReportPath) && new File(gaiaReportPath).exists()) {
 			KeywordUtil.logInfo("Uploading Gaia report attachment: ${gaiaReportPath}")
-			result.gaiaReport = uploadAttachment(executionKey, gaiaReportPath)
+			result.gaiaReportStatus = gateway.uploadAttachment(executionKey, gaiaReportPath)
 		} else {
 			KeywordUtil.logInfo("Gaia report attachment skipped. File not found.")
 		}
 
-		if (!isBlank(evidencesZipPath) && new File(evidencesZipPath).exists()) {
+		if (!owner.isBlank(evidencesZipPath) && new File(evidencesZipPath).exists()) {
 			KeywordUtil.logInfo("Uploading Evidences ZIP attachment: ${evidencesZipPath}")
-			result.evidences = uploadAttachment(executionKey, evidencesZipPath)
+			result.evidencesStatus = gateway.uploadAttachment(executionKey, evidencesZipPath)
 		} else {
 			KeywordUtil.logInfo("Evidences ZIP attachment skipped.")
 		}
 
-		if (!isBlank(resultsZipPath) && new File(resultsZipPath).exists()) {
+		if (!owner.isBlank(resultsZipPath) && new File(resultsZipPath).exists()) {
 			KeywordUtil.logInfo("Uploading Results ZIP attachment: ${resultsZipPath}")
-			result.results = uploadAttachment(executionKey, resultsZipPath)
+			result.resultsStatus = gateway.uploadAttachment(executionKey, resultsZipPath)
 		} else {
 			KeywordUtil.logInfo("Results ZIP attachment skipped.")
 		}
@@ -899,20 +1110,87 @@ public class JiraIntegration {
 		return result
 	}
 
-	// ============================================================
-	// JIRA REQUESTS
-	// ============================================================
+	Map publishExecution(String xmlPath, String executionSummary, String testPlanKey) {
+		Map result = [
+			executionKey         : '',
+			addExecutionStatus   : 0,
+			updateExecutionStatus: 0,
+			gaiaReportStatus     : 0,
+			evidencesStatus      : 0,
+			resultsStatus        : 0
+		]
+
+		String executionKey = gateway.importExecutionResults(xmlPath)
+		result.executionKey = executionKey
+
+		if (owner.isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+			return result
+		}
+
+		result.addExecutionStatus = gateway.addExecutionToTestPlan(testPlanKey, executionKey)
+		result.updateExecutionStatus = gateway.updateTestExecution(
+			executionKey,
+			executionSummary,
+			owner.LABELS,
+			owner.ENVIRONMENT
+		)
+
+		Map attachmentResult = uploadExecutionAttachments(executionKey)
+		result.putAll(attachmentResult)
+
+		return result
+	}
+}
+
+
+
+package jiraIntegration
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import keywords.JiraIntegration
+
+class JiraGateway {
+
+	JiraIntegration owner
+
+	JiraGateway(JiraIntegration owner) {
+		this.owner = owner
+	}
+
+	void validateRequiredConfiguration() {
+		if (owner.isBlank(owner.JIRA_TOKEN)) {
+			KeywordUtil.markFailed("JIRA_TOKEN is empty.")
+		}
+
+		if (owner.isBlank(owner.PROJECT_KEY)) {
+			KeywordUtil.markFailed("PROJECT_KEY is empty.")
+		}
+
+		if (owner.isBlank(owner.EPIC_KEY)) {
+			KeywordUtil.markFailed("EPIC_KEY is empty.")
+		}
+
+		if (owner.isBlank(owner.JIRA_BASE_URL)) {
+			KeywordUtil.markFailed("JIRA_BASE_URL is empty.")
+		}
+	}
 
 	String importExecutionResults(String xmlPath) {
 		def response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
 			('filePath'): xmlPath,
-			('project') : PROJECT_KEY,
-			('baseUrl') : JIRA_BASE_URL,
-			('token')   : JIRA_TOKEN
+			('project') : owner.PROJECT_KEY,
+			('baseUrl') : owner.JIRA_BASE_URL,
+			('token')   : owner.JIRA_TOKEN
 		]))
 
 		int status = WS.getResponseStatusCode(response)
-		String body = safe(response.getResponseBodyContent())
+		String body = owner.safe(response.getResponseBodyContent())
 
 		KeywordUtil.logInfo("Import results status: ${status}")
 		KeywordUtil.logInfo("Import results response: ${body}")
@@ -922,94 +1200,49 @@ public class JiraIntegration {
 		}
 
 		def parsed = new JsonSlurper().parseText(body)
-		String executionKey = safe(parsed?.testExecIssue?.key)
+		String executionKey = owner.safe(parsed?.testExecIssue?.key)
 
-		if (isBlank(executionKey)) {
+		if (owner.isBlank(executionKey)) {
 			return 'ERROR_NO_EXEC_KEY'
 		}
 
 		return executionKey
 	}
 
-	String findExistingTestPlanKey(String summary) {
-		if (FORCE_CREATE_NEW_TEST_PLAN) {
-			KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
-			return ''
-		}
-
-		if (!isBlank(MANUAL_TEST_PLAN_KEY)) {
-			KeywordUtil.logInfo("Using manual Test Plan key: ${MANUAL_TEST_PLAN_KEY}")
-			return MANUAL_TEST_PLAN_KEY
-		}
-
-		String savedKey = readSavedSuiteTestPlanKey()
-		if (!isBlank(savedKey)) {
-			KeywordUtil.logInfo("Using saved Test Plan key for suite ${getCurrentSuiteName()}: ${savedKey}")
-			return savedKey
-		}
-
+	List searchTestPlans(String summary, String epicKey) {
 		String escapedSummary = summary.replace('[', '\\\\[').replace(']', '\\\\]')
 
 		def response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan', [
-			('project'): PROJECT_KEY,
-			('token')  : JIRA_TOKEN,
+			('project'): owner.PROJECT_KEY,
+			('token')  : owner.JIRA_TOKEN,
 			('summary'): escapedSummary,
-			('parent') : EPIC_KEY
+			('parent') : epicKey
 		]))
 
 		int status = WS.getResponseStatusCode(response)
-		String body = safe(response.getResponseBodyContent())
+		String body = owner.safe(response.getResponseBodyContent())
 
 		KeywordUtil.logInfo("Get Test Plan status: ${status}")
 		KeywordUtil.logInfo("Get Test Plan response: ${body}")
 
 		if (status != 200) {
-			return ''
+			return []
 		}
 
 		def parsed = new JsonSlurper().parseText(body)
-		def issues = parsed?.issues
-
-		if (!(issues instanceof List) || issues.isEmpty()) {
-			KeywordUtil.logInfo("No existing Test Plan found for summary: ${summary}")
-			return ''
-		}
-
-		String expected = normalizeTitle(summary)
-
-		def exactMatch = issues.find { issue ->
-			normalizeTitle(issue?.fields?.summary) == expected
-		}
-
-		if (exactMatch != null) {
-			String foundKey = safe(exactMatch.key)
-			if (!isBlank(foundKey)) {
-				saveSuiteTestPlanKey(foundKey)
-				KeywordUtil.logInfo("Existing Test Plan found by exact summary: ${foundKey}")
-				return foundKey
-			}
-		}
-
-		String firstKey = safe(issues[0]?.key)
-		if (!isBlank(firstKey)) {
-			saveSuiteTestPlanKey(firstKey)
-			KeywordUtil.logInfo("Existing Test Plan found by first result fallback: ${firstKey}")
-			return firstKey
-		}
-
-		return ''
+		return parsed?.issues instanceof List ? parsed.issues : []
 	}
 
-	String createTestPlan(String summary) {
+	String createTestPlan(String summary, String epicKey) {
 		def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan', [
-			('token')  : JIRA_TOKEN,
-			('project'): PROJECT_KEY,
+			('token')  : owner.JIRA_TOKEN,
+			('project'): owner.PROJECT_KEY,
 			('summary'): summary,
-			('epic')   : EPIC_KEY
+			('epic')   : epicKey
 		]))
 
 		int status = WS.getResponseStatusCode(response)
-		String body = safe(response.getResponseBodyContent())
+		String body = owner.safe(response.getResponseBodyContent())
 
 		KeywordUtil.logInfo("Create Test Plan status: ${status}")
 		KeywordUtil.logInfo("Create Test Plan response: ${body}")
@@ -1019,27 +1252,7 @@ public class JiraIntegration {
 		}
 
 		def parsed = new JsonSlurper().parseText(body)
-		String createdKey = safe(parsed?.key)
-
-		if (!isBlank(createdKey)) {
-			saveSuiteTestPlanKey(createdKey)
-		}
-
-		return createdKey
-	}
-
-	String getOrCreateTestPlanKey() {
-		String summary = getTestPlanName()
-
-		String existingKey = findExistingTestPlanKey(summary)
-		if (!isBlank(existingKey)) {
-			KeywordUtil.logInfo("Resolved existing Test Plan for suite ${getCurrentSuiteName()}: ${existingKey}")
-			return existingKey
-		}
-
-		String createdKey = createTestPlan(summary)
-		KeywordUtil.logInfo("Created new Test Plan for suite ${getCurrentSuiteName()}: ${createdKey}")
-		return createdKey
+		return owner.safe(parsed?.key)
 	}
 
 	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
@@ -1049,7 +1262,7 @@ public class JiraIntegration {
 		])
 
 		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan', [
-			('token')      : JIRA_TOKEN,
+			('token')      : owner.JIRA_TOKEN,
 			('testPlanKey'): testPlanKey,
 			('jsonBody')   : jsonBody
 		]))
@@ -1059,13 +1272,13 @@ public class JiraIntegration {
 		return status
 	}
 
-	int updateTestExecution(String executionKey, String executionSummary) {
+	int updateTestExecution(String executionKey, String executionSummary, String labels, String environment) {
 		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name', [
 			('issueID'): executionKey,
-			('token')  : JIRA_TOKEN,
+			('token')  : owner.JIRA_TOKEN,
 			('summary'): executionSummary,
-			('labels') : LABELS,
-			('env')    : ENVIRONMENT
+			('labels') : labels,
+			('env')    : environment
 		]))
 
 		int status = WS.getResponseStatusCode(response)
@@ -1074,7 +1287,7 @@ public class JiraIntegration {
 	}
 
 	int uploadAttachment(String issueKey, String filePath) {
-		if (isBlank(filePath)) {
+		if (owner.isBlank(filePath)) {
 			return 0
 		}
 
@@ -1085,98 +1298,17 @@ public class JiraIntegration {
 		}
 
 		def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
-			('token')    : JIRA_TOKEN,
+			('token')    : owner.JIRA_TOKEN,
 			('evidences'): file,
 			('execID')   : issueKey
 		]))
 
 		int status = WS.getResponseStatusCode(response)
-		String body = safe(response.getResponseBodyContent())
+		String body = owner.safe(response.getResponseBodyContent())
 
 		KeywordUtil.logInfo("Upload attachment status: ${status}")
 		KeywordUtil.logInfo("Upload attachment response: ${body}")
 
 		return status
-	}
-
-	// ============================================================
-	// MAIN FLOW
-	// ============================================================
-
-	@Keyword
-	def jiraImport() {
-		KeywordUtil.logInfo("============================================================")
-		KeywordUtil.logInfo("Starting Jira import flow")
-		KeywordUtil.logInfo("============================================================")
-
-		String reportFolder = getResolvedReportFolder()
-		if (isBlank(reportFolder)) {
-			KeywordUtil.markFailed("Report folder could not be resolved.")
-			return
-		}
-
-		KeywordUtil.logInfo("Using report folder: ${reportFolder}")
-
-		String suiteName = getCurrentSuiteName()
-		if (isBlank(suiteName)) {
-			KeywordUtil.markFailed("Suite name could not be resolved from report path.")
-			return
-		}
-
-		KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
-
-		String executionSummary = getExecutionSummary()
-		String testPlanSummary = getTestPlanName()
-
-		KeywordUtil.logInfo("Execution title used: ${executionSummary}")
-		KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
-
-		String xmlPath = findXmlFile(reportFolder)
-		if (isBlank(xmlPath)) {
-			KeywordUtil.markFailed("JUnit or Cucumber XML file was not found in report folder.")
-			return
-		}
-
-		KeywordUtil.logInfo("XML file found: ${xmlPath}")
-
-		String gaiaReportPath = createGaiaHtmlReport()
-		if (isBlank(gaiaReportPath)) {
-			KeywordUtil.markWarning("Gaia report could not be created.")
-		} else {
-			KeywordUtil.logInfo("Gaia report created: ${gaiaReportPath}")
-		}
-
-		String executionKey = importExecutionResults(xmlPath)
-		if (executionKey.startsWith('ERROR')) {
-			KeywordUtil.markFailed("Execution import failed: ${executionKey}")
-			return
-		}
-
-		String testPlanKey = getOrCreateTestPlanKey()
-		if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
-			KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
-			return
-		}
-
-		int addExecutionStatus = addExecutionToTestPlan(testPlanKey, executionKey)
-		int updateExecutionStatus = updateTestExecution(executionKey, executionSummary)
-
-		KeywordUtil.logInfo("Uploading execution attachments...")
-
-		Map attachmentStatuses = uploadExecutionAttachments(executionKey)
-
-		KeywordUtil.logInfo("Gaia report attachment status: ${attachmentStatuses.gaiaReport}")
-		KeywordUtil.logInfo("Evidences.zip attachment status: ${attachmentStatuses.evidences}")
-		KeywordUtil.logInfo("Results.zip attachment status: ${attachmentStatuses.results}")
-
-		KeywordUtil.logInfo("============================================================")
-		KeywordUtil.logInfo("Jira import finished")
-		KeywordUtil.logInfo("============================================================")
-		KeywordUtil.logInfo("Execution key: ${executionKey}")
-		KeywordUtil.logInfo("Execution title used: ${executionSummary}")
-		KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
-		KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
-		KeywordUtil.logInfo("Add execution to Test Plan status: ${addExecutionStatus}")
-		KeywordUtil.logInfo("Update Test Execution status: ${updateExecutionStatus}")
 	}
 }
