@@ -1,723 +1,1341 @@
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurperClassic
-import com.cloudbees.groovy.cps.NonCPS
-import java.util.regex.Pattern
+package com.keywords.integrationHandler
+
+import java.io.BufferedReader
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.io.RandomAccessFile
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
-import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
+import java.text.SimpleDateFormat
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
-def TEST_SUITES = [
-    [label: 'PreLoad',                              path: 'Test Suites/PreLoad'],
-    [label: 'Help',                                 path: 'Test Suites/Help'],
-    [label: 'Correction- Add Correction',           path: 'Test Suites/Correction- Add Correction'],
-    [label: 'Correction- Computation Selection',    path: 'Test Suites/Correction- Computation Selection'],
-    [label: 'Correction- Corrected Duplication',    path: 'Test Suites/Correction- Corrected Duplication'],
-    [label: 'Correction- Correction Details',       path: 'Test Suites/Correction- Correction Details'],
-    [label: 'Correction- Download Invalid Records', path: 'Test Suites/Correction- Download Invalid Records']
-]
+import org.apache.poi.xssf.usermodel.XSSFRow
+import org.apache.poi.xssf.usermodel.XSSFSheet
+import org.apache.poi.xssf.usermodel.XSSFWorkbook
 
-pipeline {
-    agent {
-        node {
-            label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        }
-    }
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
 
-    options {
-        timestamps()
-        ansiColor('xterm')
-        disableConcurrentBuilds()
-        timeout(time: 95, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
-        skipDefaultCheckout(true)
-    }
+import groovy.io.FileType
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+import groovy.xml.XmlSlurper
 
-    parameters {
-        string(
-            name: 'STARTUP_WAIT_SECONDS',
-            defaultValue: '40',
-            description: 'Seconds to wait after backend and frontend startup'
-        )
-        string(
-            name: 'SUITE_TIMEOUT_MINUTES',
-            defaultValue: '5',
-            description: 'Maximum minutes for each suite'
-        )
-    }
+class JiraIntegration {
 
-    environment {
-        FIXED_ROOT              = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        PROJECT_PATH            = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
-        REPORTS_ROOT            = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports'
-        LOGS_DIR                = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\_logs'
-        DASHBOARD_FIXED_DIR     = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\dashboard'
-        RESULTS_JSON            = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\suite-results.json'
+	// =========================================================
+	// REQUIRED CONFIGURATION
+	// =========================================================
 
-        RUNTIME_PUBLISH_DIR     = 'published-report'
-        RUNTIME_ARCHIVE_DIR     = 'archived-report'
+	String BASE_URL                    = 'https://jira-mut.d.bbg'
+	String JIRA_TOKEN                  = 'PUT_YOUR_TOKEN_HERE'
+	String PROJECT_KEY                 = 'L96B2C'
+	String EPIC_KEY                    = 'L96B2C-8234'
 
-        GIT_URL                 = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        GIT_CRED                = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+	// =========================================================
+	// OPTIONAL CONFIGURATION
+	// =========================================================
 
-        GAIA_START_TASK         = 'GaiaBackFrontSetup'
-        KATALON_EXE             = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        EXEC_PROFILE            = 'default'
-        BROWSER_TYPE            = 'Chrome'
-    }
+	String ENVIRONMENT                 = 'REC'
+	String LABELS                      = 'automate'
+	String MANUAL_TEST_PLAN_KEY        = ''
 
-    stages {
-        stage('✨ Validate Base Paths') {
-            steps {
-                bat """
-                    @echo off
-                    echo ============================================================
-                    echo ✨ VALIDATING BASE PATHS
-                    echo ============================================================
+	boolean FORCE_CREATE_NEW_TEST_PLAN = false
+	boolean RESET_SAVED_TEST_PLAN_KEY  = false
 
-                    if not exist "${env.FIXED_ROOT}" (
-                        echo ERROR: FIXED_ROOT not found
-                        exit /b 1
-                    )
+	String TEST_PLAN_SUFFIX            = ' Test Plan'
+	String TEST_EXECUTION_SUFFIX       = ' Test Execution'
 
-                    if not exist "${env.KATALON_EXE}" (
-                        echo ERROR: KATALON_EXE not found
-                        exit /b 1
-                    )
+	String EXECUTION_TRANSITION_ID     = '11'
+	String TEST_PLAN_TRANSITION_ID     = '11'
 
-                    echo ✅ Base paths are valid
-                    echo ============================================================
-                """
-            }
-        }
+	String PRIMARY_XML_FILE_NAME       = 'JUnit_Report.xml'
+	String SECONDARY_XML_FILE_NAME     = 'cucumber.xml'
+	String GAIA_REPORT_FILE_NAME       = 'gaiaReport.html'
+	String EVIDENCE_FOLDER_NAME        = 'Evidences'
+	String TEST_PLAN_KEYS_FOLDER       = RunConfiguration.projectDir + File.separator + 'TestPlanKeys'
+	String EPIC_LINK_FIELD_ID          = 'customfield_10006'
 
-        stage('🚀 Start Gaia Backend and Frontend') {
-            steps {
-                bat """
-                    @echo off
-                    echo ============================================================
-                    echo 🚀 STARTING BACKEND AND FRONTEND
-                    echo ============================================================
-                    schtasks /run /tn "${env.GAIA_START_TASK}"
-                    if errorlevel 1 exit /b 1
-                """
-                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
-            }
-        }
+	// =========================================================
+	// BASIC HELPERS
+	// =========================================================
 
-        stage('📥 Checkout Repository') {
-            steps {
-                dir("${env.FIXED_ROOT}") {
-                    deleteDir()
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/master']],
-                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
-                        extensions: [
-                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-                        ]
-                    ])
-                }
+	boolean isBlank(def value) {
+		return value == null || value.toString().trim().isEmpty()
+	}
 
-                echo '============================================================'
-                echo '✅ CHECKOUT COMPLETED'
-                echo '============================================================'
-            }
-        }
+	String safe(def value) {
+		return value == null ? '' : value.toString()
+	}
 
-        stage('🧹 Prepare Reports Folder') {
-            steps {
-                bat """
-                    @echo off
-                    if exist "${env.REPORTS_ROOT}" rmdir /s /q "${env.REPORTS_ROOT}"
-                    mkdir "${env.REPORTS_ROOT}"
-                    mkdir "${env.LOGS_DIR}"
-                    mkdir "${env.DASHBOARD_FIXED_DIR}"
-                """
-                script {
-                    writeFile file: env.RESULTS_JSON, text: JsonOutput.prettyPrint(JsonOutput.toJson([:]))
-                }
-            }
-        }
+	String safeHtml(def value) {
+		String text = safe(value)
+		text = text.replace('&', '&amp;')
+		text = text.replace('<', '&lt;')
+		text = text.replace('>', '&gt;')
+		text = text.replace('"', '&quot;')
+		return text
+	}
 
-        stage('🧪 Execute Test Suites') {
-            steps {
-                script {
-                    TEST_SUITES.each { suite ->
-                        stage("Suite • ${suite.label}") {
-                            runSuite(this, suite, params.SUITE_TIMEOUT_MINUTES.toInteger())
-                        }
-                    }
-                }
-            }
-        }
+	void logSeparator(String title) {
+		KeywordUtil.logInfo('============================================================')
+		KeywordUtil.logInfo(title)
+		KeywordUtil.logInfo('============================================================')
+	}
 
-        stage('📊 Build Last Report') {
-            steps {
-                script {
-                    buildDashboard(this)
-                    mirrorDashboardToRuntimeWorkspace(this)
-                }
-            }
-        }
-    }
+	String nowExecution() {
+		return new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+	}
 
-    post {
-        always {
-            script {
-                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                    buildDashboard(this)
-                    mirrorDashboardToRuntimeWorkspace(this)
-                }
+	String sanitizeFileName(String value) {
+		return safe(value).replaceAll('[\\\\/:*?"<>|]', '_').trim()
+	}
 
-                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                    stopGaiaProcessesFast(this, 'Build finished')
-                }
-            }
+	String formatDurationSeconds(BigDecimal totalSeconds) {
+		if (totalSeconds == null) {
+			return '0m 0s'
+		}
 
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                archiveArtifacts artifacts: "${env.RUNTIME_ARCHIVE_DIR}/**", allowEmptyArchive: true
-            }
+		long millis = (totalSeconds * 1000).longValue()
+		long hours = (long) (millis / 3600000)
+		long minutes = (long) ((millis % 3600000) / 60000)
+		long seconds = (long) ((millis % 60000) / 1000)
+		long ms = (long) (millis % 1000)
 
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                junit allowEmptyResults: true, testResults: "${env.RUNTIME_ARCHIVE_DIR}/**/JUnit_Report.xml, ${env.RUNTIME_ARCHIVE_DIR}/**/junit*.xml, ${env.RUNTIME_ARCHIVE_DIR}/**/JUnit*.xml, ${env.RUNTIME_ARCHIVE_DIR}/**/TEST-*.xml"
-            }
+		if (hours > 0) {
+			return "${hours}h ${minutes}m ${seconds}s ${ms}ms"
+		}
+		if (minutes > 0) {
+			return "${minutes}m ${seconds}s ${ms}ms"
+		}
+		return "${seconds}s ${ms}ms"
+	}
 
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                publishHTML(target: [
-                    allowMissing: true,
-                    alwaysLinkToLastBuild: true,
-                    keepAll: true,
-                    reportDir: "${env.RUNTIME_PUBLISH_DIR}",
-                    reportFiles: 'index.html',
-                    reportName: 'Gaia Test Report'
-                ])
-            }
-        }
+	boolean isSuccessStatus(int status) {
+		return status == 200 || status == 201 || status == 204
+	}
 
-        success {
-            echo '============================================================'
-            echo '✅ PIPELINE COMPLETED'
-            echo '============================================================'
-        }
+	// =========================================================
+	// REPORT PATH / SUITE NAME
+	// =========================================================
 
-        unstable {
-            echo '============================================================'
-            echo '⚠️ PIPELINE COMPLETED WITH FAILURES'
-            echo '============================================================'
-        }
+	String getReportPath() {
+		File file = new File(RunConfiguration.projectDir + File.separator + 'LastRun.xlsx')
+		if (!file.exists()) {
+			return ''
+		}
 
-        failure {
-            echo '============================================================'
-            echo '❌ PIPELINE FAILED'
-            echo '============================================================'
-        }
+		FileInputStream fis = null
+		XSSFWorkbook wb = null
 
-        aborted {
-            echo '============================================================'
-            echo '🛑 PIPELINE ABORTED'
-            echo '============================================================'
-        }
-    }
-}
+		try {
+			fis = new FileInputStream(file)
+			wb = new XSSFWorkbook(fis)
+			XSSFSheet sheet = wb.getSheetAt(0)
+			XSSFRow row = sheet.getRow(0)
 
-def runSuite(scriptRef, Map suite, int timeoutMinutes) {
-    def safeLabel = suite.label.replaceAll('[\\\\/:*?"<>|]', '_')
-    def suiteLog  = "${scriptRef.env.LOGS_DIR}\\${safeLabel}.log"
+			if (row == null || row.getCell(0) == null) {
+				return ''
+			}
 
-    int exitCode = 999
-    boolean timedOut = false
-    long startedAt = System.currentTimeMillis()
+			return safe(row.getCell(0).stringCellValue)
+		} finally {
+			try { if (wb != null) wb.close() } catch (Exception ignored) {}
+			try { if (fis != null) fis.close() } catch (Exception ignored) {}
+		}
+	}
 
-    scriptRef.catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-        try {
-            printSuiteStart(scriptRef, suite.label, suite.path, timeoutMinutes)
+	boolean isTimestampFolderName(String name) {
+		if (isBlank(name)) {
+			return false
+		}
 
-            scriptRef.bat """
-                @echo off
-                if exist "${suiteLog}" del /f /q "${suiteLog}" >nul 2>&1
-            """
+		return name ==~ /\d{8}_\d{6}/ || name ==~ /\d{14}/
+	}
 
-            try {
-                scriptRef.timeout(time: timeoutMinutes, unit: 'MINUTES') {
-                    exitCode = scriptRef.powershell(
-                        returnStatus: true,
-                        script: """
-                            \$arguments = @(
-                                '-noSplash',
-                                '-runMode=console',
-                                '-consoleLog',
-                                '-projectPath="${scriptRef.env.PROJECT_PATH}"',
-                                '-retry=0',
-                                '-testSuitePath="${suite.path}"',
-                                '-browserType="${scriptRef.env.BROWSER_TYPE}"',
-                                '-executionProfile="${scriptRef.env.EXEC_PROFILE}"',
-                                '-reportFolder="${scriptRef.env.REPORTS_ROOT}"'
-                            )
+	String getResolvedReportPath() {
+		String reportPath = getReportPath()
+		if (isBlank(reportPath)) {
+			return ''
+		}
 
-                            \$process = Start-Process -FilePath "${scriptRef.env.KATALON_EXE}" `
-                                                     -ArgumentList \$arguments `
-                                                     -RedirectStandardOutput "${suiteLog}" `
-                                                     -RedirectStandardError "${suiteLog}" `
-                                                     -Wait `
-                                                     -PassThru
-                            exit \$process.ExitCode
-                        """
-                    )
-                }
-            } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException ex) {
-                timedOut = true
-                exitCode = 124
-                stopGaiaProcessesFast(scriptRef, "Timeout on ${suite.label}")
-            }
+		File reportFolder = new File(reportPath)
+		if (reportFolder.exists()) {
+			return reportFolder.absolutePath
+		}
 
-            def summary = collectSuiteSummary(scriptRef, suite, startedAt, exitCode, timedOut, suiteLog)
-            saveSuiteSummary(scriptRef, suite.label, summary)
-            printSuiteResult(scriptRef, summary)
-            printExecutionSummary(scriptRef)
+		return reportPath
+	}
 
-            if (summary.status != 'PASSED') {
-                scriptRef.error("Suite failed: ${suite.label}")
-            }
-        } catch (Exception ex) {
-            def fallback = [
-                label    : suite.label,
-                path     : suite.path,
-                status   : 'FAILED',
-                mood     : '❌',
-                message  : shortenReason(ex.message ?: 'Unexpected pipeline error'),
-                executed : 0,
-                passed   : 0,
-                failed   : 0,
-                skipped  : 0,
-                report   : '',
-                junit    : ''
-            ]
-            saveSuiteSummary(scriptRef, suite.label, fallback)
-            printSuiteResult(scriptRef, fallback)
-            printExecutionSummary(scriptRef)
-            throw ex
-        }
-    }
-}
+	String resolveSuiteNameFromFolder(File folder) {
+		File current = folder
 
-def collectSuiteSummary(scriptRef, Map suite, long startedAt, int exitCode, boolean timedOut, String suiteLog) {
-    def artifacts = findLatestSuiteArtifacts(scriptRef, suite.label, startedAt)
-    def junitInfo = artifacts.junit ? parseJUnitFromFile(scriptRef.readFile(file: artifacts.junit)) : defaultJUnitSummary()
-    def logReason = scriptRef.fileExists(suiteLog) ? extractShortReason(scriptRef.readFile(file: suiteLog), timedOut) : ''
+		while (current != null && isTimestampFolderName(current.getName())) {
+			current = current.getParentFile()
+		}
 
-    String status = 'PASSED'
-    String mood = '✅'
-    String message = ''
+		if (current == null) {
+			return ''
+		}
 
-    if (timedOut) {
-        status = 'FAILED'
-        mood = '⏰'
-        message = 'Execution timed out | Suite exceeded allowed time | Review timeout or slow steps'
-    } else if (exitCode != 0 || junitInfo.failed > 0) {
-        status = 'FAILED'
-        mood = '❌'
-        message = logReason ?: 'Validation failed | Review the first failed step | Open suite report for details'
-    } else {
-        status = 'PASSED'
-        mood = '✅'
-        message = junitInfo.executed > 0
-            ? "${junitInfo.passed}/${junitInfo.executed} test cases passed | Suite finished successfully"
-            : 'Suite finished successfully | No failed test cases found'
-    }
+		return safe(current.getName())
+	}
 
-    return [
-        label    : suite.label,
-        path     : suite.path,
-        status   : status,
-        mood     : mood,
-        message  : shortenReason(message),
-        executed : junitInfo.executed,
-        passed   : junitInfo.passed,
-        failed   : junitInfo.failed,
-        skipped  : junitInfo.skipped,
-        report   : artifacts.report ?: '',
-        junit    : artifacts.junit ?: '',
-        baseDir  : artifacts.baseDir ?: ''
-    ]
-}
+	String getCurrentSuiteName() {
+		String reportPath = getResolvedReportPath()
+		if (isBlank(reportPath)) {
+			return ''
+		}
 
-def printSuiteStart(scriptRef, String label, String path, int timeoutMinutes) {
-    scriptRef.echo '╔════════════════════════════════════════════════════════════╗'
-    scriptRef.echo fitLine("║ 🚀 STARTING SUITE")
-    scriptRef.echo fitLine("║ ${label}")
-    scriptRef.echo fitLine("║ 📁 ${path}")
-    scriptRef.echo fitLine("║ ⏱️ ${timeoutMinutes} min timeout")
-    scriptRef.echo '╚════════════════════════════════════════════════════════════╝'
-}
+		File current = new File(reportPath)
+		if (!current.exists()) {
+			return ''
+		}
 
-def printSuiteResult(scriptRef, Map summary) {
-    scriptRef.echo '╔════════════════════════════════════════════════════════════╗'
-    scriptRef.echo fitLine("║ ${summary.mood}")
-    scriptRef.echo fitLine("║ ${summary.label}")
-    scriptRef.echo fitLine("║ ${summary.message}")
-    scriptRef.echo fitLine("║ Executed: ${summary.executed} | Passed: ${summary.passed} | Failed: ${summary.failed} | Skipped: ${summary.skipped}")
-    scriptRef.echo '╚════════════════════════════════════════════════════════════╝'
-}
+		return resolveSuiteNameFromFolder(current)
+	}
 
-def printExecutionSummary(scriptRef) {
-    def results = loadSuiteResults(scriptRef)
-    def all = results.values() as List
+	String getIssueBaseName() {
+		String suiteName = getCurrentSuiteName()
+		return isBlank(suiteName) ? 'Unnamed Suite' : suiteName
+	}
 
-    int passed = all.count { it.status == 'PASSED' }
-    int failed = all.count { it.status == 'FAILED' }
+	String getExecutionBaseName() {
+		return getIssueBaseName() + TEST_EXECUTION_SUFFIX
+	}
 
-    scriptRef.echo '============================================================'
-    scriptRef.echo "📌 EXECUTION SUMMARY | Passed: ${passed} | Failed: ${failed}"
-    scriptRef.echo '============================================================'
-}
+	String getExecutionSummary() {
+		return getExecutionBaseName() + ' ' + nowExecution()
+	}
 
-def buildDashboard(scriptRef) {
-    def results = loadSuiteResults(scriptRef)
+	String getTestPlanName() {
+		return getIssueBaseName() + TEST_PLAN_SUFFIX
+	}
 
-    def cards = TEST_SUITES.collect { suite ->
-        def item = results[suite.label] ?: [
-            label    : suite.label,
-            status   : 'NOT EXECUTED',
-            mood     : '⚪',
-            message  : 'Suite not executed',
-            executed : 0,
-            passed   : 0,
-            failed   : 0,
-            skipped  : 0,
-            report   : ''
-        ]
+	String getExecutionReportUploadName() {
+		return sanitizeFileName(getExecutionBaseName() + ' Report.html')
+	}
 
-        def css = item.status == 'PASSED' ? 'pass' : (item.status == 'FAILED' ? 'fail' : 'neutral')
-        def linkHtml = item.report ? "<a href=\"${escapeHtml(item.report)}\" target=\"_blank\">Open suite report</a>" : "<span>No suite report found</span>"
+	String getExecutionResultsZipFileName() {
+		return sanitizeFileName(getExecutionBaseName() + ' Results.zip')
+	}
 
-        return """
-            <div class="card ${css}">
-                <div class="icon">${escapeHtml(item.mood)}</div>
-                <div class="title">${escapeHtml(item.label)}</div>
-                <div class="msg">${escapeHtml(item.message)}</div>
-                <div class="meta">Executed: ${item.executed} | Passed: ${item.passed} | Failed: ${item.failed} | Skipped: ${item.skipped}</div>
-                <div class="link">${linkHtml}</div>
-            </div>
-        """
-    }.join('\n')
+	String getExecutionEvidencesZipFileName() {
+		return sanitizeFileName(getExecutionBaseName() + ' Evidences.zip')
+	}
 
-    def html = """
-<!DOCTYPE html>
+	// =========================================================
+	// TEST PLAN KEY CACHE
+	// =========================================================
+
+	String getSuiteTestPlanFilePath() {
+		File folder = new File(TEST_PLAN_KEYS_FOLDER)
+		if (!folder.exists()) {
+			folder.mkdirs()
+		}
+
+		return folder.absolutePath + File.separator + sanitizeFileName(getIssueBaseName()) + '.txt'
+	}
+
+	void saveTestPlanKey(String key) {
+		if (isBlank(key)) {
+			return
+		}
+
+		File file = new File(getSuiteTestPlanFilePath())
+		file.write(key.trim(), 'UTF-8')
+	}
+
+	String readSavedTestPlanKey() {
+		File file = new File(getSuiteTestPlanFilePath())
+		if (!file.exists()) {
+			return ''
+		}
+
+		return file.getText('UTF-8').trim()
+	}
+
+	void resetSavedTestPlanKey() {
+		File file = new File(getSuiteTestPlanFilePath())
+		if (file.exists()) {
+			file.delete()
+		}
+	}
+
+	// =========================================================
+	// XML / IMAGES / REPORT DATA
+	// =========================================================
+
+	String getXmlFilePath() {
+		String reportPath = getResolvedReportPath()
+		if (isBlank(reportPath)) {
+			return ''
+		}
+
+		File folder = new File(reportPath)
+		if (!folder.exists()) {
+			return ''
+		}
+
+		String found = ''
+
+		folder.eachFileRecurse(FileType.FILES) { File file ->
+			if (!isBlank(found)) {
+				return
+			}
+
+			if (
+				file.name.equalsIgnoreCase(PRIMARY_XML_FILE_NAME) ||
+				file.name.equalsIgnoreCase(SECONDARY_XML_FILE_NAME)
+			) {
+				found = file.absolutePath
+			}
+		}
+
+		return found
+	}
+
+	List<File> getFailureEvidenceImages() {
+		String reportPath = getResolvedReportPath()
+		if (isBlank(reportPath)) {
+			return []
+		}
+
+		File folder = new File(reportPath)
+		if (!folder.exists()) {
+			return []
+		}
+
+		List<File> images = []
+
+		folder.eachFileRecurse(FileType.FILES) { File file ->
+			String name = file.name.toLowerCase()
+
+			if (
+				name.endsWith('.png') ||
+				name.endsWith('.jpg') ||
+				name.endsWith('.jpeg')
+			) {
+				if (
+					!name.contains('navbar') &&
+					!name.contains('homepage') &&
+					!name.contains('logo')
+				) {
+					images.add(file)
+				}
+			}
+		}
+
+		images.sort { a, b -> a.lastModified() <=> b.lastModified() }
+		return images
+	}
+
+	String fileToBase64DataUri(File file) {
+		if (file == null || !file.exists()) {
+			return ''
+		}
+
+		String mime = 'image/png'
+		String lower = file.name.toLowerCase()
+
+		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+			mime = 'image/jpeg'
+		}
+
+		byte[] bytes = Files.readAllBytes(file.toPath())
+		String base64 = bytes.encodeBase64().toString()
+
+		return "data:${mime};base64,${base64}"
+	}
+
+	String getShortErrorLog(String stackTrace) {
+		if (isBlank(stackTrace)) {
+			return ''
+		}
+
+		List<String> lines = stackTrace.readLines()
+			.collect { it?.trim() }
+			.findAll { !isBlank(it) }
+
+		List<String> selected = []
+
+		for (String line : lines) {
+			String lower = line.toLowerCase()
+
+			if (
+				lower.contains('exception') ||
+				lower.contains('error') ||
+				lower.contains('caused by') ||
+				lower.contains('timed out') ||
+				lower.contains('not found') ||
+				lower.contains('not clickable') ||
+				lower.contains('unable') ||
+				lower.contains('failed')
+			) {
+				selected.add(line)
+			}
+
+			if (selected.size() >= 3) {
+				break
+			}
+		}
+
+		if (selected.isEmpty()) {
+			selected = lines.take(3)
+		}
+
+		return selected.join('\n')
+	}
+
+	Map parseSuiteData(String xmlPath) {
+		def xml = new XmlSlurper(false, false).parse(new File(xmlPath))
+
+		List suiteNodes = []
+		if (xml.name() == 'testsuite') {
+			suiteNodes.add(xml)
+		} else {
+			suiteNodes.addAll(xml.testsuite)
+		}
+
+		BigDecimal totalTime = 0
+		List<Map> failedTests = []
+		List<Map> passedTests = []
+
+		int executed = 0
+		int failed = 0
+		int skipped = 0
+
+		List<File> evidenceImages = getFailureEvidenceImages()
+		int evidenceIndex = 0
+
+		suiteNodes.each { suite ->
+			suite.testcase.each { tc ->
+				executed++
+
+				String className = safe(tc.@classname?.text())
+				String testName = safe(tc.@name?.text())
+
+				BigDecimal timeSeconds = 0
+				try {
+					timeSeconds = new BigDecimal(safe(tc.@time?.text() ?: '0'))
+				} catch (Exception ignored) {
+					timeSeconds = 0
+				}
+
+				totalTime = totalTime + timeSeconds
+
+				boolean hasFailure = tc.failure.size() > 0 || tc.error.size() > 0
+				boolean hasSkipped = tc.skipped.size() > 0
+
+				if (hasSkipped) {
+					skipped++
+				}
+
+				if (hasFailure) {
+					failed++
+
+					def failNode = tc.failure.size() > 0 ? tc.failure[0] : tc.error[0]
+					String message = safe(failNode.@message?.text())
+					String stackTrace = safe(failNode.text())
+
+					File imageFile = null
+					if (evidenceIndex < evidenceImages.size()) {
+						imageFile = evidenceImages[evidenceIndex]
+						evidenceIndex++
+					}
+
+					failedTests.add([
+						className     : className,
+						testName      : testName,
+						failureMessage: message,
+						stackTrace    : stackTrace,
+						timeSeconds   : timeSeconds,
+						imageData     : imageFile != null ? fileToBase64DataUri(imageFile) : ''
+					])
+				} else if (!hasSkipped) {
+					passedTests.add([
+						className   : className,
+						testName    : testName,
+						timeSeconds : timeSeconds
+					])
+				}
+			}
+		}
+
+		int passed = executed - failed - skipped
+		if (passed < 0) {
+			passed = 0
+		}
+
+		return [
+			suiteName   : getIssueBaseName(),
+			startText   : new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy').format(new Date()),
+			endText     : new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy').format(new Date()),
+			suiteTime   : totalTime,
+			executed    : executed,
+			passed      : passed,
+			failed      : failed,
+			skipped     : skipped,
+			failedTests : failedTests,
+			passedTests : passedTests
+		]
+	}
+
+	// =========================================================
+	// HTML REPORT
+	// =========================================================
+
+	String buildFailedCaseHtml(Map item) {
+		String shortLog = getShortErrorLog(item.stackTrace as String)
+
+		return """
+		<div class="case failure">
+			<div class="case-title">${safeHtml((item.className ?: '') + '/' + (item.testName ?: ''))}</div>
+			<div class="case-line">❗ Mandatory failure</div>
+			${isBlank(item.failureMessage) ? '' : '<div class="case-line">' + safeHtml(item.failureMessage) + '</div>'}
+			<div class="case-line">⏱ Duration: ${safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal))}</div>
+			${isBlank(shortLog) ? '' : '<pre class="short-log">' + safeHtml(shortLog) + '</pre>'}
+			<details class="details">
+				<summary>🔎 See full error log</summary>
+				<pre class="full-log">${safeHtml(item.stackTrace as String)}</pre>
+			</details>
+			${isBlank(item.imageData) ? '' : '<img class="evidence" src="' + item.imageData + '" alt="Failure evidence" />'}
+		</div>
+		"""
+	}
+
+	String buildPassedCaseHtml(Map item) {
+		return """
+		<div class="case success">
+			<div class="case-title">${safeHtml((item.className ?: '') + '/' + (item.testName ?: ''))}</div>
+			<div class="case-line">✅ Test Passed</div>
+			<div class="case-line">⏱ Duration: ${safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal))}</div>
+		</div>
+		"""
+	}
+
+	String buildGaiaReportHtml(Map suiteData) {
+		BigDecimal avgTime = 0
+		if ((suiteData.executed as Integer) > 0) {
+			avgTime = (suiteData.suiteTime as BigDecimal) / (suiteData.executed as Integer)
+		}
+
+		String failedHtml = (suiteData.failedTests as List<Map>).collect { buildFailedCaseHtml(it) }.join('\n')
+		String passedHtml = (suiteData.passedTests as List<Map>).collect { buildPassedCaseHtml(it) }.join('\n')
+
+		return """<!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Gaia Test Report</title>
-<style>
-body { font-family: Arial, sans-serif; background:#f5f7fb; color:#1f2937; margin:0; padding:24px; }
-h1 { margin:0 0 8px 0; font-size:28px; }
-.sub { color:#64748b; margin-bottom:24px; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:16px; }
-.card { background:#ffffff; border-radius:16px; padding:18px; box-shadow:0 2px 10px rgba(0,0,0,.08); border-left:8px solid #cbd5e1; }
-.card.pass { border-left-color:#22c55e; }
-.card.fail { border-left-color:#ef4444; }
-.card.neutral { border-left-color:#94a3b8; }
-.icon { font-size:24px; margin-bottom:8px; }
-.title { font-size:18px; font-weight:700; margin-bottom:8px; }
-.msg { font-size:14px; margin-bottom:8px; color:#334155; }
-.meta { font-size:13px; color:#64748b; margin-bottom:8px; }
-a { color:#2563eb; text-decoration:none; font-weight:600; }
-span { color:#94a3b8; }
-</style>
+	<meta charset="UTF-8">
+	<title>Windows Test Execution Report - Gaia</title>
+	<style>
+		body {
+			font-family: Arial, Helvetica, sans-serif;
+			background: #ffffff;
+			color: #111111;
+			margin: 0;
+			padding: 24px;
+		}
+		h1 {
+			font-size: 18px;
+			margin: 0 0 20px 0;
+			font-weight: 700;
+		}
+		.top-grid {
+			display: grid;
+			grid-template-columns: 2.3fr 1fr 1fr 1fr 0.8fr 0.8fr 0.8fr 0.8fr 1fr;
+			column-gap: 16px;
+			row-gap: 10px;
+			margin-bottom: 24px;
+		}
+		.box-label {
+			font-size: 10px;
+			color: #7b7b7b;
+			text-transform: uppercase;
+			margin-bottom: 4px;
+		}
+		.box-value {
+			font-size: 12px;
+			line-height: 1.4;
+			word-break: break-word;
+		}
+		.section-title {
+			font-size: 16px;
+			font-weight: 700;
+			margin: 20px 0 12px 0;
+		}
+		.section-title.failed {
+			color: #b91c1c;
+		}
+		.section-title.passed {
+			color: #166534;
+		}
+		.case {
+			padding-left: 12px;
+			margin-bottom: 22px;
+		}
+		.case.failure {
+			border-left: 3px solid #d32f2f;
+		}
+		.case.success {
+			border-left: 3px solid #2e7d32;
+		}
+		.case-title {
+			font-size: 13px;
+			font-weight: 700;
+			margin-bottom: 5px;
+		}
+		.case-line {
+			font-size: 12px;
+			line-height: 1.45;
+			margin-bottom: 3px;
+		}
+		.short-log {
+			font-size: 11px;
+			line-height: 1.45;
+			white-space: pre-wrap;
+			margin: 8px 0;
+			padding: 0;
+			background: transparent;
+			border: none;
+			font-family: Arial, Helvetica, sans-serif;
+		}
+		.details {
+			margin-top: 8px;
+			margin-bottom: 10px;
+		}
+		.details summary {
+			cursor: pointer;
+			font-size: 12px;
+		}
+		.full-log {
+			font-size: 11px;
+			line-height: 1.45;
+			white-space: pre-wrap;
+			margin-top: 8px;
+			padding: 0;
+			background: transparent;
+			border: none;
+			font-family: Arial, Helvetica, sans-serif;
+		}
+		.evidence {
+			margin-top: 10px;
+			max-width: 320px;
+			height: auto;
+			border: 1px solid #d6d6d6;
+			display: block;
+		}
+		.empty {
+			font-size: 12px;
+			color: #666666;
+		}
+	</style>
 </head>
 <body>
-    <h1>Gaia Test Report</h1>
-    <div class="sub">Build #${escapeHtml(scriptRef.env.BUILD_NUMBER)} | Gaia Corrections</div>
-    <div class="grid">
-        ${cards}
-    </div>
+	<h1>Windows Test Execution Report - Gaia</h1>
+
+	<div class="top-grid">
+		<div>
+			<div class="box-label">Suite</div>
+			<div class="box-value">${safeHtml(suiteData.suiteName)}</div>
+		</div>
+		<div>
+			<div class="box-label">Start</div>
+			<div class="box-value">${safeHtml(suiteData.startText)}</div>
+		</div>
+		<div>
+			<div class="box-label">End</div>
+			<div class="box-value">${safeHtml(suiteData.endText)}</div>
+		</div>
+		<div>
+			<div class="box-label">Suite Duration</div>
+			<div class="box-value">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
+		</div>
+		<div>
+			<div class="box-label">Executed</div>
+			<div class="box-value">${suiteData.executed}</div>
+		</div>
+		<div>
+			<div class="box-label">Passed</div>
+			<div class="box-value">${suiteData.passed}</div>
+		</div>
+		<div>
+			<div class="box-label">Failed</div>
+			<div class="box-value">${suiteData.failed}</div>
+		</div>
+		<div>
+			<div class="box-label">Skipped</div>
+			<div class="box-value">${suiteData.skipped}</div>
+		</div>
+		<div>
+			<div class="box-label">Avg/Test</div>
+			<div class="box-value">${safeHtml(formatDurationSeconds(avgTime))}</div>
+		</div>
+	</div>
+
+	<div class="section-title failed">✘ Failed (${suiteData.failed})</div>
+	${isBlank(failedHtml) ? '<div class="empty">No failed tests.</div>' : failedHtml}
+
+	<div class="section-title passed">☑ Passed (${suiteData.passed})</div>
+	${isBlank(passedHtml) ? '<div class="empty">No passed tests.</div>' : passedHtml}
 </body>
-</html>
-"""
-    writeFile file: "${scriptRef.env.DASHBOARD_FIXED_DIR}\\index.html", text: html
-}
+</html>"""
+	}
 
-def mirrorDashboardToRuntimeWorkspace(scriptRef) {
-    def runtimePublish = "${scriptRef.env.WORKSPACE}\\${scriptRef.env.RUNTIME_PUBLISH_DIR}"
-    def runtimeArchive = "${scriptRef.env.WORKSPACE}\\${scriptRef.env.RUNTIME_ARCHIVE_DIR}"
+	String buildGaiaReport() {
+		String xmlPath = getXmlFilePath()
+		if (isBlank(xmlPath)) {
+			KeywordUtil.logInfo('Gaia report was not created because XML file was not found.')
+			return ''
+		}
 
-    scriptRef.powershell """
-        \$publish = "${runtimePublish}"
-        \$archive = "${runtimeArchive}"
-        \$fixedReports = "${scriptRef.env.REPORTS_ROOT}"
-        \$fixedDashboard = "${scriptRef.env.DASHBOARD_FIXED_DIR}"
+		String reportPath = getResolvedReportPath()
+		if (isBlank(reportPath)) {
+			KeywordUtil.logInfo('Gaia report was not created because report folder was not found.')
+			return ''
+		}
 
-        if (Test-Path \$publish) { Remove-Item \$publish -Recurse -Force -ErrorAction SilentlyContinue }
-        if (Test-Path \$archive) { Remove-Item \$archive -Recurse -Force -ErrorAction SilentlyContinue }
+		Map suiteData = parseSuiteData(xmlPath)
+		String html = buildGaiaReportHtml(suiteData)
 
-        New-Item -ItemType Directory -Path \$publish | Out-Null
-        New-Item -ItemType Directory -Path \$archive | Out-Null
+		File output = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
+		output.write(html, 'UTF-8')
 
-        if (Test-Path \$fixedDashboard) {
-            Copy-Item -Path (Join-Path \$fixedDashboard '*') -Destination \$publish -Recurse -Force
-        }
+		KeywordUtil.logInfo('Gaia report created: ' + output.absolutePath)
+		return output.absolutePath
+	}
 
-        if (Test-Path \$fixedReports) {
-            Copy-Item -Path (Join-Path \$fixedReports '*') -Destination \$archive -Recurse -Force
-        }
-    """
-}
+	// =========================================================
+	// FILE READY / COPY / ZIP
+	// =========================================================
 
-def saveSuiteSummary(scriptRef, String key, Map summary) {
-    def current = loadSuiteResults(scriptRef)
-    current[key] = summary
-    writeFile file: scriptRef.env.RESULTS_JSON, text: JsonOutput.prettyPrint(JsonOutput.toJson(current))
-}
+	boolean waitUntilFileReady(String filePath, int maxAttempts = 12, int sleepMillis = 500) {
+		if (isBlank(filePath)) {
+			return false
+		}
 
-def loadSuiteResults(scriptRef) {
-    if (!scriptRef.fileExists(scriptRef.env.RESULTS_JSON)) {
-        return [:]
-    }
-    def txt = scriptRef.readFile(file: scriptRef.env.RESULTS_JSON).trim()
-    if (!txt) {
-        return [:]
-    }
-    return new JsonSlurperClassic().parseText(txt) as Map
-}
+		File file = new File(filePath)
+		if (!file.exists()) {
+			return false
+		}
 
-def findLatestSuiteArtifacts(scriptRef, String suiteLabel, long startedAt) {
-    def encoded = suiteLabel.replace("'", "''")
-    def json = scriptRef.powershell(
-        returnStdout: true,
-        script: """
-            \$root = "${scriptRef.env.REPORTS_ROOT}"
-            \$suite = '${encoded}'
-            \$start = [DateTimeOffset]::FromUnixTimeMilliseconds(${startedAt}).DateTime
+		for (int i = 0; i < maxAttempts; i++) {
+			RandomAccessFile raf = null
+			try {
+				raf = new RandomAccessFile(file, 'r')
+				raf.length()
+				return true
+			} catch (Exception ignored) {
+			} finally {
+				try { if (raf != null) raf.close() } catch (Exception ignored) {}
+			}
 
-            if (!(Test-Path \$root)) {
-                Write-Output '{}'
-                exit 0
-            }
+			Thread.sleep(sleepMillis)
+		}
 
-            \$dirs = Get-ChildItem -Path \$root -Recurse -Directory -ErrorAction SilentlyContinue |
-                    Where-Object {
-                        \$_.FullName -like "*\\\\\$suite\\\\*" -and \$_.LastWriteTime -ge \$start.AddMinutes(-2)
-                    } |
-                    Sort-Object LastWriteTime -Descending
+		return false
+	}
 
-            \$baseDir = \$null
-            \$reportFile = \$null
-            \$junitFile = \$null
+	String createSafeUploadCopy(String originalFilePath, String preferredName) {
+		if (isBlank(originalFilePath)) {
+			return ''
+		}
 
-            foreach (\$dir in \$dirs) {
-                \$reportCandidate = Get-ChildItem -Path \$dir.FullName -Recurse -File -Include *.html -ErrorAction SilentlyContinue |
-                    Where-Object { \$_.Name -match '^(?i)(index|report|HarmonyReport).*\\.html$' } |
-                    Select-Object -First 1
+		File original = new File(originalFilePath)
+		if (!original.exists() || original.length() == 0) {
+			return ''
+		}
 
-                \$junitCandidate = Get-ChildItem -Path \$dir.FullName -Recurse -File -Include 'JUnit_Report.xml','junit*.xml','JUnit*.xml','TEST-*.xml' -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
+		waitUntilFileReady(original.absolutePath, 12, 500)
 
-                if (\$reportCandidate -or \$junitCandidate) {
-                    \$baseDir = \$dir.FullName
-                    if (\$reportCandidate) { \$reportFile = \$reportCandidate.FullName }
-                    if (\$junitCandidate) { \$junitFile = \$junitCandidate.FullName }
-                    break
-                }
-            }
+		File reportFolder = new File(getResolvedReportPath())
+		if (!reportFolder.exists()) {
+			return ''
+		}
 
-            \$obj = @{
-                baseDir = if (\$baseDir) { \$baseDir } else { '' }
-                report  = if (\$reportFile) { \$reportFile } else { '' }
-                junit   = if (\$junitFile) { \$junitFile } else { '' }
-            }
+		File tmpFolder = new File(reportFolder, '_jira_upload_tmp')
+		if (!tmpFolder.exists()) {
+			tmpFolder.mkdirs()
+		}
 
-            \$obj | ConvertTo-Json -Compress
-        """
-    ).trim()
+		String finalName = isBlank(preferredName) ? original.name : preferredName
+		File copied = new File(tmpFolder, sanitizeFileName(finalName))
 
-    def parsed = json ? new JsonSlurperClassic().parseText(json) : [:]
+		if (copied.exists()) {
+			copied.delete()
+		}
 
-    def reportRelative = ''
-    if (parsed.report) {
-        reportRelative = makeRelativeForDashboard(parsed.report.toString())
-    }
+		Files.copy(original.toPath(), copied.toPath(), StandardCopyOption.REPLACE_EXISTING)
+		waitUntilFileReady(copied.absolutePath, 12, 500)
 
-    return [
-        baseDir : parsed.baseDir?.toString() ?: '',
-        report  : reportRelative ?: '',
-        junit   : parsed.junit?.toString() ?: ''
-    ]
-}
+		return copied.absolutePath
+	}
 
-@NonCPS
-def parseJUnitFromFile(String xmlText) {
-    if (!xmlText?.trim()) {
-        return defaultJUnitSummary()
-    }
+	String zipReports() {
+		String reportPath = getResolvedReportPath()
+		if (isBlank(reportPath)) {
+			return ''
+		}
 
-    def executed = countMatches(xmlText, '<testcase\\b')
-    def failedByFailure = countMatches(xmlText, '<failure\\b')
-    def failedByError = countMatches(xmlText, '<error\\b')
-    def skipped = countMatches(xmlText, '<skipped\\b')
-    def failed = failedByFailure + failedByError
-    def passed = Math.max(0, executed - failed - skipped)
+		File reportFolder = new File(reportPath)
+		if (!reportFolder.exists()) {
+			return ''
+		}
 
-    return [
-        executed: executed,
-        passed  : passed,
-        failed  : failed,
-        skipped : skipped
-    ]
-}
+		File zipFile = new File(reportFolder, getExecutionResultsZipFileName())
+		if (zipFile.exists()) {
+			zipFile.delete()
+		}
 
-@NonCPS
-def defaultJUnitSummary() {
-    return [executed: 0, passed: 0, failed: 0, skipped: 0]
-}
+		ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zipFile))
+		try {
+			reportFolder.eachFile { File file ->
+				if (!file.isFile()) {
+					return
+				}
 
-@NonCPS
-def countMatches(String text, String regex) {
-    def matcher = Pattern.compile(regex).matcher(text)
-    int count = 0
-    while (matcher.find()) {
-        count++
-    }
-    return count
-}
+				if (file.name.equalsIgnoreCase(zipFile.name)) {
+					return
+				}
 
-@NonCPS
-def extractShortReason(String logText, boolean timedOut) {
-    if (timedOut) {
-        return 'Execution timed out | Suite exceeded allowed time | Review timeout or slow steps'
-    }
+				if (file.name.equalsIgnoreCase(GAIA_REPORT_FILE_NAME)) {
+					return
+				}
 
-    if (!logText?.trim()) {
-        return 'Execution failed | No detailed log message found | Open suite report for details'
-    }
+				output.putNextEntry(new ZipEntry(file.name))
 
-    def lines = logText
-        .replace('\r', '\n')
-        .split('\n')
-        .collect { it.trim() }
-        .findAll { it }
+				FileInputStream input = new FileInputStream(file)
+				try {
+					byte[] buffer = new byte[4096]
+					int read
+					while ((read = input.read(buffer)) != -1) {
+						output.write(buffer, 0, read)
+					}
+				} finally {
+					input.close()
+				}
 
-    def candidates = []
-    lines.each { line ->
-        def lower = line.toLowerCase()
-        if (
-            lower.contains('stepfailedexception') ||
-            lower.contains('unable to recognize image') ||
-            lower.contains('not found') ||
-            lower.contains('invalidconsoleargumentexception') ||
-            lower.contains('executionexception') ||
-            lower.contains('error') ||
-            lower.contains('exception') ||
-            lower.contains('failed')
-        ) {
-            candidates << line
-        }
-    }
+				output.closeEntry()
+			}
+		} finally {
+			output.close()
+		}
 
-    def joined = candidates.take(3).join(' | ')
-    return shortenReason(joined ?: lines.take(3).join(' | '))
-}
+		return zipFile.absolutePath
+	}
 
-@NonCPS
-def shortenReason(String raw) {
-    if (!raw) {
-        return 'Execution failed | Open suite report for details'
-    }
+	String zipEvidences() {
+		String reportPath = getResolvedReportPath()
+		if (isBlank(reportPath)) {
+			return ''
+		}
 
-    def text = raw.replaceAll('\\s+', ' ').trim()
+		File reportFolder = new File(reportPath)
+		File evidenceFolder = new File(reportFolder, EVIDENCE_FOLDER_NAME)
 
-    if (text.toLowerCase().contains('timed out')) {
-        return 'Execution timed out | Suite exceeded allowed time | Review timeout or slow steps'
-    }
-    if (text.toLowerCase().contains('not found')) {
-        return 'Required item not found | A file, element, or object was missing | Review locators or test data'
-    }
-    if (text.toLowerCase().contains('unable to recognize image')) {
-        return 'Visual validation failed | Expected image was not recognized | Review image baseline or screen state'
-    }
-    if (text.toLowerCase().contains('invalidconsoleargumentexception')) {
-        return 'Invalid suite configuration | Test suite path was not accepted | Review suite path in Jenkins'
-    }
-    if (text.toLowerCase().contains('stepfailedexception')) {
-        return 'Validation step failed | One mandatory verification did not pass | Open suite report for details'
-    }
-    if (text.toLowerCase().contains('files for the test not found')) {
-        return 'Missing test files | Required input files were not found | Review test data and file paths'
-    }
+		if (!evidenceFolder.exists()) {
+			return ''
+		}
 
-    def parts = text.split('\\|').collect { it.trim() }.findAll { it }
-    return parts.take(3).join(' | ')
-}
+		File zipFile = new File(reportFolder, getExecutionEvidencesZipFileName())
+		if (zipFile.exists()) {
+			zipFile.delete()
+		}
 
-@NonCPS
-def fitLine(String raw) {
-    def s = raw ?: ''
-    if (s.length() > 58) {
-        s = s.substring(0, 57)
-    }
-    return s.padRight(60) + '║'
-}
+		ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zipFile))
+		try {
+			evidenceFolder.eachFileRecurse(FileType.FILES) { File file ->
+				if (file.name.toLowerCase().endsWith('.zip')) {
+					return
+				}
 
-@NonCPS
-def escapeHtml(String value) {
-    if (value == null) {
-        return ''
-    }
-    return value
-        .replace('&', '&amp;')
-        .replace('<', '&lt;')
-        .replace('>', '&gt;')
-        .replace('"', '&quot;')
-        .replace("'", '&#39;')
-}
+				String relativeName = evidenceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+				output.putNextEntry(new ZipEntry(relativeName))
 
-@NonCPS
-def makeRelativeForDashboard(String absoluteReportPath) {
-    if (!absoluteReportPath) {
-        return ''
-    }
+				FileInputStream input = new FileInputStream(file)
+				try {
+					byte[] buffer = new byte[4096]
+					int read
+					while ((read = input.read(buffer)) != -1) {
+						output.write(buffer, 0, read)
+					}
+				} finally {
+					input.close()
+				}
 
-    def normalized = absoluteReportPath.replace('/', '\\')
-    def idx = normalized.indexOf('\\Reports\\')
-    if (idx < 0) {
-        return ''
-    }
+				output.closeEntry()
+			}
+		} finally {
+			output.close()
+		}
 
-    def rel = normalized.substring(idx + '\\Reports\\'.length()).replace('\\', '/')
-    return "../${rel}"
-}
+		return zipFile.absolutePath
+	}
 
-def stopGaiaProcessesFast(scriptRef, String reason) {
-    scriptRef.echo "🧹 Stopping Gaia processes | ${reason}"
+	// =========================================================
+	// HTTP HELPERS
+	// =========================================================
 
-    scriptRef.powershell """
-        \$patterns = @(
-            'gaia-start-back.bat',
-            'gaia-start-front.bat',
-            'gaia_web_portal_back',
-            'gaia_web_portal',
-            'spring-boot:run',
-            'NODE_ENV=development',
-            '--port 4200'
-        )
+	String readResponseText(HttpURLConnection connection, int status) {
+		InputStream stream = null
+		BufferedReader br = null
 
-        \$processes = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            \$cmd = (\$_.CommandLine | Out-String)
-            if ([string]::IsNullOrWhiteSpace(\$cmd)) { return \$false }
-            foreach (\$p in \$patterns) {
-                if (\$cmd -like "*\$p*") { return \$true }
-            }
-            return \$false
-        }
+		try {
+			try {
+				stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream()
+			} catch (Exception ignored) {
+				stream = null
+			}
 
-        foreach (\$proc in \$processes) {
-            try {
-                Stop-Process -Id \$proc.ProcessId -Force -ErrorAction SilentlyContinue
-            } catch {}
-        }
+			if (stream == null) {
+				return ''
+			}
 
-        try {
-            schtasks /end /tn "${scriptRef.env.GAIA_START_TASK}" > \$null 2>&1
-        } catch {}
+			br = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))
+			StringBuilder sb = new StringBuilder()
+			String line
 
-        exit 0
-    """
+			while ((line = br.readLine()) != null) {
+				sb.append(line)
+			}
+
+			return sb.toString()
+		} finally {
+			try { if (br != null) br.close() } catch (Exception ignored) {}
+			try { if (stream != null) stream.close() } catch (Exception ignored) {}
+		}
+	}
+
+	Map parseJsonSafe(String responseText) {
+		if (isBlank(responseText)) {
+			return [parsed: null, raw: '']
+		}
+
+		try {
+			return [parsed: new JsonSlurper().parseText(responseText), raw: responseText]
+		} catch (Exception ignored) {
+			return [parsed: responseText, raw: responseText]
+		}
+	}
+
+	Map httpJson(String method, String endpoint, Map body = null, Map<String, String> extraHeaders = [:]) {
+		HttpURLConnection connection = null
+
+		try {
+			URL url = new URL(BASE_URL + endpoint)
+			connection = (HttpURLConnection) url.openConnection()
+			connection.setRequestMethod(method)
+			connection.setRequestProperty('Authorization', 'Bearer ' + JIRA_TOKEN)
+			connection.setRequestProperty('Accept', 'application/json')
+			connection.setRequestProperty('Content-Type', 'application/json')
+			connection.setDoInput(true)
+
+			extraHeaders.each { k, v ->
+				connection.setRequestProperty(k, v)
+			}
+
+			if (body != null) {
+				connection.setDoOutput(true)
+				byte[] data = JsonOutput.toJson(body).getBytes(StandardCharsets.UTF_8)
+				OutputStream os = connection.getOutputStream()
+				try {
+					os.write(data)
+					os.flush()
+				} finally {
+					os.close()
+				}
+			}
+
+			int status = connection.getResponseCode()
+			String responseText = readResponseText(connection, status)
+			Map parsed = parseJsonSafe(responseText)
+
+			return [status: status, body: parsed.parsed, raw: parsed.raw]
+		} finally {
+			try { if (connection != null) connection.disconnect() } catch (Exception ignored) {}
+		}
+	}
+
+	Map httpMultipart(String method, String endpoint, File file, String formFieldName = 'file', Map<String, String> extraHeaders = [:]) {
+		HttpURLConnection connection = null
+		String boundary = '----KATALON-JIRA-' + System.currentTimeMillis()
+
+		try {
+			URL url = new URL(BASE_URL + endpoint)
+			connection = (HttpURLConnection) url.openConnection()
+			connection.setRequestMethod(method)
+			connection.setRequestProperty('Authorization', 'Bearer ' + JIRA_TOKEN)
+			connection.setRequestProperty('Accept', 'application/json')
+			connection.setRequestProperty('X-Atlassian-Token', 'no-check')
+			connection.setRequestProperty('Content-Type', 'multipart/form-data; boundary=' + boundary)
+			connection.setDoOutput(true)
+			connection.setDoInput(true)
+
+			extraHeaders.each { k, v ->
+				connection.setRequestProperty(k, v)
+			}
+
+			OutputStream os = connection.getOutputStream()
+			try {
+				String header = ''
+				header += '--' + boundary + '\r\n'
+				header += 'Content-Disposition: form-data; name="' + formFieldName + '"; filename="' + file.getName() + '"\r\n'
+				header += 'Content-Type: application/octet-stream\r\n\r\n'
+
+				os.write(header.getBytes(StandardCharsets.UTF_8))
+				Files.copy(file.toPath(), os)
+				os.write('\r\n'.getBytes(StandardCharsets.UTF_8))
+				os.write(('--' + boundary + '--\r\n').getBytes(StandardCharsets.UTF_8))
+				os.flush()
+			} finally {
+				os.close()
+			}
+
+			int status = connection.getResponseCode()
+			String responseText = readResponseText(connection, status)
+			Map parsed = parseJsonSafe(responseText)
+
+			return [status: status, body: parsed.parsed, raw: parsed.raw]
+		} finally {
+			try { if (connection != null) connection.disconnect() } catch (Exception ignored) {}
+		}
+	}
+
+	// =========================================================
+	// JIRA / XRAY METHODS
+	// =========================================================
+
+	String extractExecutionKeyFromImportResponse(def body) {
+		String key = safe(body?.testExecIssue?.key)
+		if (!isBlank(key)) {
+			return key
+		}
+
+		key = safe(body?.key)
+		if (!isBlank(key)) {
+			return key
+		}
+
+		return ''
+	}
+
+	String importExecutionResults(String xmlPath) {
+		File xmlFile = new File(xmlPath)
+		if (!xmlFile.exists()) {
+			return 'ERROR_XML_NOT_FOUND'
+		}
+
+		Map response = httpMultipart(
+			'POST',
+			'/rest/raven/1.0/import/execution/junit?projectKey=' + URLEncoder.encode(PROJECT_KEY, 'UTF-8'),
+			xmlFile,
+			'file'
+		)
+
+		KeywordUtil.logInfo('Import results status: ' + response.status)
+		KeywordUtil.logInfo('Import results response: ' + response.raw)
+
+		if (isSuccessStatus(response.status)) {
+			String key = extractExecutionKeyFromImportResponse(response.body)
+			return isBlank(key) ? '' : key
+		}
+
+		return 'ERROR' + response.status
+	}
+
+	int updateExecutionIssue(String issueKey, String summary) {
+		Map fields = [
+			summary     : summary,
+			labels      : isBlank(LABELS) ? [] : LABELS.split(',').collect { it.trim() }.findAll { !isBlank(it) },
+			environment : ENVIRONMENT
+		]
+
+		if (!isBlank(EPIC_KEY)) {
+			fields[EPIC_LINK_FIELD_ID] = EPIC_KEY
+		}
+
+		Map response = httpJson('PUT', '/rest/api/2/issue/' + issueKey, [fields: fields])
+
+		KeywordUtil.logInfo('Update Test Execution status: ' + response.status)
+		KeywordUtil.logInfo('Update Test Execution response: ' + response.raw)
+
+		return response.status
+	}
+
+	boolean issueExists(String issueKey) {
+		if (isBlank(issueKey)) {
+			return false
+		}
+
+		Map response = httpJson('GET', '/rest/api/2/issue/' + issueKey)
+		return response.status == 200
+	}
+
+	boolean sameEpic(def issueFields) {
+		if (isBlank(EPIC_KEY)) {
+			return true
+		}
+
+		String currentEpic = safe(issueFields?."${EPIC_LINK_FIELD_ID}")
+		return currentEpic.equalsIgnoreCase(EPIC_KEY)
+	}
+
+	String findExistingTestPlanKeyByName(String summary) {
+		if (isBlank(summary)) {
+			return ''
+		}
+
+		String escapedSummaryForJql = summary.replace('\\', '\\\\').replace('"', '\\"')
+		String jql = 'project = "' + PROJECT_KEY + '" AND issuetype = "Test Plan" AND summary ~ "\\"' + escapedSummaryForJql + '\\"" ORDER BY created DESC'
+		String fields = 'summary,' + EPIC_LINK_FIELD_ID
+		String endpoint = '/rest/api/2/search?jql=' + URLEncoder.encode(jql, 'UTF-8') + '&fields=' + URLEncoder.encode(fields, 'UTF-8')
+
+		Map response = httpJson('GET', endpoint)
+
+		KeywordUtil.logInfo('Find existing Test Plan status: ' + response.status)
+		KeywordUtil.logInfo('Find existing Test Plan response: ' + response.raw)
+
+		if (response.status != 200) {
+			return ''
+		}
+
+		List issues = response.body?.issues ?: []
+
+		for (def issue : issues) {
+			String issueSummary = safe(issue?.fields?.summary)
+
+			if (issueSummary.equalsIgnoreCase(summary) && sameEpic(issue?.fields)) {
+				return safe(issue?.key)
+			}
+		}
+
+		return ''
+	}
+
+	String createTestPlan(String summary) {
+		Map fields = [
+			project  : [key: PROJECT_KEY],
+			summary  : summary,
+			issuetype: [name: 'Test Plan']
+		]
+
+		if (!isBlank(LABELS)) {
+			fields.labels = LABELS.split(',').collect { it.trim() }.findAll { !isBlank(it) }
+		}
+
+		if (!isBlank(EPIC_KEY)) {
+			fields[EPIC_LINK_FIELD_ID] = EPIC_KEY
+		}
+
+		Map response = httpJson('POST', '/rest/api/2/issue', [fields: fields])
+
+		KeywordUtil.logInfo('Create Test Plan status: ' + response.status)
+		KeywordUtil.logInfo('Create Test Plan response: ' + response.raw)
+
+		if (response.status == 200 || response.status == 201) {
+			return safe(response.body?.key)
+		}
+
+		return 'ERROR' + response.status
+	}
+
+	String getOrCreateTestPlan() {
+		if (RESET_SAVED_TEST_PLAN_KEY) {
+			resetSavedTestPlanKey()
+		}
+
+		if (!isBlank(MANUAL_TEST_PLAN_KEY) && issueExists(MANUAL_TEST_PLAN_KEY)) {
+			return MANUAL_TEST_PLAN_KEY
+		}
+
+		if (!FORCE_CREATE_NEW_TEST_PLAN) {
+			String savedKey = readSavedTestPlanKey()
+			if (!isBlank(savedKey) && issueExists(savedKey)) {
+				return savedKey
+			}
+
+			String existingByName = findExistingTestPlanKeyByName(getTestPlanName())
+			if (!isBlank(existingByName)) {
+				saveTestPlanKey(existingByName)
+				return existingByName
+			}
+		}
+
+		String createdKey = createTestPlan(getTestPlanName())
+		if (!isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+			saveTestPlanKey(createdKey)
+		}
+
+		return createdKey
+	}
+
+	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
+		Map response = httpJson(
+			'POST',
+			'/rest/raven/1.0/api/testplan/' + testPlanKey + '/testexecution',
+			[executionKey]
+		)
+
+		KeywordUtil.logInfo('Add Execution to Test Plan status: ' + response.status)
+		KeywordUtil.logInfo('Add Execution to Test Plan response: ' + response.raw)
+
+		return response.status
+	}
+
+	int updateIssueStatus(String issueKey, String transitionId) {
+		if (isBlank(issueKey) || isBlank(transitionId)) {
+			return 0
+		}
+
+		Map response = httpJson(
+			'POST',
+			'/rest/api/2/issue/' + issueKey + '/transitions',
+			[transition: [id: transitionId]]
+		)
+
+		KeywordUtil.logInfo('Transition status response code: ' + response.status)
+		KeywordUtil.logInfo('Transition response body: ' + response.raw)
+
+		return response.status
+	}
+
+	int uploadAttachment(String issueKey, String filePath, String uploadName = '') {
+		if (isBlank(filePath)) {
+			return 0
+		}
+
+		File originalFile = new File(filePath)
+		if (!originalFile.exists() || originalFile.length() == 0) {
+			KeywordUtil.logInfo('Skipping attachment upload because file path is empty, missing or zero bytes.')
+			return 0
+		}
+
+		String preferredName = isBlank(uploadName) ? originalFile.name : uploadName
+		String safeCopyPath = createSafeUploadCopy(originalFile.absolutePath, preferredName)
+
+		if (isBlank(safeCopyPath)) {
+			KeywordUtil.logInfo('Skipping attachment upload because safe copy could not be created.')
+			return 0
+		}
+
+		File safeFile = new File(safeCopyPath)
+
+		Map response = httpMultipart(
+			'POST',
+			'/rest/api/2/issue/' + issueKey + '/attachments',
+			safeFile,
+			'file'
+		)
+
+		KeywordUtil.logInfo('Upload attachment status: ' + response.status)
+		KeywordUtil.logInfo('Upload attachment response: ' + response.raw)
+
+		return response.status
+	}
+
+	// =========================================================
+	// MAIN FLOW
+	// =========================================================
+
+	@Keyword
+	def jiraImport() {
+		logSeparator('Starting Jira import flow')
+
+		String reportPath = getResolvedReportPath()
+		String suiteName = getCurrentSuiteName()
+
+		KeywordUtil.logInfo('Using report folder: ' + reportPath)
+		KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
+
+		if (isBlank(reportPath)) {
+			KeywordUtil.markFailed('Report folder could not be resolved.')
+			return
+		}
+
+		if (isBlank(suiteName)) {
+			KeywordUtil.markFailed('Suite name could not be resolved from report folder.')
+			return
+		}
+
+		String executionSummary = getExecutionSummary()
+		String testPlanName = getTestPlanName()
+
+		KeywordUtil.logInfo('Execution title used: ' + executionSummary)
+		KeywordUtil.logInfo('Test Plan title used: ' + testPlanName)
+
+		String xmlFile = getXmlFilePath()
+		if (isBlank(xmlFile)) {
+			KeywordUtil.markFailed('XML file was not found for Jira import.')
+			return
+		}
+
+		KeywordUtil.logInfo('XML file found: ' + xmlFile)
+
+		String gaiaReportPath = buildGaiaReport()
+		String reportZipPath = zipReports()
+		String evidenceZipPath = zipEvidences()
+
+		String executionKey = importExecutionResults(xmlFile)
+		if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+			KeywordUtil.markFailed('Test Execution could not be created: ' + executionKey)
+			return
+		}
+
+		int updateExecutionStatus = updateExecutionIssue(executionKey, executionSummary)
+
+		String testPlanKey = getOrCreateTestPlan()
+		if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
+			KeywordUtil.markFailed('Test Plan could not be created or resolved: ' + testPlanKey)
+			return
+		}
+
+		int updateTestPlanStatus = addExecutionToTestPlan(testPlanKey, executionKey)
+
+		int gaiaReportAttachmentStatus = uploadAttachment(
+			executionKey,
+			gaiaReportPath,
+			getExecutionReportUploadName()
+		)
+
+		int resultsAttachmentStatus = uploadAttachment(
+			executionKey,
+			reportZipPath,
+			getExecutionResultsZipFileName()
+		)
+
+		int evidencesAttachmentStatus = uploadAttachment(
+			executionKey,
+			evidenceZipPath,
+			getExecutionEvidencesZipFileName()
+		)
+
+		int transitionExecutionStatus = updateIssueStatus(executionKey, EXECUTION_TRANSITION_ID)
+		int transitionTestPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
+
+		logSeparator('Jira import finished')
+
+		KeywordUtil.logInfo('Execution key: ' + executionKey)
+		KeywordUtil.logInfo('Using report folder: ' + reportPath)
+		KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
+		KeywordUtil.logInfo('Execution title used: ' + executionSummary)
+		KeywordUtil.logInfo('Test Plan key: ' + testPlanKey)
+		KeywordUtil.logInfo('Test Plan title used: ' + testPlanName)
+		KeywordUtil.logInfo('Gaia report attachment status: ' + gaiaReportAttachmentStatus)
+		KeywordUtil.logInfo('Results.zip attachment status: ' + resultsAttachmentStatus)
+		KeywordUtil.logInfo('Evidences.zip attachment status: ' + evidencesAttachmentStatus)
+		KeywordUtil.logInfo('Add Execution to Test Plan status: ' + updateTestPlanStatus)
+		KeywordUtil.logInfo('Update Test Execution status: ' + updateExecutionStatus)
+		KeywordUtil.logInfo('Transition Execution status: ' + transitionExecutionStatus)
+		KeywordUtil.logInfo('Transition Test Plan status: ' + transitionTestPlanStatus)
+	}
 }
