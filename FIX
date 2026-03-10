@@ -1,1 +1,272 @@
+	// =========================================================
+	// FILE READY / SAFE COPY / ZIP
+	// =========================================================
 
+	void closeQuietly(def closable) {
+		try {
+			if (closable != null) {
+				closable.close()
+			}
+		} catch (Exception ignored) {
+		}
+	}
+
+	void deleteFolderQuietly(File folder) {
+		if (folder == null || !folder.exists()) return
+
+		try {
+			List<File> files = []
+			List<File> dirs = []
+
+			folder.eachFileRecurse(FileType.FILES) { File f ->
+				files.add(f)
+			}
+
+			folder.eachFileRecurse(FileType.DIRECTORIES) { File d ->
+				dirs.add(d)
+			}
+
+			files.each { File f ->
+				try {
+					f.setWritable(true)
+					f.delete()
+				} catch (Exception ignored) {
+				}
+			}
+
+			dirs.sort { -it.absolutePath.length() }.each { File d ->
+				try {
+					d.delete()
+				} catch (Exception ignored) {
+				}
+			}
+
+			try {
+				folder.delete()
+			} catch (Exception ignored) {
+			}
+		} catch (Exception ignored) {
+		}
+	}
+
+	boolean waitUntilFileReady(String filePath, int attempts = 20, int sleepMillis = 400) {
+		if (isBlank(filePath)) return false
+
+		File file = new File(filePath)
+		if (!file.exists() || !file.isFile()) return false
+
+		for (int i = 0; i < attempts; i++) {
+			RandomAccessFile raf = null
+			try {
+				raf = new RandomAccessFile(file, 'r')
+				raf.length()
+				return true
+			} catch (Exception ignored) {
+			} finally {
+				closeQuietly(raf)
+			}
+
+			try {
+				Thread.sleep(sleepMillis)
+			} catch (Exception ignored) {
+			}
+		}
+
+		return false
+	}
+
+	boolean shouldSkipReportFile(File file) {
+		if (file == null || !file.exists() || !file.isFile()) return true
+
+		String name = file.name.toLowerCase()
+
+		if (name == REPORT_ZIP_NAME.toLowerCase()) return true
+		if (name == EVIDENCE_ZIP_NAME.toLowerCase()) return true
+		if (name == 'execution.log') return true
+		if (name == 'execution.log.lck') return true
+		if (name == 'execution.log.bak') return true
+		if (name == 'report.log') return true
+		if (name.endsWith('.lck')) return true
+		if (name.endsWith('.tmp')) return true
+		if (name.endsWith('.lock')) return true
+		if (name.startsWith('~')) return true
+
+		return false
+	}
+
+	boolean shouldSkipEvidenceFile(File file) {
+		if (file == null || !file.exists() || !file.isFile()) return true
+
+		String name = file.name.toLowerCase()
+
+		if (name == EVIDENCE_ZIP_NAME.toLowerCase()) return true
+		if (name.endsWith('.lck')) return true
+		if (name.endsWith('.tmp')) return true
+		if (name.endsWith('.lock')) return true
+		if (name.startsWith('~')) return true
+
+		return false
+	}
+
+	String createReadableTempCopy(File source, File tempFolder) {
+		if (source == null || !source.exists() || !source.isFile()) return ''
+
+		tempFolder.mkdirs()
+
+		String safeName = sanitizeFileName(source.parentFile?.name + '_' + source.name + '_' + System.nanoTime())
+		File tempCopy = new File(tempFolder, safeName)
+
+		Throwable lastError = null
+
+		for (int attempt = 1; attempt <= 15; attempt++) {
+			FileInputStream input = null
+			FileOutputStream output = null
+
+			try {
+				if (!waitUntilFileReady(source.absolutePath, 5, 300)) {
+					throw new IOException('Source file is still locked: ' + source.absolutePath)
+				}
+
+				input = new FileInputStream(source)
+				output = new FileOutputStream(tempCopy)
+
+				byte[] buffer = new byte[8192]
+				int read = 0
+
+				while ((read = input.read(buffer)) != -1) {
+					output.write(buffer, 0, read)
+				}
+
+				output.flush()
+
+				if (tempCopy.exists() && tempCopy.length() >= 0) {
+					return tempCopy.absolutePath
+				}
+			} catch (Throwable e) {
+				lastError = e
+				try {
+					Thread.sleep(350)
+				} catch (Exception ignored) {
+				}
+			} finally {
+				closeQuietly(output)
+				closeQuietly(input)
+			}
+		}
+
+		KeywordUtil.logInfo('Skipping locked file: ' + source.absolutePath + ' | reason: ' + safe(lastError?.message))
+		return ''
+	}
+
+	void addFileToZip(ZipOutputStream output, File fileToZip, String entryName) {
+		if (output == null || fileToZip == null || !fileToZip.exists() || !fileToZip.isFile()) return
+
+		FileInputStream input = null
+
+		try {
+			output.putNextEntry(new ZipEntry(entryName.replace('\\', '/')))
+			input = new FileInputStream(fileToZip)
+
+			byte[] buffer = new byte[8192]
+			int read = 0
+
+			while ((read = input.read(buffer)) != -1) {
+				output.write(buffer, 0, read)
+			}
+
+			output.closeEntry()
+		} finally {
+			closeQuietly(input)
+		}
+	}
+
+	String zipReports() {
+		String reportPath = getReportPath()
+		if (isBlank(reportPath)) return ''
+
+		File reportFolder = new File(reportPath)
+		if (!reportFolder.exists() || !reportFolder.isDirectory()) return ''
+
+		try {
+			Thread.sleep(1200)
+		} catch (Exception ignored) {
+		}
+
+		File zipFile = new File(reportFolder, REPORT_ZIP_NAME)
+		if (zipFile.exists()) {
+			try { zipFile.delete() } catch (Exception ignored) {}
+		}
+
+		File tempFolder = new File(reportFolder, '_zip_tmp_reports')
+		deleteFolderQuietly(tempFolder)
+		tempFolder.mkdirs()
+
+		ZipOutputStream output = null
+
+		try {
+			output = new ZipOutputStream(new FileOutputStream(zipFile))
+
+			reportFolder.eachFile { File file ->
+				if (file == null || !file.isFile()) return
+				if (shouldSkipReportFile(file)) return
+
+				String copiedPath = createReadableTempCopy(file, tempFolder)
+				if (isBlank(copiedPath)) return
+
+				File copied = new File(copiedPath)
+				addFileToZip(output, copied, file.name)
+			}
+		} finally {
+			closeQuietly(output)
+			deleteFolderQuietly(tempFolder)
+		}
+
+		return zipFile.exists() ? zipFile.absolutePath : ''
+	}
+
+	String zipEvidences() {
+		String reportPath = getReportPath()
+		if (isBlank(reportPath)) return ''
+
+		File evidenceFolder = new File(reportPath + File.separator + EVIDENCE_FOLDER_NAME)
+		if (!evidenceFolder.exists() || !evidenceFolder.isDirectory()) return ''
+
+		try {
+			Thread.sleep(800)
+		} catch (Exception ignored) {
+		}
+
+		File zipFile = new File(evidenceFolder, EVIDENCE_ZIP_NAME)
+		if (zipFile.exists()) {
+			try { zipFile.delete() } catch (Exception ignored) {}
+		}
+
+		File tempFolder = new File(evidenceFolder, '_zip_tmp_evidences')
+		deleteFolderQuietly(tempFolder)
+		tempFolder.mkdirs()
+
+		ZipOutputStream output = null
+
+		try {
+			output = new ZipOutputStream(new FileOutputStream(zipFile))
+
+			evidenceFolder.eachFileRecurse(FileType.FILES) { File file ->
+				if (file == null || !file.isFile()) return
+				if (file.absolutePath.equalsIgnoreCase(zipFile.absolutePath)) return
+				if (file.absolutePath.contains(tempFolder.absolutePath)) return
+				if (shouldSkipEvidenceFile(file)) return
+
+				String copiedPath = createReadableTempCopy(file, tempFolder)
+				if (isBlank(copiedPath)) return
+
+				File copied = new File(copiedPath)
+				String relativeEntry = evidenceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+				addFileToZip(output, copied, relativeEntry)
+			}
+		} finally {
+			closeQuietly(output)
+			deleteFolderQuietly(tempFolder)
+		}
+
+		return zipFile.exists() ? zipFile.absolutePath : ''
+	}
