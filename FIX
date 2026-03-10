@@ -1,63 +1,574 @@
-boolean isFileReady(String filePath) {
-	if (isBlank(filePath)) return false
+// =========================================================
+// IMPORTS TO ADD / KEEP
+// =========================================================
 
-	File file = new File(filePath)
-	if (!file.exists() || !file.isFile()) return false
-
-	RandomAccessFile raf = null
-	try {
-		raf = new RandomAccessFile(file, 'rw')
-		return true
-	} catch (Exception ignored) {
-		return false
-	} finally {
-		if (raf != null) {
-			try { raf.close() } catch (Exception ignored) {}
-		}
-	}
-}
-
-void waitUntilFileIsReady(String filePath, int retries = 20, long sleepMs = 500) {
-	for (int i = 0; i < retries; i++) {
-		if (isFileReady(filePath)) {
-			return
-		}
-		Thread.sleep(sleepMs)
-	}
-	throw new RuntimeException("File is locked or unavailable: ${filePath}")
-}
-
-String createUploadSnapshot(String originalFilePath) {
-	if (isBlank(originalFilePath)) return ''
-
-	File original = new File(originalFilePath)
-	if (!original.exists() || !original.isFile()) return ''
-
-	waitUntilFileIsReady(original.absolutePath)
-
-	File tempDir = new File(RunConfiguration.projectDir + File.separator + 'tmp_jira_upload')
-	if (!tempDir.exists()) {
-		tempDir.mkdirs()
-	}
-
-	String safeName = System.currentTimeMillis() + '_' + original.name
-	File snapshot = new File(tempDir, safeName)
-
-	Files.copy(
-		original.toPath(),
-		snapshot.toPath(),
-		StandardCopyOption.REPLACE_EXISTING
-	)
-
-	waitUntilFileIsReady(snapshot.absolutePath)
-	return snapshot.absolutePath
-}
-
-
-
-
-
-import java.io.RandomAccessFile
-import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.charset.StandardCharsets
+import groovy.io.FileType
+import groovy.xml.MarkupBuilder
+
+
+// =========================================================
+// FILE / REPORT / ATTACHMENT SECTION
+// REPLACE THE WHOLE SECTION WITH THIS
+// =========================================================
+
+boolean waitUntilFileReady(String filePath, int maxAttempts = 10, int sleepMillis = 700) {
+	if (isBlank(filePath)) {
+		return false
+	}
+
+	File file = new File(filePath)
+	if (!file.exists()) {
+		return false
+	}
+
+	for (int i = 1; i <= maxAttempts; i++) {
+		try {
+			RandomAccessFile raf = new RandomAccessFile(file, 'r')
+			try {
+				long size = raf.length()
+				if (size >= 0) {
+					return true
+				}
+			} finally {
+				raf.close()
+			}
+		} catch (Exception ignored) {
+		}
+
+		Thread.sleep(sleepMillis)
+	}
+
+	return false
+}
+
+String createSafeUploadCopy(String originalFilePath, String targetName) {
+	if (isBlank(originalFilePath)) {
+		return ''
+	}
+
+	File original = new File(originalFilePath)
+	if (!original.exists() || original.length() == 0) {
+		return ''
+	}
+
+	String reportFolder = getResolvedReportPath()
+	File tempFolder = new File(reportFolder + File.separator + '_jira_upload_tmp')
+	if (!tempFolder.exists()) {
+		tempFolder.mkdirs()
+	}
+
+	File safeCopy = new File(tempFolder, targetName)
+
+	if (safeCopy.exists()) {
+		safeCopy.delete()
+	}
+
+	Files.copy(original.toPath(), safeCopy.toPath(), StandardCopyOption.REPLACE_EXISTING)
+
+	return safeCopy.absolutePath
+}
+
+String getShortErrorLog(String stackTrace) {
+	if (isBlank(stackTrace)) {
+		return ''
+	}
+
+	List<String> lines = stackTrace
+		.readLines()
+		.findAll { !isBlank(it) }
+		.collect { it.trim() }
+
+	List<String> important = []
+
+	for (String line : lines) {
+		String lower = line.toLowerCase()
+
+		if (
+			lower.contains('exception')
+			|| lower.contains('error')
+			|| lower.contains('caused by')
+			|| lower.contains('stepfailedexception')
+			|| lower.contains('timed out')
+			|| lower.contains('not clickable')
+			|| lower.contains('not found')
+			|| lower.contains('unable')
+			|| lower.contains('failed')
+		) {
+			important.add(line)
+		}
+
+		if (important.size() >= 3) {
+			break
+		}
+	}
+
+	if (important.isEmpty()) {
+		important = lines.take(3)
+	}
+
+	return important.join('\n')
+}
+
+String buildFailureCardHtml(Map item) {
+	String shortLog = getShortErrorLog(item.stackTrace as String)
+
+	String imageHtml = ''
+	if (!isBlank(item.imageData as String)) {
+		imageHtml = """
+		<div class="case-image-wrap">
+			<img class="case-image" src="${item.imageData}" alt="Failure evidence" />
+		</div>
+		"""
+	}
+
+	return """
+	<div class="test-case failed">
+		<div class="case-header">
+			<div class="case-title">${safeHtml((item.className ?: '') + '/' + (item.testName ?: ''))}</div>
+		</div>
+
+		<div class="case-meta">❗ Mandatory failure</div>
+		<div class="case-meta">${safeHtml(item.failureMessage as String)}</div>
+		<div class="case-meta">⏱ Duration: ${safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal))}</div>
+
+		${isBlank(shortLog) ? '' : "<pre class=\"short-log\">" + safeHtml(shortLog) + "</pre>"}
+
+		<details class="details-block">
+			<summary>🔎 See full error log</summary>
+			<pre class="full-log">${safeHtml(item.stackTrace as String)}</pre>
+		</details>
+
+		${imageHtml}
+	</div>
+	"""
+}
+
+String buildPassedCardHtml(Map item) {
+	return """
+	<div class="test-case passed">
+		<div class="case-header">
+			<div class="case-title">${safeHtml((item.className ?: '') + '/' + (item.testName ?: ''))}</div>
+		</div>
+
+		<div class="case-meta">✅ Test Passed</div>
+		<div class="case-meta">⏱ Duration: ${safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal))}</div>
+	</div>
+	"""
+}
+
+String buildGaiaReportHtml(Map suiteData) {
+	BigDecimal avgSeconds = 0
+	if ((suiteData.executed as Integer) > 0) {
+		avgSeconds = (suiteData.suiteTime as BigDecimal) / (suiteData.executed as Integer)
+	}
+
+	String failedHtml = ((suiteData.failedTests ?: []) as List<Map>).collect { buildFailureCardHtml(it) }.join('\n')
+	String passedHtml = ((suiteData.passedTests ?: []) as List<Map>).collect { buildPassedCardHtml(it) }.join('\n')
+
+	return """<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<title>Windows Test Execution Report — Gaia</title>
+	<style>
+		body {
+			font-family: Arial, Helvetica, sans-serif;
+			background: #ffffff;
+			color: #222222;
+			margin: 0;
+			padding: 28px 34px;
+		}
+
+		h1 {
+			font-size: 22px;
+			font-weight: 700;
+			margin: 0 0 26px 0;
+		}
+
+		.summary-grid {
+			display: grid;
+			grid-template-columns: 2.2fr 1fr 1fr 1fr 0.8fr 0.8fr 0.8fr 0.8fr 1fr;
+			gap: 14px;
+			margin-bottom: 26px;
+		}
+
+		.summary-box {
+			padding: 0;
+		}
+
+		.summary-label {
+			font-size: 10px;
+			text-transform: uppercase;
+			color: #6b7280;
+			margin-bottom: 6px;
+		}
+
+		.summary-value {
+			font-size: 12px;
+			line-height: 1.35;
+			color: #111827;
+			word-break: break-word;
+		}
+
+		.section-title {
+			font-size: 16px;
+			font-weight: 700;
+			margin: 18px 0 12px 0;
+		}
+
+		.section-title.failed {
+			color: #b91c1c;
+		}
+
+		.section-title.passed {
+			color: #166534;
+		}
+
+		.test-case {
+			padding-left: 12px;
+			margin-bottom: 24px;
+		}
+
+		.test-case.failed {
+			border-left: 3px solid #d32f2f;
+		}
+
+		.test-case.passed {
+			border-left: 3px solid #2e7d32;
+		}
+
+		.case-title {
+			font-size: 13px;
+			font-weight: 700;
+			margin-bottom: 6px;
+		}
+
+		.case-meta {
+			font-size: 12px;
+			line-height: 1.45;
+			margin-bottom: 4px;
+		}
+
+		.short-log {
+			white-space: pre-wrap;
+			font-size: 11px;
+			line-height: 1.4;
+			margin: 8px 0;
+			padding: 0;
+			border: none;
+			background: transparent;
+			font-family: Arial, Helvetica, sans-serif;
+		}
+
+		.details-block {
+			margin-top: 8px;
+			margin-bottom: 10px;
+		}
+
+		.details-block summary {
+			cursor: pointer;
+			font-size: 12px;
+		}
+
+		.full-log {
+			white-space: pre-wrap;
+			font-size: 11px;
+			line-height: 1.4;
+			margin-top: 10px;
+			padding: 0;
+			border: none;
+			background: transparent;
+			font-family: Arial, Helvetica, sans-serif;
+		}
+
+		.case-image-wrap {
+			margin-top: 12px;
+		}
+
+		.case-image {
+			max-width: 320px;
+			height: auto;
+			border: 1px solid #d1d5db;
+			display: block;
+		}
+
+		.empty {
+			font-size: 12px;
+			color: #6b7280;
+		}
+	</style>
+</head>
+<body>
+
+	<h1>Windows Test Execution Report — Gaia</h1>
+
+	<div class="summary-grid">
+		<div class="summary-box">
+			<div class="summary-label">Suite</div>
+			<div class="summary-value">${safeHtml(suiteData.suiteName as String)}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">Start</div>
+			<div class="summary-value">${safeHtml(suiteData.startText as String)}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">End</div>
+			<div class="summary-value">${safeHtml(suiteData.endText as String)}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">Suite Duration</div>
+			<div class="summary-value">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">Executed</div>
+			<div class="summary-value">${suiteData.executed}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">Passed</div>
+			<div class="summary-value">${suiteData.passed}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">Failed</div>
+			<div class="summary-value">${suiteData.failed}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">Skipped</div>
+			<div class="summary-value">${suiteData.skipped}</div>
+		</div>
+		<div class="summary-box">
+			<div class="summary-label">Avg/Test</div>
+			<div class="summary-value">${safeHtml(formatDurationSeconds(avgSeconds))}</div>
+		</div>
+	</div>
+
+	<div class="section-title failed">✘ Failed (${suiteData.failed})</div>
+	${failedHtml}
+
+	<div class="section-title passed">☑ Passed (${suiteData.passed})</div>
+	${isBlank(passedHtml) ? '<div class="empty">No passed tests.</div>' : passedHtml}
+
+</body>
+</html>
+"""
+}
+
+String buildGaiaReport() {
+	String xmlPath = getXmlFilePath()
+	if (isBlank(xmlPath)) {
+		KeywordUtil.logInfo('Gaia report was not created because XML file was not found.')
+		return ''
+	}
+
+	String reportPath = getResolvedReportPath()
+	if (isBlank(reportPath)) {
+		KeywordUtil.logInfo('Gaia report was not created because report folder was not found.')
+		return ''
+	}
+
+	Map suiteData = parseSuiteData(xmlPath)
+	String html = buildGaiaReportHtml(suiteData)
+
+	File gaiaReportFile = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
+	gaiaReportFile.withWriter('UTF-8') { writer ->
+		writer.write(html)
+	}
+
+	if (!waitUntilFileReady(gaiaReportFile.absolutePath, 12, 500)) {
+		KeywordUtil.logInfo("Gaia report file still looks busy after creation: ${gaiaReportFile.absolutePath}")
+	}
+
+	KeywordUtil.logInfo("Gaia report created: ${gaiaReportFile.absolutePath}")
+	return gaiaReportFile.absolutePath
+}
+
+String zipReports() {
+	String reportPath = getResolvedReportPath()
+	if (isBlank(reportPath)) {
+		return ''
+	}
+
+	String zippedFile = reportPath + File.separator + RESULTS_ZIP_FILE_NAME
+
+	new File(zippedFile).delete()
+
+	ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zippedFile))
+	try {
+		new File(reportPath).eachFile { File file ->
+			if (!file.isFile()) return
+			if (file.name.equalsIgnoreCase(RESULTS_ZIP_FILE_NAME)) return
+			if (file.name.equalsIgnoreCase(EVIDENCE_ZIP_FILE_NAME)) return
+
+			output.putNextEntry(new ZipEntry(file.name))
+			FileInputStream input = new FileInputStream(file)
+
+			try {
+				byte[] buffer = new byte[4096]
+				int read
+				while ((read = input.read(buffer)) != -1) {
+					output.write(buffer, 0, read)
+				}
+			} finally {
+				input.close()
+			}
+
+			output.closeEntry()
+		}
+	} finally {
+		output.close()
+	}
+
+	waitUntilFileReady(zippedFile, 12, 500)
+	return zippedFile
+}
+
+String zipEvidences() {
+	String reportPath = getResolvedReportPath()
+	if (isBlank(reportPath)) {
+		return ''
+	}
+
+	String evidencePath = reportPath + File.separator + EVIDENCE_FOLDER_NAME
+	File evidenceFolder = new File(evidencePath)
+
+	if (!evidenceFolder.exists()) {
+		return ''
+	}
+
+	String zippedFile = evidencePath + File.separator + EVIDENCE_ZIP_FILE_NAME
+
+	new File(zippedFile).delete()
+
+	ZipOutputStream output = new ZipOutputStream(new FileOutputStream(zippedFile))
+	try {
+		evidenceFolder.eachFileRecurse(FileType.FILES) { File file ->
+			if (file.name.equalsIgnoreCase(EVIDENCE_ZIP_FILE_NAME)) return
+
+			String relativeName = evidenceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+			output.putNextEntry(new ZipEntry(relativeName))
+
+			FileInputStream input = new FileInputStream(file)
+			try {
+				byte[] buffer = new byte[4096]
+				int read
+				while ((read = input.read(buffer)) != -1) {
+					output.write(buffer, 0, read)
+				}
+			} finally {
+				input.close()
+			}
+
+			output.closeEntry()
+		}
+	} finally {
+		output.close()
+	}
+
+	waitUntilFileReady(zippedFile, 12, 500)
+	return zippedFile
+}
+
+int uploadAttachment(String issueKey, String filePath) {
+	if (isBlank(filePath)) {
+		return 0
+	}
+
+	File originalFile = new File(filePath)
+	if (!originalFile.exists() || originalFile.length() == 0) {
+		KeywordUtil.logInfo("Skipping attachment upload because file is missing or empty: ${filePath}")
+		return 0
+	}
+
+	if (!waitUntilFileReady(originalFile.absolutePath, 12, 500)) {
+		KeywordUtil.logInfo("File still locked before upload, creating safe copy: ${originalFile.absolutePath}")
+	}
+
+	String safeUploadPath = createSafeUploadCopy(originalFile.absolutePath, originalFile.name)
+	if (isBlank(safeUploadPath)) {
+		KeywordUtil.logInfo("Could not create safe upload copy for: ${originalFile.absolutePath}")
+		return 0
+	}
+
+	File safeUploadFile = new File(safeUploadPath)
+
+	def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
+		('token')     : JIRA_TOKEN,
+		('evidences') : safeUploadFile,
+		('execID')    : issueKey
+	]))
+
+	int status = WS.getResponseStatusCode(response)
+	KeywordUtil.logInfo("Upload attachment status: ${status}")
+	KeywordUtil.logInfo("Upload attachment response: ${response.getResponseBodyContent()}")
+
+	return status
+}
+
+
+// =========================================================
+// MAIN FLOW SECTION
+// REPLACE THE WHOLE jiraImport METHOD WITH THIS
+// =========================================================
+
+@Keyword
+def jiraImport() {
+	logSection('Starting Jira import flow')
+
+	String reportPath = getResolvedReportPath()
+	String suiteName = getCurrentSuiteName()
+	String executionSummary = getExecutionSummary()
+	String testPlanName = getTestPlanName()
+
+	KeywordUtil.logInfo("Using report folder: ${reportPath}")
+	KeywordUtil.logInfo("Suite name used: ${suiteName}")
+	KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+	KeywordUtil.logInfo("Test Plan title used: ${testPlanName}")
+
+	String xmlFile = getXmlFilePath()
+	if (isBlank(xmlFile)) {
+		KeywordUtil.markFailed('No XML file found for Jira import.')
+		return
+	}
+
+	String gaiaReportFile = buildGaiaReport()
+	String resultsZip = zipReports()
+	String evidencesZip = zipEvidences()
+
+	String executionKey = importResults(xmlFile)
+	if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+		KeywordUtil.markFailed("Test Execution creation failed: ${executionKey}")
+		return
+	}
+
+	String testPlanKey = getOrCreateTestPlan()
+	if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
+		KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+		return
+	}
+
+	int updateTestPlanStatus = updateTestPlan(testPlanKey, [executionKey])
+	int updateExecutionStatus = updateTestExecution(executionKey)
+
+	int gaiaReportAttachmentStatus = uploadAttachment(executionKey, gaiaReportFile)
+	int resultsAttachmentStatus = uploadAttachment(executionKey, resultsZip)
+	int evidencesAttachmentStatus = uploadAttachment(executionKey, evidencesZip)
+
+	int transitionExecutionStatus = updateIssueStatus(executionKey, EXECUTION_TRANSITION_ID)
+	int transitionTestPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
+
+	logSection('Jira import finished')
+
+	KeywordUtil.logInfo("Execution key: ${executionKey}")
+	KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+	KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+	KeywordUtil.logInfo("Test Plan title used: ${testPlanName}")
+	KeywordUtil.logInfo("Gaia report attachment status: ${gaiaReportAttachmentStatus}")
+	KeywordUtil.logInfo("Results.zip attachment status: ${resultsAttachmentStatus}")
+	KeywordUtil.logInfo("Evidences.zip attachment status: ${evidencesAttachmentStatus}")
+	KeywordUtil.logInfo("Update Test Plan status: ${updateTestPlanStatus}")
+	KeywordUtil.logInfo("Update Test Execution status: ${updateExecutionStatus}")
+	KeywordUtil.logInfo("Transition Execution status: ${transitionExecutionStatus}")
+	KeywordUtil.logInfo("Transition Test Plan status: ${transitionTestPlanStatus}")
+}
