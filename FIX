@@ -1,559 +1,528 @@
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurperClassic
-import groovy.util.XmlSlurper
+@Keyword
+def jiraImport() {
+	logSection('Starting Jira import flow')
 
-def getTestSuites() {
-    return [
-        [label: 'PreLoad',                               path: 'Test Suites/PreLoad',                               folder: 'PreLoad'],
-        [label: 'Help',                                  path: 'Test Suites/Help',                                  folder: 'Help'],
-        [label: 'Correction- Add Correction',            path: 'Test Suites/Correction- Add Correction',            folder: 'AddCorrection'],
-        [label: 'Correction- Computation Selection',     path: 'Test Suites/Correction- Computation Selection',     folder: 'ComputationSelection'],
-        [label: 'Correction- Corrected Duplication',     path: 'Test Suites/Correction- Corrected Duplication',     folder: 'CorrectedDuplication'],
-        [label: 'Correction- Correction Details',        path: 'Test Suites/Correction- Correction Details',        folder: 'CorrectionDetails'],
-        [label: 'Correction- Download Invalid Records',  path: 'Test Suites/Correction- Download Invalid Records',  folder: 'DownloadInvalidRecords']
-    ]
+	String suiteName = getCurrentSuiteName()
+	String executionSummary = getExecutionSummary()
+	String testPlanName = getTestPlanName()
+
+	KeywordUtil.logInfo("Suite name: ${suiteName}")
+	KeywordUtil.logInfo("Execution summary: ${executionSummary}")
+	KeywordUtil.logInfo("Test Plan name: ${testPlanName}")
+	KeywordUtil.logInfo("Using token: ${maskToken(JIRA_TOKEN)}")
+	KeywordUtil.logInfo("Project key: ${PROJECT_KEY}")
+	KeywordUtil.logInfo("Epic key: ${EPIC_KEY}")
+	KeywordUtil.logInfo("Report path: ${getResolvedReportPath()}")
+
+	String xmlFile = getXmlFilePath()
+
+	if (isBlank(xmlFile)) {
+		KeywordUtil.markFailed('No XML file found for Jira import.')
+		return
+	}
+
+	String gaiaReportFile = buildGaiaReport()
+	String zipReport = zipReports()
+	String zipEvidence = zipEvidences()
+
+	String execID = importResults(xmlFile)
+
+	if (isBlank(execID) || execID.contains('ERROR')) {
+		KeywordUtil.markFailed("Test Execution creation failed: ${execID}")
+		return
+	}
+
+	String testPlanKey = getOrCreateTestPlan()
+
+	if (isBlank(testPlanKey) || testPlanKey.contains('ERROR')) {
+		KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+		return
+	}
+
+	int updatePlanStatus = updateTestPlan(testPlanKey, [execID])
+	int updateExecutionStatus = updateTestExecution(execID)
+
+	int uploadExecGaiaReportStatus = uploadAttachment(execID, gaiaReportFile)
+	int uploadExecResultsStatus = uploadAttachment(execID, zipReport)
+	int uploadExecEvidenceStatus = uploadAttachment(execID, zipEvidence)
+
+	int transitionExecutionStatus = updateIssueStatus(execID, TEST_EXECUTION_TRANSITION_ID)
+	int transitionPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
+
+	logSection('Jira import finished')
+
+	KeywordUtil.logInfo("Execution key: ${execID}")
+	KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+	KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+	KeywordUtil.logInfo("Test Plan title used: ${testPlanName}")
+	KeywordUtil.logInfo("Gaia report attachment status: ${uploadExecGaiaReportStatus}")
+	KeywordUtil.logInfo("Results.zip attachment status: ${uploadExecResultsStatus}")
+	KeywordUtil.logInfo("Evidences.zip attachment status: ${uploadExecEvidenceStatus}")
+	KeywordUtil.logInfo("Update Test Plan status: ${updatePlanStatus}")
+	KeywordUtil.logInfo("Update Test Execution status: ${updateExecutionStatus}")
+	KeywordUtil.logInfo("Transition Execution status: ${transitionExecutionStatus}")
+	KeywordUtil.logInfo("Transition Test Plan status: ${transitionPlanStatus}")
 }
 
-pipeline {
-    agent {
-        node {
-            label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        }
-    }
 
-    options {
-        timestamps()
-        ansiColor('xterm')
-        disableConcurrentBuilds()
-        timeout(time: 95, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '10', daysToKeepStr: '14'))
-        skipDefaultCheckout(true)
-    }
 
-    parameters {
-        string(
-            name: 'STARTUP_WAIT_SECONDS',
-            defaultValue: '120',
-            description: 'Seconds to wait after backend and frontend startup'
-        )
-        string(
-            name: 'SUITE_TIMEOUT_MINUTES',
-            defaultValue: '10',
-            description: 'Maximum minutes for each suite'
-        )
-    }
 
-    environment {
-        WORK_DIR        = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        PROJECT_PATH    = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
-        REPORTS_DIR     = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports'
-        DASHBOARD_DIR   = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\dashboard'
-        LOGS_DIR        = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\_logs'
-        RESULTS_JSON    = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports\\suite-results.json'
 
-        GIT_URL         = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        GIT_CRED        = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+// =========================================================
+// HTML REPORT
+// =========================================================
 
-        GAIA_START_TASK = 'GaiaBackFrontSetup'
+String getShortErrorLog(String stackTrace) {
+	if (isBlank(stackTrace)) {
+		return ''
+	}
 
-        KATALON_EXE     = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        EXEC_PROFILE    = 'default'
-        BROWSER_TYPE    = 'Chrome'
-    }
+	List<String> lines = stackTrace
+		.readLines()
+		.findAll { !isBlank(it) }
+		.collect { it.trim() }
 
-    stages {
+	if (lines.isEmpty()) {
+		return ''
+	}
 
-        stage('✨ Validate Base Paths') {
-            steps {
-                bat """
-                    @echo off
-                    echo ============================================================
-                    echo ✨ VALIDATING BASE PATHS
-                    echo ============================================================
+	List<String> important = []
 
-                    if not exist "${env.WORK_DIR}" (
-                        echo ERROR: WORK_DIR not found
-                        exit /b 1
-                    )
+	for (String line : lines) {
+		if (important.size() >= 3) {
+			break
+		}
 
-                    if not exist "${env.KATALON_EXE}" (
-                        echo ERROR: KATALON_EXE not found
-                        exit /b 1
-                    )
+		if (
+			line.toLowerCase().contains('exception')
+			|| line.toLowerCase().contains('error')
+			|| line.toLowerCase().contains('caused by')
+			|| line.toLowerCase().contains('stepfailedexception')
+			|| line.toLowerCase().contains('assert')
+			|| line.toLowerCase().contains('unable')
+			|| line.toLowerCase().contains('not found')
+			|| line.toLowerCase().contains('not clickable')
+		) {
+			important.add(line)
+		}
+	}
 
-                    echo ✅ Base paths are valid
-                    echo ============================================================
-                """
-            }
-        }
+	if (important.isEmpty()) {
+		important = lines.take(3)
+	}
 
-        stage('🚀 Start Gaia Backend and Frontend') {
-            steps {
-                bat """
-                    @echo off
-                    echo ============================================================
-                    echo 🚀 STARTING BACKEND AND FRONTEND
-                    echo ============================================================
-                    schtasks /run /tn "${env.GAIA_START_TASK}"
-                    if errorlevel 1 exit /b 1
-                """
-                sleep(time: params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
-            }
-        }
-
-        stage('📥 Checkout Repository') {
-            steps {
-                dir("${env.WORK_DIR}") {
-                    deleteDir()
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/master']],
-                        userRemoteConfigs: [[url: env.GIT_URL, credentialsId: env.GIT_CRED]],
-                        extensions: [
-                            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-                        ]
-                    ])
-                }
-
-                echo '============================================================'
-                echo '✅ CHECKOUT COMPLETED'
-                echo '============================================================'
-            }
-        }
-
-        stage('🧹 Prepare Reports Folder') {
-            steps {
-                bat """
-                    @echo off
-                    if exist "${env.REPORTS_DIR}" rmdir /s /q "${env.REPORTS_DIR}"
-                    mkdir "${env.REPORTS_DIR}"
-                    mkdir "${env.DASHBOARD_DIR}"
-                    mkdir "${env.LOGS_DIR}"
-                """
-                script {
-                    writeFile file: env.RESULTS_JSON, text: JsonOutput.prettyPrint(JsonOutput.toJson([:]))
-                }
-            }
-        }
-
-        stage('🧪 Execute Test Suites') {
-            steps {
-                script {
-                    getTestSuites().each { suite ->
-                        stage("Suite • ${suite.label}") {
-                            runSuite(this, suite, params.SUITE_TIMEOUT_MINUTES.toInteger())
-                        }
-                    }
-                }
-            }
-        }
-
-        stage('📊 Build Reports Page') {
-            steps {
-                script {
-                    buildDashboard(this)
-                }
-            }
-        }
-    }
-
-    post {
-        always {
-            script {
-                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                    buildDashboard(this)
-                }
-
-                catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                    timeout(time: 15, unit: 'SECONDS') {
-                        stopGaiaProcessesFast(this, 'Build finished')
-                    }
-                }
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true, excludes: '**/*.lck'
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml, Reports/**/junit*.xml, Reports/**/JUnit*.xml, Reports/**/TEST-*.xml'
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-                publishHTML(target: [
-                    allowMissing: true,
-                    alwaysLinkToLastBuild: true,
-                    keepAll: true,
-                    reportDir: 'Reports/dashboard',
-                    reportFiles: 'index.html',
-                    reportName: 'Gaia Test Report'
-                ])
-            }
-        }
-
-        success {
-            echo '============================================================'
-            echo '✅ PIPELINE COMPLETED'
-            echo '============================================================'
-        }
-
-        unstable {
-            echo '============================================================'
-            echo '⚠️ PIPELINE COMPLETED WITH FAILURES'
-            echo '============================================================'
-        }
-
-        failure {
-            echo '============================================================'
-            echo '❌ PIPELINE FAILED'
-            echo '============================================================'
-        }
-
-        aborted {
-            echo '============================================================'
-            echo '🛑 PIPELINE ABORTED'
-            echo '============================================================'
-        }
-    }
+	return important.join('\n')
 }
 
-def runSuite(scriptRef, Map suite, int timeoutMinutes) {
-    def suiteReportDir = "${scriptRef.env.REPORTS_DIR}\\${suite.folder}"
-    def suiteLogFile   = "${scriptRef.env.LOGS_DIR}\\${suite.folder}.log"
-    def exitCode       = 999
-    def timedOut       = false
+String buildFailureCard(Map item) {
+	String fullStack = item.stackTrace as String
+	String shortStack = getShortErrorLog(fullStack)
 
-    scriptRef.catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-        try {
-            scriptRef.echo '╔════════════════════════════════════════════════════════════╗'
-            scriptRef.echo "║ 🚀 STARTING SUITE".padRight(60) + '║'
-            scriptRef.echo "║ ${suite.label}".padRight(60) + '║'
-            scriptRef.echo "║ 📁 ${suite.path}".padRight(60) + '║'
-            scriptRef.echo "║ ⏱️ ${timeoutMinutes} min timeout".padRight(60) + '║'
-            scriptRef.echo '╚════════════════════════════════════════════════════════════╝'
+	StringBuilder card = new StringBuilder()
 
-            scriptRef.bat """
-                @echo off
-                if exist "${suiteReportDir}" rmdir /s /q "${suiteReportDir}"
-                mkdir "${suiteReportDir}"
-                if exist "${suiteLogFile}" del /f /q "${suiteLogFile}" >nul 2>&1
-            """
+	card.append('<div class="case-block failed">')
+	card.append('<div class="case-title">')
+	card.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+	card.append('</div>')
 
-            scriptRef.timeout(time: timeoutMinutes, unit: 'MINUTES') {
-                exitCode = scriptRef.bat(
-                    returnStatus: true,
-                    script: """
-                        @echo off
-                        call "${scriptRef.env.KATALON_EXE}" ^
-                        -noSplash ^
-                        -runMode=console ^
-                        -consoleLog ^
-                        -projectPath="${scriptRef.env.PROJECT_PATH}" ^
-                        -retry=0 ^
-                        -testSuitePath="${suite.path}" ^
-                        -browserType="${scriptRef.env.BROWSER_TYPE}" ^
-                        -executionProfile="${scriptRef.env.EXEC_PROFILE}" ^
-                        -reportFolder="${suiteReportDir}" ^
-                        -reportFileName="${suite.folder}" > "${suiteLogFile}" 2>&1
+	card.append('<div class="case-line">❗ Mandatory failure</div>')
 
-                        exit /b %%ERRORLEVEL%%
-                    """
-                )
-            }
-        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException ex) {
-            timedOut = true
-            exitCode = 130
-            throw ex
-        } finally {
-            def summary = summarizeSuite(scriptRef, suite, suiteReportDir, suiteLogFile, exitCode, timedOut)
-            saveSuiteSummary(scriptRef, suite.folder, summary)
-            printSuiteSummary(scriptRef, summary)
-            printExecutionSummary(scriptRef)
-        }
+	if (!isBlank(item.failureMessage as String)) {
+		card.append('<div class="case-line error-message">')
+		card.append(safeHtml(item.failureMessage as String))
+		card.append('</div>')
+	}
 
-        if (exitCode != 0) {
-            scriptRef.error("Suite ${suite.label} failed with exit code ${exitCode}")
-        }
-    }
+	if (!isBlank(shortStack)) {
+		card.append('<pre class="short-log">')
+		card.append(safeHtml(shortStack))
+		card.append('</pre>')
+	}
+
+	card.append('<div class="case-line duration">Duration: ')
+	card.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+	card.append('</div>')
+
+	card.append('<details class="details-block">')
+	card.append('<summary>See full error log</summary>')
+	card.append('<pre>')
+	card.append(safeHtml(fullStack))
+	card.append('</pre>')
+	card.append('</details>')
+
+	if (!isBlank(item.imageData as String)) {
+		card.append('<div class="image-wrap">')
+		card.append('<img src="')
+		card.append(item.imageData as String)
+		card.append('" alt="Failure evidence" class="failure-image"/>')
+		card.append('</div>')
+	}
+
+	card.append('</div>')
+
+	return card.toString()
 }
 
-def summarizeSuite(scriptRef, Map suite, String suiteReportDir, String suiteLogFile, int exitCode, boolean timedOut) {
-    def junitFile = findJUnitFile(scriptRef, suiteReportDir)
-    def htmlFile  = findHtmlReport(scriptRef, suiteReportDir)
+String buildPassedCard(Map item) {
+	StringBuilder card = new StringBuilder()
 
-    int executed = 0
-    int passed = 0
-    int failed = 0
-    int skipped = 0
-    String reason = ''
-    String mood = ''
-    String shortLine2 = ''
+	card.append('<div class="case-block passed">')
+	card.append('<div class="case-title">')
+	card.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+	card.append('</div>')
 
-    if (junitFile) {
-        def xml = new XmlSlurper(false, false).parseText(scriptRef.readFile(file: junitFile))
-        def testcases = xml.'**'.findAll { it.name() == 'testcase' }
-        def failedCases = testcases.findAll { it.failure.size() > 0 || it.error.size() > 0 }
-        def skippedCases = testcases.findAll { it.skipped.size() > 0 }
+	card.append('<div class="case-line">✔ Test Passed</div>')
+	card.append('<div class="case-line duration">Duration: ')
+	card.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+	card.append('</div>')
+	card.append('</div>')
 
-        executed = testcases.size()
-        failed   = failedCases.size()
-        skipped  = skippedCases.size()
-        passed   = Math.max(0, executed - failed - skipped)
-
-        if (failedCases) {
-            def firstFail = failedCases[0]
-            def rawReason = ''
-            if (firstFail.failure.size() > 0) {
-                rawReason = firstFail.failure[0].@message?.text()
-                if (!rawReason?.trim()) {
-                    rawReason = firstFail.failure[0].text()
-                }
-            } else if (firstFail.error.size() > 0) {
-                rawReason = firstFail.error[0].@message?.text()
-                if (!rawReason?.trim()) {
-                    rawReason = firstFail.error[0].text()
-                }
-            }
-            reason = cleanReason(rawReason)
-        }
-    }
-
-    if (timedOut) {
-        mood = '⏰'
-        shortLine2 = 'Execution timed out | Suite exceeded allowed time | Review timeout or slow steps'
-        if (!reason) {
-            reason = shortLine2
-        }
-    } else if (exitCode == 0) {
-        mood = '✅'
-        shortLine2 = executed > 0 ? "${passed}/${executed} test cases passed" : 'Suite finished successfully'
-    } else {
-        mood = '❌'
-        shortLine2 = reason ? reason : "Suite failed | Exit code ${exitCode} | Review execution log"
-    }
-
-    return [
-        label     : suite.label,
-        path      : suite.path,
-        folder    : suite.folder,
-        exitCode  : exitCode,
-        timedOut  : timedOut,
-        status    : exitCode == 0 ? 'PASSED' : (timedOut ? 'TIMEOUT' : 'FAILED'),
-        executed  : executed,
-        passed    : passed,
-        failed    : failed,
-        skipped   : skipped,
-        reason    : reason ?: '',
-        mood      : mood,
-        line2     : shortLine2,
-        html      : htmlFile ?: '',
-        junit     : junitFile ?: ''
-    ]
+	return card.toString()
 }
 
-def printSuiteSummary(scriptRef, Map summary) {
-    scriptRef.echo '╔════════════════════════════════════════════════════════════╗'
-    scriptRef.echo "║ ${summary.mood}".padRight(60) + '║'
-    scriptRef.echo "║ ${summary.label}".padRight(60) + '║'
-    scriptRef.echo "║ ${summary.line2 ?: ''}".padRight(60) + '║'
-    scriptRef.echo "║ Executed: ${summary.executed} | Passed: ${summary.passed} | Failed: ${summary.failed} | Skipped: ${summary.skipped}".padRight(60) + '║'
-    scriptRef.echo '╚════════════════════════════════════════════════════════════╝'
-}
+String buildGaiaReportHtml(Map suiteData) {
+	StringBuilder failedHtml = new StringBuilder()
+	StringBuilder passedHtml = new StringBuilder()
 
-def printExecutionSummary(scriptRef) {
-    def results = loadSuiteResults(scriptRef)
-    def values = results.values() as List
-    def passed = values.count { it.status == 'PASSED' }
-    def failed = values.count { it.status == 'FAILED' }
-    def timeout = values.count { it.status == 'TIMEOUT' }
+	for (Map item : suiteData.failedTests as List<Map>) {
+		failedHtml.append(buildFailureCard(item))
+	}
 
-    scriptRef.echo '============================================================'
-    scriptRef.echo "📌 EXECUTION SUMMARY | Passed: ${passed} | Failed: ${failed} | Timeout: ${timeout}"
-    scriptRef.echo '============================================================'
-}
+	for (Map item : suiteData.passedTests as List<Map>) {
+		passedHtml.append(buildPassedCard(item))
+	}
 
-def saveSuiteSummary(scriptRef, String key, Map summary) {
-    def current = loadSuiteResults(scriptRef)
-    current[key] = summary
-    writeFile file: scriptRef.env.RESULTS_JSON, text: JsonOutput.prettyPrint(JsonOutput.toJson(current))
-}
+	String avgDuration = '0ms'
 
-def loadSuiteResults(scriptRef) {
-    if (!scriptRef.fileExists(scriptRef.env.RESULTS_JSON)) {
-        return [:]
-    }
-    def txt = scriptRef.readFile(file: scriptRef.env.RESULTS_JSON).trim()
-    if (!txt) {
-        return [:]
-    }
-    return new JsonSlurperClassic().parseText(txt) as Map
-}
+	if ((suiteData.executed as Integer) > 0) {
+		BigDecimal avg = (suiteData.suiteTime as BigDecimal) / (suiteData.executed as Integer)
+		avgDuration = formatDurationSeconds(avg)
+	}
 
-def findJUnitFile(scriptRef, String suiteReportDir) {
-    def out = scriptRef.powershell(
-        returnStdout: true,
-        script: """
-            \$base = "${suiteReportDir}"
-            if (!(Test-Path \$base)) { exit 0 }
-            \$f = Get-ChildItem -Path \$base -Recurse -File -Include 'JUnit_Report.xml','junit*.xml','JUnit*.xml','TEST-*.xml' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (\$f) { Write-Output \$f.FullName }
-        """
-    ).trim()
-    return out ?: ''
-}
-
-def findHtmlReport(scriptRef, String suiteReportDir) {
-    def out = scriptRef.powershell(
-        returnStdout: true,
-        script: """
-            \$base = "${suiteReportDir}"
-            if (!(Test-Path \$base)) { exit 0 }
-            \$f = Get-ChildItem -Path \$base -Recurse -File -Include '*.html' -ErrorAction SilentlyContinue |
-                 Where-Object { \$_.Name -ne 'index.html' } |
-                 Select-Object -First 1
-            if (\$f) {
-                \$full = \$f.FullName
-                \$root = "${scriptRef.env.REPORTS_DIR}\\"
-                if (\$full.StartsWith(\$root)) {
-                    Write-Output (\$full.Substring(\$root.Length).Replace('\\\\','/'))
-                }
-            }
-        """
-    ).trim()
-    return out ?: ''
-}
-
-def cleanReason(String raw) {
-    if (!raw) {
-        return ''
-    }
-
-    def text = raw
-        .replace('\r', '\n')
-        .split('\n')
-        .collect { it.trim() }
-        .findAll { it }
-        .take(3)
-        .join(' | ')
-
-    text = text.replaceAll('\\s+', ' ').trim()
-
-    if (text.toLowerCase().contains('timed out')) {
-        return 'Execution timed out | Suite exceeded allowed time | Review timeout or slow steps'
-    }
-    if (text.toLowerCase().contains('not found')) {
-        return 'Required item not found | A file, element, or object was missing | Review locators or test data'
-    }
-    if (text.toLowerCase().contains('unable to recognize image')) {
-        return 'Visual validation failed | Expected image was not recognized on screen | Review image baseline or screen state'
-    }
-    if (text.toLowerCase().contains('stepfailedexception')) {
-        return 'Validation step failed | One mandatory verification did not pass | Review failed test step'
-    }
-
-    return text
-}
-
-def buildDashboard(scriptRef) {
-    if (!scriptRef.fileExists(scriptRef.env.REPORTS_DIR)) {
-        return
-    }
-
-    def results = loadSuiteResults(scriptRef)
-    def ordered = getTestSuites().collect { suite ->
-        results[suite.folder] ?: [
-            label    : suite.label,
-            path     : suite.path,
-            folder   : suite.folder,
-            status   : 'NOT EXECUTED',
-            executed : 0,
-            passed   : 0,
-            failed   : 0,
-            skipped  : 0,
-            line2    : '',
-            html     : ''
-        ]
-    }
-
-    def listHtml = ordered.collect { item ->
-        def css = item.status == 'PASSED' ? 'pass' : (item.status == 'TIMEOUT' ? 'timeout' : (item.status == 'FAILED' ? 'fail' : 'neutral'))
-        def reportLink = item.html ? "<a href='../${escapeHtml(item.html)}' target='_blank'>Open suite report</a>" : "<span>No remote report available</span>"
-
-        return """
-        <div class="card ${css}">
-            <div class="title">${escapeHtml(item.label)}</div>
-            <div class="line">${escapeHtml(item.mood ?: '')}</div>
-            <div class="line">${escapeHtml(item.line2 ?: '')}</div>
-            <div class="meta">Executed: ${item.executed} | Passed: ${item.passed} | Failed: ${item.failed} | Skipped: ${item.skipped}</div>
-            <div class="meta">${reportLink}</div>
-        </div>
-        """
-    }.join('\n')
-
-    def html = """
-<!DOCTYPE html>
-<html>
+	return """<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Gaia Test Report</title>
+<title>Windows Test Execution Report — Gaia</title>
 <style>
-body { font-family: Arial, sans-serif; background:#f7f8fc; color:#1f2937; margin:0; padding:24px; }
-h1 { margin:0 0 6px 0; font-size:28px; }
-.sub { color:#6b7280; margin-bottom:24px; }
-.grid { display:grid; grid-template-columns:repeat(2,minmax(320px,1fr)); gap:16px; }
-.card { background:#fff; border-radius:16px; padding:18px; box-shadow:0 2px 8px rgba(0,0,0,.08); border-left:8px solid #cbd5e1; }
-.card.pass { border-left-color:#22c55e; }
-.card.fail { border-left-color:#ef4444; }
-.card.timeout { border-left-color:#f59e0b; }
-.card.neutral { border-left-color:#94a3b8; }
-.title { font-size:18px; font-weight:700; margin-bottom:10px; }
-.line { margin-bottom:8px; }
-.meta { color:#475569; font-size:13px; margin-top:8px; }
-a { color:#2563eb; text-decoration:none; font-weight:600; }
+	body {
+		font-family: Arial, Helvetica, sans-serif;
+		margin: 0;
+		padding: 24px 28px;
+		background: #ffffff;
+		color: #222222;
+	}
+
+	h1 {
+		font-size: 20px;
+		margin: 0 0 18px 0;
+		font-weight: 700;
+	}
+
+	table.summary {
+		width: 100%;
+		border-collapse: collapse;
+		margin-bottom: 24px;
+	}
+
+	table.summary td {
+		padding: 0 18px 0 0;
+		vertical-align: top;
+	}
+
+	.label {
+		font-size: 10px;
+		text-transform: uppercase;
+		color: #777777;
+		margin-bottom: 6px;
+	}
+
+	.value {
+		font-size: 12px;
+		line-height: 1.35;
+		font-weight: 400;
+	}
+
+	.section-title {
+		font-size: 16px;
+		font-weight: 700;
+		margin: 18px 0 12px 0;
+	}
+
+	.section-title.failed {
+		color: #b91c1c;
+	}
+
+	.section-title.passed {
+		color: #166534;
+	}
+
+	.case-block {
+		padding: 0 0 0 12px;
+		margin: 0 0 24px 0;
+	}
+
+	.case-block.failed {
+		border-left: 3px solid #cf2e2e;
+	}
+
+	.case-block.passed {
+		border-left: 3px solid #2e7d32;
+	}
+
+	.case-title {
+		font-size: 13px;
+		font-weight: 700;
+		margin-bottom: 6px;
+	}
+
+	.case-line {
+		font-size: 12px;
+		margin-bottom: 4px;
+		color: #222222;
+	}
+
+	.case-line.duration {
+		color: #666666;
+	}
+
+	.error-message {
+		color: #333333;
+	}
+
+	.short-log {
+		white-space: pre-wrap;
+		font-size: 11px;
+		line-height: 1.35;
+		margin: 8px 0 8px 0;
+		color: #333333;
+		background: #ffffff;
+		border: none;
+		padding: 0;
+	}
+
+	.details-block {
+		margin-top: 8px;
+	}
+
+	.details-block summary {
+		cursor: pointer;
+		font-size: 12px;
+		color: #111111;
+	}
+
+	.details-block pre {
+		white-space: pre-wrap;
+		font-size: 11px;
+		line-height: 1.35;
+		margin-top: 10px;
+		color: #333333;
+		background: #ffffff;
+		border: none;
+		padding: 0;
+	}
+
+	.image-wrap {
+		margin-top: 12px;
+	}
+
+	.failure-image {
+		max-width: 320px;
+		border: 1px solid #d9d9d9;
+	}
+
+	.empty-text {
+		font-size: 12px;
+		color: #777777;
+	}
 </style>
 </head>
 <body>
-    <h1>Gaia Test Report</h1>
-    <div class="sub">Build #${escapeHtml(scriptRef.env.BUILD_NUMBER)} | Gaia Corrections</div>
-    <div class="grid">
-        ${listHtml}
-    </div>
+
+<h1>Windows Test Execution Report — Gaia</h1>
+
+<table class="summary">
+	<tr>
+		<td>
+			<div class="label">Suite</div>
+			<div class="value">${safeHtml(suiteData.suiteName as String)}</div>
+		</td>
+		<td>
+			<div class="label">Start</div>
+			<div class="value">${safeHtml(suiteData.startText as String)}</div>
+		</td>
+		<td>
+			<div class="label">End</div>
+			<div class="value">${safeHtml(suiteData.endText as String)}</div>
+		</td>
+		<td>
+			<div class="label">Suite Duration</div>
+			<div class="value">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
+		</td>
+		<td>
+			<div class="label">Executed</div>
+			<div class="value">${suiteData.executed}</div>
+		</td>
+		<td>
+			<div class="label">Passed</div>
+			<div class="value">${suiteData.passed}</div>
+		</td>
+		<td>
+			<div class="label">Failed</div>
+			<div class="value">${suiteData.failed}</div>
+		</td>
+		<td>
+			<div class="label">Skipped</div>
+			<div class="value">${suiteData.skipped}</div>
+		</td>
+		<td>
+			<div class="label">Avg/Test</div>
+			<div class="value">${safeHtml(avgDuration)}</div>
+		</td>
+	</tr>
+</table>
+
+<div class="section-title failed">✘ Failed (${suiteData.failed})</div>
+${failedHtml.toString()}
+
+<div class="section-title passed">☑ Passed (${suiteData.passed})</div>
+${passedHtml.toString().trim().isEmpty() ? '<div class="empty-text">No passed tests.</div>' : passedHtml.toString()}
+
 </body>
 </html>
 """
-    writeFile file: "${scriptRef.env.DASHBOARD_DIR}\\index.html", text: html
 }
 
-def escapeHtml(String value) {
-    if (value == null) {
-        return ''
-    }
-    return value
-        .replace('&', '&amp;')
-        .replace('<', '&lt;')
-        .replace('>', '&gt;')
-        .replace('"', '&quot;')
-        .replace("'", '&#39;')
+String buildGaiaReport() {
+	String xmlPath = getXmlFilePath()
+
+	if (isBlank(xmlPath)) {
+		KeywordUtil.logInfo('Gaia HTML report was not created because XML file was not found.')
+		return null
+	}
+
+	String reportPath = getResolvedReportPath()
+
+	if (isBlank(reportPath)) {
+		KeywordUtil.logInfo('Gaia HTML report was not created because report folder was not found.')
+		return null
+	}
+
+	Map suiteData = parseSuiteData(xmlPath)
+	String html = buildGaiaReportHtml(suiteData)
+
+	File htmlFile = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
+	htmlFile.write(html, 'UTF-8')
+
+	KeywordUtil.logInfo("Gaia HTML report created successfully: ${htmlFile.absolutePath}")
+	return htmlFile.absolutePath
 }
 
-def stopGaiaProcessesFast(scriptRef, String reason) {
-    scriptRef.echo "🧹 Stopping Gaia processes | ${reason}"
 
-    scriptRef.bat(
-        returnStatus: true,
-        script: """
-            @echo off
-            schtasks /end /tn "${scriptRef.env.GAIA_START_TASK}" >nul 2>&1
 
-            taskkill /f /t /im katalonc.exe >nul 2>&1
-            taskkill /f /t /im KatalonStudio.exe >nul 2>&1
-            taskkill /f /t /im chrome.exe >nul 2>&1
-            taskkill /f /t /im chromedriver.exe >nul 2>&1
-            taskkill /f /t /im notepad.exe >nul 2>&1
-            taskkill /f /t /im cmd.exe >nul 2>&1
 
-            exit /b 0
-        """
-    )
+
+
+// =========================================================
+// SUITE NAME RESOLUTION
+// =========================================================
+
+boolean isIgnorableFolderName(String folderName) {
+	if (isBlank(folderName)) {
+		return true
+	}
+
+	String name = folderName.trim()
+
+	if (name.equalsIgnoreCase('Reports')) return true
+	if (name.equalsIgnoreCase('logs')) return true
+	if (name.equalsIgnoreCase('videos')) return true
+	if (name.equalsIgnoreCase('cucumber_report')) return true
+	if (name.equalsIgnoreCase('PreLoad')) return true
+	if (name.equalsIgnoreCase(EVIDENCE_FOLDER_NAME)) return true
+	if (isTimestampFolderName(name)) return true
+
+	return false
+}
+
+String extractSuiteNameFromNestedReportPath(String reportPath) {
+	if (isBlank(reportPath)) {
+		return ''
+	}
+
+	File current = new File(reportPath)
+
+	if (!current.exists()) {
+		return ''
+	}
+
+	/*
+	 * Expected patterns:
+	 * 1) Reports\<timestamp>\<SuiteName>
+	 * 2) Reports\<timestamp>\<SuiteName>\<timestamp>
+	 * 3) LastRun directly points to suite folder
+	 */
+
+	String currentName = current.getName()
+	File parent = current.getParentFile()
+	File grandParent = parent != null ? parent.getParentFile() : null
+
+	// Case 2: deepest folder is timestamp, parent is suite
+	if (isTimestampFolderName(currentName) && parent != null && !isIgnorableFolderName(parent.getName())) {
+		return normalizeSuiteName(parent.getName())
+	}
+
+	// Case 1 or direct suite folder
+	if (!isIgnorableFolderName(currentName)) {
+		return normalizeSuiteName(currentName)
+	}
+
+	// Walk upwards until find first valid suite folder
+	File walker = parent
+	while (walker != null) {
+		if (!isIgnorableFolderName(walker.getName())) {
+			return normalizeSuiteName(walker.getName())
+		}
+		walker = walker.getParentFile()
+	}
+
+	return ''
+}
+
+String getCurrentSuiteName() {
+	String reportPath = getResolvedReportPath()
+
+	if (!isBlank(reportPath)) {
+		String suiteName = extractSuiteNameFromNestedReportPath(reportPath)
+
+		if (!isBlank(suiteName)) {
+			KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
+			return suiteName
+		}
+	}
+
+	String lastRunPath = readLastRunPath()
+
+	if (!isBlank(lastRunPath)) {
+		String suiteName = extractSuiteNameFromNestedReportPath(lastRunPath)
+
+		if (!isBlank(suiteName)) {
+			KeywordUtil.logInfo("Suite name detected from LastRun path: ${suiteName}")
+			return suiteName
+		}
+	}
+
+	return 'UnknownTestSuite'
+}
+
+String getSanitizedSuiteName() {
+	return getCurrentSuiteName().replaceAll('[\\\\/:*?"<>|]', '_')
+}
+
+String getExecutionSummary() {
+	return getCurrentSuiteName() + ' ' + nowExecution()
+}
+
+String getTestPlanName() {
+	return getCurrentSuiteName() + TEST_PLAN_SUFFIX
 }
