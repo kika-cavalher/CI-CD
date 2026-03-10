@@ -1,1 +1,565 @@
 
+// =========================================================
+// REPLACE THIS WHOLE SECTION IN JiraIntegration.groovy
+// SUITE NAME + EXECUTION/TESPLAN NAMES + HTML REPORT
+// =========================================================
+
+
+
+// =========================================================
+// SUITE NAME RESOLUTION
+// =========================================================
+
+boolean isIgnorableFolderName(String folderName) {
+	if (isBlank(folderName)) {
+		return true
+	}
+
+	String name = folderName.trim()
+
+	if (name.equalsIgnoreCase('Reports')) return true
+	if (name.equalsIgnoreCase('logs')) return true
+	if (name.equalsIgnoreCase('videos')) return true
+	if (name.equalsIgnoreCase('cucumber_report')) return true
+	if (name.equalsIgnoreCase('PreLoad')) return true
+	if (name.equalsIgnoreCase(EVIDENCE_FOLDER_NAME)) return true
+	if (isTimestampFolderName(name)) return true
+
+	return false
+}
+
+String extractSuiteNameFromReportPath(String reportPath) {
+	if (isBlank(reportPath)) {
+		return ''
+	}
+
+	String normalized = reportPath.replace('\\', '/').trim()
+	List<String> parts = normalized.split('/').findAll { !isBlank(it) }
+
+	if (parts.isEmpty()) {
+		return ''
+	}
+
+	int reportsIndex = parts.findIndexOf { it.equalsIgnoreCase('Reports') }
+
+	/*
+	 * Expected real path:
+	 * .../Reports/<timestamp>/<Suite Name>/<timestamp>
+	 *
+	 * We want:
+	 * <Suite Name>
+	 */
+	if (reportsIndex >= 0) {
+		int firstAfterReports = reportsIndex + 1
+		int secondAfterReports = reportsIndex + 2
+		int thirdAfterReports = reportsIndex + 3
+
+		if (firstAfterReports < parts.size()) {
+			String p1 = parts[firstAfterReports]
+
+			if (isTimestampFolderName(p1)) {
+				if (secondAfterReports < parts.size()) {
+					String p2 = parts[secondAfterReports]
+
+					if (!isIgnorableFolderName(p2)) {
+						return normalizeSuiteName(p2)
+					}
+				}
+			} else {
+				if (!isIgnorableFolderName(p1)) {
+					return normalizeSuiteName(p1)
+				}
+			}
+		}
+	}
+
+	// fallback walking backwards
+	for (int i = parts.size() - 1; i >= 0; i--) {
+		String part = parts[i]
+		if (!isIgnorableFolderName(part)) {
+			return normalizeSuiteName(part)
+		}
+	}
+
+	return ''
+}
+
+String getCurrentSuiteName() {
+	String reportPath = getResolvedReportPath()
+
+	if (!isBlank(reportPath)) {
+		String suiteName = extractSuiteNameFromReportPath(reportPath)
+		if (!isBlank(suiteName)) {
+			KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
+			return suiteName
+		}
+	}
+
+	String lastRunPath = readLastRunPath()
+	if (!isBlank(lastRunPath)) {
+		String suiteName = extractSuiteNameFromReportPath(lastRunPath)
+		if (!isBlank(suiteName)) {
+			KeywordUtil.logInfo("Suite name detected from LastRun path: ${suiteName}")
+			return suiteName
+		}
+	}
+
+	return 'UnknownTestSuite'
+}
+
+String getSanitizedSuiteName() {
+	return getCurrentSuiteName().replaceAll('[\\\\/:*?"<>|]', '_')
+}
+
+String getExecutionSummary() {
+	return getCurrentSuiteName() + ' ' + nowExecution()
+}
+
+String getTestPlanName() {
+	return getCurrentSuiteName() + TEST_PLAN_SUFFIX
+}
+
+
+
+// =========================================================
+// SHORT ERROR SUMMARY
+// =========================================================
+
+String getShortErrorLog(String stackTrace) {
+	if (isBlank(stackTrace)) {
+		return ''
+	}
+
+	List<String> lines = stackTrace
+		.readLines()
+		.findAll { !isBlank(it) }
+		.collect { it.trim() }
+
+	if (lines.isEmpty()) {
+		return ''
+	}
+
+	List<String> important = []
+
+	for (String line : lines) {
+		String lower = line.toLowerCase()
+
+		if (
+			lower.contains('exception')
+			|| lower.contains('error')
+			|| lower.contains('caused by')
+			|| lower.contains('stepfailedexception')
+			|| lower.contains('unable')
+			|| lower.contains('not found')
+			|| lower.contains('not clickable')
+			|| lower.contains('timed out')
+			|| lower.contains('assert')
+		) {
+			important.add(line)
+		}
+
+		if (important.size() == 3) {
+			break
+		}
+	}
+
+	if (important.isEmpty()) {
+		important = lines.take(3)
+	}
+
+	return important.join('\n')
+}
+
+
+
+// =========================================================
+// HTML REPORT
+// =========================================================
+
+String buildFailureCard(Map item) {
+	String fullStack = item.stackTrace as String
+	String shortStack = getShortErrorLog(fullStack)
+
+	StringBuilder html = new StringBuilder()
+
+	html.append('<div class="test-card failed">')
+
+	html.append('<div class="test-title">')
+	html.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+	html.append('</div>')
+
+	html.append('<div class="test-line">')
+	html.append('<span class="bullet">❗</span> Mandatory failure')
+	html.append('</div>')
+
+	if (!isBlank(item.failureMessage as String)) {
+		html.append('<div class="test-line">')
+		html.append(safeHtml(item.failureMessage as String))
+		html.append('</div>')
+	}
+
+	if (!isBlank(shortStack)) {
+		html.append('<pre class="short-error">')
+		html.append(safeHtml(shortStack))
+		html.append('</pre>')
+	}
+
+	html.append('<div class="test-line duration">')
+	html.append('Duration: ')
+	html.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+	html.append('</div>')
+
+	html.append('<details class="details-wrap">')
+	html.append('<summary>See full error log</summary>')
+	html.append('<pre class="full-error">')
+	html.append(safeHtml(fullStack))
+	html.append('</pre>')
+	html.append('</details>')
+
+	if (!isBlank(item.imageData as String)) {
+		html.append('<div class="image-wrap">')
+		html.append('<img class="failure-image" src="')
+		html.append(item.imageData as String)
+		html.append('" alt="Failure evidence"/>')
+		html.append('</div>')
+	}
+
+	html.append('</div>')
+
+	return html.toString()
+}
+
+String buildPassedCard(Map item) {
+	StringBuilder html = new StringBuilder()
+
+	html.append('<div class="test-card passed">')
+
+	html.append('<div class="test-title">')
+	html.append(safeHtml((item.className ?: '') + '/' + (item.testName ?: '')))
+	html.append('</div>')
+
+	html.append('<div class="test-line">')
+	html.append('<span class="bullet">✔</span> Test Passed')
+	html.append('</div>')
+
+	html.append('<div class="test-line duration">')
+	html.append('Duration: ')
+	html.append(safeHtml(formatDurationSeconds(item.timeSeconds as BigDecimal)))
+	html.append('</div>')
+
+	html.append('</div>')
+
+	return html.toString()
+}
+
+String buildGaiaReportHtml(Map suiteData) {
+	StringBuilder failedHtml = new StringBuilder()
+	StringBuilder passedHtml = new StringBuilder()
+
+	for (Map item : suiteData.failedTests as List<Map>) {
+		failedHtml.append(buildFailureCard(item))
+	}
+
+	for (Map item : suiteData.passedTests as List<Map>) {
+		passedHtml.append(buildPassedCard(item))
+	}
+
+	String avgDuration = '0ms'
+	if ((suiteData.executed as Integer) > 0) {
+		BigDecimal avg = (suiteData.suiteTime as BigDecimal) / (suiteData.executed as Integer)
+		avgDuration = formatDurationSeconds(avg)
+	}
+
+	return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Windows Test Execution Report — Gaia</title>
+<style>
+	body {
+		font-family: Arial, Helvetica, sans-serif;
+		margin: 0;
+		padding: 28px 36px;
+		background: #ffffff;
+		color: #1f2937;
+	}
+
+	h1 {
+		font-size: 22px;
+		font-weight: 700;
+		margin: 0 0 20px 0;
+		color: #111827;
+	}
+
+	.summary-grid {
+		display: grid;
+		grid-template-columns: 2fr 1fr 1fr 1fr 0.8fr 0.8fr 0.8fr 0.8fr 1fr;
+		gap: 18px;
+		margin-bottom: 28px;
+	}
+
+	.summary-item {
+		min-height: 52px;
+	}
+
+	.summary-label {
+		font-size: 10px;
+		text-transform: uppercase;
+		color: #6b7280;
+		margin-bottom: 6px;
+	}
+
+	.summary-value {
+		font-size: 12px;
+		line-height: 1.4;
+		color: #111827;
+	}
+
+	.section-title {
+		font-size: 16px;
+		font-weight: 700;
+		margin: 22px 0 14px 0;
+	}
+
+	.section-title.failed {
+		color: #b91c1c;
+	}
+
+	.section-title.passed {
+		color: #166534;
+	}
+
+	.test-card {
+		padding: 0 0 0 12px;
+		margin: 0 0 22px 0;
+	}
+
+	.test-card.failed {
+		border-left: 3px solid #dc2626;
+	}
+
+	.test-card.passed {
+		border-left: 3px solid #16a34a;
+	}
+
+	.test-title {
+		font-size: 13px;
+		font-weight: 700;
+		margin-bottom: 6px;
+		color: #111827;
+	}
+
+	.test-line {
+		font-size: 12px;
+		line-height: 1.45;
+		margin-bottom: 4px;
+		color: #1f2937;
+	}
+
+	.duration {
+		color: #6b7280;
+	}
+
+	.short-error {
+		white-space: pre-wrap;
+		font-size: 11px;
+		line-height: 1.45;
+		margin: 8px 0 8px 0;
+		color: #374151;
+		background: #ffffff;
+		border: none;
+		padding: 0;
+		font-family: Arial, Helvetica, sans-serif;
+	}
+
+	.details-wrap {
+		margin-top: 8px;
+		margin-bottom: 10px;
+	}
+
+	.details-wrap summary {
+		cursor: pointer;
+		font-size: 12px;
+		color: #111827;
+	}
+
+	.full-error {
+		white-space: pre-wrap;
+		font-size: 11px;
+		line-height: 1.4;
+		margin-top: 10px;
+		color: #374151;
+		background: #ffffff;
+		border: none;
+		padding: 0;
+		font-family: Arial, Helvetica, sans-serif;
+	}
+
+	.image-wrap {
+		margin-top: 12px;
+	}
+
+	.failure-image {
+		max-width: 320px;
+		height: auto;
+		border: 1px solid #d1d5db;
+		display: block;
+	}
+
+	.empty-text {
+		font-size: 12px;
+		color: #6b7280;
+	}
+</style>
+</head>
+<body>
+
+<h1>Windows Test Execution Report — Gaia</h1>
+
+<div class="summary-grid">
+	<div class="summary-item">
+		<div class="summary-label">Suite</div>
+		<div class="summary-value">${safeHtml(suiteData.suiteName as String)}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">Start</div>
+		<div class="summary-value">${safeHtml(suiteData.startText as String)}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">End</div>
+		<div class="summary-value">${safeHtml(suiteData.endText as String)}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">Suite Duration</div>
+		<div class="summary-value">${safeHtml(formatDurationSeconds(suiteData.suiteTime as BigDecimal))}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">Executed</div>
+		<div class="summary-value">${suiteData.executed}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">Passed</div>
+		<div class="summary-value">${suiteData.passed}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">Failed</div>
+		<div class="summary-value">${suiteData.failed}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">Skipped</div>
+		<div class="summary-value">${suiteData.skipped}</div>
+	</div>
+	<div class="summary-item">
+		<div class="summary-label">Avg/Test</div>
+		<div class="summary-value">${safeHtml(avgDuration)}</div>
+	</div>
+</div>
+
+<div class="section-title failed">✘ Failed (${suiteData.failed})</div>
+${failedHtml.toString()}
+
+<div class="section-title passed">☑ Passed (${suiteData.passed})</div>
+${passedHtml.toString().trim().isEmpty() ? '<div class="empty-text">No passed tests.</div>' : passedHtml.toString()}
+
+</body>
+</html>
+"""
+}
+
+String buildGaiaReport() {
+	String xmlPath = getXmlFilePath()
+
+	if (isBlank(xmlPath)) {
+		KeywordUtil.logInfo('Gaia HTML report was not created because XML file was not found.')
+		return null
+	}
+
+	String reportPath = getResolvedReportPath()
+
+	if (isBlank(reportPath)) {
+		KeywordUtil.logInfo('Gaia HTML report was not created because report folder was not found.')
+		return null
+	}
+
+	Map suiteData = parseSuiteData(xmlPath)
+
+	// force correct suite name in header
+	suiteData.suiteName = getCurrentSuiteName()
+
+	String html = buildGaiaReportHtml(suiteData)
+
+	File htmlFile = new File(reportPath + File.separator + GAIA_REPORT_FILE_NAME)
+	htmlFile.write(html, 'UTF-8')
+
+	KeywordUtil.logInfo("Gaia HTML report created successfully: ${htmlFile.absolutePath}")
+	return htmlFile.absolutePath
+}
+
+
+
+// =========================================================
+// REPLACE THIS WHOLE METHOD TOO
+// =========================================================
+
+@Keyword
+def jiraImport() {
+	logSection('Starting Jira import flow')
+
+	String suiteName = getCurrentSuiteName()
+	String executionSummary = getExecutionSummary()
+	String testPlanName = getTestPlanName()
+
+	KeywordUtil.logInfo("Suite name used: ${suiteName}")
+	KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+	KeywordUtil.logInfo("Test Plan title used: ${testPlanName}")
+	KeywordUtil.logInfo("Using report folder: ${getResolvedReportPath()}")
+
+	String xmlFile = getXmlFilePath()
+
+	if (isBlank(xmlFile)) {
+		KeywordUtil.markFailed('No XML file found for Jira import.')
+		return
+	}
+
+	String gaiaReportFile = buildGaiaReport()
+	String zipReport = zipReports()
+	String zipEvidence = zipEvidences()
+
+	String execID = importResults(xmlFile)
+
+	if (isBlank(execID) || execID.contains('ERROR')) {
+		KeywordUtil.markFailed("Test Execution creation failed: ${execID}")
+		return
+	}
+
+	String testPlanKey = getOrCreateTestPlan()
+
+	if (isBlank(testPlanKey) || testPlanKey.contains('ERROR')) {
+		KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+		return
+	}
+
+	int updatePlanStatus = updateTestPlan(testPlanKey, [execID])
+	int updateExecutionStatus = updateTestExecution(execID)
+
+	int uploadExecGaiaReportStatus = uploadAttachment(execID, gaiaReportFile)
+	int uploadExecResultsStatus = uploadAttachment(execID, zipReport)
+	int uploadExecEvidenceStatus = uploadAttachment(execID, zipEvidence)
+
+	int transitionExecutionStatus = updateIssueStatus(execID, TEST_EXECUTION_TRANSITION_ID)
+	int transitionPlanStatus = updateIssueStatus(testPlanKey, TEST_PLAN_TRANSITION_ID)
+
+	logSection('Jira import finished')
+
+	KeywordUtil.logInfo("Execution key: ${execID}")
+	KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+	KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+	KeywordUtil.logInfo("Test Plan title used: ${testPlanName}")
+	KeywordUtil.logInfo("Gaia report attachment status: ${uploadExecGaiaReportStatus}")
+	KeywordUtil.logInfo("Results.zip attachment status: ${uploadExecResultsStatus}")
+	KeywordUtil.logInfo("Evidences.zip attachment status: ${uploadExecEvidenceStatus}")
+	KeywordUtil.logInfo("Update Test Plan status: ${updatePlanStatus}")
+	KeywordUtil.logInfo("Update Test Execution status: ${updateExecutionStatus}")
+	KeywordUtil.logInfo("Transition Execution status: ${transitionExecutionStatus}")
+	KeywordUtil.logInfo("Transition Test Plan status: ${transitionPlanStatus}")
+}
