@@ -1,1 +1,407 @@
 
+package jiraIntegration
+
+import java.io.File
+import java.util.Date
+
+import groovy.xml.XmlSlurper
+
+class JiraGaiaReportBuilder {
+
+    JiraFlowCoordinator owner
+
+    JiraGaiaReportBuilder(JiraFlowCoordinator owner) {
+        this.owner = owner
+    }
+
+    List<Map> parseXmlCases(String xmlPath) {
+        List<Map> result = []
+
+        if (owner.isBlank(xmlPath) || !new File(xmlPath).exists()) {
+            return result
+        }
+
+        def xml
+        try {
+            xml = new XmlSlurper().parse(new File(xmlPath))
+        } catch (Exception e) {
+            return result
+        }
+
+        List testcaseNodes = []
+
+        if (owner.safe(xml.name()) == 'testsuite') {
+            testcaseNodes.addAll(xml.testcase)
+        } else if (owner.safe(xml.name()) == 'testsuites') {
+            xml.testsuite.each { suite ->
+                testcaseNodes.addAll(suite.testcase)
+            }
+        }
+
+        testcaseNodes.each { tc ->
+            String classname = owner.safe(tc.@classname)
+            String name = owner.safe(tc.@name)
+            long durationMs = owner.toMillis(tc.@time)
+
+            def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
+            def errorNode = tc.error?.size() > 0 ? tc.error[0] : null
+            def skippedNode = tc.skipped?.size() > 0 ? tc.skipped[0] : null
+
+            boolean failed = failureNode != null || errorNode != null
+            boolean skipped = skippedNode != null
+
+            String message = ''
+            String details = ''
+
+            if (failureNode != null) {
+                message = owner.safe(failureNode.@message)
+                details = owner.safe(failureNode.text())
+            } else if (errorNode != null) {
+                message = owner.safe(errorNode.@message)
+                details = owner.safe(errorNode.text())
+            } else if (skippedNode != null) {
+                message = owner.safe(skippedNode.@message)
+                details = owner.safe(skippedNode.text())
+            }
+
+            String displayName = ''
+            if (!owner.isBlank(classname) && !owner.isBlank(name)) {
+                displayName = classname + '/' + name
+            } else if (!owner.isBlank(name)) {
+                displayName = name
+            } else {
+                displayName = classname
+            }
+
+            result << [
+                name      : displayName,
+                shortName : !owner.isBlank(name) ? name : displayName,
+                durationMs: durationMs,
+                status    : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
+                message   : message,
+                details   : details
+            ]
+        }
+
+        return result
+    }
+
+    List<String> getFailureSummaryLines(String message, String details) {
+        List<String> lines = []
+
+        if (!owner.isBlank(message)) {
+            lines << owner.safe(message)
+        }
+
+        owner.safe(details).readLines().each { String raw ->
+            String line = owner.safe(raw)
+
+            if (owner.isBlank(line)) {
+                return
+            }
+
+            if (line.startsWith('at ')) {
+                return
+            }
+
+            if (line.startsWith('Caused by: at ')) {
+                return
+            }
+
+            if (line.contains('com.kms.katalon') && line.length() > 120) {
+                return
+            }
+
+            if (line.contains('org.openqa.selenium') && line.length() > 120) {
+                return
+            }
+
+            lines << line
+        }
+
+        lines = lines
+            .collect { it.replaceAll(/\s+/, ' ').trim() }
+            .findAll { !owner.isBlank(it) }
+            .unique()
+
+        if (lines.isEmpty() && !owner.isBlank(details)) {
+            lines = owner.safe(details).readLines()
+                .collect { owner.safe(it) }
+                .findAll { !owner.isBlank(it) }
+                .take(3)
+        }
+
+        return lines.take(3)
+    }
+
+    String buildHeaderCard(String label, String value) {
+        return """
+            <div class="stat-card">
+                <div class="stat-label">${owner.htmlEscape(label)}</div>
+                <div class="stat-value">${owner.htmlEscape(value)}</div>
+            </div>
+        """
+    }
+
+    String buildFailedCaseHtml(Map item, File baseDir) {
+        List<String> summaryLines = getFailureSummaryLines(owner.safe(item.message), owner.safe(item.details))
+        StringBuilder block = new StringBuilder()
+
+        block.append('<div class="case-card failed">\n')
+        block.append("<div class=\"case-title\">${owner.htmlEscape(owner.safe(item.name))}</div>\n")
+        block.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+
+        summaryLines.each { String line ->
+            block.append("<div class=\"failure-line\">${owner.htmlEscape(line)}</div>\n")
+        }
+
+        block.append('<div class="details-wrap">\n')
+        block.append('<details>\n')
+        block.append('<summary>See full error log</summary>\n')
+        block.append("<pre>${owner.htmlEscape(owner.safe(item.details))}</pre>\n")
+        block.append('</details>\n')
+        block.append('</div>\n')
+
+        File image = item.image as File
+        if (image != null && image.exists()) {
+            String imgSrc = owner.relativeUri(baseDir, image)
+            block.append("<img class=\"failure-image\" src=\"${owner.htmlEscape(imgSrc)}\" alt=\"Failure evidence\">\n")
+        }
+
+        block.append('</div>\n')
+        return block.toString()
+    }
+
+    String buildPassedCaseHtml(Map item) {
+        StringBuilder block = new StringBuilder()
+        block.append('<div class="case-card passed">\n')
+        block.append("<div class=\"case-title\">${owner.htmlEscape(owner.safe(item.name))}</div>\n")
+        block.append("<div class=\"case-meta\">Test Passed</div>\n")
+        block.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+        block.append('</div>\n')
+        return block.toString()
+    }
+
+    String buildSkippedCaseHtml(Map item) {
+        StringBuilder block = new StringBuilder()
+        block.append('<div class="case-card skipped">\n')
+        block.append("<div class=\"case-title\">${owner.htmlEscape(owner.safe(item.name))}</div>\n")
+        block.append("<div class=\"case-meta\">Test Skipped</div>\n")
+        block.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+        block.append('</div>\n')
+        return block.toString()
+    }
+
+    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
+        if (owner.isBlank(reportFolder) || owner.isBlank(xmlPath)) {
+            return ''
+        }
+
+        List<Map> cases = parseXmlCases(xmlPath)
+        List<Map> failedCases = cases.findAll { it.status == 'failed' }
+        List<Map> passedCases = cases.findAll { it.status == 'passed' }
+        List<Map> skippedCases = cases.findAll { it.status == 'skipped' }
+
+        List<File> failureImages = owner.collectFailureImages(reportFolder)
+
+        int imageIndex = 0
+        failedCases.each { Map item ->
+            if (imageIndex < failureImages.size()) {
+                item.image = failureImages[imageIndex]
+                imageIndex++
+            } else {
+                item.image = null
+            }
+        }
+
+        long totalDurationMs = 0L
+        cases.each { totalDurationMs += ((itemDuration(it)) as long) }
+
+        File baseDir = new File(reportFolder)
+        Date endDate = new Date(baseDir.lastModified())
+        Date startDate = new Date(endDate.time - totalDurationMs)
+
+        int executed = cases.size()
+        String avgTest = executed > 0 ? owner.formatDurationMillis((long) (totalDurationMs / executed)) : '0m 0s 0ms'
+
+        File htmlFile = new File(reportFolder + File.separator + owner.GAIA_REPORT_FILE_NAME)
+
+        StringBuilder html = new StringBuilder()
+        html.append('<!DOCTYPE html>\n')
+        html.append('<html lang="en">\n')
+        html.append('<head>\n')
+        html.append('<meta charset="UTF-8">\n')
+        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
+        html.append('<title>Gaia Test Execution Report</title>\n')
+        html.append('''
+<style>
+    body {
+        font-family: Arial, Helvetica, sans-serif;
+        margin: 28px;
+        color: #1f2937;
+        background: #ffffff;
+    }
+    h1 {
+        font-size: 22px;
+        margin: 0 0 22px 0;
+        font-weight: 700;
+    }
+    .header-grid {
+        display: grid;
+        grid-template-columns: repeat(8, minmax(110px, 1fr));
+        gap: 10px;
+        margin-bottom: 26px;
+    }
+    .stat-card {
+        background: #f8fafc;
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        padding: 12px;
+        min-height: 70px;
+    }
+    .stat-label {
+        font-size: 10px;
+        text-transform: uppercase;
+        color: #6b7280;
+        margin-bottom: 8px;
+        font-weight: 700;
+    }
+    .stat-value {
+        font-size: 14px;
+        font-weight: 600;
+        line-height: 1.4;
+    }
+    .section-title {
+        font-size: 14px;
+        font-weight: 700;
+        margin: 22px 0 10px 0;
+    }
+    .section-title.failed {
+        color: #b91c1c;
+    }
+    .section-title.passed {
+        color: #15803d;
+    }
+    .section-title.skipped {
+        color: #92400e;
+    }
+    .case-card {
+        border-left: 3px solid #d1d5db;
+        background: #ffffff;
+        padding: 10px 12px 14px 12px;
+        margin-bottom: 18px;
+    }
+    .case-card.failed {
+        border-left-color: #dc2626;
+        background: #fff7f7;
+    }
+    .case-card.passed {
+        border-left-color: #16a34a;
+        background: #f8fff9;
+    }
+    .case-card.skipped {
+        border-left-color: #d97706;
+        background: #fffaf0;
+    }
+    .case-title {
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 4px;
+    }
+    .case-meta {
+        font-size: 12px;
+        color: #4b5563;
+        margin-bottom: 6px;
+    }
+    .failure-line {
+        font-size: 12px;
+        color: #374151;
+        margin: 2px 0;
+    }
+    .details-wrap {
+        margin-top: 8px;
+    }
+    details summary {
+        cursor: pointer;
+        font-size: 12px;
+        color: #111827;
+        font-weight: 600;
+    }
+    pre {
+        margin-top: 8px;
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        padding: 10px;
+        font-size: 11px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-x: auto;
+    }
+    .failure-image {
+        margin-top: 12px;
+        max-width: 320px;
+        max-height: 180px;
+        border: 1px solid #d1d5db;
+        border-radius: 4px;
+        display: block;
+        background: #ffffff;
+    }
+    .empty-text {
+        font-size: 13px;
+        color: #6b7280;
+        margin-top: 10px;
+    }
+</style>
+''')
+        html.append('</head>\n')
+        html.append('<body>\n')
+        html.append('<h1>Windows Test Execution Report | Gaia</h1>\n')
+        html.append('<div class="header-grid">\n')
+        html.append(buildHeaderCard('Suite', owner.safe(suiteName)))
+        html.append(buildHeaderCard('Start', owner.formatHeaderDate(startDate)))
+        html.append(buildHeaderCard('End', owner.formatHeaderDate(endDate)))
+        html.append(buildHeaderCard('Suite Duration', owner.formatDurationMillis(totalDurationMs)))
+        html.append(buildHeaderCard('Executed', String.valueOf(executed)))
+        html.append(buildHeaderCard('Passed', String.valueOf(passedCases.size())))
+        html.append(buildHeaderCard('Failed', String.valueOf(failedCases.size())))
+        html.append(buildHeaderCard('Avg/Test', avgTest))
+        html.append('</div>\n')
+
+        html.append("<div class=\"section-title failed\">✘ Failed (${failedCases.size()})</div>\n")
+        if (failedCases.isEmpty()) {
+            html.append('<div class="empty-text">No failed tests.</div>\n')
+        } else {
+            failedCases.each { Map item ->
+                html.append(buildFailedCaseHtml(item, baseDir))
+            }
+        }
+
+        html.append("<div class=\"section-title passed\">✔ Passed (${passedCases.size()})</div>\n")
+        if (passedCases.isEmpty()) {
+            html.append('<div class="empty-text">No passed tests.</div>\n')
+        } else {
+            passedCases.each { Map item ->
+                html.append(buildPassedCaseHtml(item))
+            }
+        }
+
+        if (!skippedCases.isEmpty()) {
+            html.append("<div class=\"section-title skipped\">Skipped (${skippedCases.size()})</div>\n")
+            skippedCases.each { Map item ->
+                html.append(buildSkippedCaseHtml(item))
+            }
+        }
+
+        html.append('</body>\n')
+        html.append('</html>\n')
+
+        htmlFile.setText(html.toString(), 'UTF-8')
+        return htmlFile.absolutePath
+    }
+
+    long itemDuration(Map item) {
+        return (item.durationMs ?: 0L) as long
+    }
+}
