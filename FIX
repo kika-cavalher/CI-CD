@@ -2,690 +2,20 @@
 package jiraIntegration
 
 import java.io.File
-import java.nio.file.Files
 import java.text.SimpleDateFormat
-import java.util.Base64
 import java.util.Date
 import java.util.Locale
 
 import groovy.json.JsonSlurper
-import groovy.xml.XmlSlurper
+import groovy.util.Node
+import groovy.util.XmlParser
 
 class JiraGaiaReportBuilder {
 
     JiraFlowCoordinator flow
-    JiraGaiaHtmlTemplateBuilder templateBuilder
 
     JiraGaiaReportBuilder(JiraFlowCoordinator flow) {
         this.flow = flow
-        this.templateBuilder = new JiraGaiaHtmlTemplateBuilder()
-    }
-
-    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
-        if (isBlank(reportFolder)) {
-            return ''
-        }
-
-        List<Map> cases = parseCucumberCases(reportFolder)
-
-        if (cases.isEmpty()) {
-            cases = parseXmlCases(xmlPath)
-        }
-
-        Map<String, List<Map>> scenarioEvents = parseScenarioEvents(reportFolder)
-        enrichCasesWithScenarioEvents(cases, scenarioEvents)
-
-        attachEvidenceImages(cases, reportFolder)
-        calculateCaseTimes(cases, reportFolder)
-        fillCaseSummaries(cases)
-
-        Map counts = calculateCounts(cases)
-        String logoDataUri = resolveLogoDataUri(reportFolder)
-
-        Map model = [
-            suiteName    : safeValue(suiteName),
-            generatedAt  : formatDateTime(new Date()),
-            total        : counts.total,
-            passed       : counts.passed,
-            failed       : counts.failed,
-            skipped      : counts.skipped,
-            startAt      : cases ? safeValue(cases.first().startAt) : '',
-            endAt        : cases ? safeValue(cases.last().endAt) : '',
-            durationText : formatDurationMillis(sumDuration(cases)),
-            logoDataUri  : logoDataUri,
-            cases        : cases
-        ]
-
-        String html = templateBuilder.buildHtml(model)
-
-        File htmlFile = new File(reportFolder + File.separator + flow.GAIA_REPORT_FILE_NAME)
-        htmlFile.setText(html, 'UTF-8')
-        return htmlFile.absolutePath
-    }
-
-    private List<Map> parseCucumberCases(String reportFolder) {
-        List<Map> result = []
-
-        File cucumberJson = findFirstFileByNames(reportFolder, ['cucumber.json', 'k-cucumber.json'])
-        if (cucumberJson == null || !cucumberJson.exists()) {
-            return result
-        }
-
-        def parsed
-        try {
-            parsed = new JsonSlurper().parse(cucumberJson)
-        } catch (Exception ignored) {
-            return result
-        }
-
-        if (!(parsed instanceof List)) {
-            return result
-        }
-
-        parsed.each { feature ->
-            List elements = feature?.elements instanceof List ? feature.elements : []
-            elements.each { scenario ->
-                String scenarioType = safeValue(scenario?.type)
-                if (scenarioType == 'background') {
-                    return
-                }
-
-                String scenarioName = safeValue(scenario?.name)
-                List stepItems = []
-                long totalDurationMs = 0L
-                String finalStatus = 'passed'
-                String errorSummary = ''
-                String errorFull = ''
-
-                List steps = scenario?.steps instanceof List ? scenario.steps : []
-                steps.each { step ->
-                    String keyword = safeValue(step?.keyword)
-                    String name = safeValue(step?.name)
-                    String detail = (keyword + ' ' + name).trim()
-
-                    Map resultNode = step?.result instanceof Map ? step.result : [:]
-                    String rawStatus = safeValue(resultNode?.status).toLowerCase(Locale.ENGLISH)
-                    long durationNs = toLong(resultNode?.duration)
-                    long durationMs = durationNs > 0L ? (long) (durationNs / 1_000_000L) : 0L
-                    totalDurationMs += durationMs
-
-                    String mappedStatus = mapCucumberStatus(rawStatus)
-                    String errorMessage = safeValue(resultNode?.error_message)
-
-                    if (mappedStatus == 'fail') {
-                        finalStatus = 'fail'
-                        if (isBlank(errorSummary)) {
-                            errorSummary = firstMeaningfulErrorLine(errorMessage)
-                        }
-                        if (isBlank(errorFull)) {
-                            errorFull = errorMessage
-                        }
-                    } else if (mappedStatus == 'skip' && finalStatus != 'fail') {
-                        finalStatus = 'skip'
-                    }
-
-                    Map row = [
-                        status     : mappedStatus,
-                        timestamp  : '',
-                        details    : detail,
-                        fullText   : errorMessage,
-                        durationMs : durationMs
-                    ]
-
-                    stepItems.add(row)
-                }
-
-                Map caseRow = [
-                    id           : 'case_' + (result.size() + 1),
-                    name         : scenarioName,
-                    shortName    : scenarioName,
-                    status       : finalStatus,
-                    durationMs   : totalDurationMs,
-                    durationText : formatDurationMillis(totalDurationMs),
-                    steps        : stepItems,
-                    summary      : '',
-                    errorSummary : errorSummary,
-                    errorFull    : errorFull,
-                    evidences    : [],
-                    startAt      : '',
-                    endAt        : ''
-                ]
-
-                result.add(caseRow)
-            }
-        }
-
-        return result
-    }
-
-    private List<Map> parseXmlCases(String xmlPath) {
-        List<Map> result = []
-
-        if (isBlank(xmlPath)) {
-            return result
-        }
-
-        File xmlFile = new File(xmlPath)
-        if (!xmlFile.exists()) {
-            return result
-        }
-
-        def xml
-        try {
-            xml = new XmlSlurper().parse(xmlFile)
-        } catch (Exception ignored) {
-            return result
-        }
-
-        List testcaseNodes = []
-        String rootName = safeValue(xml.name())
-
-        if (rootName == 'testsuite') {
-            testcaseNodes.addAll(xml.testcase)
-        } else if (rootName == 'testsuites') {
-            xml.testsuite.each { suite ->
-                testcaseNodes.addAll(suite.testcase)
-            }
-        }
-
-        testcaseNodes.each { tc ->
-            String className = safeValue(tc.@classname?.toString())
-            String testName = safeValue(tc.@name?.toString())
-            long durationMs = toMillis(tc.@time?.toString())
-
-            def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
-            def errorNode = tc.error?.size() > 0 ? tc.error[0] : null
-            def skippedNode = tc.skipped?.size() > 0 ? tc.skipped[0] : null
-
-            boolean failed = failureNode != null || errorNode != null
-            boolean skipped = skippedNode != null
-
-            String message = ''
-            String details = ''
-
-            if (failureNode != null) {
-                message = safeValue(failureNode.@message?.toString())
-                details = safeValue(failureNode.text())
-            } else if (errorNode != null) {
-                message = safeValue(errorNode.@message?.toString())
-                details = safeValue(errorNode.text())
-            } else if (skippedNode != null) {
-                message = safeValue(skippedNode.@message?.toString())
-                details = safeValue(skippedNode.text())
-            }
-
-            String displayName = ''
-            if (!isBlank(className) && !isBlank(testName)) {
-                displayName = className + '/' + testName
-            } else if (!isBlank(testName)) {
-                displayName = testName
-            } else {
-                displayName = className
-            }
-
-            Map row = [
-                id           : 'case_' + (result.size() + 1),
-                name         : displayName,
-                shortName    : isBlank(testName) ? displayName : testName,
-                status       : skipped ? 'skip' : (failed ? 'fail' : 'pass'),
-                durationMs   : durationMs,
-                durationText : formatDurationMillis(durationMs),
-                steps        : [],
-                summary      : '',
-                errorSummary : firstMeaningfulErrorLine(message + '\n' + details),
-                errorFull    : details,
-                evidences    : [],
-                startAt      : '',
-                endAt        : ''
-            ]
-
-            result.add(row)
-        }
-
-        return result
-    }
-
-    private Map<String, List<Map>> parseScenarioEvents(String reportFolder) {
-        Map<String, List<Map>> scenarioEvents = [:]
-
-        File logFile = findFirstExecutionLog(reportFolder)
-        if (logFile == null || !logFile.exists()) {
-            return scenarioEvents
-        }
-
-        String currentScenario = ''
-        List<String> lines = []
-
-        try {
-            lines = logFile.readLines('UTF-8')
-        } catch (Exception ignored) {
-            return scenarioEvents
-        }
-
-        lines.each { String rawLine ->
-            String line = stripAnsi(rawLine)
-            String time = extractTime(line)
-            String message = extractMessage(line)
-
-            if (message.contains('SCENARIO ')) {
-                currentScenario = safeValue(message.substring(message.indexOf('SCENARIO ') + 'SCENARIO '.length()))
-                if (!scenarioEvents.containsKey(currentScenario)) {
-                    scenarioEvents[currentScenario] = []
-                }
-                return
-            }
-
-            if (isBlank(currentScenario)) {
-                return
-            }
-
-            if (message.startsWith('Failed scenarios:')) {
-                currentScenario = ''
-                return
-            }
-
-            if (!isInterestingScenarioLine(message)) {
-                return
-            }
-
-            Map eventRow = [
-                status    : classifyEventStatus(message),
-                timestamp : time,
-                details   : oneLine(message, 180),
-                fullText  : safeValue(message),
-                durationMs: 0L
-            ]
-
-            scenarioEvents[currentScenario].add(eventRow)
-        }
-
-        return scenarioEvents
-    }
-
-    private void enrichCasesWithScenarioEvents(List<Map> cases, Map<String, List<Map>> scenarioEvents) {
-        if (cases == null || cases.isEmpty() || scenarioEvents == null || scenarioEvents.isEmpty()) {
-            return
-        }
-
-        cases.each { Map caseRow ->
-            String caseNameKey = normalizeKey(caseRow.name)
-            String matchedKey = ''
-
-            scenarioEvents.keySet().each { String scenarioName ->
-                String scenarioKey = normalizeKey(scenarioName)
-                if (caseNameKey == scenarioKey || caseNameKey.contains(scenarioKey) || scenarioKey.contains(caseNameKey)) {
-                    matchedKey = scenarioName
-                }
-            }
-
-            if (!isBlank(matchedKey)) {
-                List<Map> events = scenarioEvents[matchedKey]
-                if (events != null && !events.isEmpty()) {
-                    caseRow.steps = events
-                }
-            }
-        }
-    }
-
-    private void attachEvidenceImages(List<Map> cases, String reportFolder) {
-        List<File> images = collectImages(reportFolder)
-        if (images.isEmpty() || cases == null || cases.isEmpty()) {
-            return
-        }
-
-        List<Map> failedCases = cases.findAll { Map item -> safeValue(item.status) == 'fail' }
-
-        if (failedCases.size() == 1) {
-            failedCases[0].evidences = images.collect { File img ->
-                [
-                    name    : img.name,
-                    dataUri : toImageDataUri(img)
-                ]
-            }
-            return
-        }
-
-        int index = 0
-        failedCases.each { Map item ->
-            List evidences = []
-            if (index < images.size()) {
-                evidences.add([
-                    name    : images[index].name,
-                    dataUri : toImageDataUri(images[index])
-                ])
-                index++
-            }
-            item.evidences = evidences
-        }
-    }
-
-    private void calculateCaseTimes(List<Map> cases, String reportFolder) {
-        if (cases == null || cases.isEmpty()) {
-            return
-        }
-
-        long totalDurationMs = sumDuration(cases)
-        File reportDir = new File(reportFolder)
-
-        long endMillis = reportDir.exists() ? reportDir.lastModified() : System.currentTimeMillis()
-        long startMillis = endMillis - totalDurationMs
-
-        long cursor = startMillis
-        cases.each { Map caseRow ->
-            long caseDuration = toLong(caseRow.durationMs)
-
-            Date startDate = new Date(cursor)
-            Date endDate = new Date(cursor + caseDuration)
-
-            caseRow.startAt = formatTime(startDate)
-            caseRow.endAt = formatTime(endDate)
-
-            List<Map> steps = caseRow.steps instanceof List ? caseRow.steps : []
-            long stepCursor = cursor
-
-            steps.each { Map step ->
-                long stepDuration = toLong(step.durationMs)
-                if (isBlank(step.timestamp)) {
-                    step.timestamp = formatTime(new Date(stepCursor))
-                }
-                stepCursor += stepDuration
-            }
-
-            cursor += caseDuration
-        }
-    }
-
-    private void fillCaseSummaries(List<Map> cases) {
-        cases.each { Map caseRow ->
-            String summary = ''
-
-            if (!isBlank(caseRow.errorSummary)) {
-                summary = caseRow.errorSummary
-            } else {
-                List steps = caseRow.steps instanceof List ? caseRow.steps : []
-                if (!steps.isEmpty()) {
-                    Map firstFail = steps.find { Map row -> safeValue(row.status) == 'fail' }
-                    if (firstFail != null) {
-                        summary = safeValue(firstFail.details)
-                    } else {
-                        Map firstStep = steps[0]
-                        summary = safeValue(firstStep.details)
-                    }
-                }
-            }
-
-            caseRow.summary = oneLine(summary, 92)
-        }
-    }
-
-    private Map calculateCounts(List<Map> cases) {
-        int passed = 0
-        int failed = 0
-        int skipped = 0
-
-        cases.each { Map caseRow ->
-            String status = safeValue(caseRow.status)
-            if (status == 'pass') {
-                passed++
-            } else if (status == 'fail') {
-                failed++
-            } else {
-                skipped++
-            }
-        }
-
-        return [
-            total  : cases.size(),
-            passed : passed,
-            failed : failed,
-            skipped: skipped
-        ]
-    }
-
-    private String resolveLogoDataUri(String reportFolder) {
-        List<File> candidates = []
-
-        candidates.add(new File(System.getProperty('user.dir') + File.separator + JiraGaiaHtmlTemplateBuilder.LOGO_PROJECT_PATH))
-        candidates.add(new File(reportFolder + File.separator + JiraGaiaHtmlTemplateBuilder.LOGO_PROJECT_PATH))
-        candidates.add(new File(System.getProperty('user.dir') + File.separator + 'Image' + File.separator + 'gaia-logo.png'))
-        candidates.add(new File(System.getProperty('user.dir') + File.separator + 'image' + File.separator + 'gaia-logo.png'))
-
-        File chosen = candidates.find { File file -> file.exists() && file.isFile() }
-
-        if (chosen == null) {
-            return ''
-        }
-
-        try {
-            byte[] bytes = Files.readAllBytes(chosen.toPath())
-            String base64 = Base64.encoder.encodeToString(bytes)
-            return 'data:image/png;base64,' + base64
-        } catch (Exception ignored) {
-            return ''
-        }
-    }
-
-    private File findFirstExecutionLog(String reportFolder) {
-        List<File> matches = []
-        new File(reportFolder).eachFileRecurse { File file ->
-            if (file.isFile() && file.name.toLowerCase(Locale.ENGLISH).startsWith('execution') && file.name.toLowerCase(Locale.ENGLISH).endsWith('.log')) {
-                matches.add(file)
-            }
-        }
-
-        matches.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
-        return matches ? matches[0] : null
-    }
-
-    private File findFirstFileByNames(String root, List<String> names) {
-        List<File> matches = []
-        List<String> lowered = names.collect { String item -> item.toLowerCase(Locale.ENGLISH) }
-
-        new File(root).eachFileRecurse { File file ->
-            if (file.isFile() && lowered.contains(file.name.toLowerCase(Locale.ENGLISH))) {
-                matches.add(file)
-            }
-        }
-
-        matches.sort { File a, File b -> a.absolutePath <=> b.absolutePath }
-        return matches ? matches[0] : null
-    }
-
-    private List<File> collectImages(String reportFolder) {
-        List<File> matches = []
-        new File(reportFolder).eachFileRecurse { File file ->
-            if (!file.isFile()) {
-                return
-            }
-
-            String lower = file.name.toLowerCase(Locale.ENGLISH)
-            if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')) {
-                matches.add(file)
-            }
-        }
-
-        matches.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
-        return matches
-    }
-
-    private String toImageDataUri(File file) {
-        try {
-            byte[] bytes = Files.readAllBytes(file.toPath())
-            String base64 = Base64.encoder.encodeToString(bytes)
-
-            String lower = file.name.toLowerCase(Locale.ENGLISH)
-            String mime = 'image/png'
-            if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
-                mime = 'image/jpeg'
-            } else if (lower.endsWith('.webp')) {
-                mime = 'image/webp'
-            }
-
-            return 'data:' + mime + ';base64,' + base64
-        } catch (Exception ignored) {
-            return ''
-        }
-    }
-
-    private boolean isInterestingScenarioLine(String message) {
-        String value = safeValue(message)
-
-        if (isBlank(value)) {
-            return false
-        }
-
-        if (value.startsWith('at ') || value.startsWith('Caused by: at ')) {
-            return false
-        }
-
-        List<String> keywords = [
-            'Opening browser',
-            'Navigating to',
-            'Waiting for',
-            'Trying to click',
-            'Clicked',
-            'Home page loaded',
-            'Element is visible',
-            'search',
-            'select option',
-            'Create Correction',
-            'Import file',
-            'Assert visible',
-            'ERROR',
-            'Exception',
-            'Unable to',
-            'not clickable',
-            'intercepted',
-            'passed',
-            'failed'
-        ]
-
-        boolean containsKeyword = keywords.any { String item ->
-            value.toLowerCase(Locale.ENGLISH).contains(item.toLowerCase(Locale.ENGLISH))
-        }
-
-        if (containsKeyword) {
-            return true
-        }
-
-        return value ==~ /^\\d+\\s*[-:].*$/ || value.startsWith('Given ') || value.startsWith('When ') || value.startsWith('Then ') || value.startsWith('And ')
-    }
-
-    private String classifyEventStatus(String message) {
-        String value = safeValue(message).toLowerCase(Locale.ENGLISH)
-
-        if (value.contains('error') || value.contains('exception') || value.contains('unable to') || value.contains('not clickable') || value.contains('intercepted') || value.contains('failed')) {
-            return 'fail'
-        }
-
-        if (value.contains('clicked') || value.contains('loaded successfully') || value.contains('is visible') || value.contains('verified') || value.contains('passed')) {
-            return 'pass'
-        }
-
-        if (value.contains('skip') || value.contains('pending') || value.contains('undefined')) {
-            return 'skip'
-        }
-
-        return 'info'
-    }
-
-    private String mapCucumberStatus(String rawStatus) {
-        String value = safeValue(rawStatus)
-        if (value == 'passed') {
-            return 'pass'
-        }
-        if (value == 'failed' || value == 'undefined' || value == 'ambiguous') {
-            return 'fail'
-        }
-        if (value == 'skipped' || value == 'pending') {
-            return 'skip'
-        }
-        return 'info'
-    }
-
-    private String firstMeaningfulErrorLine(String value) {
-        List<String> lines = safeValue(value).readLines()
-
-        for (String raw : lines) {
-            String line = safeValue(raw)
-            if (isBlank(line)) {
-                continue
-            }
-            if (line.startsWith('at ') || line.startsWith('Caused by: at ')) {
-                continue
-            }
-            return oneLine(line, 180)
-        }
-
-        return oneLine(value, 180)
-    }
-
-    private String extractTime(String line) {
-        def matcher = (safeValue(line) =~ /^(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\.\\d{3})/)
-        if (!matcher.find()) {
-            return ''
-        }
-
-        try {
-            Date parsed = new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS').parse(matcher.group(1))
-            return new SimpleDateFormat('hh:mm:ss a', Locale.ENGLISH).format(parsed)
-        } catch (Exception ignored) {
-            return ''
-        }
-    }
-
-    private String extractMessage(String line) {
-        String value = safeValue(line)
-        int idx = value.indexOf(' - ')
-        if (idx >= 0) {
-            return safeValue(value.substring(idx + 3))
-        }
-        return value
-    }
-
-    private String stripAnsi(String value) {
-        return safeValue(value).replaceAll('\\u001B\\[[;\\d]*m', '')
-    }
-
-    private long sumDuration(List<Map> cases) {
-        long total = 0L
-        cases.each { Map item ->
-            total += toLong(item.durationMs)
-        }
-        return total
-    }
-
-    private long toMillis(def secondsValue) {
-        String raw = safeValue(secondsValue)
-        if (raw.isEmpty()) {
-            return 0L
-        }
-
-        try {
-            return (long) (Double.parseDouble(raw) * 1000D)
-        } catch (Exception ignored) {
-            return 0L
-        }
-    }
-
-    private long toLong(def value) {
-        try {
-            return Long.parseLong(safeValue(value))
-        } catch (Exception ignored) {
-            return 0L
-        }
-    }
-
-    private String oneLine(def value, int maxSize) {
-        String text = safeValue(value).replaceAll('\\s+', ' ').trim()
-        if (text.size() <= maxSize) {
-            return text
-        }
-        return text.substring(0, Math.max(0, maxSize - 1)).trim() + '…'
-    }
-
-    private String normalizeKey(def value) {
-        return safeValue(value).toLowerCase(Locale.ENGLISH).replaceAll('[^a-z0-9]', '')
     }
 
     private String safeValue(def value) {
@@ -696,32 +26,509 @@ class JiraGaiaReportBuilder {
         return safeValue(value).isEmpty()
     }
 
-    private String formatTime(Date date) {
-        return new SimpleDateFormat('MMM dd, yyyy hh:mm:ss a', Locale.ENGLISH).format(date)
+    private long toMillis(def secondsValue) {
+        String raw = safeValue(secondsValue).replace(',', '.')
+        if (raw.isEmpty()) {
+            return 0L
+        }
+
+        try {
+            BigDecimal seconds = new BigDecimal(raw)
+            return seconds.multiply(new BigDecimal('1000')).longValue()
+        } catch (Exception ignored) {
+            return 0L
+        }
     }
 
-    private String formatDateTime(Date date) {
-        return new SimpleDateFormat('MMM dd, yyyy hh:mm:ss a', Locale.ENGLISH).format(date)
+    private long nanosToMillis(def nanosValue) {
+        if (nanosValue == null) {
+            return 0L
+        }
+
+        try {
+            return (long) Math.round((safeValue(nanosValue).toBigDecimal() / 1000000G) as double)
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    private String oneLine(def value, int max = 105) {
+        String text = safeValue(value).replaceAll(/[\\r\\n]+/, ' ').replaceAll(/\\s+/, ' ').trim()
+        if (text.length() <= max) {
+            return text
+        }
+        return text.substring(0, Math.max(0, max - 3)).trim() + '...'
+    }
+
+    private String firstLine(def value) {
+        String text = safeValue(value)
+        if (text.isEmpty()) {
+            return ''
+        }
+
+        for (String line : text.readLines()) {
+            String clean = safeValue(line)
+            if (!clean.isEmpty()) {
+                return clean
+            }
+        }
+
+        return ''
+    }
+
+    private String formatHeaderDate(Date date) {
+        if (date == null) {
+            return ''
+        }
+        return new SimpleDateFormat('MMM d, yyyy h:mm:ss a', Locale.ENGLISH).format(date)
+    }
+
+    private String formatTime(Date date) {
+        if (date == null) {
+            return ''
+        }
+        return new SimpleDateFormat('hh:mm:ss a', Locale.ENGLISH).format(date)
     }
 
     private String formatDurationMillis(long millis) {
-        long hours = (long) (millis / 3600000L)
-        long minutes = (long) ((millis % 3600000L) / 60000L)
-        long seconds = (long) ((millis % 60000L) / 1000L)
-        long ms = (long) (millis % 1000L)
+        long hours = millis / 3600000L
+        long minutes = (millis % 3600000L) / 60000L
+        long seconds = (millis % 60000L) / 1000L
+        long ms = millis % 1000L
 
-        if (hours > 0L) {
-            return hours + 'h ' + minutes + 'm ' + seconds + 's'
+        if (hours > 0) {
+            return "${hours}h ${minutes}m ${seconds}s ${ms}ms"
         }
-        if (minutes > 0L) {
-            return minutes + 'm ' + seconds + 's ' + ms + 'ms'
+        if (minutes > 0) {
+            return "${minutes}m ${seconds}s ${ms}ms"
         }
-        if (seconds > 0L) {
-            return seconds + 's ' + ms + 'ms'
+        if (seconds > 0) {
+            return "${seconds}s ${ms}ms"
         }
-        return ms + 'ms'
+        return "${ms}ms"
+    }
+
+    private String normalizeStatus(String rawStatus) {
+        String value = safeValue(rawStatus).toLowerCase()
+
+        if (value in ['failed', 'fail', 'error', 'undefined', 'pending', 'ambiguous']) {
+            return 'fail'
+        }
+        if (value in ['skipped', 'skip']) {
+            return 'skip'
+        }
+        if (value in ['passed', 'pass']) {
+            return 'pass'
+        }
+        return 'info'
+    }
+
+    private List<File> findFilesRecursively(File root, Closure<Boolean> matcher) {
+        List<File> result = []
+
+        if (root == null || !root.exists()) {
+            return result
+        }
+
+        root.eachFileRecurse { File f ->
+            if (f.isFile() && matcher.call(f)) {
+                result << f
+            }
+        }
+
+        return result
+    }
+
+    private File findBestCucumberJson(String reportFolder) {
+        File baseDir = new File(reportFolder)
+        if (!baseDir.exists()) {
+            return null
+        }
+
+        List<File> candidates = findFilesRecursively(baseDir) { File f ->
+            String lower = f.name.toLowerCase()
+            return lower == 'cucumber.json' || lower == 'k-cucumber.json'
+        }
+
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        candidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
+        return candidates[0]
+    }
+
+    private List<File> collectEvidenceImages(String reportFolder) {
+        File baseDir = new File(reportFolder)
+        if (!baseDir.exists()) {
+            return []
+        }
+
+        List<File> images = findFilesRecursively(baseDir) { File f ->
+            String path = f.absolutePath.toLowerCase().replace('\\', '/')
+            boolean allowedExt = path.endsWith('.png') || path.endsWith('.jpg') || path.endsWith('.jpeg') || path.endsWith('.webp')
+            boolean ignoredFolder = path.contains('/requests/') || path.contains('/cucumber_report/') || path.contains('/html/')
+            return allowedExt && !ignoredFolder
+        }
+
+        images.sort { a, b -> a.name <=> b.name }
+        return images
+    }
+
+    private String relativePath(File fromDir, File targetFile) {
+        try {
+            return fromDir.toPath().relativize(targetFile.toPath()).toString().replace('\\', '/')
+        } catch (Exception ignored) {
+            return targetFile.name
+        }
+    }
+
+    private List<Map> parseXmlFallback(String xmlPath, Date suiteStart) {
+        List<Map> scenarios = []
+
+        if (isBlank(xmlPath)) {
+            return scenarios
+        }
+
+        File xmlFile = new File(xmlPath)
+        if (!xmlFile.exists()) {
+            return scenarios
+        }
+
+        Node root
+        try {
+            root = new XmlParser().parse(xmlFile)
+        } catch (Exception ignored) {
+            return scenarios
+        }
+
+        List<Node> testcaseNodes = []
+        String rootName = safeValue(root.name())
+
+        if (rootName == 'testsuite') {
+            testcaseNodes.addAll(root.children().findAll { it instanceof Node && safeValue(((Node) it).name()) == 'testcase' } as List<Node>)
+        } else if (rootName == 'testsuites') {
+            root.children().findAll { it instanceof Node && safeValue(((Node) it).name()) == 'testsuite' }.each { Node suite ->
+                testcaseNodes.addAll(suite.children().findAll { it instanceof Node && safeValue(((Node) it).name()) == 'testcase' } as List<Node>)
+            }
+        }
+
+        long cursor = suiteStart.time
+        int index = 1
+
+        testcaseNodes.each { Node tc ->
+            String className = safeValue(tc.attribute('classname'))
+            String testName = safeValue(tc.attribute('name'))
+            long durationMs = toMillis(tc.attribute('time'))
+
+            Node failureNode = (tc.children().find { it instanceof Node && safeValue(((Node) it).name()) == 'failure' } as Node)
+            Node errorNode = (tc.children().find { it instanceof Node && safeValue(((Node) it).name()) == 'error' } as Node)
+            Node skippedNode = (tc.children().find { it instanceof Node && safeValue(((Node) it).name()) == 'skipped' } as Node)
+
+            String status = 'pass'
+            if (failureNode != null || errorNode != null) {
+                status = 'fail'
+            } else if (skippedNode != null) {
+                status = 'skip'
+            }
+
+            String details = ''
+            String message = ''
+
+            if (failureNode != null) {
+                message = safeValue(failureNode.attribute('message'))
+                details = safeValue(failureNode.text())
+            } else if (errorNode != null) {
+                message = safeValue(errorNode.attribute('message'))
+                details = safeValue(errorNode.text())
+            } else if (skippedNode != null) {
+                message = safeValue(skippedNode.attribute('message'))
+                details = safeValue(skippedNode.text())
+            }
+
+            String scenarioName = !isBlank(testName) ? testName : className
+            String displayName = !isBlank(className) && !isBlank(testName) ? "${className}/${testName}" : scenarioName
+
+            Date scenarioStart = new Date(cursor)
+            Date scenarioEnd = new Date(cursor + durationMs)
+
+            List<Map> steps = []
+            steps << [
+                status       : 'info',
+                statusLabel  : 'Info',
+                time         : formatTime(scenarioStart),
+                detail       : 'Test execution started',
+                fullDetail   : 'Test execution started'
+            ]
+
+            if (status == 'pass') {
+                steps << [
+                    status       : 'pass',
+                    statusLabel  : 'Pass',
+                    time         : formatTime(scenarioEnd),
+                    detail       : 'Test passed',
+                    fullDetail   : 'Test passed'
+                ]
+            } else if (status == 'skip') {
+                steps << [
+                    status       : 'skip',
+                    statusLabel  : 'Skip',
+                    time         : formatTime(scenarioEnd),
+                    detail       : oneLine(message ?: 'Test skipped'),
+                    fullDetail   : details ?: message ?: 'Test skipped'
+                ]
+            } else {
+                steps << [
+                    status       : 'fail',
+                    statusLabel  : 'Fail',
+                    time         : formatTime(scenarioEnd),
+                    detail       : oneLine(firstLine(details ?: message ?: 'Test failed')),
+                    fullDetail   : details ?: message ?: 'Test failed'
+                ]
+            }
+
+            scenarios << [
+                id            : "scenario-${index}",
+                name          : displayName,
+                listName      : oneLine(displayName, 58),
+                summary       : oneLine(displayName, 96),
+                status        : status,
+                statusLabel   : status == 'pass' ? 'Passed' : (status == 'fail' ? 'Failed' : 'Skipped'),
+                durationMs    : durationMs,
+                durationText  : formatDurationMillis(durationMs),
+                startAt       : formatHeaderDate(scenarioStart),
+                endAt         : formatHeaderDate(scenarioEnd),
+                startTime     : formatTime(scenarioStart),
+                endTime       : formatTime(scenarioEnd),
+                errorLine     : oneLine(firstLine(details ?: message), 140),
+                fullError     : safeValue(details),
+                steps         : steps,
+                imagePath     : '',
+                imageName     : ''
+            ]
+
+            cursor += durationMs
+            index++
+        }
+
+        return scenarios
+    }
+
+    private List<Map> parseCucumberScenarios(String reportFolder, Date suiteStart) {
+        List<Map> scenarios = []
+        File cucumberFile = findBestCucumberJson(reportFolder)
+
+        if (cucumberFile == null || !cucumberFile.exists()) {
+            return scenarios
+        }
+
+        def parsed
+        try {
+            parsed = new JsonSlurper().parse(cucumberFile)
+        } catch (Exception ignored) {
+            return scenarios
+        }
+
+        if (!(parsed instanceof List)) {
+            return scenarios
+        }
+
+        long suiteCursor = suiteStart.time
+        int index = 1
+
+        parsed.each { feature ->
+            List elements = feature?.elements instanceof List ? feature.elements : []
+
+            elements.each { scenario ->
+                List rawSteps = scenario?.steps instanceof List ? scenario.steps : []
+                if (rawSteps.isEmpty()) {
+                    return
+                }
+
+                String scenarioName = safeValue(scenario?.name)
+                String featureName = safeValue(feature?.name)
+                String displayName = !isBlank(featureName) ? "${featureName} - ${scenarioName}" : scenarioName
+
+                long durationMs = 0L
+                String scenarioStatus = 'pass'
+                String firstError = ''
+                String fullError = ''
+                List<Map> stepRows = []
+
+                long scenarioCursor = suiteCursor
+
+                rawSteps.each { step ->
+                    String keyword = safeValue(step?.keyword)
+                    String stepName = safeValue(step?.name)
+                    String detailText = (keyword + stepName).trim()
+
+                    String rawStatus = safeValue(step?.result?.status)
+                    String normalizedStatus = normalizeStatus(rawStatus)
+                    long stepMs = nanosToMillis(step?.result?.duration)
+                    String errorMessage = safeValue(step?.result?.error_message)
+
+                    if (normalizedStatus == 'fail') {
+                        scenarioStatus = 'fail'
+                        if (firstError.isEmpty()) {
+                            firstError = firstLine(errorMessage)
+                            fullError = errorMessage
+                        }
+                    } else if (normalizedStatus == 'skip' && scenarioStatus != 'fail') {
+                        scenarioStatus = 'skip'
+                    }
+
+                    String stepShort = oneLine(detailText, 150)
+                    if (normalizedStatus == 'fail' && !isBlank(errorMessage)) {
+                        stepShort = oneLine("${detailText} | ${firstLine(errorMessage)}", 150)
+                    }
+
+                    stepRows << [
+                        status      : normalizedStatus,
+                        statusLabel : normalizedStatus == 'pass' ? 'Pass' : (normalizedStatus == 'fail' ? 'Fail' : (normalizedStatus == 'skip' ? 'Skip' : 'Info')),
+                        time        : formatTime(new Date(scenarioCursor)),
+                        detail      : stepShort,
+                        fullDetail  : !isBlank(errorMessage) ? errorMessage : detailText
+                    ]
+
+                    durationMs += stepMs
+                    scenarioCursor += stepMs
+                }
+
+                Date scenarioStart = new Date(suiteCursor)
+                Date scenarioEnd = new Date(suiteCursor + durationMs)
+
+                scenarios << [
+                    id            : "scenario-${index}",
+                    name          : displayName,
+                    listName      : oneLine(scenarioName, 58),
+                    summary       : oneLine(displayName, 96),
+                    status        : scenarioStatus,
+                    statusLabel   : scenarioStatus == 'pass' ? 'Passed' : (scenarioStatus == 'fail' ? 'Failed' : 'Skipped'),
+                    durationMs    : durationMs,
+                    durationText  : formatDurationMillis(durationMs),
+                    startAt       : formatHeaderDate(scenarioStart),
+                    endAt         : formatHeaderDate(scenarioEnd),
+                    startTime     : formatTime(scenarioStart),
+                    endTime       : formatTime(scenarioEnd),
+                    errorLine     : oneLine(firstError, 140),
+                    fullError     : safeValue(fullError),
+                    steps         : stepRows,
+                    imagePath     : '',
+                    imageName     : ''
+                ]
+
+                suiteCursor += durationMs
+                index++
+            }
+        }
+
+        return scenarios
+    }
+
+    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
+        if (isBlank(reportFolder)) {
+            return ''
+        }
+
+        File baseDir = new File(reportFolder)
+        if (!baseDir.exists()) {
+            return ''
+        }
+
+        Date suiteEnd = new Date(baseDir.lastModified())
+        Date suiteStart = new Date(Math.max(0L, suiteEnd.time - 1000L))
+
+        List<Map> scenarios = parseCucumberScenarios(reportFolder, suiteStart)
+        if (scenarios.isEmpty()) {
+            scenarios = parseXmlFallback(xmlPath, suiteStart)
+        }
+
+        long totalDurationMs = 0L
+        scenarios.each { Map scenario ->
+            totalDurationMs += (scenario.durationMs ?: 0L) as long
+        }
+
+        suiteStart = new Date(Math.max(0L, suiteEnd.time - totalDurationMs))
+
+        long currentStart = suiteStart.time
+        scenarios.each { Map scenario ->
+            long durationMs = (scenario.durationMs ?: 0L) as long
+            Date scenarioStart = new Date(currentStart)
+            Date scenarioEnd = new Date(currentStart + durationMs)
+
+            scenario.startAt = formatHeaderDate(scenarioStart)
+            scenario.endAt = formatHeaderDate(scenarioEnd)
+            scenario.startTime = formatTime(scenarioStart)
+            scenario.endTime = formatTime(scenarioEnd)
+
+            long stepCursor = scenarioStart.time
+            List<Map> steps = scenario.steps instanceof List ? scenario.steps : []
+            steps.each { Map step ->
+                step.time = formatTime(new Date(stepCursor))
+                stepCursor += 400L
+            }
+
+            currentStart += durationMs
+        }
+
+        List<File> images = collectEvidenceImages(reportFolder)
+        List<Map> failedScenarios = scenarios.findAll { safeValue(it.status) == 'fail' }
+
+        for (int i = 0; i < failedScenarios.size(); i++) {
+            if (i < images.size()) {
+                File img = images[i]
+                failedScenarios[i].imagePath = relativePath(baseDir, img)
+                failedScenarios[i].imageName = img.name
+            }
+        }
+
+        int passed = scenarios.count { safeValue(it.status) == 'pass' }
+        int failed = scenarios.count { safeValue(it.status) == 'fail' }
+        int skipped = scenarios.count { safeValue(it.status) == 'skip' }
+
+        List<Map> allImages = images.collect { File img ->
+            [
+                path : relativePath(baseDir, img),
+                name : img.name
+            ]
+        }
+
+        String logoUri = ''
+        File projectLogo = new File(System.getProperty('user.dir'), 'Image/gaia-logo.png')
+        if (projectLogo.exists()) {
+            logoUri = projectLogo.toURI().toString()
+        }
+
+        Map model = [
+            appName       : 'GAIA',
+            subtitle      : 'GAIA execution overview',
+            reportTitle   : "Test report - ${safeValue(suiteName)}",
+            suiteName     : safeValue(suiteName),
+            generatedAt   : formatHeaderDate(new Date()),
+            startAt       : formatHeaderDate(suiteStart),
+            endAt         : formatHeaderDate(suiteEnd),
+            durationText  : formatDurationMillis(totalDurationMs),
+            total         : scenarios.size(),
+            passed        : passed,
+            failed        : failed,
+            skipped       : skipped,
+            scenarios     : scenarios,
+            evidences     : allImages,
+            logoSrc       : logoUri
+        ]
+
+        String html = new JiraGaiaHtmlTemplateBuilder().buildHtml(model)
+
+        File htmlFile = new File(baseDir, safeValue(flow?.GAIA_REPORT_FILE_NAME) ?: 'gaiaReport.html')
+        htmlFile.setText(html, 'UTF-8')
+        return htmlFile.absolutePath
     }
 }
+
+
+
+
+
 
 
 
@@ -749,1228 +556,19 @@ package jiraIntegration
 
 class JiraGaiaHtmlTemplateBuilder {
 
-    // ============================================================
-    // EASY CONFIG
-    // Change these values whenever you want to customize branding
-    // ============================================================
-
-    static final String APP_NAME = 'GAIA'
-    static final String REPORT_TITLE_PREFIX = 'Test report - '
-    static final String LOGO_PROJECT_PATH = 'Image/gaia-logo.png'
-
-    static final String BANNER_GRADIENT = 'linear-gradient(90deg, #0d2d57 0%, #155c78 55%, #2ddf57 100%)'
-    static final String STATUS_PASS = '#00af87'
-    static final String STATUS_FAIL = '#dc3545'
-    static final String STATUS_SKIP = '#ffc107'
-    static final String STATUS_INFO = '#17a2b8'
-    static final String STATUS_ACTIVE = '#e9f7f3'
-
-    String buildHtml(Map model) {
-        List<Map> cases = model.cases instanceof List ? model.cases : []
-        Map firstCase = cases ? cases[0] : [:]
-
-        StringBuilder html = new StringBuilder()
-
-        html.append('<!DOCTYPE html>')
-        html.append('<html lang="en">')
-        html.append('<head>')
-        html.append('<meta charset="UTF-8">')
-        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
-        html.append('<title>')
-        html.append(htmlEscape(REPORT_TITLE_PREFIX + safeValue(model.suiteName)))
-        html.append('</title>')
-        html.append('<style>')
-        html.append(buildCss())
-        html.append('</style>')
-        html.append('</head>')
-        html.append('<body>')
-
-        html.append('<header class="top-banner">')
-        html.append('<div class="brand-left">')
-
-        html.append('<div class="brand-logo">')
-        if (!isBlank(model.logoDataUri)) {
-            html.append('<img src="')
-            html.append(htmlEscape(model.logoDataUri))
-            html.append('" alt="GAIA logo">')
-        } else {
-            html.append('<div class="brand-logo-fallback">G</div>')
-        }
-        html.append('</div>')
-
-        html.append('<div class="brand-texts">')
-        html.append('<div class="report-title-main">')
-        html.append(htmlEscape(REPORT_TITLE_PREFIX + safeValue(model.suiteName)))
-        html.append('</div>')
-        html.append('<div class="report-subtitle">')
-        html.append(htmlEscape(APP_NAME + ' execution overview'))
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('</div>')
-
-        html.append('<div class="brand-right">')
-        html.append('<div><strong>Generated</strong> ')
-        html.append(htmlEscape(safeValue(model.generatedAt)))
-        html.append('</div>')
-        html.append('<div><strong>Project</strong> ')
-        html.append(htmlEscape(APP_NAME))
-        html.append('</div>')
-        html.append('</div>')
-        html.append('</header>')
-
-        html.append('<div class="layout">')
-
-        html.append('<aside class="sidebar">')
-        html.append('<div class="sidebar-top-tabs">')
-        html.append('<button class="tab-btn active" type="button" onclick="switchView(\'tests\')">Tests</button>')
-        html.append('<button class="tab-btn" type="button" onclick="switchView(\'charts\')">Charts</button>')
-        html.append('</div>')
-
-        html.append('<div class="sidebar-summary">')
-        html.append(buildDonutBlock(model))
-        html.append(buildSideCounters(model))
-        html.append('</div>')
-
-        html.append('<div class="sidebar-search">')
-        html.append('<input id="caseSearch" type="text" placeholder="Search test name, path, or status…" onkeyup="filterCases()">')
-        html.append('</div>')
-
-        html.append('<div id="sidebarCaseList" class="sidebar-case-list">')
-        cases.eachWithIndex { Map caseRow, int index ->
-            html.append(buildSidebarCaseItem(caseRow, index == 0))
-        }
-        html.append('</div>')
-        html.append('</aside>')
-
-        html.append('<main class="content-area">')
-
-        html.append('<section id="view-tests" class="content-view active">')
-        cases.eachWithIndex { Map caseRow, int index ->
-            html.append(buildCasePanel(caseRow, index == 0))
-        }
-        html.append('</section>')
-
-        html.append('<section id="view-charts" class="content-view">')
-        html.append(buildChartsPanel(model))
-        html.append('</section>')
-
-        html.append('</main>')
-        html.append('</div>')
-
-        html.append('<script>')
-        html.append(buildJavascript(firstCase?.id))
-        html.append('</script>')
-
-        html.append('</body>')
-        html.append('</html>')
-
-        return html.toString()
-    }
-
-    private String buildSidebarCaseItem(Map caseRow, boolean active) {
-        StringBuilder html = new StringBuilder()
-        String caseId = safeValue(caseRow.id)
-        String status = safeValue(caseRow.status)
-        String activeClass = active ? ' active' : ''
-
-        html.append('<button type="button" class="sidebar-case-item')
-        html.append(activeClass)
-        html.append('" data-case-id="')
-        html.append(htmlEscape(caseId))
-        html.append('" data-filter="')
-        html.append(htmlEscape((safeValue(caseRow.name) + ' ' + safeValue(caseRow.summary) + ' ' + status).toLowerCase()))
-        html.append('" onclick="selectCase(\'')
-        html.append(jsEscape(caseId))
-        html.append('\')">')
-
-        html.append('<div class="sidebar-case-row">')
-        html.append('<div class="sidebar-case-title" title="')
-        html.append(htmlEscape(safeValue(caseRow.name)))
-        html.append('">')
-        html.append(htmlEscape(oneLine(caseRow.name, 62)))
-        html.append('</div>')
-        html.append('<span class="status-pill ')
-        html.append(statusClass(status))
-        html.append('">')
-        html.append(htmlEscape(statusLabel(status)))
-        html.append('</span>')
-        html.append('</div>')
-
-        html.append('<div class="sidebar-case-desc" title="')
-        html.append(htmlEscape(safeValue(caseRow.summary)))
-        html.append('">')
-        html.append(htmlEscape(oneLine(caseRow.summary, 76)))
-        html.append('</div>')
-
-        html.append('<div class="sidebar-case-meta">')
-        html.append('<span>')
-        html.append(htmlEscape(safeValue(caseRow.durationText)))
-        html.append('</span>')
-        html.append('<span>')
-        html.append(htmlEscape(safeValue(caseRow.startAt)))
-        html.append('</span>')
-        html.append('</div>')
-
-        html.append('</button>')
-        return html.toString()
-    }
-
-    private String buildCasePanel(Map caseRow, boolean active) {
-        StringBuilder html = new StringBuilder()
-        String caseId = safeValue(caseRow.id)
-        String activeClass = active ? ' active' : ''
-
-        html.append('<section class="case-panel')
-        html.append(activeClass)
-        html.append('" data-case-id="')
-        html.append(htmlEscape(caseId))
-        html.append('">')
-
-        html.append('<div class="case-header">')
-        html.append('<div class="case-title-wrap">')
-        html.append('<div class="case-main-title">')
-        html.append(htmlEscape(safeValue(caseRow.name)))
-        html.append('</div>')
-        html.append('<div class="case-subtitle" title="')
-        html.append(htmlEscape(safeValue(caseRow.summary)))
-        html.append('">')
-        html.append(htmlEscape(oneLine(caseRow.summary, 120)))
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="case-tags">')
-        html.append(tag('Suite: ' + safeValue(caseRow.shortName), 'tag-neutral'))
-        html.append(tag('Status: ' + statusLabel(caseRow.status), 'tag-' + statusClass(caseRow.status)))
-        html.append(tag('Start: ' + safeValue(caseRow.startAt), 'tag-neutral'))
-        html.append(tag('End: ' + safeValue(caseRow.endAt), 'tag-neutral'))
-        html.append(tag('Duration: ' + safeValue(caseRow.durationText), 'tag-neutral'))
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="panel-card">')
-        html.append('<div class="panel-title">Steps</div>')
-        html.append(buildStepsTable(caseRow))
-        html.append('</div>')
-
-        if (safeValue(caseRow.status) == 'fail') {
-            html.append('<div class="panel-card">')
-            html.append('<div class="panel-title">Visual Error Log</div>')
-            html.append('<div class="error-summary-line">')
-            html.append('<span class="error-mark"></span>')
-            html.append('<span class="error-summary-text" title="')
-            html.append(htmlEscape(safeValue(caseRow.errorSummary)))
-            html.append('">')
-            html.append(htmlEscape(oneLine(caseRow.errorSummary, 180)))
-            html.append('</span>')
-            html.append('</div>')
-
-            if (!isBlank(caseRow.errorFull)) {
-                html.append('<details class="details-block">')
-                html.append('<summary>🔎 View full error</summary>')
-                html.append('<pre>')
-                html.append(htmlEscape(safeValue(caseRow.errorFull)))
-                html.append('</pre>')
-                html.append('</details>')
-            }
-            html.append('</div>')
-        }
-
-        html.append('<div class="panel-card">')
-        html.append('<div class="panel-title">Evidence</div>')
-        html.append(buildEvidenceBlock(caseRow))
-        html.append('</div>')
-
-        html.append('</section>')
-        return html.toString()
-    }
-
-    private String buildStepsTable(Map caseRow) {
-        List<Map> steps = caseRow.steps instanceof List ? caseRow.steps : []
-        StringBuilder html = new StringBuilder()
-
-        html.append('<table class="steps-table">')
-        html.append('<thead>')
-        html.append('<tr>')
-        html.append('<th>Status</th>')
-        html.append('<th>Timestamp</th>')
-        html.append('<th>Details</th>')
-        html.append('</tr>')
-        html.append('</thead>')
-        html.append('<tbody>')
-
-        if (steps.isEmpty()) {
-            html.append('<tr><td colspan="3" class="empty-row">No step details were found for this test.</td></tr>')
-        } else {
-            steps.eachWithIndex { Map step, int index ->
-                String status = safeValue(step.status)
-                String detail = safeValue(step.details)
-                String fullText = safeValue(step.fullText)
-
-                html.append('<tr>')
-                html.append('<td>')
-                html.append('<span class="status-pill ')
-                html.append(statusClass(status))
-                html.append('">')
-                html.append(htmlEscape(statusLabel(status)))
-                html.append('</span>')
-                html.append('</td>')
-
-                html.append('<td class="timestamp-cell">')
-                html.append(htmlEscape(safeValue(step.timestamp)))
-                html.append('</td>')
-
-                html.append('<td>')
-                html.append('<div class="step-line" title="')
-                html.append(htmlEscape(detail))
-                html.append('">')
-                html.append(htmlEscape(oneLine(detail, 180)))
-                html.append('</div>')
-                html.append('</td>')
-                html.append('</tr>')
-
-                if (!isBlank(fullText) && oneLine(fullText, 180) != oneLine(detail, 180)) {
-                    html.append('<tr class="expand-row">')
-                    html.append('<td colspan="3">')
-                    html.append('<details class="details-block step-expand">')
-                    html.append('<summary>🔎 View full log</summary>')
-                    html.append('<pre>')
-                    html.append(htmlEscape(fullText))
-                    html.append('</pre>')
-                    html.append('</details>')
-                    html.append('</td>')
-                    html.append('</tr>')
-                }
-            }
-        }
-
-        html.append('</tbody>')
-        html.append('</table>')
-        return html.toString()
-    }
-
-    private String buildEvidenceBlock(Map caseRow) {
-        List evidences = caseRow.evidences instanceof List ? caseRow.evidences : []
-        StringBuilder html = new StringBuilder()
-
-        if (evidences.isEmpty()) {
-            html.append('<div class="empty-row">No evidence image found for this test.</div>')
-            return html.toString()
-        }
-
-        html.append('<div class="evidence-list">')
-        evidences.eachWithIndex { Map item, int index ->
-            html.append('<details class="evidence-item">')
-            html.append('<summary>📎 Evidence ')
-            html.append(index + 1)
-            html.append(' • ')
-            html.append(htmlEscape(safeValue(item.name)))
-            html.append('</summary>')
-            html.append('<div class="evidence-body">')
-            html.append('<img src="')
-            html.append(htmlEscape(safeValue(item.dataUri)))
-            html.append('" alt="Evidence image">')
-            html.append('</div>')
-            html.append('</details>')
-        }
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildChartsPanel(Map model) {
-        List<Map> cases = model.cases instanceof List ? model.cases : []
-        StringBuilder html = new StringBuilder()
-
-        html.append('<div class="charts-grid">')
-
-        html.append('<div class="panel-card">')
-        html.append('<div class="panel-title">Execution Summary</div>')
-        html.append(buildDonutBlock(model))
-        html.append(buildSideCounters(model))
-        html.append('</div>')
-
-        html.append('<div class="panel-card">')
-        html.append('<div class="panel-title">Scenario Duration & Status</div>')
-        html.append('<div class="bar-list">')
-
-        long maxDuration = 1L
-        cases.each { Map item ->
-            long current = toLong(item.durationMs)
-            if (current > maxDuration) {
-                maxDuration = current
-            }
-        }
-
-        cases.each { Map item ->
-            int width = (int) Math.max(8, Math.round((toLong(item.durationMs) * 100D) / maxDuration))
-
-            html.append('<div class="bar-row">')
-            html.append('<div class="bar-title" title="')
-            html.append(htmlEscape(safeValue(item.name)))
-            html.append('">')
-            html.append(htmlEscape(oneLine(item.name, 72)))
-            html.append('</div>')
-
-            html.append('<div class="bar-track">')
-            html.append('<div class="bar-fill ')
-            html.append(statusClass(item.status))
-            html.append('" style="width:')
-            html.append(width)
-            html.append('%;"></div>')
-            html.append('</div>')
-
-            html.append('<div class="bar-value">')
-            html.append(htmlEscape(safeValue(item.durationText)))
-            html.append('</div>')
-            html.append('</div>')
-        }
-
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildDonutBlock(Map model) {
-        int total = toInt(model.total)
-        int passed = toInt(model.passed)
-        int failed = toInt(model.failed)
-        int skipped = toInt(model.skipped)
-
-        double passedPct = total > 0 ? (passed * 100D / total) : 0D
-        double failedPct = total > 0 ? (failed * 100D / total) : 0D
-        double skippedPct = total > 0 ? (skipped * 100D / total) : 0D
-
-        double passedEnd = passedPct
-        double failedEnd = passedPct + failedPct
-        double skippedEnd = passedPct + failedPct + skippedPct
-
-        StringBuilder html = new StringBuilder()
-        html.append('<div class="donut-wrap">')
-        html.append('<div class="donut-chart" style="background: conic-gradient(')
-        html.append(STATUS_PASS).append(' 0% ').append(formatPct(passedEnd)).append('%, ')
-        html.append(STATUS_FAIL).append(' ').append(formatPct(passedEnd)).append('% ').append(formatPct(failedEnd)).append('%, ')
-        html.append(STATUS_SKIP).append(' ').append(formatPct(failedEnd)).append('% ').append(formatPct(skippedEnd)).append('%, ')
-        html.append('#e5e7eb ').append(formatPct(skippedEnd)).append('% 100%);">')
-        html.append('<div class="donut-center">')
-        html.append('<div class="donut-total">').append(total).append('</div>')
-        html.append('<div class="donut-label">tests</div>')
-        html.append('</div>')
-        html.append('</div>')
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildSideCounters(Map model) {
-        StringBuilder html = new StringBuilder()
-        html.append('<div class="side-counts">')
-        html.append(counterRow('Passed', toInt(model.passed), 'pass'))
-        html.append(counterRow('Failed', toInt(model.failed), 'fail'))
-        html.append(counterRow('Skipped', toInt(model.skipped), 'skip'))
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String counterRow(String label, int value, String status) {
-        StringBuilder html = new StringBuilder()
-        html.append('<div class="count-row">')
-        html.append('<span class="count-dot ').append(statusClass(status)).append('"></span>')
-        html.append('<span class="count-label">').append(htmlEscape(label)).append('</span>')
-        html.append('<span class="count-value">').append(value).append('</span>')
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String tag(String text, String cssClass) {
-        return '<span class="meta-tag ' + cssClass + '">' + htmlEscape(text) + '</span>'
-    }
-
-    private String buildJavascript(def firstCaseId) {
-        String initialId = jsEscape(safeValue(firstCaseId))
-
-        return """
-            let currentView = 'tests';
-            let selectedCaseId = '${initialId}';
-
-            function switchView(viewName) {
-                currentView = viewName;
-
-                document.querySelectorAll('.tab-btn').forEach(function(btn) {
-                    btn.classList.remove('active');
-                });
-
-                const buttons = document.querySelectorAll('.tab-btn');
-                if (viewName === 'tests') {
-                    buttons[0].classList.add('active');
-                } else {
-                    buttons[1].classList.add('active');
-                }
-
-                document.getElementById('view-tests').classList.toggle('active', viewName === 'tests');
-                document.getElementById('view-charts').classList.toggle('active', viewName === 'charts');
-            }
-
-            function selectCase(caseId) {
-                selectedCaseId = caseId;
-
-                document.querySelectorAll('.sidebar-case-item').forEach(function(item) {
-                    item.classList.toggle('active', item.getAttribute('data-case-id') === caseId);
-                });
-
-                document.querySelectorAll('.case-panel').forEach(function(panel) {
-                    panel.classList.toggle('active', panel.getAttribute('data-case-id') === caseId);
-                });
-
-                switchView('tests');
-            }
-
-            function filterCases() {
-                const value = document.getElementById('caseSearch').value.toLowerCase();
-
-                document.querySelectorAll('.sidebar-case-item').forEach(function(item) {
-                    const target = item.getAttribute('data-filter') || '';
-                    const visible = target.indexOf(value) >= 0;
-                    item.style.display = visible ? 'block' : 'none';
-                });
-            }
-        """
-    }
-
-    private String buildCss() {
-        return """
-            :root {
-                --banner-gradient: ${BANNER_GRADIENT};
-                --pass: ${STATUS_PASS};
-                --fail: ${STATUS_FAIL};
-                --skip: ${STATUS_SKIP};
-                --info: ${STATUS_INFO};
-                --active: ${STATUS_ACTIVE};
-                --bg: #eef3f7;
-                --card: #ffffff;
-                --line: #e5e7eb;
-                --muted: #667085;
-                --text: #111827;
-                --soft-blue: #0d2d57;
-                --soft-blue-2: #173d71;
-            }
-
-            * {
-                box-sizing: border-box;
-            }
-
-            body {
-                margin: 0;
-                font-family: Arial, Helvetica, sans-serif;
-                background: var(--bg);
-                color: var(--text);
-            }
-
-            .top-banner {
-                background: var(--banner-gradient);
-                color: #ffffff;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 14px 22px;
-                box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
-            }
-
-            .brand-left {
-                display: flex;
-                align-items: center;
-                gap: 14px;
-                min-width: 0;
-            }
-
-            .brand-logo {
-                width: 40px;
-                height: 40px;
-                border-radius: 10px;
-                background: rgba(255, 255, 255, 0.12);
-                border: 1px solid rgba(255, 255, 255, 0.22);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                overflow: hidden;
-                flex-shrink: 0;
-            }
-
-            .brand-logo img {
-                width: 100%;
-                height: 100%;
-                object-fit: contain;
-                display: block;
-            }
-
-            .brand-logo-fallback {
-                width: 100%;
-                height: 100%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-weight: 700;
-                font-size: 18px;
-                color: #ffffff;
-            }
-
-            .report-title-main {
-                font-size: 24px;
-                font-weight: 700;
-                line-height: 1.2;
-            }
-
-            .report-subtitle {
-                font-size: 12px;
-                opacity: 0.9;
-                margin-top: 4px;
-            }
-
-            .brand-right {
-                text-align: right;
-                font-size: 12px;
-                line-height: 1.7;
-            }
-
-            .layout {
-                display: grid;
-                grid-template-columns: 360px 1fr;
-                min-height: calc(100vh - 68px);
-            }
-
-            .sidebar {
-                background: #f8fbfd;
-                border-right: 1px solid var(--line);
-                padding: 16px;
-            }
-
-            .sidebar-top-tabs {
-                display: flex;
-                gap: 8px;
-                margin-bottom: 14px;
-            }
-
-            .tab-btn {
-                border: 1px solid #cfd8e3;
-                background: #ffffff;
-                color: var(--soft-blue);
-                padding: 9px 14px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-weight: 600;
-            }
-
-            .tab-btn.active {
-                background: var(--soft-blue);
-                color: #ffffff;
-                border-color: var(--soft-blue);
-            }
-
-            .sidebar-summary {
-                background: #ffffff;
-                border: 1px solid var(--line);
-                border-radius: 14px;
-                padding: 16px;
-                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
-                margin-bottom: 14px;
-            }
-
-            .donut-wrap {
-                display: flex;
-                justify-content: center;
-                padding: 8px 0 14px 0;
-            }
-
-            .donut-chart {
-                width: 140px;
-                height: 140px;
-                border-radius: 50%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                box-shadow: inset 0 0 0 1px rgba(17, 24, 39, 0.05);
-            }
-
-            .donut-center {
-                width: 86px;
-                height: 86px;
-                border-radius: 50%;
-                background: #ffffff;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-            }
-
-            .donut-total {
-                font-size: 30px;
-                font-weight: 700;
-            }
-
-            .donut-label {
-                font-size: 12px;
-                color: var(--muted);
-            }
-
-            .side-counts {
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-            }
-
-            .count-row {
-                display: grid;
-                grid-template-columns: 12px 1fr auto;
-                align-items: center;
-                gap: 10px;
-                font-size: 13px;
-            }
-
-            .count-dot {
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-                display: inline-block;
-            }
-
-            .count-dot.pass {
-                background: var(--pass);
-            }
-
-            .count-dot.fail {
-                background: var(--fail);
-            }
-
-            .count-dot.skip {
-                background: var(--skip);
-            }
-
-            .count-value {
-                font-weight: 700;
-            }
-
-            .sidebar-search input {
-                width: 100%;
-                border: 1px solid #cfd8e3;
-                border-radius: 10px;
-                padding: 10px 12px;
-                font-size: 13px;
-                background: #ffffff;
-                outline: none;
-            }
-
-            .sidebar-case-list {
-                margin-top: 14px;
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-            }
-
-            .sidebar-case-item {
-                border: 1px solid var(--line);
-                background: #ffffff;
-                border-radius: 12px;
-                padding: 12px;
-                text-align: left;
-                cursor: pointer;
-                width: 100%;
-                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-            }
-
-            .sidebar-case-item.active {
-                background: var(--active);
-                border-color: #9bd5c6;
-                box-shadow: 0 0 0 2px rgba(0, 175, 135, 0.08);
-            }
-
-            .sidebar-case-row {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-
-            .sidebar-case-title {
-                flex: 1;
-                min-width: 0;
-                font-size: 13px;
-                font-weight: 700;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .sidebar-case-desc {
-                margin-top: 6px;
-                font-size: 12px;
-                color: var(--muted);
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .sidebar-case-meta {
-                margin-top: 8px;
-                display: flex;
-                justify-content: space-between;
-                gap: 10px;
-                font-size: 11px;
-                color: var(--muted);
-            }
-
-            .content-area {
-                padding: 18px;
-                min-width: 0;
-            }
-
-            .content-view {
-                display: none;
-            }
-
-            .content-view.active {
-                display: block;
-            }
-
-            .case-panel {
-                display: none;
-                flex-direction: column;
-                gap: 16px;
-            }
-
-            .case-panel.active {
-                display: flex;
-            }
-
-            .case-header {
-                background: #ffffff;
-                border: 1px solid var(--line);
-                border-radius: 16px;
-                padding: 18px;
-                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
-            }
-
-            .case-main-title {
-                font-size: 28px;
-                font-weight: 700;
-                line-height: 1.25;
-            }
-
-            .case-subtitle {
-                margin-top: 8px;
-                font-size: 14px;
-                color: var(--muted);
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .case-tags {
-                margin-top: 14px;
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px;
-            }
-
-            .meta-tag {
-                padding: 6px 10px;
-                border-radius: 999px;
-                font-size: 12px;
-                font-weight: 600;
-                border: 1px solid transparent;
-            }
-
-            .tag-neutral {
-                background: #f3f6f9;
-                color: #344054;
-                border-color: #d8e0e8;
-            }
-
-            .tag-pass {
-                background: rgba(0, 175, 135, 0.10);
-                color: var(--pass);
-                border-color: rgba(0, 175, 135, 0.24);
-            }
-
-            .tag-fail {
-                background: rgba(220, 53, 69, 0.10);
-                color: var(--fail);
-                border-color: rgba(220, 53, 69, 0.22);
-            }
-
-            .tag-skip {
-                background: rgba(255, 193, 7, 0.12);
-                color: #9a6700;
-                border-color: rgba(255, 193, 7, 0.28);
-            }
-
-            .status-pill {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 54px;
-                padding: 4px 10px;
-                border-radius: 999px;
-                font-size: 11px;
-                font-weight: 700;
-                color: #ffffff;
-                text-transform: uppercase;
-            }
-
-            .status-pill.pass {
-                background: var(--pass);
-            }
-
-            .status-pill.fail {
-                background: var(--fail);
-            }
-
-            .status-pill.skip {
-                background: var(--skip);
-                color: #212529;
-            }
-
-            .status-pill.info {
-                background: var(--info);
-            }
-
-            .panel-card {
-                background: #ffffff;
-                border: 1px solid var(--line);
-                border-radius: 16px;
-                padding: 16px 18px;
-                box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
-            }
-
-            .panel-title {
-                font-size: 18px;
-                font-weight: 700;
-                margin-bottom: 14px;
-            }
-
-            .steps-table {
-                width: 100%;
-                border-collapse: collapse;
-                table-layout: fixed;
-            }
-
-            .steps-table thead th {
-                text-align: left;
-                font-size: 12px;
-                color: #667085;
-                padding: 10px 10px;
-                border-bottom: 1px solid var(--line);
-                text-transform: uppercase;
-                letter-spacing: 0.02em;
-            }
-
-            .steps-table tbody td {
-                padding: 10px;
-                border-bottom: 1px solid #eef2f6;
-                vertical-align: top;
-                font-size: 13px;
-            }
-
-            .steps-table th:nth-child(1),
-            .steps-table td:nth-child(1) {
-                width: 96px;
-            }
-
-            .steps-table th:nth-child(2),
-            .steps-table td:nth-child(2) {
-                width: 150px;
-            }
-
-            .timestamp-cell {
-                color: var(--muted);
-                white-space: nowrap;
-            }
-
-            .step-line {
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                max-width: 100%;
-            }
-
-            .expand-row td {
-                padding-top: 0;
-                background: #fafcfe;
-            }
-
-            .details-block {
-                border: 1px solid #dde5ee;
-                border-radius: 12px;
-                background: #fbfcfd;
-                padding: 0 12px;
-            }
-
-            .details-block summary {
-                cursor: pointer;
-                padding: 10px 0;
-                font-size: 13px;
-                font-weight: 600;
-                color: var(--soft-blue);
-                list-style: none;
-            }
-
-            .details-block summary::-webkit-details-marker {
-                display: none;
-            }
-
-            .details-block pre {
-                margin: 0 0 12px 0;
-                white-space: pre-wrap;
-                word-break: break-word;
-                font-size: 12px;
-                color: #374151;
-                line-height: 1.45;
-                max-height: 360px;
-                overflow: auto;
-            }
-
-            .error-summary-line {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                padding: 10px 12px;
-                background: rgba(220, 53, 69, 0.06);
-                border: 1px solid rgba(220, 53, 69, 0.18);
-                border-radius: 12px;
-                margin-bottom: 12px;
-            }
-
-            .error-mark {
-                width: 4px;
-                height: 34px;
-                background: var(--fail);
-                border-radius: 999px;
-                flex-shrink: 0;
-            }
-
-            .error-summary-text {
-                font-size: 13px;
-                font-weight: 600;
-                min-width: 0;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .evidence-list {
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-            }
-
-            .evidence-item {
-                border: 1px solid #dde5ee;
-                border-radius: 12px;
-                background: #fbfcfd;
-                padding: 0 12px;
-            }
-
-            .evidence-item summary {
-                cursor: pointer;
-                padding: 12px 0;
-                font-size: 13px;
-                font-weight: 600;
-                color: var(--soft-blue);
-                list-style: none;
-            }
-
-            .evidence-item summary::-webkit-details-marker {
-                display: none;
-            }
-
-            .evidence-body {
-                padding-bottom: 14px;
-            }
-
-            .evidence-body img {
-                width: 100%;
-                max-width: 900px;
-                border-radius: 12px;
-                border: 1px solid #d7dee6;
-                display: block;
-                background: #ffffff;
-            }
-
-            .empty-row {
-                color: var(--muted);
-                font-size: 13px;
-                padding: 12px 0;
-            }
-
-            .charts-grid {
-                display: grid;
-                grid-template-columns: minmax(320px, 380px) 1fr;
-                gap: 16px;
-            }
-
-            .bar-list {
-                display: flex;
-                flex-direction: column;
-                gap: 14px;
-            }
-
-            .bar-row {
-                display: grid;
-                grid-template-columns: minmax(260px, 1fr) 1fr 90px;
-                gap: 12px;
-                align-items: center;
-            }
-
-            .bar-title {
-                font-size: 13px;
-                font-weight: 600;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .bar-track {
-                height: 12px;
-                background: #eef2f6;
-                border-radius: 999px;
-                overflow: hidden;
-            }
-
-            .bar-fill {
-                height: 100%;
-                border-radius: 999px;
-            }
-
-            .bar-fill.pass {
-                background: var(--pass);
-            }
-
-            .bar-fill.fail {
-                background: var(--fail);
-            }
-
-            .bar-fill.skip {
-                background: var(--skip);
-            }
-
-            .bar-fill.info {
-                background: var(--info);
-            }
-
-            .bar-value {
-                font-size: 12px;
-                color: var(--muted);
-                text-align: right;
-                white-space: nowrap;
-            }
-
-            @media (max-width: 1380px) {
-                .layout {
-                    grid-template-columns: 320px 1fr;
-                }
-
-                .charts-grid {
-                    grid-template-columns: 1fr;
-                }
-            }
-
-            @media (max-width: 1080px) {
-                .layout {
-                    grid-template-columns: 1fr;
-                }
-
-                .sidebar {
-                    border-right: 0;
-                    border-bottom: 1px solid var(--line);
-                }
-
-                .top-banner {
-                    flex-direction: column;
-                    align-items: flex-start;
-                    gap: 10px;
-                }
-
-                .brand-right {
-                    text-align: left;
-                }
-
-                .bar-row {
-                    grid-template-columns: 1fr;
-                }
-            }
-        """
-    }
-
-    private String statusClass(def status) {
-        String value = safeValue(status).toLowerCase()
-        if (value == 'pass' || value == 'passed') {
-            return 'pass'
-        }
-        if (value == 'fail' || value == 'failed') {
-            return 'fail'
-        }
-        if (value == 'skip' || value == 'skipped') {
-            return 'skip'
-        }
-        return 'info'
-    }
-
-    private String statusLabel(def status) {
-        String css = statusClass(status)
-        if (css == 'pass') {
-            return 'Pass'
-        }
-        if (css == 'fail') {
-            return 'Fail'
-        }
-        if (css == 'skip') {
-            return 'Skip'
-        }
-        return 'Info'
-    }
-
-    private String oneLine(def value, int maxSize) {
-        String text = safeValue(value).replaceAll('\\s+', ' ').trim()
-        if (text.size() <= maxSize) {
-            return text
-        }
-        return text.substring(0, Math.max(0, maxSize - 1)).trim() + '…'
-    }
-
-    private String formatPct(def value) {
-        return String.format(Locale.US, '%.2f', toDouble(value))
-    }
-
-    private int toInt(def value) {
-        try {
-            return Integer.parseInt(safeValue(value))
-        } catch (Exception ignored) {
-            return 0
-        }
-    }
-
-    private long toLong(def value) {
-        try {
-            return Long.parseLong(safeValue(value))
-        } catch (Exception ignored) {
-            return 0L
-        }
-    }
-
-    private double toDouble(def value) {
-        try {
-            return Double.parseDouble(safeValue(value))
-        } catch (Exception ignored) {
-            return 0D
-        }
-    }
-
-    private String jsEscape(def value) {
-        return safeValue(value)
-            .replace('\\', '\\\\')
-            .replace("'", "\\'")
-            .replace('"', '\\"')
-            .replace('\\r', '')
-            .replace('\\n', '\\n')
+    private static final String APP_NAME = 'GAIA'
+    private static final String REPORT_TITLE_PREFIX = 'Test report - '
+    private static final String LOGO_SRC_FALLBACK = ''
+    private static final String BANNER_GRADIENT = 'linear-gradient(90deg, #123b73 0%, #155c78 55%, #5fd05f 100%)'
+
+    private static final String STATUS_PASS = '#63b85b'
+    private static final String STATUS_FAIL = '#d85b61'
+    private static final String STATUS_SKIP = '#f0ad4e'
+    private static final String STATUS_INFO = '#4da3ff'
+    private static final String STATUS_NEUTRAL = '#6b7280'
+
+    private String safeValue(def value) {
+        return value == null ? '' : String.valueOf(value).trim()
     }
 
     private String htmlEscape(def value) {
@@ -1983,11 +581,705 @@ class JiraGaiaHtmlTemplateBuilder {
             .replace("'", '&#39;')
     }
 
-    private String safeValue(def value) {
-        return value == null ? '' : String.valueOf(value).trim()
+    private int toInt(def value) {
+        try {
+            return Integer.parseInt(safeValue(value))
+        } catch (Exception ignored) {
+            return 0
+        }
     }
 
-    private boolean isBlank(def value) {
-        return safeValue(value).isEmpty()
+    private String oneLine(def value, int max = 64) {
+        String text = safeValue(value).replaceAll(/[\\r\\n]+/, ' ').replaceAll(/\\s+/, ' ').trim()
+        if (text.length() <= max) {
+            return text
+        }
+        return text.substring(0, Math.max(0, max - 3)).trim() + '...'
+    }
+
+    private String colorForStatus(String status) {
+        String s = safeValue(status).toLowerCase()
+        if (s == 'pass') return STATUS_PASS
+        if (s == 'fail') return STATUS_FAIL
+        if (s == 'skip') return STATUS_SKIP
+        return STATUS_INFO
+    }
+
+    private String labelForStatus(String status) {
+        String s = safeValue(status).toLowerCase()
+        if (s == 'pass') return 'Pass'
+        if (s == 'fail') return 'Fail'
+        if (s == 'skip') return 'Skip'
+        return 'Info'
+    }
+
+    private String renderLogo(String logoSrc) {
+        String src = safeValue(logoSrc)
+        if (!src.isEmpty()) {
+            return '<img class="brand-logo-image" src="' + htmlEscape(src) + '" alt="Project logo">'
+        }
+
+        return '<div class="brand-logo-fallback">G</div>'
+    }
+
+    private String renderSidebarList(List<Map> scenarios) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div id="sidebar-tests-view" class="sidebar-view active">')
+        html.append('<input id="scenarioSearch" class="scenario-search" type="text" placeholder="Search test name, path, or status..." onkeyup="filterScenarios()">')
+        html.append('<div class="scenario-list">')
+
+        scenarios.eachWithIndex { Map scenario, int index ->
+            String status = safeValue(scenario.status)
+            String activeClass = index == 0 ? ' active' : ''
+            String scenarioId = safeValue(scenario.id)
+
+            html.append('<button class="scenario-row')
+            html.append(activeClass)
+            html.append('" data-scenario-id="')
+            html.append(htmlEscape(scenarioId))
+            html.append('" data-name="')
+            html.append(htmlEscape((safeValue(scenario.name) + ' ' + safeValue(scenario.statusLabel)).toLowerCase()))
+            html.append('" onclick="selectScenario(\'')
+            html.append(htmlEscape(scenarioId))
+            html.append('\')">')
+
+            html.append('<span class="scenario-status-dot" style="background:')
+            html.append(htmlEscape(colorForStatus(status)))
+            html.append('"></span>')
+
+            html.append('<span class="scenario-name">')
+            html.append(htmlEscape(oneLine(scenario.listName ?: scenario.name, 42)))
+            html.append('</span>')
+
+            html.append('<span class="scenario-badge" style="background:')
+            html.append(htmlEscape(colorForStatus(status)))
+            html.append('">')
+            html.append(htmlEscape(labelForStatus(status)))
+            html.append('</span>')
+
+            html.append('<span class="scenario-duration">')
+            html.append(htmlEscape(safeValue(scenario.durationText)))
+            html.append('</span>')
+
+            html.append('</button>')
+        }
+
+        html.append('</div>')
+        html.append('</div>')
+
+        return html.toString()
+    }
+
+    private String renderSidebarCharts(Map model) {
+        int total = Math.max(1, toInt(model.total))
+        int passed = toInt(model.passed)
+        int failed = toInt(model.failed)
+        int skipped = toInt(model.skipped)
+
+        int passPercent = Math.round((passed * 100.0f) / total)
+        int failPercent = Math.round((failed * 100.0f) / total)
+        int skipPercent = Math.round((skipped * 100.0f) / total)
+
+        String donut = "conic-gradient(${STATUS_PASS} 0 ${passPercent}%, ${STATUS_FAIL} ${passPercent}% ${passPercent + failPercent}%, ${STATUS_SKIP} ${passPercent + failPercent}% 100%)"
+
+        StringBuilder html = new StringBuilder()
+        html.append('<div id="sidebar-charts-view" class="sidebar-view">')
+
+        html.append('<div class="chart-card">')
+        html.append('<div class="donut" style="background:')
+        html.append(htmlEscape(donut))
+        html.append('"><div class="donut-center"><div class="donut-total">')
+        html.append(htmlEscape(String.valueOf(model.total)))
+        html.append('</div><div class="donut-label">Tests</div></div></div>')
+
+        html.append('<div class="chart-legend">')
+        html.append('<div class="legend-row"><span class="legend-dot" style="background:')
+        html.append(STATUS_PASS)
+        html.append('"></span><span>Passed</span><strong>')
+        html.append(htmlEscape(String.valueOf(model.passed)))
+        html.append('</strong></div>')
+
+        html.append('<div class="legend-row"><span class="legend-dot" style="background:')
+        html.append(STATUS_FAIL)
+        html.append('"></span><span>Failed</span><strong>')
+        html.append(htmlEscape(String.valueOf(model.failed)))
+        html.append('</strong></div>')
+
+        html.append('<div class="legend-row"><span class="legend-dot" style="background:')
+        html.append(STATUS_SKIP)
+        html.append('"></span><span>Skipped</span><strong>')
+        html.append(htmlEscape(String.valueOf(model.skipped)))
+        html.append('</strong></div>')
+        html.append('</div>')
+
+        html.append('<div class="small-metric"><span>Passed</span><div class="metric-line"><i style="width:')
+        html.append(htmlEscape(String.valueOf(passPercent)))
+        html.append('%;background:')
+        html.append(STATUS_PASS)
+        html.append('"></i></div><strong>')
+        html.append(htmlEscape(String.valueOf(model.passed)))
+        html.append('</strong></div>')
+
+        html.append('<div class="small-metric"><span>Failed</span><div class="metric-line"><i style="width:')
+        html.append(htmlEscape(String.valueOf(failPercent)))
+        html.append('%;background:')
+        html.append(STATUS_FAIL)
+        html.append('"></i></div><strong>')
+        html.append(htmlEscape(String.valueOf(model.failed)))
+        html.append('</strong></div>')
+
+        html.append('<div class="small-metric"><span>Skipped</span><div class="metric-line"><i style="width:')
+        html.append(htmlEscape(String.valueOf(skipPercent)))
+        html.append('%;background:')
+        html.append(STATUS_SKIP)
+        html.append('"></i></div><strong>')
+        html.append(htmlEscape(String.valueOf(model.skipped)))
+        html.append('</strong></div>')
+
+        html.append('</div>')
+        html.append('</div>')
+
+        return html.toString()
+    }
+
+    private String renderTags(Map model, Map scenario) {
+        StringBuilder html = new StringBuilder()
+        html.append('<div class="tag-row">')
+        html.append('<span class="info-tag">Suite: ')
+        html.append(htmlEscape(safeValue(model.suiteName)))
+        html.append('</span>')
+        html.append('<span class="info-tag">Status: ')
+        html.append(htmlEscape(safeValue(scenario.statusLabel)))
+        html.append('</span>')
+        html.append('<span class="info-tag">Start: ')
+        html.append(htmlEscape(safeValue(scenario.startAt)))
+        html.append('</span>')
+        html.append('<span class="info-tag">End: ')
+        html.append(htmlEscape(safeValue(scenario.endAt)))
+        html.append('</span>')
+        html.append('<span class="info-tag">Duration: ')
+        html.append(htmlEscape(safeValue(scenario.durationText)))
+        html.append('</span>')
+        html.append('</div>')
+        return html.toString()
+    }
+
+    private String renderStepTable(List<Map> steps) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<table class="steps-table">')
+        html.append('<thead><tr><th>Status</th><th>Timestamp</th><th>Details</th></tr></thead>')
+        html.append('<tbody>')
+
+        steps.each { Map step ->
+            String status = safeValue(step.status)
+            String shortDetail = oneLine(step.detail ?: step.fullDetail, 110)
+            String fullDetail = safeValue(step.fullDetail)
+
+            html.append('<tr>')
+            html.append('<td><span class="status-pill" style="background:')
+            html.append(htmlEscape(colorForStatus(status)))
+            html.append('">')
+            html.append(htmlEscape(labelForStatus(status)))
+            html.append('</span></td>')
+
+            html.append('<td class="step-time">')
+            html.append(htmlEscape(safeValue(step.time)))
+            html.append('</td>')
+
+            html.append('<td class="step-detail">')
+            html.append('<div class="step-detail-line">')
+            html.append(htmlEscape(shortDetail))
+            html.append('</div>')
+
+            if (!fullDetail.isEmpty() && fullDetail != shortDetail) {
+                html.append('<details class="more-block">')
+                html.append('<summary>🔎 View full detail</summary>')
+                html.append('<pre>')
+                html.append(htmlEscape(fullDetail))
+                html.append('</pre>')
+                html.append('</details>')
+            }
+
+            html.append('</td>')
+            html.append('</tr>')
+        }
+
+        html.append('</tbody>')
+        html.append('</table>')
+
+        return html.toString()
+    }
+
+    private String renderEvidenceSection(Map scenario) {
+        String imagePath = safeValue(scenario.imagePath)
+        String imageName = safeValue(scenario.imageName)
+
+        if (imagePath.isEmpty()) {
+            return ''
+        }
+
+        StringBuilder html = new StringBuilder()
+        html.append('<details class="evidence-block">')
+        html.append('<summary>📎 Evidence</summary>')
+        html.append('<div class="evidence-grid">')
+        html.append('<a class="evidence-card" href="')
+        html.append(htmlEscape(imagePath))
+        html.append('" target="_blank">')
+        html.append('<img src="')
+        html.append(htmlEscape(imagePath))
+        html.append('" alt="Evidence">')
+        html.append('<span>')
+        html.append(htmlEscape(imageName))
+        html.append('</span>')
+        html.append('</a>')
+        html.append('</div>')
+        html.append('</details>')
+        return html.toString()
+    }
+
+    private String renderErrorBlock(Map scenario) {
+        String errorLine = safeValue(scenario.errorLine)
+        String fullError = safeValue(scenario.fullError)
+
+        if (errorLine.isEmpty() && fullError.isEmpty()) {
+            return ''
+        }
+
+        StringBuilder html = new StringBuilder()
+        html.append('<div class="error-summary-box">')
+        html.append('<div class="error-summary-title">Visual Error Log</div>')
+        html.append('<div class="error-summary-line">')
+        html.append(htmlEscape(oneLine(errorLine ?: fullError, 220)))
+        html.append('</div>')
+
+        if (!fullError.isEmpty()) {
+            html.append('<details class="more-block open-space">')
+            html.append('<summary>🔎 View full error</summary>')
+            html.append('<pre>')
+            html.append(htmlEscape(fullError))
+            html.append('</pre>')
+            html.append('</details>')
+        }
+
+        html.append('</div>')
+        return html.toString()
+    }
+
+    private String renderScenarioPanels(Map model) {
+        List<Map> scenarios = model.scenarios instanceof List ? model.scenarios : []
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div id="tests-content-view" class="content-view active">')
+
+        if (scenarios.isEmpty()) {
+            html.append('<div class="empty-view">No test scenario data was found.</div>')
+            html.append('</div>')
+            return html.toString()
+        }
+
+        scenarios.eachWithIndex { Map scenario, int index ->
+            String scenarioId = safeValue(scenario.id)
+            String activeClass = index == 0 ? ' active' : ''
+
+            html.append('<section class="scenario-panel')
+            html.append(activeClass)
+            html.append('" id="panel-')
+            html.append(htmlEscape(scenarioId))
+            html.append('">')
+
+            html.append('<div class="scenario-header">')
+            html.append('<div class="scenario-title-wrap">')
+            html.append('<h1 class="scenario-title">')
+            html.append(htmlEscape(REPORT_TITLE_PREFIX + safeValue(model.suiteName)))
+            html.append('</h1>')
+
+            html.append('<div class="scenario-description">')
+            html.append(htmlEscape(oneLine(safeValue(scenario.name), 140)))
+            html.append('</div>')
+            html.append(renderTags(model, scenario))
+            html.append('</div>')
+            html.append('</div>')
+
+            html.append('<div class="section-label">Steps</div>')
+            html.append(renderStepTable(scenario.steps instanceof List ? scenario.steps : []))
+            html.append(renderErrorBlock(scenario))
+            html.append(renderEvidenceSection(scenario))
+            html.append('</section>')
+        }
+
+        html.append('</div>')
+        return html.toString()
+    }
+
+    private String renderChartsContent(Map model) {
+        int total = Math.max(1, toInt(model.total))
+        int passed = toInt(model.passed)
+        int failed = toInt(model.failed)
+        int skipped = toInt(model.skipped)
+
+        int passPercent = Math.round((passed * 100.0f) / total)
+        int failPercent = Math.round((failed * 100.0f) / total)
+        int skipPercent = Math.round((skipped * 100.0f) / total)
+
+        StringBuilder html = new StringBuilder()
+        html.append('<div id="charts-content-view" class="content-view">')
+        html.append('<div class="overview-title">Global Overview</div>')
+        html.append('<div class="overview-grid">')
+
+        html.append('<div class="overview-card">')
+        html.append('<div class="overview-card-title">Passed</div>')
+        html.append('<div class="overview-big-number">')
+        html.append(htmlEscape(String.valueOf(model.passed)))
+        html.append('</div>')
+        html.append('<div class="overview-progress"><i style="width:')
+        html.append(htmlEscape(String.valueOf(passPercent)))
+        html.append('%;background:')
+        html.append(STATUS_PASS)
+        html.append('"></i></div>')
+        html.append('<div class="overview-footer">')
+        html.append(htmlEscape(String.valueOf(passPercent)))
+        html.append('% of execution</div>')
+        html.append('</div>')
+
+        html.append('<div class="overview-card">')
+        html.append('<div class="overview-card-title">Failed</div>')
+        html.append('<div class="overview-big-number">')
+        html.append(htmlEscape(String.valueOf(model.failed)))
+        html.append('</div>')
+        html.append('<div class="overview-progress"><i style="width:')
+        html.append(htmlEscape(String.valueOf(failPercent)))
+        html.append('%;background:')
+        html.append(STATUS_FAIL)
+        html.append('"></i></div>')
+        html.append('<div class="overview-footer">')
+        html.append(htmlEscape(String.valueOf(failPercent)))
+        html.append('% of execution</div>')
+        html.append('</div>')
+
+        html.append('<div class="overview-card">')
+        html.append('<div class="overview-card-title">Skipped</div>')
+        html.append('<div class="overview-big-number">')
+        html.append(htmlEscape(String.valueOf(model.skipped)))
+        html.append('</div>')
+        html.append('<div class="overview-progress"><i style="width:')
+        html.append(htmlEscape(String.valueOf(skipPercent)))
+        html.append('%;background:')
+        html.append(STATUS_SKIP)
+        html.append('"></i></div>')
+        html.append('<div class="overview-footer">')
+        html.append(htmlEscape(String.valueOf(skipPercent)))
+        html.append('% of execution</div>')
+        html.append('</div>')
+
+        html.append('</div>')
+        html.append('</div>')
+
+        return html.toString()
+    }
+
+    String buildHtml(Map model) {
+        List<Map> scenarios = model.scenarios instanceof List ? model.scenarios : []
+        String logoSrc = safeValue(model.logoSrc)
+        if (logoSrc.isEmpty()) {
+            logoSrc = LOGO_SRC_FALLBACK
+        }
+
+        StringBuilder html = new StringBuilder()
+
+        html.append('<!DOCTYPE html>')
+        html.append('<html lang="en">')
+        html.append('<head>')
+        html.append('<meta charset="UTF-8">')
+        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
+        html.append('<title>')
+        html.append(htmlEscape(safeValue(model.reportTitle)))
+        html.append('</title>')
+
+        html.append('''
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f7fb;color:#19212b}
+body{min-height:100vh}
+.top-banner{
+    background:''')
+        html.append(BANNER_GRADIENT)
+        html.append(''';color:#fff;padding:18px 24px;display:flex;align-items:center;justify-content:space-between;gap:20px;
+    box-shadow:0 2px 8px rgba(0,0,0,.18)
+}
+.brand-wrap{display:flex;align-items:center;gap:14px}
+.brand-logo{
+    width:42px;height:42px;border-radius:10px;background:rgba(255,255,255,.12);
+    display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid rgba(255,255,255,.18)
+}
+.brand-logo-image{width:100%;height:100%;object-fit:contain;background:#fff}
+.brand-logo-fallback{font-size:22px;font-weight:700;color:#fff}
+.brand-texts{display:flex;flex-direction:column;gap:3px}
+.report-name{font-size:24px;font-weight:700;line-height:1.2}
+.report-subtitle{font-size:12px;opacity:.9}
+.banner-meta{text-align:right;font-size:12px;line-height:1.6;opacity:.95}
+.page-shell{display:flex;min-height:calc(100vh - 78px)}
+.sidebar{
+    width:360px;min-width:360px;background:#fff;border-right:1px solid #dce4ee;
+    display:flex;flex-direction:column
+}
+.sidebar-head{
+    padding:14px 16px;border-bottom:1px solid #e5ebf2;background:#fbfcfe
+}
+.sidebar-tabs{display:flex;gap:8px}
+.sidebar-tab{
+    border:1px solid #cfd8e3;background:#fff;color:#234;cursor:pointer;
+    border-radius:7px;padding:8px 14px;font-size:12px;font-weight:700
+}
+.sidebar-tab.active{
+    background:#e9f1fb;border-color:#9bb7d7;color:#123b73
+}
+.sidebar-body{padding:12px 12px 18px 12px;overflow:auto;flex:1}
+.sidebar-view{display:none}
+.sidebar-view.active{display:block}
+.scenario-search{
+    width:100%;padding:10px 12px;border:1px solid #d7dee8;border-radius:8px;
+    font-size:12px;margin-bottom:12px;background:#fff
+}
+.scenario-list{display:flex;flex-direction:column;gap:8px}
+.scenario-row{
+    width:100%;border:1px solid #e4eaf2;background:#fff;border-radius:10px;padding:11px 12px;
+    text-align:left;display:grid;grid-template-columns:10px 1fr auto;gap:10px;align-items:center;cursor:pointer
+}
+.scenario-row:hover{background:#f9fbfe}
+.scenario-row.active{background:#eef5fd;border-left:4px solid #123b73;padding-left:9px}
+.scenario-status-dot{width:8px;height:8px;border-radius:50%}
+.scenario-name{
+    font-size:12px;color:#263444;white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+}
+.scenario-badge{
+    color:#fff;font-size:10px;font-weight:700;padding:4px 7px;border-radius:999px;display:inline-block
+}
+.scenario-duration{
+    grid-column:2 / span 2;font-size:11px;color:#6d7885;margin-top:2px
+}
+.chart-card{
+    border:1px solid #e4eaf2;border-radius:12px;background:#fff;padding:16px
+}
+.donut{
+    width:170px;height:170px;border-radius:50%;margin:4px auto 18px auto;
+    display:flex;align-items:center;justify-content:center
+}
+.donut-center{
+    width:108px;height:108px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;
+    flex-direction:column;box-shadow:inset 0 0 0 1px #e4eaf2
+}
+.donut-total{font-size:28px;font-weight:700;color:#1f2d3d}
+.donut-label{font-size:11px;color:#778394}
+.chart-legend{display:flex;flex-direction:column;gap:8px;margin-bottom:18px}
+.legend-row{display:flex;align-items:center;justify-content:space-between;font-size:12px;color:#324255}
+.legend-row span:nth-child(2){flex:1;margin-left:10px}
+.legend-dot{width:10px;height:10px;border-radius:50%}
+.small-metric{display:grid;grid-template-columns:60px 1fr 28px;gap:10px;align-items:center;margin-bottom:10px;font-size:12px}
+.metric-line{height:8px;background:#edf2f7;border-radius:999px;overflow:hidden}
+.metric-line i{display:block;height:100%;border-radius:999px}
+.content{
+    flex:1;padding:26px 28px 32px 28px;overflow:auto
+}
+.content-view{display:none}
+.content-view.active{display:block}
+.scenario-panel{display:none}
+.scenario-panel.active{display:block}
+.scenario-title-wrap{margin-bottom:16px}
+.scenario-title{margin:0;font-size:34px;color:#1f2b38;font-weight:700}
+.scenario-description{margin-top:8px;color:#4b5563;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.info-tag{
+    display:inline-flex;align-items:center;padding:7px 10px;border-radius:999px;background:#f2f7fc;
+    border:1px solid #d9e4ef;color:#24425d;font-size:12px;font-weight:600
+}
+.section-label{
+    font-size:15px;font-weight:700;color:#243446;margin:18px 0 10px 0
+}
+.steps-table{
+    width:100%;border-collapse:collapse;background:#fff;border:1px solid #e3e8ef;border-radius:12px;overflow:hidden
+}
+.steps-table thead th{
+    text-align:left;padding:12px 14px;background:#fbfcfe;border-bottom:1px solid #e3e8ef;font-size:12px;
+    color:#4c5c6d;text-transform:uppercase
+}
+.steps-table tbody td{
+    padding:11px 14px;border-bottom:1px solid #eef2f7;vertical-align:top;font-size:13px
+}
+.steps-table tbody tr:hover{background:#fafcff}
+.status-pill{
+    display:inline-flex;align-items:center;justify-content:center;min-width:52px;
+    padding:5px 9px;border-radius:999px;font-size:11px;font-weight:700;color:#fff
+}
+.step-time{color:#5d6b7a;white-space:nowrap;width:150px}
+.step-detail-line{color:#1f2937;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.more-block{margin-top:8px}
+.more-block summary{cursor:pointer;color:#123b73;font-size:12px;font-weight:700}
+.more-block pre{
+    margin-top:8px;padding:12px;border-radius:10px;background:#0f172a;color:#dbe7ff;border:1px solid #1e293b;
+    white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.5;max-height:360px;overflow:auto
+}
+.open-space{margin-top:10px}
+.error-summary-box{
+    margin-top:20px;border:1px solid #f1c7cb;border-left:4px solid #d85b61;background:#fff7f8;border-radius:12px;padding:14px
+}
+.error-summary-title{font-size:14px;font-weight:700;color:#912c35;margin-bottom:8px}
+.error-summary-line{
+    font-size:13px;color:#5c2028;white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+}
+.evidence-block{
+    margin-top:20px;background:#fff;border:1px solid #e4eaf2;border-radius:12px;padding:0 14px 14px 14px
+}
+.evidence-block summary{
+    cursor:pointer;list-style:none;padding:14px 0;font-size:14px;font-weight:700;color:#243446
+}
+.evidence-grid{
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px
+}
+.evidence-card{
+    display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid #e4eaf2;border-radius:10px;
+    background:#fff;text-decoration:none;color:#1f2937
+}
+.evidence-card img{
+    width:100%;height:160px;object-fit:cover;border-radius:8px;background:#f3f6fa;border:1px solid #edf2f7
+}
+.evidence-card span{
+    font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+}
+.overview-title{
+    font-size:28px;font-weight:700;color:#1f2b38;margin-bottom:20px
+}
+.overview-grid{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px
+}
+.overview-card{
+    border:1px solid #e4eaf2;border-radius:14px;background:#fff;padding:18px
+}
+.overview-card-title{font-size:14px;color:#516172;margin-bottom:10px;font-weight:700}
+.overview-big-number{font-size:42px;font-weight:700;color:#1b2735;margin-bottom:12px}
+.overview-progress{height:10px;background:#edf2f7;border-radius:999px;overflow:hidden}
+.overview-progress i{display:block;height:100%;border-radius:999px}
+.overview-footer{margin-top:10px;color:#6c7886;font-size:12px}
+.empty-view{
+    padding:24px;border:1px dashed #cfd8e3;border-radius:12px;background:#fff;color:#546274;font-size:14px
+}
+@media (max-width: 1200px){
+    .page-shell{flex-direction:column}
+    .sidebar{width:100%;min-width:100%;border-right:none;border-bottom:1px solid #dce4ee}
+}
+</style>
+''')
+
+        html.append('</head>')
+        html.append('<body>')
+
+        html.append('<header class="top-banner">')
+        html.append('<div class="brand-wrap">')
+        html.append('<div class="brand-logo">')
+        html.append(renderLogo(logoSrc))
+        html.append('</div>')
+        html.append('<div class="brand-texts">')
+        html.append('<div class="report-name">')
+        html.append(htmlEscape(safeValue(model.reportTitle)))
+        html.append('</div>')
+        html.append('<div class="report-subtitle">')
+        html.append(htmlEscape(safeValue(model.subtitle) ?: (APP_NAME + ' execution overview')))
+        html.append('</div>')
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div class="banner-meta">')
+        html.append('<div><strong>Generated:</strong> ')
+        html.append(htmlEscape(safeValue(model.generatedAt)))
+        html.append('</div>')
+        html.append('<div><strong>Project:</strong> ')
+        html.append(htmlEscape(APP_NAME))
+        html.append('</div>')
+        html.append('</div>')
+        html.append('</header>')
+
+        html.append('<div class="page-shell">')
+
+        html.append('<aside class="sidebar">')
+        html.append('<div class="sidebar-head">')
+        html.append('<div class="sidebar-tabs">')
+        html.append('<button id="tab-tests" class="sidebar-tab active" onclick="switchView(\'tests\')">Tests</button>')
+        html.append('<button id="tab-charts" class="sidebar-tab" onclick="switchView(\'charts\')">Charts</button>')
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div class="sidebar-body">')
+        html.append(renderSidebarList(scenarios))
+        html.append(renderSidebarCharts(model))
+        html.append('</div>')
+        html.append('</aside>')
+
+        html.append('<main class="content">')
+        html.append(renderScenarioPanels(model))
+        html.append(renderChartsContent(model))
+        html.append('</main>')
+
+        html.append('</div>')
+
+        html.append('''
+<script>
+function switchView(view){
+    var testsTab = document.getElementById('tab-tests');
+    var chartsTab = document.getElementById('tab-charts');
+    var testsSidebar = document.getElementById('sidebar-tests-view');
+    var chartsSidebar = document.getElementById('sidebar-charts-view');
+    var testsContent = document.getElementById('tests-content-view');
+    var chartsContent = document.getElementById('charts-content-view');
+
+    if(view === 'charts'){
+        testsTab.classList.remove('active');
+        chartsTab.classList.add('active');
+        testsSidebar.classList.remove('active');
+        chartsSidebar.classList.add('active');
+        testsContent.classList.remove('active');
+        chartsContent.classList.add('active');
+    } else {
+        chartsTab.classList.remove('active');
+        testsTab.classList.add('active');
+        chartsSidebar.classList.remove('active');
+        testsSidebar.classList.add('active');
+        chartsContent.classList.remove('active');
+        testsContent.classList.add('active');
+    }
+}
+
+function selectScenario(id){
+    var rows = document.querySelectorAll('.scenario-row');
+    var panels = document.querySelectorAll('.scenario-panel');
+
+    rows.forEach(function(row){
+        row.classList.toggle('active', row.getAttribute('data-scenario-id') === id);
+    });
+
+    panels.forEach(function(panel){
+        panel.classList.toggle('active', panel.id === 'panel-' + id);
+    });
+
+    switchView('tests');
+}
+
+function filterScenarios(){
+    var input = document.getElementById('scenarioSearch');
+    var query = (input.value || '').toLowerCase();
+    var rows = document.querySelectorAll('.scenario-row');
+
+    rows.forEach(function(row){
+        var hay = row.getAttribute('data-name') || '';
+        row.style.display = hay.indexOf(query) >= 0 ? '' : 'none';
+    });
+}
+</script>
+''')
+
+        html.append('</body>')
+        html.append('</html>')
+
+        return html.toString()
     }
 }
