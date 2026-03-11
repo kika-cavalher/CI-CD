@@ -1,9 +1,6 @@
-Keywords/jiraIntegration/JiraGaiaReportBuilder.groovy
-
 package jiraIntegration
 
 import java.io.File
-import java.math.BigDecimal
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -13,7 +10,6 @@ import javax.xml.parsers.DocumentBuilderFactory
 
 import org.w3c.dom.Document
 import org.w3c.dom.Element
-import org.w3c.dom.Node
 
 class JiraGaiaReportBuilder {
 
@@ -90,8 +86,8 @@ class JiraGaiaReportBuilder {
             Element errorNode = firstChildElement(testcase, 'error')
             Element skippedNode = firstChildElement(testcase, 'skipped')
 
-            boolean failed = failureNode != null || errorNode != null
-            boolean skipped = skippedNode != null
+            boolean failed = (failureNode != null) || (errorNode != null)
+            boolean skipped = (skippedNode != null)
 
             String message = ''
             String details = ''
@@ -208,7 +204,7 @@ class JiraGaiaReportBuilder {
             currentScenario.errorShort = resolveScenarioErrorShort(currentScenario)
             currentScenario.errorFull = resolveScenarioErrorFull(currentScenario)
             currentScenario.sidebarSubtitle = resolveScenarioSidebarSubtitle(currentScenario)
-            currentScenario.durationLabel = formatDurationHHMM(currentScenario.durationMs as long)
+            currentScenario.durationLabel = formatDurationHHMM((currentScenario.durationMs ?: 0L) as long)
 
             scenarios << currentScenario
             currentScenario = null
@@ -297,7 +293,7 @@ class JiraGaiaReportBuilder {
 
                 if (event.status == 'failed') {
                     currentStep.status = 'failed'
-                    currentStep.errorLines << (event.message ?: '')
+                    currentStep.errorLines << safeValue(event.message)
                 } else if (currentStep.status != 'failed' && event.status == 'passed') {
                     currentStep.status = 'passed'
                 } else if (currentStep.status == 'skipped' && event.status == 'info') {
@@ -308,7 +304,6 @@ class JiraGaiaReportBuilder {
 
             if (!isBlank(line)) {
                 currentStep.detailLines << line
-
                 if (currentStep.status == 'failed' || looksLikeErrorStack(line)) {
                     currentStep.errorLines << line
                 }
@@ -333,9 +328,9 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            if ((scenario.durationMs ?: 0L) == 0L) {
+            if (((scenario.durationMs ?: 0L) as long) == 0L) {
                 scenario.durationMs = (xmlCase.durationMs ?: 0L) as long
-                scenario.durationLabel = formatDurationHHMM(scenario.durationMs as long)
+                scenario.durationLabel = formatDurationHHMM((scenario.durationMs ?: 0L) as long)
             }
 
             if (scenario.status == 'skipped' && safeValue(xmlCase.status) != 'skipped') {
@@ -434,14 +429,15 @@ class JiraGaiaReportBuilder {
             return
         }
 
-        List<Map> targetScenarios = scenarios.findAll { Map item -> safeValue(item.status) == 'failed' }
-        if (targetScenarios.isEmpty()) {
-            targetScenarios = scenarios
+        List<Map> targets = scenarios.findAll { Map item -> safeValue(item.status) == 'failed' }
+        if (targets.isEmpty()) {
+            targets = scenarios
         }
 
         int targetIndex = 0
         imageFiles.each { File image ->
-            Map target = targetScenarios[targetIndex]
+            Map target = targets[targetIndex]
+
             if (target.evidences == null) {
                 target.evidences = []
             }
@@ -453,7 +449,7 @@ class JiraGaiaReportBuilder {
                 previewUrl: image.toURI().toString()
             ]
 
-            if (targetIndex < targetScenarios.size() - 1) {
+            if (targetIndex < targets.size() - 1) {
                 targetIndex++
             }
         }
@@ -468,7 +464,12 @@ class JiraGaiaReportBuilder {
             }
 
             String lowerName = file.name.toLowerCase(Locale.ENGLISH)
-            if (lowerName.endsWith('.png') || lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg') || lowerName.endsWith('.webp')) {
+            boolean isImage = lowerName.endsWith('.png')
+            isImage = isImage || lowerName.endsWith('.jpg')
+            isImage = isImage || lowerName.endsWith('.jpeg')
+            isImage = isImage || lowerName.endsWith('.webp')
+
+            if (isImage) {
                 images << file
             }
         }
@@ -489,7 +490,8 @@ class JiraGaiaReportBuilder {
             }
 
             String lowerName = file.name.toLowerCase(Locale.ENGLISH)
-            if (lowerName.startsWith('execution') && lowerName.endsWith('.log')) {
+            boolean isExecutionLog = lowerName.startsWith('execution') && lowerName.endsWith('.log')
+            if (isExecutionLog) {
                 candidates << file
             }
         }
@@ -518,7 +520,7 @@ class JiraGaiaReportBuilder {
     }
 
     private Map parseEventLine(String line) {
-        def matcher = line =~ /^(\d{2}:\d{2}:\d{2}\.\d{3})\s+([A-Z]+)\s+(.*)$/
+        def matcher = (line =~ /^(\\d{2}:\\d{2}:\\d{2}\\.\\d{3})\\s+([A-Z]+)\\s+(.*)$/)
         if (!matcher.find()) {
             return null
         }
@@ -535,33 +537,35 @@ class JiraGaiaReportBuilder {
     }
 
     private String normalizeEventStatus(String rawStatus) {
-        switch (rawStatus) {
-            case 'PASSED':
-                return 'passed'
-            case 'FAILED':
-            case 'ERROR':
-                return 'failed'
-            case 'SKIPPED':
-                return 'skipped'
-            default:
-                return 'info'
+        if (rawStatus == 'PASSED') {
+            return 'passed'
         }
+        if (rawStatus == 'FAILED' || rawStatus == 'ERROR') {
+            return 'failed'
+        }
+        if (rawStatus == 'SKIPPED') {
+            return 'skipped'
+        }
+        return 'info'
     }
 
     private boolean shouldIgnoreStep(String title) {
         String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
 
-        return lower.startsWith('start listener action')
-            || lower.startsWith('glue')
-            || lower.startsWith('runfeaturefile')
-            || lower.startsWith('exportkatalonreports')
-            || lower.startsWith('sampleaftertestcase')
-            || lower.startsWith('video')
-            || lower.startsWith('beforetestcase')
+        boolean ignored = false
+        ignored = ignored || lower.startsWith('start listener action')
+        ignored = ignored || lower.startsWith('glue')
+        ignored = ignored || lower.startsWith('runfeaturefile')
+        ignored = ignored || lower.startsWith('exportkatalonreports')
+        ignored = ignored || lower.startsWith('sampleaftertestcase')
+        ignored = ignored || lower.startsWith('video')
+        ignored = ignored || lower.startsWith('beforetestcase')
+
+        return ignored
     }
 
     private void applyTimingInfo(Map target, String timingLine) {
-        def matcher = timingLine =~ /^Start \/ End \/ Elapsed:\s*(.+?)\s*\/\s*(.+?)\s*\/\s*(.+)$/
+        def matcher = (timingLine =~ /^Start \\/ End \\/ Elapsed:\\s*(.+?)\\s*\\/\\s*(.+?)\\s*\\/\\s*(.+)$/)
         if (!matcher.find()) {
             return
         }
@@ -623,8 +627,8 @@ class JiraGaiaReportBuilder {
         }
 
         try {
-            BigDecimal seconds = new BigDecimal(raw)
-            return seconds.multiply(new BigDecimal('1000')).longValue()
+            double seconds = Double.parseDouble(raw)
+            return Math.round(seconds * 1000d)
         } catch (Exception ignored) {
             return 0L
         }
@@ -636,7 +640,7 @@ class JiraGaiaReportBuilder {
             return 0L
         }
 
-        def matcher = raw =~ /^(\d{2}):(\d{2}):(\d{2})\.(\d{3})$/
+        def matcher = (raw =~ /^(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})$/)
         if (!matcher.find()) {
             return 0L
         }
@@ -646,7 +650,7 @@ class JiraGaiaReportBuilder {
         long seconds = matcher.group(3) as long
         long millis = matcher.group(4) as long
 
-        return (((hours * 60 + minutes) * 60) + seconds) * 1000L + millis
+        return (((hours * 60L + minutes) * 60L) + seconds) * 1000L + millis
     }
 
     private String formatDurationHHMM(long durationMs) {
@@ -664,35 +668,43 @@ class JiraGaiaReportBuilder {
     private boolean looksLikeErrorStack(String line) {
         String lower = safeValue(line).toLowerCase(Locale.ENGLISH)
 
-        return lower.startsWith('at ')
-            || lower.startsWith('caused by:')
-            || lower.contains('root cause')
-            || lower.contains('exception')
-            || lower.contains('webdriver')
-            || lower.contains('session info')
-            || lower.contains('build info')
-            || lower.contains('driver info')
-            || lower.contains('capabilities')
-            || lower.contains('stacktrace')
+        boolean match = false
+        match = match || lower.startsWith('at ')
+        match = match || lower.startsWith('caused by:')
+        match = match || lower.contains('root cause')
+        match = match || lower.contains('exception')
+        match = match || lower.contains('webdriver')
+        match = match || lower.contains('session info')
+        match = match || lower.contains('build info')
+        match = match || lower.contains('driver info')
+        match = match || lower.contains('capabilities')
+        match = match || lower.contains('stacktrace')
+
+        return match
     }
 
     private String buildStepPreview(Map step) {
-        String title = safeValue(step.title)
-        return title
+        return safeValue(step.title)
     }
 
     private String resolveScenarioStatus(Map scenario) {
-        boolean hasFail = scenario.steps.any { Map step -> safeValue(step.status) == 'failed' }
+        boolean hasFail = scenario.steps.any { Map step ->
+            safeValue(step.status) == 'failed'
+        }
         if (hasFail) {
             return 'failed'
         }
 
-        boolean hasPass = scenario.steps.any { Map step -> safeValue(step.status) == 'passed' }
+        boolean hasPass = scenario.steps.any { Map step ->
+            safeValue(step.status) == 'passed'
+        }
         if (hasPass) {
             return 'passed'
         }
 
-        boolean hasInfo = scenario.steps.any { Map step -> safeValue(step.status) == 'info' }
+        boolean hasInfo = scenario.steps.any { Map step ->
+            safeValue(step.status) == 'info'
+        }
         if (hasInfo) {
             return 'info'
         }
@@ -701,18 +713,26 @@ class JiraGaiaReportBuilder {
     }
 
     private String resolveScenarioErrorShort(Map scenario) {
-        Map failedStep = scenario.steps.find { Map step -> safeValue(step.status) == 'failed' }
+        Map failedStep = scenario.steps.find { Map step ->
+            safeValue(step.status) == 'failed'
+        }
+
         if (failedStep != null) {
             return extractShortError(failedStep.shortError ?: failedStep.errorFull ?: failedStep.detailText)
         }
+
         return ''
     }
 
     private String resolveScenarioErrorFull(Map scenario) {
-        Map failedStep = scenario.steps.find { Map step -> safeValue(step.status) == 'failed' }
+        Map failedStep = scenario.steps.find { Map step ->
+            safeValue(step.status) == 'failed'
+        }
+
         if (failedStep != null) {
             return safeValue(failedStep.errorFull ?: failedStep.detailText)
         }
+
         return ''
     }
 
@@ -738,19 +758,20 @@ class JiraGaiaReportBuilder {
 
         String preferred = lines.find { String line ->
             String lower = line.toLowerCase(Locale.ENGLISH)
-            return lower.contains('unable to ')
-                || lower.contains('element click intercepted')
-                || lower.contains('object repository')
-                || lower.contains('no such element')
-                || lower.contains('timeout')
-                || lower.contains('assert')
+            boolean good = false
+            good = good || lower.contains('unable to ')
+            good = good || lower.contains('element click intercepted')
+            good = good || lower.contains('object repository')
+            good = good || lower.contains('no such element')
+            good = good || lower.contains('timeout')
+            good = good || lower.contains('assert')
+            return good
         }
 
         String base = safeValue(preferred ?: lines.first())
-
         base = base.replace('com.kms.katalon.core.exception.StepFailedException:', '').trim()
         base = base.replace('org.codehaus.groovy.runtime.InvokerInvocationException:', '').trim()
-        base = base.replaceAll(/\s+/, ' ').trim()
+        base = base.replaceAll(/\\s+/, ' ').trim()
 
         int rootCauseIndex = base.indexOf('(Root cause:')
         if (rootCauseIndex > 0) {
@@ -836,1332 +857,5 @@ class JiraGaiaReportBuilder {
             current = current.parentFile
         }
         return null
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Keywords/jiraIntegration/JiraGaiaHtmlTemplateBuilder.groovy
-
-package jiraIntegration
-
-import groovy.json.JsonOutput
-
-class JiraGaiaHtmlTemplateBuilder {
-
-    private static final String APP_NAME = 'GAIA'
-    private static final String REPORT_TITLE_PREFIX = 'Test report - '
-    private static final String BANNER_GRADIENT = 'linear-gradient(90deg, #0f2d57 0%, #155c78 58%, #6ad05f 100%)'
-    private static final String STATUS_PASS = '#7bc86c'
-    private static final String STATUS_FAIL = '#d45555'
-    private static final String STATUS_SKIP = '#d8b44a'
-    private static final String STATUS_INFO = '#4aa3df'
-    private static final String STATUS_ACTIVE = '#e8f2ff'
-
-    String build(Map model) {
-        StringBuilder html = new StringBuilder()
-
-        List<Map> scenarios = (model.scenarios ?: []) as List<Map>
-        Map summary = (model.summary ?: [:]) as Map
-        String initialScenarioId = scenarios ? safeValue(scenarios.first().id) : ''
-
-        html.append('<!DOCTYPE html>')
-        html.append('<html lang="en">')
-        html.append('<head>')
-        html.append('<meta charset="UTF-8">')
-        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
-        html.append('<title>')
-        html.append(htmlEscape(model.reportTitle ?: (REPORT_TITLE_PREFIX + safeValue(model.suiteName))))
-        html.append('</title>')
-        html.append('<style>')
-        html.append('''
-            :root {
-                --bg-page: #f7f9fc;
-                --bg-panel: #ffffff;
-                --bg-soft: #fbfcfe;
-                --text-main: #243446;
-                --text-muted: #718096;
-                --border: #e5eaf0;
-                --border-strong: #d8e0ea;
-                --banner-gradient: linear-gradient(90deg, #0f2d57 0%, #155c78 58%, #6ad05f 100%);
-                --pass: #7bc86c;
-                --fail: #d45555;
-                --skip: #d8b44a;
-                --info: #4aa3df;
-                --shadow: 0 8px 22px rgba(21, 44, 84, 0.08);
-            }
-
-            * {
-                box-sizing: border-box;
-            }
-
-            body {
-                margin: 0;
-                font-family: "Segoe UI", Arial, sans-serif;
-                background: var(--bg-page);
-                color: var(--text-main);
-            }
-
-            .top-banner {
-                height: 82px;
-                background: ''' + BANNER_GRADIENT + ''';
-                color: #ffffff;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 0 22px;
-                box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
-            }
-
-            .brand-wrap {
-                display: flex;
-                align-items: center;
-                gap: 14px;
-                min-width: 0;
-            }
-
-            .brand-logo {
-                width: 48px;
-                height: 48px;
-                border-radius: 12px;
-                background: rgba(255, 255, 255, 0.12);
-                border: 1px solid rgba(255, 255, 255, 0.16);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                overflow: hidden;
-                flex-shrink: 0;
-            }
-
-            .brand-logo img {
-                width: 76%;
-                height: 76%;
-                object-fit: contain;
-                filter: brightness(0) invert(1);
-            }
-
-            .brand-logo-fallback {
-                font-size: 26px;
-                font-weight: 700;
-                color: #ffffff;
-            }
-
-            .brand-texts {
-                min-width: 0;
-            }
-
-            .report-name {
-                font-size: 16px;
-                font-weight: 700;
-                line-height: 1.2;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .report-subtitle {
-                margin-top: 3px;
-                font-size: 12px;
-                color: rgba(255, 255, 255, 0.82);
-            }
-
-            .banner-meta {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                flex-wrap: wrap;
-                justify-content: flex-end;
-            }
-
-            .banner-pill {
-                padding: 7px 14px;
-                border-radius: 999px;
-                border: 1px solid rgba(255, 255, 255, 0.18);
-                background: rgba(255, 255, 255, 0.16);
-                font-size: 12px;
-                font-weight: 700;
-                color: #ffffff;
-            }
-
-            .page {
-                display: grid;
-                grid-template-columns: 430px 1fr;
-                min-height: calc(100vh - 82px);
-            }
-
-            .sidebar {
-                background: var(--bg-panel);
-                border-right: 1px solid var(--border);
-                display: flex;
-                flex-direction: column;
-                min-width: 0;
-            }
-
-            .sidebar-top {
-                padding: 18px 18px 10px 18px;
-                border-bottom: 1px solid var(--border);
-            }
-
-            .sidebar-tabs {
-                display: inline-flex;
-                gap: 8px;
-            }
-
-            .sidebar-tab {
-                padding: 8px 16px;
-                border-radius: 8px;
-                border: 1px solid var(--border-strong);
-                background: #ffffff;
-                color: var(--text-main);
-                font-size: 13px;
-                font-weight: 600;
-                cursor: pointer;
-                transition: all 0.2s ease;
-            }
-
-            .sidebar-tab.active {
-                background: #eef5ff;
-                border-color: #bdd0e3;
-                color: #15406f;
-            }
-
-            .sidebar-body {
-                padding: 16px 18px;
-                border-bottom: 1px solid var(--border);
-            }
-
-            .search-box {
-                width: 100%;
-                border: 1px solid #d4dce6;
-                border-radius: 10px;
-                background: #ffffff;
-                padding: 11px 12px;
-                font-size: 13px;
-                color: var(--text-main);
-                outline: none;
-            }
-
-            .search-box:focus {
-                border-color: #8eb3d8;
-                box-shadow: 0 0 0 3px rgba(74, 163, 223, 0.14);
-            }
-
-            .scenario-list {
-                overflow: auto;
-                flex: 1;
-            }
-
-            .scenario-item {
-                display: grid;
-                grid-template-columns: 1fr auto;
-                gap: 10px;
-                padding: 16px 18px;
-                border-bottom: 1px solid var(--border);
-                cursor: pointer;
-                transition: background 0.2s ease;
-            }
-
-            .scenario-item:hover {
-                background: #f8fbff;
-            }
-
-            .scenario-item.active {
-                background: var(--STATUS_ACTIVE, #eef5ff);
-                border-left: 4px solid #2f6fa5;
-                padding-left: 14px;
-            }
-
-            .scenario-main {
-                min-width: 0;
-            }
-
-            .scenario-title {
-                font-size: 13px;
-                font-weight: 700;
-                line-height: 1.35;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .scenario-subtitle {
-                margin-top: 4px;
-                font-size: 12px;
-                color: var(--text-muted);
-                line-height: 1.35;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .scenario-meta {
-                margin-top: 6px;
-                display: flex;
-                gap: 12px;
-                flex-wrap: wrap;
-                font-size: 11px;
-                color: var(--text-muted);
-            }
-
-            .scenario-side {
-                display: flex;
-                flex-direction: column;
-                align-items: flex-end;
-                gap: 8px;
-                min-width: 82px;
-            }
-
-            .status-badge {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 70px;
-                padding: 5px 10px;
-                border-radius: 999px;
-                font-size: 11px;
-                font-weight: 700;
-                color: #ffffff;
-            }
-
-            .status-badge.pass,
-            .chip.pass,
-            .tiny-badge.pass {
-                background: ''' + STATUS_PASS + ''';
-            }
-
-            .status-badge.fail,
-            .chip.fail,
-            .tiny-badge.fail {
-                background: ''' + STATUS_FAIL + ''';
-            }
-
-            .status-badge.skip,
-            .chip.skip,
-            .tiny-badge.skip {
-                background: ''' + STATUS_SKIP + ''';
-                color: #ffffff;
-            }
-
-            .status-badge.info,
-            .chip.info,
-            .tiny-badge.info {
-                background: ''' + STATUS_INFO + ''';
-            }
-
-            .sidebar-summary {
-                padding: 18px;
-                border-top: 1px solid var(--border);
-                background: #fafcff;
-            }
-
-            .summary-title {
-                font-size: 12px;
-                font-weight: 700;
-                color: var(--text-muted);
-                text-transform: uppercase;
-                margin-bottom: 14px;
-            }
-
-            .summary-stat {
-                margin-bottom: 12px;
-            }
-
-            .summary-label-row {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                margin-bottom: 5px;
-                font-size: 12px;
-            }
-
-            .summary-bar {
-                height: 7px;
-                border-radius: 999px;
-                background: #edf2f7;
-                overflow: hidden;
-            }
-
-            .summary-bar-fill {
-                height: 100%;
-                border-radius: 999px;
-            }
-
-            .content {
-                padding: 22px 26px;
-                min-width: 0;
-            }
-
-            .detail-view,
-            .chart-view {
-                display: none;
-            }
-
-            .detail-view.active,
-            .chart-view.active {
-                display: block;
-            }
-
-            .scenario-heading {
-                font-size: 24px;
-                font-weight: 700;
-                margin-bottom: 14px;
-            }
-
-            .meta-chips {
-                display: flex;
-                gap: 10px;
-                flex-wrap: wrap;
-                margin-bottom: 22px;
-            }
-
-            .chip {
-                display: inline-flex;
-                align-items: center;
-                padding: 8px 14px;
-                border-radius: 999px;
-                font-size: 12px;
-                font-weight: 700;
-                line-height: 1;
-                border: 1px solid transparent;
-            }
-
-            .chip.meta {
-                color: #17456d;
-                background: #eef5ff;
-                border-color: #cadef2;
-            }
-
-            .chip.suite {
-                color: #114465;
-                background: #eaf4fb;
-                border-color: #d7e7f3;
-            }
-
-            .section-title {
-                font-size: 13px;
-                font-weight: 700;
-                margin: 0 0 10px 0;
-                color: #26384c;
-            }
-
-            .steps-table {
-                width: 100%;
-                border-collapse: collapse;
-                background: var(--bg-panel);
-                border: 1px solid var(--border);
-                border-radius: 14px;
-                overflow: hidden;
-                box-shadow: var(--shadow);
-            }
-
-            .steps-table th,
-            .steps-table td {
-                text-align: left;
-                vertical-align: top;
-                padding: 12px 14px;
-                border-bottom: 1px solid var(--border);
-            }
-
-            .steps-table th {
-                font-size: 11px;
-                text-transform: uppercase;
-                color: var(--text-muted);
-                font-weight: 700;
-                letter-spacing: 0.04em;
-                background: #fbfcfe;
-            }
-
-            .steps-table tr:last-child td {
-                border-bottom: none;
-            }
-
-            .col-status {
-                width: 80px;
-            }
-
-            .col-time {
-                width: 132px;
-                white-space: nowrap;
-            }
-
-            .step-title-line {
-                font-size: 14px;
-                line-height: 1.45;
-                color: #26384c;
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                min-width: 0;
-            }
-
-            .step-title-line .title-text {
-                min-width: 0;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                display: inline-block;
-            }
-
-            .detail-link {
-                display: inline-block;
-                margin-top: 6px;
-                font-size: 12px;
-                color: #2e75b5;
-                text-decoration: none;
-                cursor: pointer;
-            }
-
-            .detail-link:hover {
-                text-decoration: underline;
-            }
-
-            .step-detail-box {
-                display: none;
-                margin-top: 8px;
-                padding: 12px 14px;
-                border-radius: 12px;
-                background: #122236;
-                color: #f1f5f9;
-                font-family: Consolas, "Courier New", monospace;
-                font-size: 12px;
-                line-height: 1.55;
-                white-space: pre-wrap;
-                overflow-x: auto;
-                max-width: 100%;
-            }
-
-            .visual-error {
-                margin-top: 22px;
-                background: #ffffff;
-                border: 1px solid #f0d0d0;
-                border-left: 4px solid ''' + STATUS_FAIL + ''';
-                border-radius: 14px;
-                padding: 16px 18px;
-                box-shadow: var(--shadow);
-            }
-
-            .visual-error-title {
-                font-size: 14px;
-                font-weight: 700;
-                color: #7f2d2d;
-                margin-bottom: 8px;
-            }
-
-            .visual-error-line {
-                font-size: 13px;
-                line-height: 1.5;
-                color: #455468;
-            }
-
-            .visual-error-details {
-                margin-top: 8px;
-            }
-
-            .visual-error-details summary {
-                list-style: none;
-                cursor: pointer;
-                color: #2e75b5;
-                font-size: 12px;
-                font-weight: 700;
-            }
-
-            .visual-error-details summary::-webkit-details-marker {
-                display: none;
-            }
-
-            .visual-error-pre {
-                margin-top: 10px;
-                padding: 14px;
-                border-radius: 12px;
-                background: #122236;
-                color: #f1f5f9;
-                font-family: Consolas, "Courier New", monospace;
-                font-size: 12px;
-                line-height: 1.55;
-                white-space: pre-wrap;
-                overflow-x: auto;
-            }
-
-            .evidence-wrap {
-                margin-top: 22px;
-                background: #ffffff;
-                border: 1px solid var(--border);
-                border-radius: 14px;
-                padding: 16px 18px;
-                box-shadow: var(--shadow);
-            }
-
-            .evidence-title {
-                font-size: 14px;
-                font-weight: 700;
-                margin-bottom: 12px;
-            }
-
-            .evidence-item {
-                border-top: 1px solid var(--border);
-                padding-top: 12px;
-                margin-top: 12px;
-            }
-
-            .evidence-item:first-child {
-                border-top: none;
-                padding-top: 0;
-                margin-top: 0;
-            }
-
-            .evidence-name {
-                font-size: 13px;
-                font-weight: 600;
-                color: #334155;
-            }
-
-            .evidence-link {
-                display: inline-block;
-                margin-top: 8px;
-                color: #2e75b5;
-                font-size: 12px;
-                text-decoration: none;
-            }
-
-            .evidence-link:hover {
-                text-decoration: underline;
-            }
-
-            .evidence-preview {
-                margin-top: 10px;
-                max-width: 100%;
-                max-height: 360px;
-                border: 1px solid var(--border);
-                border-radius: 10px;
-                background: #f8fafc;
-                display: block;
-            }
-
-            .evidence-missing {
-                margin-top: 10px;
-                display: none;
-                color: var(--text-muted);
-                font-size: 12px;
-            }
-
-            .chart-grid {
-                display: grid;
-                grid-template-columns: 340px 1fr;
-                gap: 24px;
-                align-items: start;
-            }
-
-            .chart-card,
-            .stats-card {
-                background: #ffffff;
-                border: 1px solid var(--border);
-                border-radius: 16px;
-                padding: 20px;
-                box-shadow: var(--shadow);
-            }
-
-            .chart-card h2,
-            .stats-card h2 {
-                margin: 0 0 18px 0;
-                font-size: 24px;
-                font-weight: 700;
-            }
-
-            .donut {
-                width: 180px;
-                height: 180px;
-                border-radius: 50%;
-                position: relative;
-                margin: 8px auto 18px auto;
-            }
-
-            .donut-center {
-                position: absolute;
-                inset: 22px;
-                border-radius: 50%;
-                background: #ffffff;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                flex-direction: column;
-                text-align: center;
-                box-shadow: inset 0 0 0 1px var(--border);
-            }
-
-            .donut-total {
-                font-size: 34px;
-                font-weight: 700;
-                line-height: 1;
-            }
-
-            .donut-label {
-                font-size: 12px;
-                color: var(--text-muted);
-                margin-top: 4px;
-            }
-
-            .chart-legend {
-                margin-top: 10px;
-            }
-
-            .legend-row {
-                display: grid;
-                grid-template-columns: 14px 1fr auto;
-                align-items: center;
-                gap: 10px;
-                margin-bottom: 8px;
-                font-size: 13px;
-            }
-
-            .legend-dot {
-                width: 10px;
-                height: 10px;
-                border-radius: 50%;
-            }
-
-            .big-stat-grid {
-                display: grid;
-                grid-template-columns: repeat(3, minmax(0, 1fr));
-                gap: 18px;
-                margin-top: 10px;
-            }
-
-            .big-stat {
-                padding: 16px;
-                border-radius: 14px;
-                border: 1px solid var(--border);
-                background: #fbfcfe;
-            }
-
-            .big-stat-title {
-                font-size: 13px;
-                color: var(--text-muted);
-                font-weight: 600;
-                margin-bottom: 10px;
-            }
-
-            .big-stat-value {
-                font-size: 38px;
-                font-weight: 700;
-                margin-bottom: 10px;
-                line-height: 1;
-            }
-
-            .big-stat-bar {
-                height: 7px;
-                border-radius: 999px;
-                background: #edf2f7;
-                overflow: hidden;
-            }
-
-            .big-stat-bar-fill {
-                height: 100%;
-                border-radius: 999px;
-            }
-
-            .empty-box {
-                background: #ffffff;
-                border: 1px dashed var(--border-strong);
-                border-radius: 16px;
-                padding: 28px;
-                text-align: center;
-                color: var(--text-muted);
-                box-shadow: var(--shadow);
-            }
-
-            @media (max-width: 1260px) {
-                .page {
-                    grid-template-columns: 380px 1fr;
-                }
-
-                .chart-grid {
-                    grid-template-columns: 1fr;
-                }
-
-                .big-stat-grid {
-                    grid-template-columns: 1fr;
-                }
-            }
-        ''')
-        html.append('</style>')
-        html.append('</head>')
-        html.append('<body>')
-
-        html.append('<header class="top-banner">')
-        html.append('<div class="brand-wrap">')
-        html.append('<div class="brand-logo">')
-        if (!isBlank(model.logoSrc)) {
-            html.append('<img src="')
-            html.append(htmlEscape(model.logoSrc))
-            html.append('" alt="GAIA Logo" onerror="this.style.display=\'none\';this.parentNode.querySelector(\'.brand-logo-fallback\').style.display=\'flex\';">')
-        }
-        html.append('<div class="brand-logo-fallback" style="display:')
-        html.append(isBlank(model.logoSrc) ? 'flex' : 'none')
-        html.append(';">G</div>')
-        html.append('</div>')
-        html.append('<div class="brand-texts">')
-        html.append('<div class="report-name">')
-        html.append(htmlEscape(model.reportTitle ?: (REPORT_TITLE_PREFIX + safeValue(model.suiteName))))
-        html.append('</div>')
-        html.append('<div class="report-subtitle">')
-        html.append(htmlEscape(model.subtitle ?: 'GAIA execution overview'))
-        html.append('</div>')
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="banner-meta">')
-        html.append('<div class="banner-pill">Generated ')
-        html.append(htmlEscape(safeValue(model.generatedAt)))
-        html.append('</div>')
-        html.append('<div class="banner-pill">Project ')
-        html.append(htmlEscape(APP_NAME))
-        html.append('</div>')
-        html.append('</div>')
-        html.append('</header>')
-
-        html.append('<div class="page">')
-
-        html.append('<aside class="sidebar">')
-        html.append('<div class="sidebar-top">')
-        html.append('<div class="sidebar-tabs">')
-        html.append('<button id="tab-tests" class="sidebar-tab active" type="button" onclick="switchTab(\'tests\')">Tests</button>')
-        html.append('<button id="tab-charts" class="sidebar-tab" type="button" onclick="switchTab(\'charts\')">Charts</button>')
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div id="sidebar-tests-panel">')
-        html.append('<div class="sidebar-body">')
-        html.append('<input id="scenarioSearch" class="search-box" type="text" placeholder="Search test name, path, or status." onkeyup="filterScenarios()">')
-        html.append('</div>')
-
-        html.append('<div id="scenarioList" class="scenario-list">')
-        scenarios.eachWithIndex { Map scenario, int index ->
-            html.append(buildScenarioListItem(scenario, index == 0))
-        }
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div id="sidebar-summary-panel" class="sidebar-summary">')
-        html.append('<div class="summary-title">Execution status</div>')
-        html.append(buildSidebarSummaryRow('Passed', safeInt(summary.passed), safeInt(summary.total), STATUS_PASS))
-        html.append(buildSidebarSummaryRow('Failed', safeInt(summary.failed), safeInt(summary.total), STATUS_FAIL))
-        html.append(buildSidebarSummaryRow('Skipped', safeInt(summary.skipped), safeInt(summary.total), STATUS_SKIP))
-        html.append('</div>')
-        html.append('</aside>')
-
-        html.append('<main class="content">')
-
-        html.append('<div id="testsContent">')
-        if (scenarios.isEmpty()) {
-            html.append('<div class="empty-box">No scenario data found.</div>')
-        } else {
-            scenarios.eachWithIndex { Map scenario, int index ->
-                html.append(buildScenarioDetail(scenario, index == 0))
-            }
-        }
-        html.append('</div>')
-
-        html.append('<div id="chartsContent" class="chart-view">')
-        html.append(buildChartView(summary))
-        html.append('</div>')
-
-        html.append('</main>')
-        html.append('</div>')
-
-        html.append('<script>')
-        html.append('''
-            function switchTab(tabName) {
-                const testsTab = document.getElementById('tab-tests');
-                const chartsTab = document.getElementById('tab-charts');
-                const testsContent = document.getElementById('testsContent');
-                const chartsContent = document.getElementById('chartsContent');
-                const testsPanel = document.getElementById('sidebar-tests-panel');
-
-                if (tabName === 'charts') {
-                    testsTab.classList.remove('active');
-                    chartsTab.classList.add('active');
-                    if (testsContent) {
-                        testsContent.style.display = 'none';
-                    }
-                    if (chartsContent) {
-                        chartsContent.classList.add('active');
-                    }
-                    if (testsPanel) {
-                        testsPanel.style.display = 'none';
-                    }
-                } else {
-                    chartsTab.classList.remove('active');
-                    testsTab.classList.add('active');
-                    if (chartsContent) {
-                        chartsContent.classList.remove('active');
-                    }
-                    if (testsContent) {
-                        testsContent.style.display = 'block';
-                    }
-                    if (testsPanel) {
-                        testsPanel.style.display = 'block';
-                    }
-                }
-            }
-
-            function selectScenario(id) {
-                const items = document.querySelectorAll('.scenario-item');
-                const panels = document.querySelectorAll('.detail-view');
-
-                items.forEach(function(item) {
-                    item.classList.toggle('active', item.getAttribute('data-scenario-id') === id);
-                });
-
-                panels.forEach(function(panel) {
-                    panel.classList.toggle('active', panel.getAttribute('data-scenario-id') === id);
-                });
-
-                switchTab('tests');
-            }
-
-            function filterScenarios() {
-                const input = document.getElementById('scenarioSearch');
-                const value = input ? input.value.toLowerCase() : '';
-                const items = document.querySelectorAll('.scenario-item');
-
-                items.forEach(function(item) {
-                    const haystack = (item.getAttribute('data-search') || '').toLowerCase();
-                    item.style.display = haystack.indexOf(value) > -1 ? 'grid' : 'none';
-                });
-            }
-
-            function toggleDetail(id) {
-                const box = document.getElementById(id);
-                if (!box) {
-                    return;
-                }
-                box.style.display = box.style.display === 'block' ? 'none' : 'block';
-            }
-
-            document.addEventListener('DOMContentLoaded', function() {
-                const firstId = ''' + JsonOutput.toJson(initialScenarioId) + ''';
-                if (firstId) {
-                    selectScenario(firstId);
-                }
-            });
-        ''')
-        html.append('</script>')
-
-        html.append('</body>')
-        html.append('</html>')
-
-        return html.toString()
-    }
-
-    private String buildScenarioListItem(Map scenario, boolean active) {
-        StringBuilder html = new StringBuilder()
-
-        html.append('<div class="scenario-item')
-        if (active) {
-            html.append(' active')
-        }
-        html.append('" data-scenario-id="')
-        html.append(htmlEscape(safeValue(scenario.id)))
-        html.append('" data-search="')
-        html.append(htmlEscape(buildScenarioSearchText(scenario)))
-        html.append('" onclick="selectScenario(\'')
-        html.append(jsEscape(safeValue(scenario.id)))
-        html.append('\')">')
-
-        html.append('<div class="scenario-main">')
-        html.append('<div class="scenario-title">')
-        html.append(htmlEscape(safeValue(scenario.title)))
-        html.append('</div>')
-        html.append('<div class="scenario-subtitle">')
-        html.append(htmlEscape(safeValue(scenario.sidebarSubtitle)))
-        html.append('</div>')
-        html.append('<div class="scenario-meta">')
-        html.append('<span>')
-        html.append(htmlEscape(safeValue(scenario.startLabel)))
-        html.append('</span>')
-        html.append('<span>')
-        html.append(htmlEscape(safeValue(scenario.durationLabel)))
-        html.append('</span>')
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="scenario-side">')
-        html.append('<span class="status-badge ')
-        html.append(statusCss(scenario.status))
-        html.append('">')
-        html.append(statusLabel(scenario.status))
-        html.append('</span>')
-        html.append('<div class="scenario-meta"><span>')
-        html.append(htmlEscape(safeValue(scenario.durationLabel)))
-        html.append('</span></div>')
-        html.append('</div>')
-
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildScenarioSearchText(Map scenario) {
-        return [
-            safeValue(scenario.title),
-            safeValue(scenario.sidebarSubtitle),
-            safeValue(scenario.status),
-            safeValue(scenario.startLabel)
-        ].join(' ')
-    }
-
-    private String buildScenarioDetail(Map scenario, boolean active) {
-        StringBuilder html = new StringBuilder()
-
-        html.append('<section class="detail-view')
-        if (active) {
-            html.append(' active')
-        }
-        html.append('" data-scenario-id="')
-        html.append(htmlEscape(safeValue(scenario.id)))
-        html.append('">')
-
-        html.append('<div class="scenario-heading">')
-        html.append(htmlEscape(safeValue(scenario.title)))
-        html.append('</div>')
-
-        html.append('<div class="meta-chips">')
-        html.append('<span class="chip suite">Suite: ')
-        html.append(htmlEscape(normalizeSuiteName(scenario)))
-        html.append('</span>')
-
-        html.append('<span class="chip ')
-        html.append(statusCss(scenario.status))
-        html.append('">Status: ')
-        html.append(htmlEscape(statusLabel(scenario.status)))
-        html.append('</span>')
-
-        html.append('<span class="chip meta">Start: ')
-        html.append(htmlEscape(safeValue(scenario.startLabel)))
-        html.append('</span>')
-
-        html.append('<span class="chip meta">End: ')
-        html.append(htmlEscape(safeValue(scenario.endLabel)))
-        html.append('</span>')
-
-        html.append('<span class="chip meta">Duration: ')
-        html.append(htmlEscape(safeValue(scenario.durationLabel)))
-        html.append('</span>')
-        html.append('</div>')
-
-        html.append('<div class="section-title">Steps</div>')
-        html.append('<table class="steps-table">')
-        html.append('<thead><tr>')
-        html.append('<th class="col-status">Status</th>')
-        html.append('<th class="col-time">Timestamp</th>')
-        html.append('<th>Details</th>')
-        html.append('</tr></thead>')
-        html.append('<tbody>')
-
-        List<Map> steps = (scenario.steps ?: []) as List<Map>
-        steps.eachWithIndex { Map step, int index ->
-            html.append(buildStepRow(scenario, step, index))
-        }
-
-        html.append('</tbody>')
-        html.append('</table>')
-
-        if (!isBlank(scenario.errorShort)) {
-            html.append('<section class="visual-error">')
-            html.append('<div class="visual-error-title">Visual Error Log</div>')
-            html.append('<div class="visual-error-line">')
-            html.append(htmlEscape(safeValue(scenario.errorShort)))
-            html.append('</div>')
-
-            if (!isBlank(scenario.errorFull)) {
-                html.append('<details class="visual-error-details">')
-                html.append('<summary>🔎 View full error</summary>')
-                html.append('<pre class="visual-error-pre">')
-                html.append(htmlEscape(safeValue(scenario.errorFull)))
-                html.append('</pre>')
-                html.append('</details>')
-            }
-            html.append('</section>')
-        }
-
-        if ((scenario.evidences ?: []).size() > 0) {
-            html.append('<section class="evidence-wrap">')
-            html.append('<div class="evidence-title">Evidence</div>')
-
-            scenario.evidences.eachWithIndex { Map evidence, int evidenceIndex ->
-                String imageId = safeValue(scenario.id) + '-evidence-' + evidenceIndex
-
-                html.append('<div class="evidence-item">')
-                html.append('<div class="evidence-name">')
-                html.append(htmlEscape(safeValue(evidence.name)))
-                html.append('</div>')
-
-                html.append('<a class="evidence-link" href="')
-                html.append(htmlEscape(safeValue(evidence.openUrl)))
-                html.append('" target="_blank">🔎 Open evidence</a>')
-
-                html.append('<img id="')
-                html.append(htmlEscape(imageId))
-                html.append('" class="evidence-preview" src="')
-                html.append(htmlEscape(safeValue(evidence.previewUrl)))
-                html.append('" alt="Evidence" onerror="this.style.display=\'none\';document.getElementById(\'')
-                html.append(jsEscape(imageId + '-missing'))
-                html.append('\').style.display=\'block\';">')
-
-                html.append('<div id="')
-                html.append(htmlEscape(imageId + '-missing'))
-                html.append('" class="evidence-missing">Preview not available.</div>')
-                html.append('</div>')
-            }
-
-            html.append('</section>')
-        }
-
-        html.append('</section>')
-        return html.toString()
-    }
-
-    private String normalizeSuiteName(Map scenario) {
-        String title = safeValue(scenario.title)
-        int marker = title.indexOf(' - ')
-        if (marker > 0) {
-            return title.substring(0, marker).replace('[', '').replace(']', '').trim()
-        }
-        return ''
-    }
-
-    private String buildStepRow(Map scenario, Map step, int index) {
-        String detailId = safeValue(scenario.id) + '-step-' + index
-        StringBuilder html = new StringBuilder()
-
-        html.append('<tr>')
-        html.append('<td class="col-status">')
-        html.append('<span class="status-badge ')
-        html.append(statusCss(step.status))
-        html.append('">')
-        html.append(statusLabel(step.status))
-        html.append('</span>')
-        html.append('</td>')
-
-        html.append('<td class="col-time">')
-        html.append(htmlEscape(safeValue(step.timeLabel)))
-        html.append('</td>')
-
-        html.append('<td>')
-        html.append('<div class="step-title-line">')
-        html.append('<span>')
-        html.append(htmlEscape(safeValue(step.emoji)))
-        html.append('</span>')
-        html.append('<span class="title-text">')
-        html.append(htmlEscape(safeValue(step.title)))
-        html.append('</span>')
-        html.append('</div>')
-
-        if (!isBlank(step.detailText)) {
-            html.append('<a class="detail-link" href="javascript:void(0)" onclick="toggleDetail(\'')
-            html.append(jsEscape(detailId))
-            html.append('\')">🔎 View full detail</a>')
-            html.append('<div id="')
-            html.append(htmlEscape(detailId))
-            html.append('" class="step-detail-box">')
-            html.append(htmlEscape(safeValue(step.detailText)))
-            html.append('</div>')
-        }
-        html.append('</td>')
-        html.append('</tr>')
-
-        return html.toString()
-    }
-
-    private String buildChartView(Map summary) {
-        int total = safeInt(summary.total)
-        int passed = safeInt(summary.passed)
-        int failed = safeInt(summary.failed)
-        int skipped = safeInt(summary.skipped)
-
-        String donutStyle = buildDonutStyle(total, passed, failed, skipped)
-
-        StringBuilder html = new StringBuilder()
-        html.append('<section class="chart-view active">')
-        html.append('<div class="chart-grid">')
-
-        html.append('<div class="chart-card">')
-        html.append('<h2>Global Overview</h2>')
-        html.append('<div class="donut" style="background:')
-        html.append(donutStyle)
-        html.append(';">')
-        html.append('<div class="donut-center">')
-        html.append('<div class="donut-total">')
-        html.append(total)
-        html.append('</div>')
-        html.append('<div class="donut-label">Tests</div>')
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="chart-legend">')
-        html.append(buildLegendRow('Passed', passed, STATUS_PASS))
-        html.append(buildLegendRow('Failed', failed, STATUS_FAIL))
-        html.append(buildLegendRow('Skipped', skipped, STATUS_SKIP))
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="stats-card">')
-        html.append('<h2>Execution distribution</h2>')
-        html.append('<div class="big-stat-grid">')
-        html.append(buildBigStat('Passed', passed, total, STATUS_PASS))
-        html.append(buildBigStat('Failed', failed, total, STATUS_FAIL))
-        html.append(buildBigStat('Skipped', skipped, total, STATUS_SKIP))
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('</div>')
-        html.append('</section>')
-        return html.toString()
-    }
-
-    private String buildSidebarSummaryRow(String label, int value, int total, String color) {
-        int percentage = total > 0 ? (int) Math.round((value * 100.0d) / total) : 0
-
-        StringBuilder html = new StringBuilder()
-        html.append('<div class="summary-stat">')
-        html.append('<div class="summary-label-row"><span>')
-        html.append(htmlEscape(label))
-        html.append('</span><span>')
-        html.append(value)
-        html.append('</span></div>')
-        html.append('<div class="summary-bar"><div class="summary-bar-fill" style="width:')
-        html.append(percentage)
-        html.append('%;background:')
-        html.append(color)
-        html.append(';"></div></div>')
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildLegendRow(String label, int value, String color) {
-        StringBuilder html = new StringBuilder()
-        html.append('<div class="legend-row">')
-        html.append('<span class="legend-dot" style="background:')
-        html.append(color)
-        html.append(';"></span>')
-        html.append('<span>')
-        html.append(htmlEscape(label))
-        html.append('</span>')
-        html.append('<span>')
-        html.append(value)
-        html.append('</span>')
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildBigStat(String label, int value, int total, String color) {
-        int percentage = total > 0 ? (int) Math.round((value * 100.0d) / total) : 0
-
-        StringBuilder html = new StringBuilder()
-        html.append('<div class="big-stat">')
-        html.append('<div class="big-stat-title">')
-        html.append(htmlEscape(label))
-        html.append('</div>')
-        html.append('<div class="big-stat-value">')
-        html.append(value)
-        html.append('</div>')
-        html.append('<div class="big-stat-bar"><div class="big-stat-bar-fill" style="width:')
-        html.append(percentage)
-        html.append('%;background:')
-        html.append(color)
-        html.append(';"></div></div>')
-        html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildDonutStyle(int total, int passed, int failed, int skipped) {
-        if (total <= 0) {
-            return 'conic-gradient(#edf2f7 0 100%)'
-        }
-
-        double passedPercent = (passed * 100.0d) / total
-        double failedPercent = (failed * 100.0d) / total
-        double skippedPercent = (skipped * 100.0d) / total
-
-        double firstStop = passedPercent
-        double secondStop = passedPercent + failedPercent
-        double thirdStop = secondStop + skippedPercent
-
-        return "conic-gradient(${STATUS_PASS} 0 ${firstStop}%, ${STATUS_FAIL} ${firstStop}% ${secondStop}%, ${STATUS_SKIP} ${secondStop}% ${thirdStop}%, #edf2f7 ${thirdStop}% 100%)"
-    }
-
-    private String statusCss(def status) {
-        String value = safeValue(status).toLowerCase(Locale.ENGLISH)
-        switch (value) {
-            case 'passed':
-                return 'pass'
-            case 'failed':
-                return 'fail'
-            case 'skipped':
-                return 'skip'
-            default:
-                return 'info'
-        }
-    }
-
-    private String statusLabel(def status) {
-        String value = safeValue(status).toLowerCase(Locale.ENGLISH)
-        switch (value) {
-            case 'passed':
-                return 'Passed'
-            case 'failed':
-                return 'Failed'
-            case 'skipped':
-                return 'Skip'
-            default:
-                return 'Info'
-        }
-    }
-
-    private int safeInt(def value) {
-        try {
-            return Integer.parseInt(safeValue(value))
-        } catch (Exception ignored) {
-            return 0
-        }
-    }
-
-    private String safeValue(def value) {
-        return value == null ? '' : String.valueOf(value).trim()
-    }
-
-    private boolean isBlank(def value) {
-        return safeValue(value).isEmpty()
-    }
-
-    private String htmlEscape(def value) {
-        String text = safeValue(value)
-        return text
-            .replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;')
-            .replace('"', '&quot;')
-            .replace("'", '&#39;')
-    }
-
-    private String jsEscape(def value) {
-        String text = safeValue(value)
-        return text
-            .replace('\\', '\\\\')
-            .replace("'", "\\'")
-            .replace('"', '\\"')
-            .replace('\r', '')
-            .replace('\n', '\\n')
     }
 }
