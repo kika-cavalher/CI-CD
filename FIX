@@ -1,479 +1,95 @@
-package jiraIntegration
-
-import java.io.File
-import java.util.Date
-
-import groovy.xml.XmlSlurper
-
-class JiraGaiaReportBuilder {
-
-    JiraFlowCoordinator owner
-
-    JiraGaiaReportBuilder(JiraFlowCoordinator owner) {
-        this.owner = owner
-    }
-
-    List<Map> parseXmlCases(String xmlPath) {
-        List<Map> result = []
-
-        if (owner.isBlank(xmlPath)) {
-            return result
-        }
-
-        File xmlFile = new File(xmlPath)
-        if (!xmlFile.exists()) {
-            return result
-        }
-
-        def xml
-        try {
-            xml = new XmlSlurper().parse(xmlFile)
-        } catch (Exception ignored) {
-            return result
-        }
-
-        List testcaseNodes = []
-
-        String rootName = owner.safe(xml.name())
-
-        if (rootName == 'testsuite') {
-            testcaseNodes.addAll(xml.testcase)
-        } else if (rootName == 'testsuites') {
-            xml.testsuite.each { suite ->
-                testcaseNodes.addAll(suite.testcase)
-            }
-        }
-
-        testcaseNodes.each { tc ->
-            String className = owner.safe(tc.@classname)
-            String testName = owner.safe(tc.@name)
-            long durationMs = owner.toMillis(tc.@time)
-
-            def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
-            def errorNode = tc.error?.size() > 0 ? tc.error[0] : null
-            def skippedNode = tc.skipped?.size() > 0 ? tc.skipped[0] : null
-
-            boolean failed = failureNode != null || errorNode != null
-            boolean skipped = skippedNode != null
-
-            String message = ''
-            String details = ''
-
-            if (failureNode != null) {
-                message = owner.safe(failureNode.@message)
-                details = owner.safe(failureNode.text())
-            } else if (errorNode != null) {
-                message = owner.safe(errorNode.@message)
-                details = owner.safe(errorNode.text())
-            } else if (skippedNode != null) {
-                message = owner.safe(skippedNode.@message)
-                details = owner.safe(skippedNode.text())
-            }
-
-            String displayName = ''
-            if (!owner.isBlank(className) && !owner.isBlank(testName)) {
-                displayName = className + '/' + testName
-            } else if (!owner.isBlank(testName)) {
-                displayName = testName
-            } else {
-                displayName = className
-            }
-
-            Map row = [:]
-            row.name = displayName
-            row.shortName = owner.isBlank(testName) ? displayName : testName
-            row.durationMs = durationMs
-            row.status = skipped ? 'skipped' : (failed ? 'failed' : 'passed')
-            row.message = message
-            row.details = details
-
-            result.add(row)
-        }
-
-        return result
-    }
-
-    List<String> getFailureSummaryLines(String message, String details) {
-        List<String> lines = []
-
-        String safeMessage = owner.safe(message)
-        String safeDetails = owner.safe(details)
-
-        if (!owner.isBlank(safeMessage)) {
-            lines.add(safeMessage)
-        }
-
-        safeDetails.readLines().each { String raw ->
-            String line = owner.safe(raw)
-
-            if (owner.isBlank(line)) {
-                return
-            }
-
-            if (line.startsWith('at ')) {
-                return
-            }
-
-            if (line.startsWith('Caused by: at ')) {
-                return
-            }
-
-            if (line.contains('com.kms.katalon') && line.length() > 120) {
-                return
-            }
-
-            if (line.contains('org.openqa.selenium') && line.length() > 120) {
-                return
-            }
-
-            lines.add(line)
-        }
-
-        List<String> cleaned = []
-        lines.each { String item ->
-            String normalized = owner.safe(item).replaceAll(/\s+/, ' ').trim()
-            if (!owner.isBlank(normalized) && !cleaned.contains(normalized)) {
-                cleaned.add(normalized)
-            }
-        }
-
-        if (cleaned.isEmpty() && !owner.isBlank(safeDetails)) {
-            safeDetails.readLines().each { String raw ->
-                String line = owner.safe(raw)
-                if (!owner.isBlank(line) && cleaned.size() < 3) {
-                    cleaned.add(line)
-                }
-            }
-        }
-
-        if (cleaned.size() > 3) {
-            return cleaned.subList(0, 3)
-        }
-
-        return cleaned
-    }
-
-    String buildHeaderCard(String label, String value) {
-        String safeLabel = owner.htmlEscape(owner.safe(label))
-        String safeValue = owner.htmlEscape(owner.safe(value))
-
-        return """
-            <div class="stat-card">
-                <div class="stat-label">${safeLabel}</div>
-                <div class="stat-value">${safeValue}</div>
-            </div>
-        """
-    }
-
-    String buildFailedCaseHtml(Map item, File baseDir) {
-        StringBuilder block = new StringBuilder()
-
-        String itemName = owner.safe(item.name)
-        String itemMessage = owner.safe(item.message)
-        String itemDetails = owner.safe(item.details)
-        long itemDuration = (item.durationMs ?: 0L) as long
-
-        List<String> summaryLines = getFailureSummaryLines(itemMessage, itemDetails)
-
-        block.append('<div class="case-card failed">\n')
-        block.append('<div class="case-title">')
-        block.append(owner.htmlEscape(itemName))
-        block.append('</div>\n')
-
-        block.append('<div class="case-meta">Duration: ')
-        block.append(owner.htmlEscape(owner.formatDurationMillis(itemDuration)))
-        block.append('</div>\n')
-
-        summaryLines.each { String line ->
-            String safeLine = owner.safe(line)
-            block.append('<div class="failure-line">')
-            block.append(owner.htmlEscape(safeLine))
-            block.append('</div>\n')
-        }
-
-        block.append('<div class="details-wrap">\n')
-        block.append('<details>\n')
-        block.append('<summary>See full error log</summary>\n')
-        block.append('<pre>')
-        block.append(owner.htmlEscape(itemDetails))
-        block.append('</pre>\n')
-        block.append('</details>\n')
-        block.append('</div>\n')
-
-        File image = item.image as File
-        if (image != null && image.exists()) {
-            String imgSrc = owner.relativeUri(baseDir, image)
-            block.append('<img class="failure-image" src="')
-            block.append(owner.htmlEscape(imgSrc))
-            block.append('" alt="Failure evidence">\n')
-        }
-
-        block.append('</div>\n')
-        return block.toString()
-    }
-
-    String buildPassedCaseHtml(Map item) {
-        StringBuilder block = new StringBuilder()
-
-        String itemName = owner.safe(item.name)
-        long itemDuration = (item.durationMs ?: 0L) as long
-
-        block.append('<div class="case-card passed">\n')
-        block.append('<div class="case-title">')
-        block.append(owner.htmlEscape(itemName))
-        block.append('</div>\n')
-
-        block.append('<div class="case-meta">Test Passed</div>\n')
-
-        block.append('<div class="case-meta">Duration: ')
-        block.append(owner.htmlEscape(owner.formatDurationMillis(itemDuration)))
-        block.append('</div>\n')
-
-        block.append('</div>\n')
-        return block.toString()
-    }
-
-    String buildSkippedCaseHtml(Map item) {
-        StringBuilder block = new StringBuilder()
-
-        String itemName = owner.safe(item.name)
-        long itemDuration = (item.durationMs ?: 0L) as long
-
-        block.append('<div class="case-card skipped">\n')
-        block.append('<div class="case-title">')
-        block.append(owner.htmlEscape(itemName))
-        block.append('</div>\n')
-
-        block.append('<div class="case-meta">Test Skipped</div>\n')
-
-        block.append('<div class="case-meta">Duration: ')
-        block.append(owner.htmlEscape(owner.formatDurationMillis(itemDuration)))
-        block.append('</div>\n')
-
-        block.append('</div>\n')
-        return block.toString()
-    }
-
-    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
-        if (owner.isBlank(reportFolder) || owner.isBlank(xmlPath)) {
-            return ''
-        }
-
-        List<Map> cases = parseXmlCases(xmlPath)
-        List<Map> failedCases = cases.findAll { Map item -> owner.safe(item.status) == 'failed' }
-        List<Map> passedCases = cases.findAll { Map item -> owner.safe(item.status) == 'passed' }
-        List<Map> skippedCases = cases.findAll { Map item -> owner.safe(item.status) == 'skipped' }
-
-        List<File> failureImages = owner.collectFailureImages(reportFolder)
-
-        int imageIndex = 0
-        failedCases.each { Map item ->
-            if (imageIndex < failureImages.size()) {
-                item.image = failureImages[imageIndex]
-                imageIndex++
-            } else {
-                item.image = null
-            }
-        }
-
-        long totalDurationMs = 0L
-        cases.each { Map item ->
-            totalDurationMs += ((item.durationMs ?: 0L) as long)
-        }
-
-        File baseDir = new File(reportFolder)
-        Date endDate = new Date(baseDir.lastModified())
-        Date startDate = new Date(endDate.time - totalDurationMs)
-
-        int executed = cases.size()
-        String avgTest = executed > 0
-            ? owner.formatDurationMillis((long) (totalDurationMs / executed))
-            : '0m 0s 0ms'
-
-        File htmlFile = new File(reportFolder + File.separator + owner.GAIA_REPORT_FILE_NAME)
-
-        StringBuilder html = new StringBuilder()
-        html.append('<!DOCTYPE html>\n')
-        html.append('<html lang="en">\n')
-        html.append('<head>\n')
-        html.append('<meta charset="UTF-8">\n')
-        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
-        html.append('<title>Gaia Test Execution Report</title>\n')
-        html.append('''
-<style>
-    body {
-        font-family: Arial, Helvetica, sans-serif;
-        margin: 28px;
-        color: #1f2937;
-        background: #ffffff;
-    }
-    h1 {
-        font-size: 22px;
-        margin: 0 0 22px 0;
-        font-weight: 700;
-    }
-    .header-grid {
-        display: grid;
-        grid-template-columns: repeat(8, minmax(110px, 1fr));
-        gap: 10px;
-        margin-bottom: 26px;
-    }
-    .stat-card {
-        background: #f8fafc;
-        border: 1px solid #e5e7eb;
-        border-radius: 6px;
-        padding: 12px;
-        min-height: 70px;
-    }
-    .stat-label {
-        font-size: 10px;
-        text-transform: uppercase;
-        color: #6b7280;
-        margin-bottom: 8px;
-        font-weight: 700;
-    }
-    .stat-value {
-        font-size: 14px;
-        font-weight: 600;
-        line-height: 1.4;
-    }
-    .section-title {
-        font-size: 14px;
-        font-weight: 700;
-        margin: 22px 0 10px 0;
-    }
-    .section-title.failed {
-        color: #b91c1c;
-    }
-    .section-title.passed {
-        color: #15803d;
-    }
-    .section-title.skipped {
-        color: #92400e;
-    }
-    .case-card {
-        border-left: 3px solid #d1d5db;
-        background: #ffffff;
-        padding: 10px 12px 14px 12px;
-        margin-bottom: 18px;
-    }
-    .case-card.failed {
-        border-left-color: #dc2626;
-        background: #fff7f7;
-    }
-    .case-card.passed {
-        border-left-color: #16a34a;
-        background: #f8fff9;
-    }
-    .case-card.skipped {
-        border-left-color: #d97706;
-        background: #fffaf0;
-    }
-    .case-title {
-        font-size: 13px;
-        font-weight: 700;
-        margin-bottom: 4px;
-    }
-    .case-meta {
-        font-size: 12px;
-        color: #4b5563;
-        margin-bottom: 6px;
-    }
-    .failure-line {
-        font-size: 12px;
-        color: #374151;
-        margin: 2px 0;
-    }
-    .details-wrap {
-        margin-top: 8px;
-    }
-    details summary {
-        cursor: pointer;
-        font-size: 12px;
-        color: #111827;
-        font-weight: 600;
-    }
-    pre {
-        margin-top: 8px;
-        background: #ffffff;
-        border: 1px solid #e5e7eb;
-        border-radius: 6px;
-        padding: 10px;
-        font-size: 11px;
-        line-height: 1.45;
-        white-space: pre-wrap;
-        word-break: break-word;
-        overflow-x: auto;
-    }
-    .failure-image {
-        margin-top: 12px;
-        max-width: 320px;
-        max-height: 180px;
-        border: 1px solid #d1d5db;
-        border-radius: 4px;
-        display: block;
-        background: #ffffff;
-    }
-    .empty-text {
-        font-size: 13px;
-        color: #6b7280;
-        margin-top: 10px;
-    }
-</style>
-''')
-        html.append('</head>\n')
-        html.append('<body>\n')
-        html.append('<h1>Windows Test Execution Report | Gaia</h1>\n')
-
-        html.append('<div class="header-grid">\n')
-        html.append(buildHeaderCard('Suite', owner.safe(suiteName)))
-        html.append(buildHeaderCard('Start', owner.formatHeaderDate(startDate)))
-        html.append(buildHeaderCard('End', owner.formatHeaderDate(endDate)))
-        html.append(buildHeaderCard('Suite Duration', owner.formatDurationMillis(totalDurationMs)))
-        html.append(buildHeaderCard('Executed', String.valueOf(executed)))
-        html.append(buildHeaderCard('Passed', String.valueOf(passedCases.size())))
-        html.append(buildHeaderCard('Failed', String.valueOf(failedCases.size())))
-        html.append(buildHeaderCard('Avg/Test', avgTest))
-        html.append('</div>\n')
-
-        html.append('<div class="section-title failed">✘ Failed (')
-        html.append(String.valueOf(failedCases.size()))
-        html.append(')</div>\n')
-
-        if (failedCases.isEmpty()) {
-            html.append('<div class="empty-text">No failed tests.</div>\n')
-        } else {
-            failedCases.each { Map item ->
-                html.append(buildFailedCaseHtml(item, baseDir))
-            }
-        }
-
-        html.append('<div class="section-title passed">✔ Passed (')
-        html.append(String.valueOf(passedCases.size()))
-        html.append(')</div>\n')
-
-        if (passedCases.isEmpty()) {
-            html.append('<div class="empty-text">No passed tests.</div>\n')
-        } else {
-            passedCases.each { Map item ->
-                html.append(buildPassedCaseHtml(item))
-            }
-        }
-
-        if (!skippedCases.isEmpty()) {
-            html.append('<div class="section-title skipped">Skipped (')
-            html.append(String.valueOf(skippedCases.size()))
-            html.append(')</div>\n')
-
-            skippedCases.each { Map item ->
-                html.append(buildSkippedCaseHtml(item))
-            }
-        }
-
-        html.append('</body>\n')
-        html.append('</html>\n')
-
-        htmlFile.setText(html.toString(), 'UTF-8')
-        return htmlFile.absolutePath
-    }
-}
+2026-03-11 10:20:02.625 INFO  com.kms.katalon.core.util.KeywordUtil    - ============================================================
+2026-03-11 10:20:02.628 INFO  com.kms.katalon.core.util.KeywordUtil    - Using report folder: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_101749\Correction- Add Correction\20260311_101749
+2026-03-11 10:20:02.633 INFO  com.kms.katalon.core.util.KeywordUtil    - Suite name detected from report path: Correction- Add Correction
+2026-03-11 10:20:02.659 INFO  com.kms.katalon.core.util.KeywordUtil    - Execution title used: Correction- Add Correction 2026-03-11 10.20.02
+2026-03-11 10:20:02.661 INFO  com.kms.katalon.core.util.KeywordUtil    - Test Plan title used: Correction- Add Correction Test Plan
+2026-03-11 10:20:02.707 INFO  com.kms.katalon.core.util.KeywordUtil    - XML file found: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_101749\Correction- Add Correction\20260311_101749\cucumber_report\1773224276429\cucumber.xml
+2026-03-11 10:20:02.902 ERROR k.k.c.m.CustomKeywordDelegatingMetaClass - ❌ groovy.lang.MissingMethodException: No signature of method: jiraIntegration.JiraGaiaReportBuilder.safe() is applicable for argument types: (groovy.xml.slurpersupport.Attributes) values: [Add Correction]
+Possible solutions: wait(), any(), wait(long), tap(groovy.lang.Closure), isCase(java.lang.Object), each(groovy.lang.Closure)
+2026-03-11 10:20:02.905 ERROR c.k.katalon.core.main.TestCaseExecutor   - ❌ Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira FAILED.
+Reason:
+com.kms.katalon.core.exception.StepErrorException: org.codehaus.groovy.runtime.InvokerInvocationException: groovy.lang.MissingMethodException: No signature of method: jiraIntegration.JiraGaiaReportBuilder.safe() is applicable for argument types: (groovy.xml.slurpersupport.Attributes) values: [Add Correction]
+Possible solutions: wait(), any(), wait(long), tap(groovy.lang.Closure), isCase(java.lang.Object), each(groovy.lang.Closure)
+	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.throwError(CustomKeywordDelegatingMetaClass.java:101)
+	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:73)
+	at Correction Import Jira.run(Correction Import Jira:1)
+	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+	at TempTestSuite1773224269289.run(TempTestSuite1773224269289.groovy:35)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: org.codehaus.groovy.runtime.InvokerInvocationException: groovy.lang.MissingMethodException: No signature of method: jiraIntegration.JiraGaiaReportBuilder.safe() is applicable for argument types: (groovy.xml.slurpersupport.Attributes) values: [Add Correction]
+Possible solutions: wait(), any(), wait(long), tap(groovy.lang.Closure), isCase(java.lang.Object), each(groovy.lang.Closure)
+	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:55)
+	at Script1773158334366.run(Script1773158334366.groovy:1)
+	... 15 more
+Caused by: groovy.lang.MissingMethodException: No signature of method: jiraIntegration.JiraGaiaReportBuilder.safe() is applicable for argument types: (groovy.xml.slurpersupport.Attributes) values: [Add Correction]
+Possible solutions: wait(), any(), wait(long), tap(groovy.lang.Closure), isCase(java.lang.Object), each(groovy.lang.Closure)
+	at jiraIntegration.JiraGaiaReportBuilder$_parseXmlCases_closure2.doCall(JiraGaiaReportBuilder.groovy:48)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at jiraIntegration.JiraGaiaReportBuilder.parseXmlCases(JiraGaiaReportBuilder.groovy:47)
+	at jiraIntegration.JiraGaiaReportBuilder.createGaiaHtmlReport(JiraGaiaReportBuilder.groovy:262)
+	at jiraIntegration.JiraFlowCoordinator.jiraImport(JiraFlowCoordinator.groovy:489)
+	at keywords.JiraIntegration.jiraImport(JiraIntegration.groovy:15)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:55)
+	at Correction Import Jira.run(Correction Import Jira:1)
+	... 15 more
+
+2026-03-11 10:20:02.907 ERROR c.k.katalon.core.main.TestCaseExecutor   - ❌ Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira FAILED.
+Reason:
+org.codehaus.groovy.runtime.InvokerInvocationException: groovy.lang.MissingMethodException: No signature of method: jiraIntegration.JiraGaiaReportBuilder.safe() is applicable for argument types: (groovy.xml.slurpersupport.Attributes) values: [Add Correction]
+Possible solutions: wait(), any(), wait(long), tap(groovy.lang.Closure), isCase(java.lang.Object), each(groovy.lang.Closure)
+	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:55)
+	at Correction Import Jira.run(Correction Import Jira:1)
+	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+	at TempTestSuite1773224269289.run(TempTestSuite1773224269289.groovy:35)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: groovy.lang.MissingMethodException: No signature of method: jiraIntegration.JiraGaiaReportBuilder.safe() is applicable for argument types: (groovy.xml.slurpersupport.Attributes) values: [Add Correction]
+Possible solutions: wait(), any(), wait(long), tap(groovy.lang.Closure), isCase(java.lang.Object), each(groovy.lang.Closure)
+	at jiraIntegration.JiraGaiaReportBuilder$_parseXmlCases_closure2.doCall(JiraGaiaReportBuilder.groovy:48)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at jiraIntegration.JiraGaiaReportBuilder.parseXmlCases(JiraGaiaReportBuilder.groovy:47)
+	at jiraIntegration.JiraGaiaReportBuilder.createGaiaHtmlReport(JiraGaiaReportBuilder.groovy:262)
+	at jiraIntegration.JiraFlowCoordinator.jiraImport(JiraFlowCoordinator.groovy:489)
+	at keywords.JiraIntegration.jiraImport(JiraIntegration.groovy:15)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	... 17 more
+
+2026-03-11 10:20:05.004 INFO  c.k.k.c.c.internal.VideoRecorderService  - Video recording for test case 'Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira' .
+2026-03-11 10:20:05.005 INFO  c.k.katalon.core.main.TestCaseExecutor   - END Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira
+2026-03-11 10:20:05.410 INFO  com.kms.katalon.core.util.KeywordUtil    - Start generating HTML report folder at: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_101749\Correction- Add Correction\20260311_101749...
+2026-03-11 10:20:05.532 INFO  com.kms.katalon.core.util.KeywordUtil    - HTML report generated
+2026-03-11 10:20:05.610 INFO  c.k.katalon.core.main.TestSuiteExecutor  - --------------------
+2026-03-11 10:20:05.610 INFO  c.k.katalon.core.main.TestSuiteExecutor  - END Test Suites/Correction- Add Correction
+2026-03-11 10:20:05.610 INFO  c.k.katalon.core.main.TestSuiteExecutor  - ====================
