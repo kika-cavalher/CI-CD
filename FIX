@@ -1,4 +1,3 @@
-
 package jiraIntegration
 
 import java.io.File
@@ -17,30 +16,37 @@ class JiraGaiaReportBuilder {
     List<Map> parseXmlCases(String xmlPath) {
         List<Map> result = []
 
-        if (owner.isBlank(xmlPath) || !new File(xmlPath).exists()) {
+        if (owner.isBlank(xmlPath)) {
+            return result
+        }
+
+        File xmlFile = new File(xmlPath)
+        if (!xmlFile.exists()) {
             return result
         }
 
         def xml
         try {
-            xml = new XmlSlurper().parse(new File(xmlPath))
-        } catch (Exception e) {
+            xml = new XmlSlurper().parse(xmlFile)
+        } catch (Exception ignored) {
             return result
         }
 
         List testcaseNodes = []
 
-        if (owner.safe(xml.name()) == 'testsuite') {
+        String rootName = owner.safe(xml.name())
+
+        if (rootName == 'testsuite') {
             testcaseNodes.addAll(xml.testcase)
-        } else if (owner.safe(xml.name()) == 'testsuites') {
+        } else if (rootName == 'testsuites') {
             xml.testsuite.each { suite ->
                 testcaseNodes.addAll(suite.testcase)
             }
         }
 
         testcaseNodes.each { tc ->
-            String classname = owner.safe(tc.@classname)
-            String name = owner.safe(tc.@name)
+            String className = owner.safe(tc.@classname)
+            String testName = owner.safe(tc.@name)
             long durationMs = owner.toMillis(tc.@time)
 
             def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
@@ -65,22 +71,23 @@ class JiraGaiaReportBuilder {
             }
 
             String displayName = ''
-            if (!owner.isBlank(classname) && !owner.isBlank(name)) {
-                displayName = classname + '/' + name
-            } else if (!owner.isBlank(name)) {
-                displayName = name
+            if (!owner.isBlank(className) && !owner.isBlank(testName)) {
+                displayName = className + '/' + testName
+            } else if (!owner.isBlank(testName)) {
+                displayName = testName
             } else {
-                displayName = classname
+                displayName = className
             }
 
-            result << [
-                name      : displayName,
-                shortName : !owner.isBlank(name) ? name : displayName,
-                durationMs: durationMs,
-                status    : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
-                message   : message,
-                details   : details
-            ]
+            Map row = [:]
+            row.name = displayName
+            row.shortName = owner.isBlank(testName) ? displayName : testName
+            row.durationMs = durationMs
+            row.status = skipped ? 'skipped' : (failed ? 'failed' : 'passed')
+            row.message = message
+            row.details = details
+
+            result.add(row)
         }
 
         return result
@@ -89,11 +96,14 @@ class JiraGaiaReportBuilder {
     List<String> getFailureSummaryLines(String message, String details) {
         List<String> lines = []
 
-        if (!owner.isBlank(message)) {
-            lines << owner.safe(message)
+        String safeMessage = owner.safe(message)
+        String safeDetails = owner.safe(details)
+
+        if (!owner.isBlank(safeMessage)) {
+            lines.add(safeMessage)
         }
 
-        owner.safe(details).readLines().each { String raw ->
+        safeDetails.readLines().each { String raw ->
             String line = owner.safe(raw)
 
             if (owner.isBlank(line)) {
@@ -116,56 +126,86 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            lines << line
+            lines.add(line)
         }
 
-        lines = lines
-            .collect { it.replaceAll(/\s+/, ' ').trim() }
-            .findAll { !owner.isBlank(it) }
-            .unique()
-
-        if (lines.isEmpty() && !owner.isBlank(details)) {
-            lines = owner.safe(details).readLines()
-                .collect { owner.safe(it) }
-                .findAll { !owner.isBlank(it) }
-                .take(3)
+        List<String> cleaned = []
+        lines.each { String item ->
+            String normalized = owner.safe(item).replaceAll(/\s+/, ' ').trim()
+            if (!owner.isBlank(normalized) && !cleaned.contains(normalized)) {
+                cleaned.add(normalized)
+            }
         }
 
-        return lines.take(3)
+        if (cleaned.isEmpty() && !owner.isBlank(safeDetails)) {
+            safeDetails.readLines().each { String raw ->
+                String line = owner.safe(raw)
+                if (!owner.isBlank(line) && cleaned.size() < 3) {
+                    cleaned.add(line)
+                }
+            }
+        }
+
+        if (cleaned.size() > 3) {
+            return cleaned.subList(0, 3)
+        }
+
+        return cleaned
     }
 
     String buildHeaderCard(String label, String value) {
+        String safeLabel = owner.htmlEscape(owner.safe(label))
+        String safeValue = owner.htmlEscape(owner.safe(value))
+
         return """
             <div class="stat-card">
-                <div class="stat-label">${owner.htmlEscape(label)}</div>
-                <div class="stat-value">${owner.htmlEscape(value)}</div>
+                <div class="stat-label">${safeLabel}</div>
+                <div class="stat-value">${safeValue}</div>
             </div>
         """
     }
 
     String buildFailedCaseHtml(Map item, File baseDir) {
-        List<String> summaryLines = getFailureSummaryLines(owner.safe(item.message), owner.safe(item.details))
         StringBuilder block = new StringBuilder()
 
+        String itemName = owner.safe(item.name)
+        String itemMessage = owner.safe(item.message)
+        String itemDetails = owner.safe(item.details)
+        long itemDuration = (item.durationMs ?: 0L) as long
+
+        List<String> summaryLines = getFailureSummaryLines(itemMessage, itemDetails)
+
         block.append('<div class="case-card failed">\n')
-        block.append("<div class=\"case-title\">${owner.htmlEscape(owner.safe(item.name))}</div>\n")
-        block.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+        block.append('<div class="case-title">')
+        block.append(owner.htmlEscape(itemName))
+        block.append('</div>\n')
+
+        block.append('<div class="case-meta">Duration: ')
+        block.append(owner.htmlEscape(owner.formatDurationMillis(itemDuration)))
+        block.append('</div>\n')
 
         summaryLines.each { String line ->
-            block.append("<div class=\"failure-line\">${owner.htmlEscape(line)}</div>\n")
+            String safeLine = owner.safe(line)
+            block.append('<div class="failure-line">')
+            block.append(owner.htmlEscape(safeLine))
+            block.append('</div>\n')
         }
 
         block.append('<div class="details-wrap">\n')
         block.append('<details>\n')
         block.append('<summary>See full error log</summary>\n')
-        block.append("<pre>${owner.htmlEscape(owner.safe(item.details))}</pre>\n")
+        block.append('<pre>')
+        block.append(owner.htmlEscape(itemDetails))
+        block.append('</pre>\n')
         block.append('</details>\n')
         block.append('</div>\n')
 
         File image = item.image as File
         if (image != null && image.exists()) {
             String imgSrc = owner.relativeUri(baseDir, image)
-            block.append("<img class=\"failure-image\" src=\"${owner.htmlEscape(imgSrc)}\" alt=\"Failure evidence\">\n")
+            block.append('<img class="failure-image" src="')
+            block.append(owner.htmlEscape(imgSrc))
+            block.append('" alt="Failure evidence">\n')
         }
 
         block.append('</div>\n')
@@ -174,20 +214,42 @@ class JiraGaiaReportBuilder {
 
     String buildPassedCaseHtml(Map item) {
         StringBuilder block = new StringBuilder()
+
+        String itemName = owner.safe(item.name)
+        long itemDuration = (item.durationMs ?: 0L) as long
+
         block.append('<div class="case-card passed">\n')
-        block.append("<div class=\"case-title\">${owner.htmlEscape(owner.safe(item.name))}</div>\n")
-        block.append("<div class=\"case-meta\">Test Passed</div>\n")
-        block.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+        block.append('<div class="case-title">')
+        block.append(owner.htmlEscape(itemName))
+        block.append('</div>\n')
+
+        block.append('<div class="case-meta">Test Passed</div>\n')
+
+        block.append('<div class="case-meta">Duration: ')
+        block.append(owner.htmlEscape(owner.formatDurationMillis(itemDuration)))
+        block.append('</div>\n')
+
         block.append('</div>\n')
         return block.toString()
     }
 
     String buildSkippedCaseHtml(Map item) {
         StringBuilder block = new StringBuilder()
+
+        String itemName = owner.safe(item.name)
+        long itemDuration = (item.durationMs ?: 0L) as long
+
         block.append('<div class="case-card skipped">\n')
-        block.append("<div class=\"case-title\">${owner.htmlEscape(owner.safe(item.name))}</div>\n")
-        block.append("<div class=\"case-meta\">Test Skipped</div>\n")
-        block.append("<div class=\"case-meta\">Duration: ${owner.htmlEscape(owner.formatDurationMillis((item.durationMs ?: 0L) as long))}</div>\n")
+        block.append('<div class="case-title">')
+        block.append(owner.htmlEscape(itemName))
+        block.append('</div>\n')
+
+        block.append('<div class="case-meta">Test Skipped</div>\n')
+
+        block.append('<div class="case-meta">Duration: ')
+        block.append(owner.htmlEscape(owner.formatDurationMillis(itemDuration)))
+        block.append('</div>\n')
+
         block.append('</div>\n')
         return block.toString()
     }
@@ -198,9 +260,9 @@ class JiraGaiaReportBuilder {
         }
 
         List<Map> cases = parseXmlCases(xmlPath)
-        List<Map> failedCases = cases.findAll { it.status == 'failed' }
-        List<Map> passedCases = cases.findAll { it.status == 'passed' }
-        List<Map> skippedCases = cases.findAll { it.status == 'skipped' }
+        List<Map> failedCases = cases.findAll { Map item -> owner.safe(item.status) == 'failed' }
+        List<Map> passedCases = cases.findAll { Map item -> owner.safe(item.status) == 'passed' }
+        List<Map> skippedCases = cases.findAll { Map item -> owner.safe(item.status) == 'skipped' }
 
         List<File> failureImages = owner.collectFailureImages(reportFolder)
 
@@ -215,14 +277,18 @@ class JiraGaiaReportBuilder {
         }
 
         long totalDurationMs = 0L
-        cases.each { totalDurationMs += ((itemDuration(it)) as long) }
+        cases.each { Map item ->
+            totalDurationMs += ((item.durationMs ?: 0L) as long)
+        }
 
         File baseDir = new File(reportFolder)
         Date endDate = new Date(baseDir.lastModified())
         Date startDate = new Date(endDate.time - totalDurationMs)
 
         int executed = cases.size()
-        String avgTest = executed > 0 ? owner.formatDurationMillis((long) (totalDurationMs / executed)) : '0m 0s 0ms'
+        String avgTest = executed > 0
+            ? owner.formatDurationMillis((long) (totalDurationMs / executed))
+            : '0m 0s 0ms'
 
         File htmlFile = new File(reportFolder + File.separator + owner.GAIA_REPORT_FILE_NAME)
 
@@ -358,6 +424,7 @@ class JiraGaiaReportBuilder {
         html.append('</head>\n')
         html.append('<body>\n')
         html.append('<h1>Windows Test Execution Report | Gaia</h1>\n')
+
         html.append('<div class="header-grid">\n')
         html.append(buildHeaderCard('Suite', owner.safe(suiteName)))
         html.append(buildHeaderCard('Start', owner.formatHeaderDate(startDate)))
@@ -369,7 +436,10 @@ class JiraGaiaReportBuilder {
         html.append(buildHeaderCard('Avg/Test', avgTest))
         html.append('</div>\n')
 
-        html.append("<div class=\"section-title failed\">✘ Failed (${failedCases.size()})</div>\n")
+        html.append('<div class="section-title failed">✘ Failed (')
+        html.append(String.valueOf(failedCases.size()))
+        html.append(')</div>\n')
+
         if (failedCases.isEmpty()) {
             html.append('<div class="empty-text">No failed tests.</div>\n')
         } else {
@@ -378,7 +448,10 @@ class JiraGaiaReportBuilder {
             }
         }
 
-        html.append("<div class=\"section-title passed\">✔ Passed (${passedCases.size()})</div>\n")
+        html.append('<div class="section-title passed">✔ Passed (')
+        html.append(String.valueOf(passedCases.size()))
+        html.append(')</div>\n')
+
         if (passedCases.isEmpty()) {
             html.append('<div class="empty-text">No passed tests.</div>\n')
         } else {
@@ -388,7 +461,10 @@ class JiraGaiaReportBuilder {
         }
 
         if (!skippedCases.isEmpty()) {
-            html.append("<div class=\"section-title skipped\">Skipped (${skippedCases.size()})</div>\n")
+            html.append('<div class="section-title skipped">Skipped (')
+            html.append(String.valueOf(skippedCases.size()))
+            html.append(')</div>\n')
+
             skippedCases.each { Map item ->
                 html.append(buildSkippedCaseHtml(item))
             }
@@ -399,9 +475,5 @@ class JiraGaiaReportBuilder {
 
         htmlFile.setText(html.toString(), 'UTF-8')
         return htmlFile.absolutePath
-    }
-
-    long itemDuration(Map item) {
-        return (item.durationMs ?: 0L) as long
     }
 }
