@@ -1,487 +1,340 @@
-package jiraIntegration
 
-import java.io.File
-import java.util.Date
-
-import groovy.xml.XmlSlurper
-
-class JiraGaiaReportBuilder {
-
-    JiraFlowCoordinator owner
-
-    JiraGaiaReportBuilder(JiraFlowCoordinator owner) {
-        this.owner = owner
-    }
-
-    List<Map> parseXmlCases(String xmlPath) {
-        JiraFlowCoordinator flow = this.owner
-        List<Map> result = []
-
-        if (flow.isBlank(xmlPath)) {
-            return result
-        }
-
-        File xmlFile = new File(xmlPath)
-        if (!xmlFile.exists()) {
-            return result
-        }
-
-        def xml
-        try {
-            xml = new XmlSlurper().parse(xmlFile)
-        } catch (Exception ignored) {
-            return result
-        }
-
-        List testcaseNodes = []
-
-        String rootName = flow.safe(xml.name())
-
-        if (rootName == 'testsuite') {
-            testcaseNodes.addAll(xml.testcase)
-        } else if (rootName == 'testsuites') {
-            xml.testsuite.each { suite ->
-                testcaseNodes.addAll(suite.testcase)
-            }
-        }
-
-        testcaseNodes.each { tc ->
-            String className = flow.safe(tc.@classname?.text())
-            String testName = flow.safe(tc.@name?.text())
-            long durationMs = flow.toMillis(tc.@time?.text())
-
-            def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
-            def errorNode = tc.error?.size() > 0 ? tc.error[0] : null
-            def skippedNode = tc.skipped?.size() > 0 ? tc.skipped[0] : null
-
-            boolean failed = failureNode != null || errorNode != null
-            boolean skipped = skippedNode != null
-
-            String message = ''
-            String details = ''
-
-            if (failureNode != null) {
-                message = flow.safe(failureNode.@message?.text())
-                details = flow.safe(failureNode.text())
-            } else if (errorNode != null) {
-                message = flow.safe(errorNode.@message?.text())
-                details = flow.safe(errorNode.text())
-            } else if (skippedNode != null) {
-                message = flow.safe(skippedNode.@message?.text())
-                details = flow.safe(skippedNode.text())
-            }
-
-            String displayName = ''
-            if (!flow.isBlank(className) && !flow.isBlank(testName)) {
-                displayName = className + '/' + testName
-            } else if (!flow.isBlank(testName)) {
-                displayName = testName
-            } else {
-                displayName = className
-            }
-
-            Map row = [:]
-            row.name = displayName
-            row.shortName = flow.isBlank(testName) ? displayName : testName
-            row.durationMs = durationMs
-            row.status = skipped ? 'skipped' : (failed ? 'failed' : 'passed')
-            row.message = message
-            row.details = details
-
-            result.add(row)
-        }
-
-        return result
-    }
-
-    List<String> getFailureSummaryLines(String message, String details) {
-        JiraFlowCoordinator flow = this.owner
-        List<String> lines = []
-
-        String safeMessage = flow.safe(message)
-        String safeDetails = flow.safe(details)
-
-        if (!flow.isBlank(safeMessage)) {
-            lines.add(safeMessage)
-        }
-
-        safeDetails.readLines().each { String raw ->
-            String line = flow.safe(raw)
-
-            if (flow.isBlank(line)) {
-                return
-            }
-
-            if (line.startsWith('at ')) {
-                return
-            }
-
-            if (line.startsWith('Caused by: at ')) {
-                return
-            }
-
-            if (line.contains('com.kms.katalon') && line.length() > 120) {
-                return
-            }
-
-            if (line.contains('org.openqa.selenium') && line.length() > 120) {
-                return
-            }
-
-            lines.add(line)
-        }
-
-        List<String> cleaned = []
-        lines.each { String item ->
-            String normalized = flow.safe(item).replaceAll(/\s+/, ' ').trim()
-            if (!flow.isBlank(normalized) && !cleaned.contains(normalized)) {
-                cleaned.add(normalized)
-            }
-        }
-
-        if (cleaned.isEmpty() && !flow.isBlank(safeDetails)) {
-            safeDetails.readLines().each { String raw ->
-                String line = flow.safe(raw)
-                if (!flow.isBlank(line) && cleaned.size() < 3) {
-                    cleaned.add(line)
-                }
-            }
-        }
-
-        if (cleaned.size() > 3) {
-            return cleaned.subList(0, 3)
-        }
-
-        return cleaned
-    }
-
-    String buildHeaderCard(String label, String value) {
-        JiraFlowCoordinator flow = this.owner
-        String safeLabel = flow.htmlEscape(flow.safe(label))
-        String safeValue = flow.htmlEscape(flow.safe(value))
-
-        return """
-            <div class="stat-card">
-                <div class="stat-label">${safeLabel}</div>
-                <div class="stat-value">${safeValue}</div>
-            </div>
-        """
-    }
-
-    String buildFailedCaseHtml(Map item, File baseDir) {
-        JiraFlowCoordinator flow = this.owner
-        StringBuilder block = new StringBuilder()
-
-        String itemName = flow.safe(item.name)
-        String itemMessage = flow.safe(item.message)
-        String itemDetails = flow.safe(item.details)
-        long itemDuration = (item.durationMs ?: 0L) as long
-
-        List<String> summaryLines = getFailureSummaryLines(itemMessage, itemDetails)
-
-        block.append('<div class="case-card failed">\n')
-        block.append('<div class="case-title">')
-        block.append(flow.htmlEscape(itemName))
-        block.append('</div>\n')
-
-        block.append('<div class="case-meta">Duration: ')
-        block.append(flow.htmlEscape(flow.formatDurationMillis(itemDuration)))
-        block.append('</div>\n')
-
-        summaryLines.each { String line ->
-            String safeLine = flow.safe(line)
-            block.append('<div class="failure-line">')
-            block.append(flow.htmlEscape(safeLine))
-            block.append('</div>\n')
-        }
-
-        block.append('<div class="details-wrap">\n')
-        block.append('<details>\n')
-        block.append('<summary>See full error log</summary>\n')
-        block.append('<pre>')
-        block.append(flow.htmlEscape(itemDetails))
-        block.append('</pre>\n')
-        block.append('</details>\n')
-        block.append('</div>\n')
-
-        File image = item.image as File
-        if (image != null && image.exists()) {
-            String imgSrc = flow.relativeUri(baseDir, image)
-            block.append('<img class="failure-image" src="')
-            block.append(flow.htmlEscape(imgSrc))
-            block.append('" alt="Failure evidence">\n')
-        }
-
-        block.append('</div>\n')
-        return block.toString()
-    }
-
-    String buildPassedCaseHtml(Map item) {
-        JiraFlowCoordinator flow = this.owner
-        StringBuilder block = new StringBuilder()
-
-        String itemName = flow.safe(item.name)
-        long itemDuration = (item.durationMs ?: 0L) as long
-
-        block.append('<div class="case-card passed">\n')
-        block.append('<div class="case-title">')
-        block.append(flow.htmlEscape(itemName))
-        block.append('</div>\n')
-
-        block.append('<div class="case-meta">Test Passed</div>\n')
-
-        block.append('<div class="case-meta">Duration: ')
-        block.append(flow.htmlEscape(flow.formatDurationMillis(itemDuration)))
-        block.append('</div>\n')
-
-        block.append('</div>\n')
-        return block.toString()
-    }
-
-    String buildSkippedCaseHtml(Map item) {
-        JiraFlowCoordinator flow = this.owner
-        StringBuilder block = new StringBuilder()
-
-        String itemName = flow.safe(item.name)
-        long itemDuration = (item.durationMs ?: 0L) as long
-
-        block.append('<div class="case-card skipped">\n')
-        block.append('<div class="case-title">')
-        block.append(flow.htmlEscape(itemName))
-        block.append('</div>\n')
-
-        block.append('<div class="case-meta">Test Skipped</div>\n')
-
-        block.append('<div class="case-meta">Duration: ')
-        block.append(flow.htmlEscape(flow.formatDurationMillis(itemDuration)))
-        block.append('</div>\n')
-
-        block.append('</div>\n')
-        return block.toString()
-    }
-
-    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
-        JiraFlowCoordinator flow = this.owner
-
-        if (flow.isBlank(reportFolder) || flow.isBlank(xmlPath)) {
-            return ''
-        }
-
-        List<Map> cases = parseXmlCases(xmlPath)
-        List<Map> failedCases = cases.findAll { Map item -> flow.safe(item.status) == 'failed' }
-        List<Map> passedCases = cases.findAll { Map item -> flow.safe(item.status) == 'passed' }
-        List<Map> skippedCases = cases.findAll { Map item -> flow.safe(item.status) == 'skipped' }
-
-        List<File> failureImages = flow.collectFailureImages(reportFolder)
-
-        int imageIndex = 0
-        failedCases.each { Map item ->
-            if (imageIndex < failureImages.size()) {
-                item.image = failureImages[imageIndex]
-                imageIndex++
-            } else {
-                item.image = null
-            }
-        }
-
-        long totalDurationMs = 0L
-        cases.each { Map item ->
-            totalDurationMs += ((item.durationMs ?: 0L) as long)
-        }
-
-        File baseDir = new File(reportFolder)
-        Date endDate = new Date(baseDir.lastModified())
-        Date startDate = new Date(endDate.time - totalDurationMs)
-
-        int executed = cases.size()
-        String avgTest = executed > 0
-            ? flow.formatDurationMillis((long) (totalDurationMs / executed))
-            : '0m 0s 0ms'
-
-        File htmlFile = new File(reportFolder + File.separator + flow.GAIA_REPORT_FILE_NAME)
-
-        StringBuilder html = new StringBuilder()
-        html.append('<!DOCTYPE html>\n')
-        html.append('<html lang="en">\n')
-        html.append('<head>\n')
-        html.append('<meta charset="UTF-8">\n')
-        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
-        html.append('<title>Gaia Test Execution Report</title>\n')
-        html.append('''
-<style>
-    body {
-        font-family: Arial, Helvetica, sans-serif;
-        margin: 28px;
-        color: #1f2937;
-        background: #ffffff;
-    }
-    h1 {
-        font-size: 22px;
-        margin: 0 0 22px 0;
-        font-weight: 700;
-    }
-    .header-grid {
-        display: grid;
-        grid-template-columns: repeat(8, minmax(110px, 1fr));
-        gap: 10px;
-        margin-bottom: 26px;
-    }
-    .stat-card {
-        background: #f8fafc;
-        border: 1px solid #e5e7eb;
-        border-radius: 6px;
-        padding: 12px;
-        min-height: 70px;
-    }
-    .stat-label {
-        font-size: 10px;
-        text-transform: uppercase;
-        color: #6b7280;
-        margin-bottom: 8px;
-        font-weight: 700;
-    }
-    .stat-value {
-        font-size: 14px;
-        font-weight: 600;
-        line-height: 1.4;
-    }
-    .section-title {
-        font-size: 14px;
-        font-weight: 700;
-        margin: 22px 0 10px 0;
-    }
-    .section-title.failed {
-        color: #b91c1c;
-    }
-    .section-title.passed {
-        color: #15803d;
-    }
-    .section-title.skipped {
-        color: #92400e;
-    }
-    .case-card {
-        border-left: 3px solid #d1d5db;
-        background: #ffffff;
-        padding: 10px 12px 14px 12px;
-        margin-bottom: 18px;
-    }
-    .case-card.failed {
-        border-left-color: #dc2626;
-        background: #fff7f7;
-    }
-    .case-card.passed {
-        border-left-color: #16a34a;
-        background: #f8fff9;
-    }
-    .case-card.skipped {
-        border-left-color: #d97706;
-        background: #fffaf0;
-    }
-    .case-title {
-        font-size: 13px;
-        font-weight: 700;
-        margin-bottom: 4px;
-    }
-    .case-meta {
-        font-size: 12px;
-        color: #4b5563;
-        margin-bottom: 6px;
-    }
-    .failure-line {
-        font-size: 12px;
-        color: #374151;
-        margin: 2px 0;
-    }
-    .details-wrap {
-        margin-top: 8px;
-    }
-    details summary {
-        cursor: pointer;
-        font-size: 12px;
-        color: #111827;
-        font-weight: 600;
-    }
-    pre {
-        margin-top: 8px;
-        background: #ffffff;
-        border: 1px solid #e5e7eb;
-        border-radius: 6px;
-        padding: 10px;
-        font-size: 11px;
-        line-height: 1.45;
-        white-space: pre-wrap;
-        word-break: break-word;
-        overflow-x: auto;
-    }
-    .failure-image {
-        margin-top: 12px;
-        max-width: 320px;
-        max-height: 180px;
-        border: 1px solid #d1d5db;
-        border-radius: 4px;
-        display: block;
-        background: #ffffff;
-    }
-    .empty-text {
-        font-size: 13px;
-        color: #6b7280;
-        margin-top: 10px;
-    }
-</style>
-''')
-        html.append('</head>\n')
-        html.append('<body>\n')
-        html.append('<h1>Windows Test Execution Report | Gaia</h1>\n')
-
-        html.append('<div class="header-grid">\n')
-        html.append(buildHeaderCard('Suite', flow.safe(suiteName)))
-        html.append(buildHeaderCard('Start', flow.formatHeaderDate(startDate)))
-        html.append(buildHeaderCard('End', flow.formatHeaderDate(endDate)))
-        html.append(buildHeaderCard('Suite Duration', flow.formatDurationMillis(totalDurationMs)))
-        html.append(buildHeaderCard('Executed', String.valueOf(executed)))
-        html.append(buildHeaderCard('Passed', String.valueOf(passedCases.size())))
-        html.append(buildHeaderCard('Failed', String.valueOf(failedCases.size())))
-        html.append(buildHeaderCard('Avg/Test', avgTest))
-        html.append('</div>\n')
-
-        html.append('<div class="section-title failed">✘ Failed (')
-        html.append(String.valueOf(failedCases.size()))
-        html.append(')</div>\n')
-
-        if (failedCases.isEmpty()) {
-            html.append('<div class="empty-text">No failed tests.</div>\n')
-        } else {
-            failedCases.each { Map item ->
-                html.append(buildFailedCaseHtml(item, baseDir))
-            }
-        }
-
-        html.append('<div class="section-title passed">✔ Passed (')
-        html.append(String.valueOf(passedCases.size()))
-        html.append(')</div>\n')
-
-        if (passedCases.isEmpty()) {
-            html.append('<div class="empty-text">No passed tests.</div>\n')
-        } else {
-            passedCases.each { Map item ->
-                html.append(buildPassedCaseHtml(item))
-            }
-        }
-
-        if (!skippedCases.isEmpty()) {
-            html.append('<div class="section-title skipped">Skipped (')
-            html.append(String.valueOf(skippedCases.size()))
-            html.append(')</div>\n')
-
-            skippedCases.each { Map item ->
-                html.append(buildSkippedCaseHtml(item))
-            }
-        }
-
-        html.append('</body>\n')
-        html.append('</html>\n')
-
-        htmlFile.setText(html.toString(), 'UTF-8')
-        return htmlFile.absolutePath
-    }
+[31mFailed scenarios:[0m
+[31mC:/Users/BGS32GG/Workspace/gaia/Include/features/Correction/B2C CM/CM-RC/Add Correction.feature:12 [0m# [PORTAL] [CM-RC] [NEW_COR] - import file to Create Correction - import two distinct files
+[31mC:/Users/BGS32GG/Workspace/gaia/Include/features/Correction/B2C CM/CM-RC/Add Correction.feature:26 [0m# [PORTAL] [CM-RC] [NEW_COR] - Create correction – insert version comment
+
+2 Scenarios ([31m2 failed[0m)
+29 Steps ([31m2 failed[0m, [36m20 skipped[0m, [33m1 undefined[0m, [32m6 passed[0m)
+2m4.943s
+
+com.kms.katalon.core.exception.StepFailedException: Unable to click on object 'Object Repository/Table/Common Button'
+	at com.kms.katalon.core.webui.keyword.internal.WebUIKeywordMain.stepFailed(WebUIKeywordMain.groovy:64)
+	at com.kms.katalon.core.webui.keyword.internal.WebUIKeywordMain.runKeyword(WebUIKeywordMain.groovy:26)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.click(ClickKeyword.groovy:74)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.execute(ClickKeyword.groovy:40)
+	at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+	at com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords.click(WebUiBuiltInKeywords.groovy:659)
+	at common.Button.clickCreate(Button.groovy:123)
+	at ✽.Click on Create Correction(C:/Users/BGS32GG/Workspace/gaia/Include/features/Correction/B2C CM/CM-RC/Add Correction.feature:13)
+Caused by: org.openqa.selenium.ElementClickInterceptedException: element click intercepted: Element <button class="MuiButton-root MuiButton-contained MuiButton-containedPrimary MuiButton-sizeLarge MuiButton-containedSizeLarge MuiButtonBase-root Mui-disabled css-1pgaju4" tabindex="-1" type="button" disabled="">...</button> is not clickable at point (945, 883). Other element would receive the click: <div class="MuiBox-root css-1b8kq3c">...</div>
+  (Session info: chrome=145.0.7632.110)
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '100.88.132.219', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: com.kms.katalon.selenium.driver.CChromeDriver
+Capabilities {acceptInsecureCerts: false, browserName: chrome, browserVersion: 145.0.7632.110, chrome: {chromedriverVersion: 144.0.7559.60 (c5d4451293ea..., userDataDir: C:\Users\BGS32GG\AppData\Lo...}, fedcm:accounts: true, goog:chromeOptions: {debuggerAddress: localhost:53692}, goog:processID: 3180, javascriptEnabled: true, networkConnectionEnabled: false, pageLoadStrategy: normal, platform: WINDOWS, platformName: WINDOWS, proxy: Proxy(), setWindowRect: true, strictFileInteractability: false, timeouts: {implicit: 0, pageLoad: 300000, script: 30000}, unhandledPromptBehavior: dismiss and notify, webauthn:extension:credBlob: true, webauthn:extension:largeBlob: true, webauthn:extension:minPinLength: true, webauthn:extension:prf: true, webauthn:virtualAuthenticators: true}
+Session ID: 97b9be1d6b2edfd76ca40ba8ed7e1932
+	at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+	at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at org.openqa.selenium.remote.http.W3CHttpResponseCodec.createException(W3CHttpResponseCodec.java:187)
+	at org.openqa.selenium.remote.http.W3CHttpResponseCodec.decode(W3CHttpResponseCodec.java:122)
+	at org.openqa.selenium.remote.http.W3CHttpResponseCodec.decode(W3CHttpResponseCodec.java:49)
+	at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+	at org.openqa.selenium.remote.service.DriverCommandExecutor.execute(DriverCommandExecutor.java:83)
+	at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+	at com.kms.katalon.selenium.driver.CChromeDriver.execute(CChromeDriver.java:19)
+	at org.openqa.selenium.remote.RemoteWebElement.execute(RemoteWebElement.java:285)
+	at org.openqa.selenium.remote.RemoteWebElement.click(RemoteWebElement.java:84)
+	at jdk.internal.reflect.GeneratedMethodAccessor13.invoke(Unknown Source)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at org.openqa.selenium.support.events.EventFiringWebDriver$EventFiringWebElement.lambda$new$0(EventFiringWebDriver.java:404)
+	at jdk.proxy2/jdk.proxy2.$Proxy34.click(Unknown Source)
+	at org.openqa.selenium.support.events.EventFiringWebDriver$EventFiringWebElement.click(EventFiringWebDriver.java:417)
+	at org.openqa.selenium.WebElement$click.call(Unknown Source)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.clickUntilSuccessWithTimeout(ClickKeyword.groovy:81)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.clickUntilSuccessWithTimeout(ClickKeyword.groovy)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword$_click_closure1.doCall(ClickKeyword.groovy:67)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword$_click_closure1.call(ClickKeyword.groovy)
+	at com.kms.katalon.core.webui.keyword.internal.WebUIKeywordMain.runKeyword(WebUIKeywordMain.groovy:20)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.click(ClickKeyword.groovy:74)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.execute(ClickKeyword.groovy:40)
+	at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+	at com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords.click(WebUiBuiltInKeywords.groovy:659)
+	at common.Button.clickCreate(Button.groovy:123)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at cucumber.runtime.Utils$1.call(Utils.java:26)
+	at cucumber.runtime.Timeout.timeout(Timeout.java:16)
+	at cucumber.runtime.Utils.invoke(Utils.java:20)
+	at cucumber.runtime.java.JavaStepDefinition.execute(JavaStepDefinition.java:48)
+	at cucumber.runtime.PickleStepDefinitionMatch.runStep(PickleStepDefinitionMatch.java:50)
+	at cucumber.runner.TestStep.executeStep(TestStep.java:72)
+	at cucumber.runner.TestStep.run(TestStep.java:54)
+	at cucumber.runner.PickleStepTestStep.run(PickleStepTestStep.java:53)
+	at cucumber.runner.TestCase.run(TestCase.java:47)
+	at cucumber.runner.Runner.runPickle(Runner.java:44)
+	at cucumber.runtime.Runtime.runFeature(Runtime.java:120)
+	at cucumber.runtime.Runtime.run(Runtime.java:106)
+	at cucumber.api.cli.Main.run(Main.java:35)
+	at cucumber.api.cli.Main$run.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy:110)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:75)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:69)
+	at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:77)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$runFeatureFile.callStatic(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:256)
+	at AddCorrection.run(AddCorrection:3)
+	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+	at TempTestSuite1773225867056.run(TempTestSuite1773225867056.groovy:35)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+
+com.kms.katalon.core.exception.StepFailedException: Unable to click on object 'Object Repository/Table/Common Button'
+	at com.kms.katalon.core.webui.keyword.internal.WebUIKeywordMain.stepFailed(WebUIKeywordMain.groovy:64)
+	at com.kms.katalon.core.webui.keyword.internal.WebUIKeywordMain.runKeyword(WebUIKeywordMain.groovy:26)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.click(ClickKeyword.groovy:74)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.execute(ClickKeyword.groovy:40)
+	at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+	at com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords.click(WebUiBuiltInKeywords.groovy:659)
+	at common.Button.clickCreate(Button.groovy:123)
+	at ✽.Click on Create Correction(C:/Users/BGS32GG/Workspace/gaia/Include/features/Correction/B2C CM/CM-RC/Add Correction.feature:27)
+Caused by: org.openqa.selenium.ElementClickInterceptedException: element click intercepted: Element <button class="MuiButton-root MuiButton-contained MuiButton-containedPrimary MuiButton-sizeLarge MuiButton-containedSizeLarge MuiButtonBase-root Mui-disabled css-1pgaju4" tabindex="-1" type="button" disabled="">...</button> is not clickable at point (945, 883). Other element would receive the click: <div class="MuiBox-root css-1b8kq3c">...</div>
+  (Session info: chrome=145.0.7632.110)
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '100.88.132.219', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: com.kms.katalon.selenium.driver.CChromeDriver
+Capabilities {acceptInsecureCerts: false, browserName: chrome, browserVersion: 145.0.7632.110, chrome: {chromedriverVersion: 144.0.7559.60 (c5d4451293ea..., userDataDir: C:\Users\BGS32GG\AppData\Lo...}, fedcm:accounts: true, goog:chromeOptions: {debuggerAddress: localhost:57540}, goog:processID: 40020, javascriptEnabled: true, networkConnectionEnabled: false, pageLoadStrategy: normal, platform: WINDOWS, platformName: WINDOWS, proxy: Proxy(), setWindowRect: true, strictFileInteractability: false, timeouts: {implicit: 0, pageLoad: 300000, script: 30000}, unhandledPromptBehavior: dismiss and notify, webauthn:extension:credBlob: true, webauthn:extension:largeBlob: true, webauthn:extension:minPinLength: true, webauthn:extension:prf: true, webauthn:virtualAuthenticators: true}
+Session ID: 892ea1a33261dd61816fe9a4223de8ae
+	at jdk.internal.reflect.GeneratedConstructorAccessor36.newInstance(Unknown Source)
+	at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at org.openqa.selenium.remote.http.W3CHttpResponseCodec.createException(W3CHttpResponseCodec.java:187)
+	at org.openqa.selenium.remote.http.W3CHttpResponseCodec.decode(W3CHttpResponseCodec.java:122)
+	at org.openqa.selenium.remote.http.W3CHttpResponseCodec.decode(W3CHttpResponseCodec.java:49)
+	at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+	at org.openqa.selenium.remote.service.DriverCommandExecutor.execute(DriverCommandExecutor.java:83)
+	at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+	at com.kms.katalon.selenium.driver.CChromeDriver.execute(CChromeDriver.java:19)
+	at org.openqa.selenium.remote.RemoteWebElement.execute(RemoteWebElement.java:285)
+	at org.openqa.selenium.remote.RemoteWebElement.click(RemoteWebElement.java:84)
+	at jdk.internal.reflect.GeneratedMethodAccessor13.invoke(Unknown Source)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at org.openqa.selenium.support.events.EventFiringWebDriver$EventFiringWebElement.lambda$new$0(EventFiringWebDriver.java:404)
+	at jdk.proxy2/jdk.proxy2.$Proxy34.click(Unknown Source)
+	at org.openqa.selenium.support.events.EventFiringWebDriver$EventFiringWebElement.click(EventFiringWebDriver.java:417)
+	at org.openqa.selenium.WebElement$click.call(Unknown Source)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.clickUntilSuccessWithTimeout(ClickKeyword.groovy:81)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.clickUntilSuccessWithTimeout(ClickKeyword.groovy)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword$_click_closure1.doCall(ClickKeyword.groovy:67)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword$_click_closure1.call(ClickKeyword.groovy)
+	at com.kms.katalon.core.webui.keyword.internal.WebUIKeywordMain.runKeyword(WebUIKeywordMain.groovy:20)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.click(ClickKeyword.groovy:74)
+	at com.kms.katalon.core.webui.keyword.builtin.ClickKeyword.execute(ClickKeyword.groovy:40)
+	at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+	at com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords.click(WebUiBuiltInKeywords.groovy:659)
+	at common.Button.clickCreate(Button.groovy:123)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at cucumber.runtime.Utils$1.call(Utils.java:26)
+	at cucumber.runtime.Timeout.timeout(Timeout.java:16)
+	at cucumber.runtime.Utils.invoke(Utils.java:20)
+	at cucumber.runtime.java.JavaStepDefinition.execute(JavaStepDefinition.java:48)
+	at cucumber.runtime.PickleStepDefinitionMatch.runStep(PickleStepDefinitionMatch.java:50)
+	at cucumber.runner.TestStep.executeStep(TestStep.java:72)
+	at cucumber.runner.TestStep.run(TestStep.java:54)
+	at cucumber.runner.PickleStepTestStep.run(PickleStepTestStep.java:53)
+	at cucumber.runner.TestCase.run(TestCase.java:47)
+	at cucumber.runner.Runner.runPickle(Runner.java:44)
+	at cucumber.runtime.Runtime.runFeature(Runtime.java:120)
+	at cucumber.runtime.Runtime.run(Runtime.java:106)
+	at cucumber.api.cli.Main.run(Main.java:35)
+	at cucumber.api.cli.Main$run.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy:110)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:75)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:69)
+	at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:77)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$runFeatureFile.callStatic(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:256)
+	at AddCorrection.run(AddCorrection:3)
+	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+	at TempTestSuite1773225867056.run(TempTestSuite1773225867056.groovy:35)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+
+
+You can implement missing steps with the snippets below:
+
+@Then("Import file using {string}   \\/\\/error")
+public void import_file_using_error(String string) {
+    // Write code here that turns the phrase above into concrete actions
+    throw new PendingException();
 }
+
+2026-03-11 10:46:40.236 ERROR c.k.k.core.keyword.internal.KeywordMain  - ❌ Feature file 'Include/features/Correction/B2C CM/CM-RC/Add Correction.feature' was failed
+2026-03-11 10:46:40.238 ERROR c.k.k.core.keyword.internal.KeywordMain  - ❌ Keyword runFeatureFile was failed (Root cause: com.kms.katalon.core.exception.StepFailedException: Feature file 'Include/features/Correction/B2C CM/CM-RC/Add Correction.feature' was failed
+	at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:23)
+	at com.kms.katalon.core.keyword.internal.KeywordMain$stepFailed$0.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy:116)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:75)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:69)
+	at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:77)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$runFeatureFile.callStatic(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:256)
+	at AddCorrection.run(AddCorrection:3)
+	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+	at TempTestSuite1773225867056.run(TempTestSuite1773225867056.groovy:35)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+)
+2026-03-11 10:46:40.240 ERROR c.k.katalon.core.main.TestCaseExecutor   - ❌ Test Cases/Correction/B2C CM/CM-RC/AddCorrection FAILED.
+Reason:
+com.kms.katalon.core.exception.StepFailedException: Feature file 'Include/features/Correction/B2C CM/CM-RC/Add Correction.feature' was failed
+	at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:23)
+	at com.kms.katalon.core.keyword.internal.KeywordMain$stepFailed$0.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy:116)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$_runFeatureFile_closure1.doCall(CucumberBuiltinKeywords.groovy)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:75)
+	at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:69)
+	at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:77)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords$runFeatureFile.callStatic(Unknown Source)
+	at com.kms.katalon.core.cucumber.keyword.CucumberBuiltinKeywords.runFeatureFile(CucumberBuiltinKeywords.groovy:256)
+	at AddCorrection.run(AddCorrection:3)
+	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+	at TempTestSuite1773225867056.run(TempTestSuite1773225867056.groovy:35)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+
+2026-03-11 10:46:43.797 INFO  c.k.k.c.c.internal.VideoRecorderService  - Video recording for test case 'Test Cases/Correction/B2C CM/CM-RC/AddCorrection' .
+2026-03-11 10:46:43.798 INFO  c.k.katalon.core.main.TestCaseExecutor   - END Test Cases/Correction/B2C CM/CM-RC/AddCorrection
+2026-03-11 10:46:43.807 INFO  c.k.katalon.core.main.TestCaseExecutor   - --------------------
+2026-03-11 10:46:43.807 INFO  c.k.katalon.core.main.TestCaseExecutor   - START Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira
+Start recording video for test case 'Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira'.
+2026-03-11 10:46:43.883 DEBUG testcase.Correction Import Jira          - 1: keywords.JiraIntegration.jiraImport("L96B2C-8234")
+2026-03-11 10:46:44.032 INFO  com.kms.katalon.core.util.KeywordUtil    - ============================================================
+2026-03-11 10:46:44.033 INFO  com.kms.katalon.core.util.KeywordUtil    - Starting Jira import flow
+2026-03-11 10:46:44.033 INFO  com.kms.katalon.core.util.KeywordUtil    - ============================================================
+2026-03-11 10:46:44.035 INFO  com.kms.katalon.core.util.KeywordUtil    - Using report folder: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427
+2026-03-11 10:46:44.045 INFO  com.kms.katalon.core.util.KeywordUtil    - Suite name detected from report path: Correction- Add Correction
+2026-03-11 10:46:44.082 INFO  com.kms.katalon.core.util.KeywordUtil    - Execution title used: Correction- Add Correction 2026-03-11 10.46.44
+2026-03-11 10:46:44.082 INFO  com.kms.katalon.core.util.KeywordUtil    - Test Plan title used: Correction- Add Correction Test Plan
+2026-03-11 10:46:44.109 INFO  com.kms.katalon.core.util.KeywordUtil    - XML file found: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\cucumber_report\1773225874267\cucumber.xml
+2026-03-11 10:46:44.612 INFO  com.kms.katalon.core.util.KeywordUtil    - Gaia report created: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\gaiaReport.html
+2026-03-11 10:46:44.620 INFO  com.kms.katalon.core.util.KeywordUtil    - Using saved Test Plan key for suite Correction- Add Correction: L96B2C-8255
+2026-03-11 10:46:44.622 INFO  com.kms.katalon.core.util.KeywordUtil    - Resolved existing Test Plan for suite Correction- Add Correction: L96B2C-8255
+2026-03-11 10:46:48.567 INFO  c.k.k.core.webservice.common.HarLogger   - HAR: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\requests\main\0.har
+2026-03-11 10:46:48.743 INFO  com.kms.katalon.core.util.KeywordUtil    - Import results status: 200
+2026-03-11 10:46:48.744 INFO  com.kms.katalon.core.util.KeywordUtil    - Import results response: {"testExecIssue":{"id":"2726565","key":"L96B2C-8279","self":"https://jira-mut.d.bbg/rest/api/2/issue/2726565"},"infoMessages":["Could not make transition from workflow status <b>New</b> to workflow status <b>Done</b>."],"testIssues":{"success":[{"id":"2722755","key":"L96B2C-8239","self":"https://jira-mut.d.bbg/rest/api/2/issue/2722755","testVersionId":273925},{"id":"2722756","key":"L96B2C-8240","self":"https://jira-mut.d.bbg/rest/api/2/issue/2722756","testVersionId":273926}]}}
+2026-03-11 10:46:49.716 INFO  c.k.k.core.webservice.common.HarLogger   - HAR: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\requests\main\1.har
+2026-03-11 10:46:49.724 INFO  com.kms.katalon.core.util.KeywordUtil    - Add execution to Test Plan status: 200
+2026-03-11 10:46:50.740 INFO  c.k.k.core.webservice.common.HarLogger   - HAR: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\requests\main\2.har
+2026-03-11 10:46:50.745 INFO  com.kms.katalon.core.util.KeywordUtil    - Update Test Execution status: 204
+2026-03-11 10:46:50.747 INFO  com.kms.katalon.core.util.KeywordUtil    - Evidence ZIP skipped. Folder not found: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\Evidences
+2026-03-11 10:46:50.878 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: 1773225937467.png
+2026-03-11 10:46:50.897 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: 1773225999818.png
+2026-03-11 10:46:50.911 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/cucumber.json
+2026-03-11 10:46:50.917 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/cucumber.xml
+2026-03-11 10:46:50.931 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/html/formatter.js
+2026-03-11 10:46:50.936 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/html/index.html
+2026-03-11 10:46:50.943 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/html/jquery-1.8.2.min.js
+2026-03-11 10:46:50.946 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/html/report.js
+2026-03-11 10:46:50.948 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/html/style.css
+2026-03-11 10:46:50.951 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: cucumber_report/1773225874267/k-cucumber.json
+2026-03-11 10:46:50.953 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: execution.properties
+2026-03-11 10:46:50.962 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: execution0.log
+2026-03-11 10:46:50.965 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: gaia_homepage.png
+2026-03-11 10:46:50.969 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: navbar_Correction_B2C CM.png
+2026-03-11 10:46:50.975 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: search_for_Computation_.png
+2026-03-11 10:46:50.978 INFO  com.kms.katalon.core.util.KeywordUtil    - Adding file to ZIP: testCaseBinding
+2026-03-11 10:46:50.979 INFO  com.kms.katalon.core.util.KeywordUtil    - Report ZIP created successfully: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\Results.zip
+2026-03-11 10:46:50.987 INFO  com.kms.katalon.core.util.KeywordUtil    - Uploading Gaia report attachment: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\gaiaReport.html
+2026-03-11 10:46:52.233 INFO  c.k.k.core.webservice.common.HarLogger   - HAR: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\requests\main\3.har
+2026-03-11 10:46:52.238 INFO  com.kms.katalon.core.util.KeywordUtil    - Upload attachment status: 200
+2026-03-11 10:46:52.239 INFO  com.kms.katalon.core.util.KeywordUtil    - Upload attachment response: [{"self":"https://jira-mut.d.bbg/rest/api/2/attachment/2147894","id":"2147894","filename":"gaiaReport.html","author":{"self":"https://jira-mut.d.bbg/rest/api/2/user?username=cavalherer","name":"cavalherer","key":"JIRAUSER106506","emailAddress":"erica.cavalher-ext@natixis.com","avatarUrls":{"48x48":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=48","24x24":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=24","16x16":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=16","32x32":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=32"},"displayName":"CAVALHER Erica (EXT)","active":true,"timeZone":"Europe/Paris"},"created":"2026-03-11T11:46:51.000+0100","size":45099,"mimeType":"multipart/form-data","content":"https://jira-mut.d.bbg/secure/attachment/2147894/gaiaReport.html"}]
+2026-03-11 10:46:52.240 INFO  com.kms.katalon.core.util.KeywordUtil    - Evidences ZIP attachment skipped.
+2026-03-11 10:46:52.241 INFO  com.kms.katalon.core.util.KeywordUtil    - Uploading Results ZIP attachment: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\Results.zip
+2026-03-11 10:46:54.126 INFO  c.k.k.core.webservice.common.HarLogger   - HAR: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427\requests\main\4.har
+2026-03-11 10:46:54.130 INFO  com.kms.katalon.core.util.KeywordUtil    - Upload attachment status: 200
+2026-03-11 10:46:54.131 INFO  com.kms.katalon.core.util.KeywordUtil    - Upload attachment response: [{"self":"https://jira-mut.d.bbg/rest/api/2/attachment/2147930","id":"2147930","filename":"Results.zip","author":{"self":"https://jira-mut.d.bbg/rest/api/2/user?username=cavalherer","name":"cavalherer","key":"JIRAUSER106506","emailAddress":"erica.cavalher-ext@natixis.com","avatarUrls":{"48x48":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=48","24x24":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=24","16x16":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=16","32x32":"https://www.gravatar.com/avatar/3c1006a30be1b5c266005123a092a2cb?d=mm&s=32"},"displayName":"CAVALHER Erica (EXT)","active":true,"timeZone":"Europe/Paris"},"created":"2026-03-11T11:46:53.000+0100","size":482633,"mimeType":"multipart/form-data","content":"https://jira-mut.d.bbg/secure/attachment/2147930/Results.zip"}]
+2026-03-11 10:46:54.133 INFO  com.kms.katalon.core.util.KeywordUtil    - ============================================================
+2026-03-11 10:46:54.133 INFO  com.kms.katalon.core.util.KeywordUtil    - Jira import finished
+2026-03-11 10:46:54.133 INFO  com.kms.katalon.core.util.KeywordUtil    - ============================================================
+2026-03-11 10:46:54.134 INFO  com.kms.katalon.core.util.KeywordUtil    - Execution key: L96B2C-8279
+2026-03-11 10:46:54.134 INFO  com.kms.katalon.core.util.KeywordUtil    - Execution title used: Correction- Add Correction 2026-03-11 10.46.44
+2026-03-11 10:46:54.134 INFO  com.kms.katalon.core.util.KeywordUtil    - Test Plan key: L96B2C-8255
+2026-03-11 10:46:54.134 INFO  com.kms.katalon.core.util.KeywordUtil    - Test Plan title used: Correction- Add Correction Test Plan
+2026-03-11 10:46:54.135 INFO  com.kms.katalon.core.util.KeywordUtil    - Gaia report attachment status: 200
+2026-03-11 10:46:54.135 INFO  com.kms.katalon.core.util.KeywordUtil    - Evidences.zip attachment status: 0
+2026-03-11 10:46:54.135 INFO  com.kms.katalon.core.util.KeywordUtil    - Results.zip attachment status: 200
+2026-03-11 10:46:54.135 INFO  com.kms.katalon.core.util.KeywordUtil    - Add execution to Test Plan status: 200
+2026-03-11 10:46:54.137 INFO  com.kms.katalon.core.util.KeywordUtil    - Update Test Execution status: 204
+2026-03-11 10:46:54.137 INFO  k.k.c.m.CustomKeywordDelegatingMetaClass - keywords.JiraIntegration.jiraImport is PASSED
+2026-03-11 10:46:56.217 INFO  c.k.k.c.c.internal.VideoRecorderService  - Video recording for test case 'Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira' .
+2026-03-11 10:46:56.217 INFO  c.k.katalon.core.main.TestCaseExecutor   - END Test Cases/Correction/B2C CM/CM-RC/Correction Import Jira
+2026-03-11 10:46:56.596 INFO  com.kms.katalon.core.util.KeywordUtil    - Start generating HTML report folder at: C:\Users\BGS32GG\Workspace\gaia\Reports\20260311_104427\Correction- Add Correction\20260311_104427...
+2026-03-11 10:46:56.712 INFO  com.kms.katalon.core.util.KeywordUtil    - HTML report generated
+2026-03-11 10:46:56.810 INFO  c.k.katalon.core.main.TestSuiteExecutor  - --------------------
+2026-03-11 10:46:56.810 INFO  c.k.katalon.core.main.TestSuiteExecutor  - END Test Suites/Correction- Add Correction
