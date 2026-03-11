@@ -1,3 +1,4 @@
+Keywords/jiraIntegration/JiraGaiaReportBuilder.groovy
 package jiraIntegration
 
 import java.io.File
@@ -32,26 +33,30 @@ class JiraGaiaReportBuilder {
             return ''
         }
 
+        String resolvedSuiteName = resolveSuiteName(reportDir, suiteName)
         List<Map> xmlCases = parseXmlCases(xmlPath)
-        List<Map> scenarios = parseExecutionScenarios(reportDir, xmlCases)
+        List<Map> scenarios = parseExecutionScenarios(reportDir)
 
         if (scenarios.isEmpty()) {
             scenarios = buildFallbackScenarios(xmlCases)
+        } else {
+            enrichScenariosWithFallbackData(scenarios, xmlCases)
         }
 
-        attachEvidenceToScenarios(reportDir, scenarios)
+        normalizeScenarioSteps(scenarios)
+        attachEvidenceToFailedScenarios(reportDir, scenarios)
 
-        Map summary = buildSummary(scenarios)
+        Map summary = buildSummary(reportDir, scenarios)
         String logoSrc = resolveAssetUrl(reportDir, DEFAULT_LOGO_RELATIVE_PATH)
 
         Map model = [
-            suiteName   : safeValue(suiteName),
-            reportTitle : 'Test report - ' + safeValue(suiteName),
-            subtitle    : 'GAIA execution overview',
-            generatedAt : formatDisplayDate(new Date()),
-            logoSrc     : logoSrc,
-            summary     : summary,
-            scenarios   : scenarios
+            suiteName  : resolvedSuiteName,
+            reportTitle: 'Test report - ' + resolvedSuiteName,
+            subtitle   : 'GAIA execution overview',
+            generatedAt: formatDisplayDate(new Date()),
+            logoSrc    : logoSrc,
+            summary    : summary,
+            scenarios  : scenarios
         ]
 
         String html = new JiraGaiaHtmlTemplateBuilder().build(model)
@@ -60,6 +65,77 @@ class JiraGaiaReportBuilder {
         htmlFile.setText(html, 'UTF-8')
         return htmlFile.absolutePath
     }
+
+    // =========================================================================
+    // SUITE / SUMMARY
+    // =========================================================================
+
+    private String resolveSuiteName(File reportDir, String suiteName) {
+        String candidate = safeValue(suiteName)
+        if (!isBlank(candidate)) {
+            return candidate
+        }
+
+        File parent = reportDir.parentFile
+        if (parent != null && !isBlank(parent.name)) {
+            return safeValue(parent.name)
+        }
+
+        return 'GAIA Execution'
+    }
+
+    private Map buildSummary(File reportDir, List<Map> scenarios) {
+        int passed = scenarios.count { Map item -> safeValue(item.status) == 'passed' }
+        int failed = scenarios.count { Map item -> safeValue(item.status) == 'failed' }
+        int skipped = scenarios.count { Map item -> safeValue(item.status) == 'skipped' }
+        int info = scenarios.count { Map item -> safeValue(item.status) == 'info' }
+
+        long totalDurationMs = 0L
+        scenarios.each { Map item ->
+            totalDurationMs += toLong(item.durationMs)
+        }
+
+        String startLabel = ''
+        String endLabel = ''
+
+        List<String> starts = scenarios.collect { safeValue(it.startLabel) }.findAll { !isBlank(it) }
+        List<String> ends = scenarios.collect { safeValue(it.endLabel) }.findAll { !isBlank(it) }
+
+        if (!starts.isEmpty()) {
+            startLabel = starts.first()
+        }
+        if (!ends.isEmpty()) {
+            endLabel = ends.last()
+        }
+
+        if (isBlank(startLabel) || isBlank(endLabel)) {
+            Date endDate = new Date(reportDir.lastModified())
+            Date startDate = new Date(endDate.time - totalDurationMs)
+
+            if (isBlank(startLabel)) {
+                startLabel = formatTimeOnly(startDate)
+            }
+            if (isBlank(endLabel)) {
+                endLabel = formatTimeOnly(endDate)
+            }
+        }
+
+        return [
+            total         : scenarios.size(),
+            passed        : passed,
+            failed        : failed,
+            skipped       : skipped,
+            info          : info,
+            totalDuration : totalDurationMs,
+            durationLabel : formatDurationFull(totalDurationMs),
+            startLabel    : startLabel,
+            endLabel      : endLabel
+        ]
+    }
+
+    // =========================================================================
+    // XML FALLBACK
+    // =========================================================================
 
     private List<Map> parseXmlCases(String xmlPath) {
         List<Map> result = []
@@ -86,8 +162,8 @@ class JiraGaiaReportBuilder {
             Element errorNode = firstChildElement(testcase, 'error')
             Element skippedNode = firstChildElement(testcase, 'skipped')
 
-            boolean failed = (failureNode != null) || (errorNode != null)
-            boolean skipped = (skippedNode != null)
+            boolean failed = failureNode != null || errorNode != null
+            boolean skipped = skippedNode != null
 
             String message = ''
             String details = ''
@@ -103,12 +179,10 @@ class JiraGaiaReportBuilder {
                 details = safeValue(skippedNode.getTextContent())
             }
 
-            String displayName = buildDisplayName(className, testName)
-
             result << [
                 index      : index + 1,
-                name       : displayName,
-                shortName  : isBlank(testName) ? displayName : testName,
+                name       : buildDisplayName(className, testName),
+                shortName  : isBlank(testName) ? buildDisplayName(className, testName) : testName,
                 durationMs : durationMs,
                 status     : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
                 message    : message,
@@ -154,7 +228,78 @@ class JiraGaiaReportBuilder {
         return className
     }
 
-    private List<Map> parseExecutionScenarios(File reportDir, List<Map> xmlCases) {
+    private List<Map> buildFallbackScenarios(List<Map> xmlCases) {
+        List<Map> scenarios = []
+
+        xmlCases.eachWithIndex { Map xmlCase, int index ->
+            String title = safeValue(xmlCase.shortName)
+
+            Map failedStep = [
+                id           : 'step-' + (index + 1) + '-1',
+                title        : title,
+                status       : safeValue(xmlCase.status),
+                timeLabel    : '',
+                startLabel   : '',
+                endLabel     : '',
+                durationMs   : toLong(xmlCase.durationMs),
+                durationLabel: formatDurationFull(toLong(xmlCase.durationMs)),
+                detailText   : safeValue(xmlCase.details),
+                shortError   : extractShortError(xmlCase.message ?: xmlCase.details),
+                errorFull    : safeValue(xmlCase.details),
+                emoji        : resolveStepEmoji(title)
+            ]
+
+            scenarios << [
+                id             : 'scenario-' + (index + 1),
+                title          : title,
+                status         : safeValue(xmlCase.status),
+                startLabel     : '',
+                endLabel       : '',
+                durationMs     : toLong(xmlCase.durationMs),
+                durationLabel  : formatDurationFull(toLong(xmlCase.durationMs)),
+                steps          : [failedStep],
+                errorShort     : extractShortError(xmlCase.message ?: xmlCase.details),
+                errorFull      : safeValue(xmlCase.details),
+                sidebarSubtitle: extractShortError(xmlCase.message ?: xmlCase.details),
+                evidences      : []
+            ]
+        }
+
+        return scenarios
+    }
+
+    private void enrichScenariosWithFallbackData(List<Map> scenarios, List<Map> xmlCases) {
+        scenarios.eachWithIndex { Map scenario, int index ->
+            if (index >= xmlCases.size()) {
+                return
+            }
+
+            Map xmlCase = xmlCases[index]
+
+            if (toLong(scenario.durationMs) <= 0L) {
+                scenario.durationMs = toLong(xmlCase.durationMs)
+                scenario.durationLabel = formatDurationFull(toLong(xmlCase.durationMs))
+            }
+
+            if (isBlank(scenario.errorShort)) {
+                scenario.errorShort = extractShortError(xmlCase.message ?: xmlCase.details)
+            }
+
+            if (isBlank(scenario.errorFull)) {
+                scenario.errorFull = safeValue(xmlCase.details)
+            }
+
+            if (isBlank(scenario.sidebarSubtitle)) {
+                scenario.sidebarSubtitle = scenario.errorShort
+            }
+        }
+    }
+
+    // =========================================================================
+    // EXECUTION LOG PARSING
+    // =========================================================================
+
+    private List<Map> parseExecutionScenarios(File reportDir) {
         File logFile = findExecutionLog(reportDir)
         if (logFile == null || !logFile.exists()) {
             return []
@@ -174,19 +319,22 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            currentStep.detailText = normalizeLines(currentStep.detailLines)
-            currentStep.errorFull = normalizeLines(currentStep.errorLines)
-            currentStep.shortError = extractShortError(currentStep.errorFull ?: currentStep.detailText)
-            currentStep.detailPreview = buildStepPreview(currentStep)
-
-            if (currentStep.status == 'skipped' && !isBlank(currentStep.shortError)) {
-                currentStep.status = 'failed'
+            if (currentStep.status == 'info' && currentStep.detailText.toLowerCase(Locale.ENGLISH).contains('skipped')) {
+                currentStep.status = 'skipped'
             }
 
-            if (isBlank(currentStep.timeLabel)) {
-                currentStep.timeLabel = safeValue(currentStep.startClock)
+            if (currentStep.status == 'pending') {
+                currentStep.status = 'skipped'
             }
 
+            currentStep.detailText = normalizeText(currentStep.detailLines)
+            currentStep.errorFull = normalizeText(currentStep.errorLines)
+
+            if (isBlank(currentStep.shortError)) {
+                currentStep.shortError = extractShortError(currentStep.errorFull ?: currentStep.detailText)
+            }
+
+            currentStep.durationLabel = formatDurationFull(toLong(currentStep.durationMs))
             currentStep = null
         }
 
@@ -200,40 +348,38 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            currentScenario.status = resolveScenarioStatus(currentScenario)
-            currentScenario.errorShort = resolveScenarioErrorShort(currentScenario)
-            currentScenario.errorFull = resolveScenarioErrorFull(currentScenario)
-            currentScenario.sidebarSubtitle = resolveScenarioSidebarSubtitle(currentScenario)
-            currentScenario.durationLabel = formatDurationHHMM((currentScenario.durationMs ?: 0L) as long)
-
+            currentScenario.status = resolveScenarioStatus(currentScenario.steps)
+            currentScenario.errorShort = resolveScenarioErrorShort(currentScenario.steps)
+            currentScenario.errorFull = resolveScenarioErrorFull(currentScenario.steps)
+            currentScenario.sidebarSubtitle = isBlank(currentScenario.errorShort)
+                ? safeValue(currentScenario.title)
+                : currentScenario.errorShort
+            currentScenario.durationLabel = formatDurationFull(toLong(currentScenario.durationMs))
             scenarios << currentScenario
             currentScenario = null
         }
 
         lines.each { String rawLine ->
             String line = safeValue(rawLine)
+            if (isBlank(line)) {
+                return
+            }
 
-            if (line.contains('TEST STEP: Start Test Case : SCENARIO ')) {
+            String scenarioTitleVerbose = extractScenarioTitleFromVerboseLine(line)
+            if (!isBlank(scenarioTitleVerbose)) {
                 finalizeStep.call()
                 finalizeScenario.call()
 
-                String scenarioTitle = line.substring(line.indexOf('SCENARIO ') + 'SCENARIO '.length()).trim()
+                currentScenario = newScenarioMap('scenario-' + (scenarios.size() + 1), scenarioTitleVerbose)
+                return
+            }
 
-                currentScenario = [
-                    id             : 'scenario-' + (scenarios.size() + 1),
-                    title          : scenarioTitle,
-                    status         : 'skipped',
-                    startLabel     : '',
-                    endLabel       : '',
-                    durationMs     : 0L,
-                    durationLabel  : '00h 00m',
-                    steps          : [],
-                    errorShort     : '',
-                    errorFull      : '',
-                    sidebarSubtitle: '',
-                    evidences      : []
-                ]
-                currentStep = null
+            Map scenarioCompact = parseCompactScenarioLine(line, scenarios.size() + 1)
+            if (scenarioCompact != null) {
+                finalizeStep.call()
+                finalizeScenario.call()
+
+                currentScenario = scenarioCompact
                 return
             }
 
@@ -250,31 +396,38 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            if (line.contains('TEST STEP: ') && !line.contains('Start Test Case : SCENARIO ')) {
-                String stepTitle = line.substring(line.indexOf('TEST STEP: ') + 'TEST STEP: '.length()).trim()
+            Map compactStep = parseCompactStepLine(line, currentScenario.steps.size() + 1)
+            if (compactStep != null) {
+                finalizeStep.call()
+                currentStep = compactStep
+                currentScenario.steps << currentStep
+                return
+            }
 
-                if (shouldIgnoreStep(stepTitle)) {
+            String testStepTitle = extractStepTitleFromVerboseLine(line)
+            if (!isBlank(testStepTitle)) {
+                if (shouldIgnoreStep(testStepTitle)) {
                     return
                 }
 
                 finalizeStep.call()
 
                 currentStep = [
-                    title        : stepTitle,
-                    status       : 'skipped',
+                    id           : currentScenario.id + '-step-' + (currentScenario.steps.size() + 1),
+                    title        : testStepTitle,
+                    status       : 'pending',
                     timeLabel    : '',
-                    startClock   : '',
-                    endClock     : '',
+                    startLabel   : '',
+                    endLabel     : '',
                     durationMs   : 0L,
+                    durationLabel: formatDurationFull(0L),
                     detailLines  : [],
                     errorLines   : [],
                     detailText   : '',
                     errorFull    : '',
                     shortError   : '',
-                    detailPreview: '',
-                    emoji        : resolveStepEmoji(stepTitle)
+                    emoji        : resolveStepEmoji(testStepTitle)
                 ]
-
                 currentScenario.steps << currentStep
                 return
             }
@@ -289,23 +442,38 @@ class JiraGaiaReportBuilder {
                     currentStep.timeLabel = event.timeLabel
                 }
 
-                currentStep.detailLines << (event.rawLine ?: line)
+                currentStep.detailLines << safeValue(event.message)
 
                 if (event.status == 'failed') {
                     currentStep.status = 'failed'
                     currentStep.errorLines << safeValue(event.message)
-                } else if (currentStep.status != 'failed' && event.status == 'passed') {
-                    currentStep.status = 'passed'
-                } else if (currentStep.status == 'skipped' && event.status == 'info') {
-                    currentStep.status = 'info'
+                    currentStep.shortError = extractShortError(event.message)
+                } else if (event.status == 'passed') {
+                    if (currentStep.status != 'failed') {
+                        currentStep.status = 'passed'
+                    }
+                } else if (event.status == 'skipped') {
+                    if (currentStep.status != 'failed' && currentStep.status != 'passed') {
+                        currentStep.status = 'skipped'
+                    }
+                } else {
+                    if (currentStep.status == 'pending') {
+                        currentStep.status = 'info'
+                    }
                 }
+
                 return
             }
 
-            if (!isBlank(line)) {
-                currentStep.detailLines << line
-                if (currentStep.status == 'failed' || looksLikeErrorStack(line)) {
-                    currentStep.errorLines << line
+            currentStep.detailLines << line
+
+            if (looksLikeErrorLine(line)) {
+                currentStep.errorLines << line
+                if (currentStep.status != 'failed') {
+                    currentStep.status = 'failed'
+                }
+                if (isBlank(currentStep.shortError)) {
+                    currentStep.shortError = extractShortError(line)
                 }
             }
         }
@@ -313,214 +481,141 @@ class JiraGaiaReportBuilder {
         finalizeStep.call()
         finalizeScenario.call()
 
-        scenarios = applyXmlFallbacks(scenarios, xmlCases)
+        applySequentialTimingFallback(reportDir, scenarios)
         return scenarios
     }
 
-    private List<Map> applyXmlFallbacks(List<Map> scenarios, List<Map> xmlCases) {
-        if (scenarios.isEmpty() || xmlCases.isEmpty()) {
-            return scenarios
-        }
-
-        scenarios.eachWithIndex { Map scenario, int index ->
-            Map xmlCase = index < xmlCases.size() ? xmlCases[index] : null
-            if (xmlCase == null) {
-                return
-            }
-
-            if (((scenario.durationMs ?: 0L) as long) == 0L) {
-                scenario.durationMs = (xmlCase.durationMs ?: 0L) as long
-                scenario.durationLabel = formatDurationHHMM((scenario.durationMs ?: 0L) as long)
-            }
-
-            if (scenario.status == 'skipped' && safeValue(xmlCase.status) != 'skipped') {
-                scenario.status = safeValue(xmlCase.status)
-            }
-
-            if (isBlank(scenario.errorShort) && !isBlank(xmlCase.message)) {
-                scenario.errorShort = extractShortError(xmlCase.message)
-            }
-
-            if (isBlank(scenario.errorFull) && !isBlank(xmlCase.details)) {
-                scenario.errorFull = safeValue(xmlCase.details)
-            }
-
-            if (isBlank(scenario.sidebarSubtitle)) {
-                scenario.sidebarSubtitle = resolveScenarioSidebarSubtitle(scenario)
-            }
-        }
-
-        return scenarios
-    }
-
-    private List<Map> buildFallbackScenarios(List<Map> xmlCases) {
-        List<Map> scenarios = []
-
-        xmlCases.eachWithIndex { Map xmlCase, int index ->
-            String title = safeValue(xmlCase.shortName)
-
-            Map step = [
-                title        : title,
-                status       : safeValue(xmlCase.status),
-                timeLabel    : '',
-                startClock   : '',
-                endClock     : '',
-                durationMs   : (xmlCase.durationMs ?: 0L) as long,
-                detailLines  : !isBlank(xmlCase.details) ? xmlCase.details.readLines() : [],
-                errorLines   : !isBlank(xmlCase.details) ? xmlCase.details.readLines() : [],
-                detailText   : safeValue(xmlCase.details),
-                errorFull    : safeValue(xmlCase.details),
-                shortError   : extractShortError(xmlCase.message ?: xmlCase.details),
-                detailPreview: title,
-                emoji        : resolveStepEmoji(title)
-            ]
-
-            Map scenario = [
-                id             : 'scenario-' + (index + 1),
-                title          : title,
-                status         : safeValue(xmlCase.status),
-                startLabel     : '',
-                endLabel       : '',
-                durationMs     : (xmlCase.durationMs ?: 0L) as long,
-                durationLabel  : formatDurationHHMM((xmlCase.durationMs ?: 0L) as long),
-                steps          : [step],
-                errorShort     : extractShortError(xmlCase.message ?: xmlCase.details),
-                errorFull      : safeValue(xmlCase.details),
-                sidebarSubtitle: extractShortError(xmlCase.message ?: xmlCase.details),
-                evidences      : []
-            ]
-
-            scenarios << scenario
-        }
-
-        return scenarios
-    }
-
-    private Map buildSummary(List<Map> scenarios) {
-        int passed = scenarios.count { Map item -> safeValue(item.status) == 'passed' }
-        int failed = scenarios.count { Map item -> safeValue(item.status) == 'failed' }
-        int skipped = scenarios.count { Map item -> safeValue(item.status) == 'skipped' }
-        int info = scenarios.count { Map item -> safeValue(item.status) == 'info' }
-
-        long totalDuration = 0L
-        scenarios.each { Map item ->
-            totalDuration += ((item.durationMs ?: 0L) as long)
-        }
-
-        List<String> startValues = scenarios.collect { safeValue(it.startLabel) }.findAll { !isBlank(it) }
-        List<String> endValues = scenarios.collect { safeValue(it.endLabel) }.findAll { !isBlank(it) }
-
+    private Map newScenarioMap(String id, String title) {
         return [
-            total        : scenarios.size(),
-            passed       : passed,
-            failed       : failed,
-            skipped      : skipped,
-            info         : info,
-            totalDuration: totalDuration,
-            durationLabel: formatDurationHHMM(totalDuration),
-            startLabel   : startValues ? startValues.first() : '',
-            endLabel     : endValues ? endValues.last() : ''
+            id             : id,
+            title          : title,
+            status         : 'skipped',
+            startLabel     : '',
+            endLabel       : '',
+            durationMs     : 0L,
+            durationLabel  : formatDurationFull(0L),
+            steps          : [],
+            errorShort     : '',
+            errorFull      : '',
+            sidebarSubtitle: '',
+            evidences      : []
         ]
     }
 
-    private void attachEvidenceToScenarios(File reportDir, List<Map> scenarios) {
-        List<File> imageFiles = collectEvidenceImages(reportDir)
-        if (imageFiles.isEmpty() || scenarios.isEmpty()) {
-            return
+    private String extractScenarioTitleFromVerboseLine(String line) {
+        String marker = 'TEST STEP: Start Test Case : SCENARIO '
+        if (!line.contains(marker)) {
+            return ''
         }
 
-        List<Map> targets = scenarios.findAll { Map item -> safeValue(item.status) == 'failed' }
-        if (targets.isEmpty()) {
-            targets = scenarios
-        }
-
-        int targetIndex = 0
-        imageFiles.each { File image ->
-            Map target = targets[targetIndex]
-
-            if (target.evidences == null) {
-                target.evidences = []
-            }
-
-            target.evidences << [
-                name      : image.name,
-                filePath  : image.absolutePath,
-                openUrl   : image.toURI().toString(),
-                previewUrl: image.toURI().toString()
-            ]
-
-            if (targetIndex < targets.size() - 1) {
-                targetIndex++
-            }
-        }
+        String title = line.substring(line.indexOf(marker) + marker.length()).trim()
+        return cleanupScenarioTitle(title)
     }
 
-    private List<File> collectEvidenceImages(File reportDir) {
-        List<File> images = []
-
-        reportDir.eachFileRecurse { File file ->
-            if (!file.isFile()) {
-                return
-            }
-
-            String lowerName = file.name.toLowerCase(Locale.ENGLISH)
-            boolean isImage = lowerName.endsWith('.png')
-            isImage = isImage || lowerName.endsWith('.jpg')
-            isImage = isImage || lowerName.endsWith('.jpeg')
-            isImage = isImage || lowerName.endsWith('.webp')
-
-            if (isImage) {
-                images << file
-            }
-        }
-
-        images.sort { File left, File right ->
-            left.lastModified() <=> right.lastModified()
-        }
-
-        return images
-    }
-
-    private File findExecutionLog(File reportDir) {
-        List<File> candidates = []
-
-        reportDir.eachFileRecurse { File file ->
-            if (!file.isFile()) {
-                return
-            }
-
-            String lowerName = file.name.toLowerCase(Locale.ENGLISH)
-            boolean isExecutionLog = lowerName.startsWith('execution') && lowerName.endsWith('.log')
-            if (isExecutionLog) {
-                candidates << file
-            }
-        }
-
-        if (candidates.isEmpty()) {
+    private Map parseCompactScenarioLine(String line, int scenarioIndex) {
+        def matcher = (line =~ /^SCENARIO\s+(.+?)\s*\(([^)]*)\)$/)
+        if (!matcher.find()) {
             return null
         }
 
-        candidates.sort { File left, File right ->
-            right.lastModified() <=> left.lastModified()
-        }
+        String title = cleanupScenarioTitle(safeValue(matcher.group(1)))
+        long durationMs = toMillisFromCompactSeconds(matcher.group(2))
 
-        return candidates.first()
+        return [
+            id             : 'scenario-' + scenarioIndex,
+            title          : title,
+            status         : 'skipped',
+            startLabel     : '',
+            endLabel       : '',
+            durationMs     : durationMs,
+            durationLabel  : formatDurationFull(durationMs),
+            steps          : [],
+            errorShort     : '',
+            errorFull      : '',
+            sidebarSubtitle: '',
+            evidences      : []
+        ]
     }
 
-    private List<String> readFileLines(File file) {
-        try {
-            return file.readLines(StandardCharsets.UTF_8.name())
-        } catch (Exception ignored) {
-            try {
-                return file.readLines()
-            } catch (Exception ignoredAgain) {
-                return []
-            }
+    private Map parseCompactStepLine(String line, int stepIndex) {
+        def matcher = (line =~ /^\d+\s*-\s*(.+?)\s*\(([^)]*)\)$/)
+        if (!matcher.find()) {
+            return null
+        }
+
+        String stepTitle = safeValue(matcher.group(1))
+        long durationMs = toMillisFromCompactSeconds(matcher.group(2))
+
+        return [
+            id           : 'step-' + stepIndex,
+            title        : stepTitle,
+            status       : inferStatusFromCompactStepTitle(stepTitle),
+            timeLabel    : '',
+            startLabel   : '',
+            endLabel     : '',
+            durationMs   : durationMs,
+            durationLabel: formatDurationFull(durationMs),
+            detailLines  : [],
+            errorLines   : [],
+            detailText   : '',
+            errorFull    : '',
+            shortError   : '',
+            emoji        : resolveStepEmoji(stepTitle)
+        ]
+    }
+
+    private String extractStepTitleFromVerboseLine(String line) {
+        String marker = 'TEST STEP: '
+        if (!line.contains(marker)) {
+            return ''
+        }
+
+        String value = line.substring(line.indexOf(marker) + marker.length()).trim()
+        return safeValue(value)
+    }
+
+    private String inferStatusFromCompactStepTitle(String title) {
+        String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
+
+        if (lower.contains('failed')) {
+            return 'failed'
+        }
+        if (lower.contains('passed')) {
+            return 'passed'
+        }
+        if (lower.contains('skipped')) {
+            return 'skipped'
+        }
+
+        return 'info'
+    }
+
+    private void applyTimingInfo(Map target, String timingLine) {
+        def matcher = (timingLine =~ /^Start \/ End \/ Elapsed:\s*(.*?)\s*\/\s*(.*?)\s*\/\s*(.*)$/)
+        if (!matcher.find()) {
+            return
+        }
+
+        String rawStart = safeValue(matcher.group(1))
+        String rawEnd = safeValue(matcher.group(2))
+        String rawElapsed = safeValue(matcher.group(3))
+
+        if (!isBlank(rawStart)) {
+            target.startLabel = formatTimeFromAny(rawStart)
+        }
+        if (!isBlank(rawEnd)) {
+            target.endLabel = formatTimeFromAny(rawEnd)
+        }
+
+        long durationMs = toMillisFromElapsed(rawElapsed)
+        if (durationMs > 0L) {
+            target.durationMs = durationMs
+            target.durationLabel = formatDurationFull(durationMs)
         }
     }
 
     private Map parseEventLine(String line) {
-        def matcher = (line =~ /^(\\d{2}:\\d{2}:\\d{2}\\.\\d{3})\\s+([A-Z]+)\\s+(.*)$/)
+        def matcher = (line =~ /^(\d{2}:\d{2}:\d{2}\.\d{3})\s+([A-Z]+)\s+(.*)$/)
         if (!matcher.find()) {
             return null
         }
@@ -529,10 +624,9 @@ class JiraGaiaReportBuilder {
         String message = safeValue(matcher.group(3))
 
         return [
-            timeLabel: formatClockLabel(matcher.group(1)),
+            timeLabel: formatTimeFromClock(matcher.group(1)),
             status   : normalizeEventStatus(rawStatus),
-            message  : message,
-            rawLine  : line
+            message  : message
         ]
     }
 
@@ -560,68 +654,237 @@ class JiraGaiaReportBuilder {
         ignored = ignored || lower.startsWith('sampleaftertestcase')
         ignored = ignored || lower.startsWith('video')
         ignored = ignored || lower.startsWith('beforetestcase')
+        ignored = ignored || lower.startsWith('start test case : scenario')
 
         return ignored
     }
 
-    private void applyTimingInfo(Map target, String timingLine) {
-        def matcher = (timingLine =~ /^Start \\/ End \\/ Elapsed:\\s*(.+?)\\s*\\/\\s*(.+?)\\s*\\/\\s*(.+)$/)
-        if (!matcher.find()) {
+    // =========================================================================
+    // STEP NORMALIZATION
+    // =========================================================================
+
+    private void normalizeScenarioSteps(List<Map> scenarios) {
+        scenarios.each { Map scenario ->
+            List<Map> narrativeSteps = extractNarrativeSteps(safeValue(scenario.errorFull))
+            if (narrativeSteps.size() > scenario.steps.size()) {
+                Map failedOriginal = scenario.steps.find { Map item -> safeValue(item.status) == 'failed' }
+
+                narrativeSteps.eachWithIndex { Map item, int idx ->
+                    item.id = scenario.id + '-step-' + (idx + 1)
+                    item.emoji = resolveStepEmoji(item.title)
+                    item.durationMs = 0L
+                    item.durationLabel = formatDurationFull(0L)
+                    item.timeLabel = ''
+                    item.startLabel = ''
+                    item.endLabel = ''
+                    item.detailText = item.title
+                    item.errorFull = ''
+                    item.shortError = ''
+
+                    if (safeValue(item.status) == 'failed') {
+                        item.shortError = safeValue(scenario.errorShort)
+                        item.errorFull = safeValue(scenario.errorFull)
+                        if (isBlank(item.shortError) && failedOriginal != null) {
+                            item.shortError = safeValue(failedOriginal.shortError)
+                        }
+                        if (isBlank(item.errorFull) && failedOriginal != null) {
+                            item.errorFull = safeValue(failedOriginal.errorFull)
+                        }
+                    }
+                }
+
+                scenario.steps = narrativeSteps
+            }
+
+            scenario.steps.eachWithIndex { Map step, int index ->
+                step.id = isBlank(step.id) ? (scenario.id + '-step-' + (index + 1)) : step.id
+                step.title = cleanupStepTitle(step.title)
+                step.emoji = resolveStepEmoji(step.title)
+                step.durationMs = toLong(step.durationMs)
+                step.durationLabel = formatDurationFull(toLong(step.durationMs))
+                step.timeLabel = safeValue(step.timeLabel)
+                step.shortError = safeValue(step.shortError)
+                step.errorFull = safeValue(step.errorFull)
+                step.detailText = safeValue(step.detailText)
+
+                if (safeValue(step.status) == 'failed' && isBlank(step.shortError)) {
+                    step.shortError = extractShortError(step.errorFull ?: step.detailText)
+                }
+            }
+
+            scenario.status = resolveScenarioStatus(scenario.steps)
+            scenario.errorShort = resolveScenarioErrorShort(scenario.steps)
+            scenario.errorFull = resolveScenarioErrorFull(scenario.steps)
+            scenario.sidebarSubtitle = isBlank(scenario.errorShort) ? safeValue(scenario.title) : scenario.errorShort
+        }
+    }
+
+    private List<Map> extractNarrativeSteps(String source) {
+        List<Map> steps = []
+        if (isBlank(source)) {
+            return steps
+        }
+
+        source.readLines().each { String raw ->
+            String line = safeValue(raw)
+            if (isBlank(line)) {
+                return
+            }
+
+            String lower = line.toLowerCase(Locale.ENGLISH)
+            if (!(lower.endsWith('passed') || lower.endsWith('failed') || lower.endsWith('skipped'))) {
+                return
+            }
+
+            String status = ''
+            if (lower.endsWith('passed')) {
+                status = 'passed'
+            } else if (lower.endsWith('failed')) {
+                status = 'failed'
+            } else if (lower.endsWith('skipped')) {
+                status = 'skipped'
+            }
+
+            String base = line.substring(0, line.length() - status.length()).trim()
+            base = base.replaceAll(/[.]+$/, '').trim()
+            if (isBlank(base)) {
+                return
+            }
+
+            boolean looksLikeGherkin = false
+            String baseLower = base.toLowerCase(Locale.ENGLISH)
+            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('given ')
+            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('when ')
+            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('then ')
+            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('and ')
+
+            if (!looksLikeGherkin) {
+                return
+            }
+
+            steps << [
+                title : cleanupStepTitle(base),
+                status: status
+            ]
+        }
+
+        return steps
+    }
+
+    private String cleanupScenarioTitle(String value) {
+        String text = safeValue(value)
+        text = text.replaceAll(/\s+\(\d+[.,]\d+s\)$/, '').trim()
+        return text
+    }
+
+    private String cleanupStepTitle(String value) {
+        String text = safeValue(value)
+        text = text.replaceAll(/\s+\(\d+[.,]\d+s\)$/, '').trim()
+        text = text.replaceAll(/[.]{2,}$/, '').trim()
+        return text
+    }
+
+    private String resolveScenarioStatus(List<Map> steps) {
+        boolean hasFailed = steps.any { Map item -> safeValue(item.status) == 'failed' }
+        if (hasFailed) {
+            return 'failed'
+        }
+
+        boolean hasPassed = steps.any { Map item -> safeValue(item.status) == 'passed' }
+        if (hasPassed) {
+            return 'passed'
+        }
+
+        boolean hasInfo = steps.any { Map item -> safeValue(item.status) == 'info' }
+        if (hasInfo) {
+            return 'info'
+        }
+
+        return 'skipped'
+    }
+
+    private String resolveScenarioErrorShort(List<Map> steps) {
+        Map failedStep = steps.find { Map item -> safeValue(item.status) == 'failed' }
+        if (failedStep == null) {
+            return ''
+        }
+
+        return extractShortError(failedStep.shortError ?: failedStep.errorFull ?: failedStep.detailText)
+    }
+
+    private String resolveScenarioErrorFull(List<Map> steps) {
+        Map failedStep = steps.find { Map item -> safeValue(item.status) == 'failed' }
+        if (failedStep == null) {
+            return ''
+        }
+
+        return safeValue(failedStep.errorFull ?: failedStep.detailText)
+    }
+
+    // =========================================================================
+    // TIMING / DURATION
+    // =========================================================================
+
+    private void applySequentialTimingFallback(File reportDir, List<Map> scenarios) {
+        if (scenarios.isEmpty()) {
             return
         }
 
-        String rawStart = safeValue(matcher.group(1))
-        String rawEnd = safeValue(matcher.group(2))
-        String rawElapsed = safeValue(matcher.group(3))
+        long totalDurationMs = 0L
+        scenarios.each { Map item ->
+            if (toLong(item.durationMs) <= 0L) {
+                item.durationMs = sumStepDurations(item.steps)
+            }
+            totalDurationMs += toLong(item.durationMs)
+        }
 
-        target.startLabel = formatDateLabel(rawStart)
-        target.endLabel = formatDateLabel(rawEnd)
-        target.startClock = formatClockFromDate(rawStart)
-        target.endClock = formatClockFromDate(rawEnd)
-        target.durationMs = toMillisFromElapsed(rawElapsed)
+        Date suiteEnd = new Date(reportDir.lastModified())
+        Date suiteStart = new Date(suiteEnd.time - totalDurationMs)
+
+        long cursor = suiteStart.time
+        scenarios.each { Map item ->
+            long scenarioDuration = toLong(item.durationMs)
+
+            if (isBlank(item.startLabel)) {
+                item.startLabel = formatTimeOnly(new Date(cursor))
+            }
+            if (isBlank(item.endLabel)) {
+                item.endLabel = formatTimeOnly(new Date(cursor + scenarioDuration))
+            }
+
+            item.durationLabel = formatDurationFull(scenarioDuration)
+            cursor += scenarioDuration
+        }
     }
 
-    private String formatDateLabel(String raw) {
+    private long sumStepDurations(List<Map> steps) {
+        long value = 0L
+        steps.each { Map item ->
+            value += toLong(item.durationMs)
+        }
+        return value
+    }
+
+    private long toMillisFromElapsed(String rawValue) {
+        String raw = safeValue(rawValue)
         if (isBlank(raw)) {
-            return ''
+            return 0L
         }
 
-        try {
-            Date value = new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS', Locale.ENGLISH).parse(raw)
-            return new SimpleDateFormat('MM.dd.yyyy hh:mm:ss a', Locale.ENGLISH).format(value)
-        } catch (Exception ignored) {
-            return raw
+        def matcher = (raw =~ /^(\d{2}):(\d{2}):(\d{2})\.(\d{3})$/)
+        if (matcher.find()) {
+            long hours = matcher.group(1) as long
+            long minutes = matcher.group(2) as long
+            long seconds = matcher.group(3) as long
+            long millis = matcher.group(4) as long
+            return (((hours * 60L + minutes) * 60L) + seconds) * 1000L + millis
         }
+
+        return toMillisFromCompactSeconds(raw)
     }
 
-    private String formatClockFromDate(String raw) {
-        if (isBlank(raw)) {
-            return ''
-        }
-
-        try {
-            Date value = new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS', Locale.ENGLISH).parse(raw)
-            return new SimpleDateFormat('hh:mm:ss a', Locale.ENGLISH).format(value)
-        } catch (Exception ignored) {
-            return raw
-        }
-    }
-
-    private String formatClockLabel(String raw) {
-        if (isBlank(raw)) {
-            return ''
-        }
-
-        try {
-            Date value = new SimpleDateFormat('HH:mm:ss.SSS', Locale.ENGLISH).parse(raw)
-            return new SimpleDateFormat('hh:mm:ss a', Locale.ENGLISH).format(value)
-        } catch (Exception ignored) {
-            return raw
-        }
-    }
-
-    private long toMillisFromSeconds(def secondsValue) {
-        String raw = safeValue(secondsValue).replace(',', '.')
+    private long toMillisFromCompactSeconds(String rawValue) {
+        String raw = safeValue(rawValue).replace(',', '.').replace('s', '').trim()
         if (isBlank(raw)) {
             return 0L
         }
@@ -634,116 +897,60 @@ class JiraGaiaReportBuilder {
         }
     }
 
-    private long toMillisFromElapsed(def elapsedValue) {
-        String raw = safeValue(elapsedValue)
-        if (isBlank(raw)) {
-            return 0L
-        }
-
-        def matcher = (raw =~ /^(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})$/)
-        if (!matcher.find()) {
-            return 0L
-        }
-
-        long hours = matcher.group(1) as long
-        long minutes = matcher.group(2) as long
-        long seconds = matcher.group(3) as long
-        long millis = matcher.group(4) as long
-
-        return (((hours * 60L + minutes) * 60L) + seconds) * 1000L + millis
+    private long toMillisFromSeconds(String rawValue) {
+        return toMillisFromCompactSeconds(rawValue)
     }
 
-    private String formatDurationHHMM(long durationMs) {
-        long totalMinutes = durationMs > 0L ? (long) Math.floor(durationMs / 60000L) : 0L
-        long hours = (long) Math.floor(totalMinutes / 60L)
-        long minutes = totalMinutes % 60L
+    private String formatDurationFull(long durationMs) {
+        long totalSeconds = durationMs > 0L ? Math.round(durationMs / 1000d) : 0L
+        long hours = (long) Math.floor(totalSeconds / 3600L)
+        long minutes = (long) Math.floor((totalSeconds % 3600L) / 60L)
+        long seconds = totalSeconds % 60L
 
-        return String.format(Locale.ENGLISH, '%02dh %02dm', hours, minutes)
+        return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
     }
 
     private String formatDisplayDate(Date value) {
         return new SimpleDateFormat('MM.dd.yyyy hh:mm:ss a', Locale.ENGLISH).format(value)
     }
 
-    private boolean looksLikeErrorStack(String line) {
-        String lower = safeValue(line).toLowerCase(Locale.ENGLISH)
-
-        boolean match = false
-        match = match || lower.startsWith('at ')
-        match = match || lower.startsWith('caused by:')
-        match = match || lower.contains('root cause')
-        match = match || lower.contains('exception')
-        match = match || lower.contains('webdriver')
-        match = match || lower.contains('session info')
-        match = match || lower.contains('build info')
-        match = match || lower.contains('driver info')
-        match = match || lower.contains('capabilities')
-        match = match || lower.contains('stacktrace')
-
-        return match
+    private String formatTimeOnly(Date value) {
+        return new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH).format(value)
     }
 
-    private String buildStepPreview(Map step) {
-        return safeValue(step.title)
+    private String formatTimeFromAny(String raw) {
+        String text = safeValue(raw)
+
+        List<String> formats = [
+            'yyyy-MM-dd HH:mm:ss.SSS',
+            'yyyy-MM-dd HH:mm:ss',
+            'dd-MM-yyyy HH:mm:ss',
+            'MM.dd.yyyy hh:mm:ss a'
+        ]
+
+        for (String pattern : formats) {
+            try {
+                Date value = new SimpleDateFormat(pattern, Locale.ENGLISH).parse(text)
+                return formatTimeOnly(value)
+            } catch (Exception ignored) {
+            }
+        }
+
+        return text
     }
 
-    private String resolveScenarioStatus(Map scenario) {
-        boolean hasFail = scenario.steps.any { Map step ->
-            safeValue(step.status) == 'failed'
+    private String formatTimeFromClock(String raw) {
+        try {
+            Date value = new SimpleDateFormat('HH:mm:ss.SSS', Locale.ENGLISH).parse(safeValue(raw))
+            return formatTimeOnly(value)
+        } catch (Exception ignored) {
+            return safeValue(raw)
         }
-        if (hasFail) {
-            return 'failed'
-        }
-
-        boolean hasPass = scenario.steps.any { Map step ->
-            safeValue(step.status) == 'passed'
-        }
-        if (hasPass) {
-            return 'passed'
-        }
-
-        boolean hasInfo = scenario.steps.any { Map step ->
-            safeValue(step.status) == 'info'
-        }
-        if (hasInfo) {
-            return 'info'
-        }
-
-        return 'skipped'
     }
 
-    private String resolveScenarioErrorShort(Map scenario) {
-        Map failedStep = scenario.steps.find { Map step ->
-            safeValue(step.status) == 'failed'
-        }
-
-        if (failedStep != null) {
-            return extractShortError(failedStep.shortError ?: failedStep.errorFull ?: failedStep.detailText)
-        }
-
-        return ''
-    }
-
-    private String resolveScenarioErrorFull(Map scenario) {
-        Map failedStep = scenario.steps.find { Map step ->
-            safeValue(step.status) == 'failed'
-        }
-
-        if (failedStep != null) {
-            return safeValue(failedStep.errorFull ?: failedStep.detailText)
-        }
-
-        return ''
-    }
-
-    private String resolveScenarioSidebarSubtitle(Map scenario) {
-        if (!isBlank(scenario.errorShort)) {
-            return scenario.errorShort
-        }
-
-        Map firstStep = scenario.steps ? scenario.steps.first() : null
-        return firstStep != null ? safeValue(firstStep.title) : ''
-    }
+    // =========================================================================
+    // ERROR / EVIDENCE
+    // =========================================================================
 
     private String extractShortError(def source) {
         String text = safeValue(source)
@@ -758,37 +965,184 @@ class JiraGaiaReportBuilder {
 
         String preferred = lines.find { String line ->
             String lower = line.toLowerCase(Locale.ENGLISH)
-            boolean good = false
-            good = good || lower.contains('unable to ')
-            good = good || lower.contains('element click intercepted')
-            good = good || lower.contains('object repository')
-            good = good || lower.contains('no such element')
-            good = good || lower.contains('timeout')
-            good = good || lower.contains('assert')
-            return good
+            boolean match = false
+            match = match || lower.contains('unable to ')
+            match = match || lower.contains('element click intercepted')
+            match = match || lower.contains('object repository')
+            match = match || lower.contains('no such element')
+            match = match || lower.contains('timeout')
+            return match
         }
 
-        String base = safeValue(preferred ?: lines.first())
-        base = base.replace('com.kms.katalon.core.exception.StepFailedException:', '').trim()
-        base = base.replace('org.codehaus.groovy.runtime.InvokerInvocationException:', '').trim()
-        base = base.replaceAll(/\\s+/, ' ').trim()
+        String value = safeValue(preferred ?: lines.first())
+        value = value.replace('com.kms.katalon.core.exception.StepFailedException:', '').trim()
+        value = value.replace('org.codehaus.groovy.runtime.InvokerInvocationException:', '').trim()
 
-        int rootCauseIndex = base.indexOf('(Root cause:')
+        int rootCauseIndex = value.indexOf('(Root cause:')
         if (rootCauseIndex > 0) {
-            base = base.substring(0, rootCauseIndex).trim()
+            value = value.substring(0, rootCauseIndex).trim()
         }
 
-        int atIndex = base.indexOf(' at com.kms')
-        if (atIndex > 0) {
-            base = base.substring(0, atIndex).trim()
+        int stackIndex = value.indexOf(' at com.kms')
+        if (stackIndex > 0) {
+            value = value.substring(0, stackIndex).trim()
         }
 
-        if (base.length() > 150) {
-            return base.substring(0, 147) + '...'
+        value = value.replaceAll(/\s+/, ' ').trim()
+
+        if (value.length() > 130) {
+            return value.substring(0, 127) + '...'
         }
 
-        return base
+        return value
     }
+
+    private boolean looksLikeErrorLine(String line) {
+        String lower = safeValue(line).toLowerCase(Locale.ENGLISH)
+
+        boolean match = false
+        match = match || lower.startsWith('at ')
+        match = match || lower.startsWith('caused by:')
+        match = match || lower.contains('exception')
+        match = match || lower.contains('root cause')
+        match = match || lower.contains('webdriver')
+        match = match || lower.contains('session info')
+        match = match || lower.contains('build info')
+        match = match || lower.contains('driver info')
+        match = match || lower.contains('capabilities')
+        match = match || lower.contains('unable to ')
+        match = match || lower.contains('stacktrace')
+
+        return match
+    }
+
+    private void attachEvidenceToFailedScenarios(File reportDir, List<Map> scenarios) {
+        List<File> images = collectEvidenceImages(reportDir)
+        if (images.isEmpty()) {
+            return
+        }
+
+        List<Map> failedScenarios = scenarios.findAll { Map item -> safeValue(item.status) == 'failed' }
+        if (failedScenarios.isEmpty()) {
+            return
+        }
+
+        int scenarioIndex = 0
+        images.each { File image ->
+            Map scenario = failedScenarios[scenarioIndex]
+
+            scenario.evidences << [
+                name      : image.name,
+                filePath  : image.absolutePath,
+                openUrl   : image.toURI().toString(),
+                previewUrl: image.toURI().toString()
+            ]
+
+            if (scenarioIndex < failedScenarios.size() - 1) {
+                scenarioIndex++
+            }
+        }
+    }
+
+    private List<File> collectEvidenceImages(File reportDir) {
+        List<File> images = []
+
+        reportDir.eachFileRecurse { File file ->
+            if (!file.isFile()) {
+                return
+            }
+
+            String lower = file.name.toLowerCase(Locale.ENGLISH)
+            boolean isImage = false
+            isImage = isImage || lower.endsWith('.png')
+            isImage = isImage || lower.endsWith('.jpg')
+            isImage = isImage || lower.endsWith('.jpeg')
+            isImage = isImage || lower.endsWith('.webp')
+
+            if (isImage) {
+                images << file
+            }
+        }
+
+        images.sort { File left, File right ->
+            left.lastModified() <=> right.lastModified()
+        }
+
+        return images
+    }
+
+    // =========================================================================
+    // FILE / TEXT HELPERS
+    // =========================================================================
+
+    private File findExecutionLog(File reportDir) {
+        List<File> candidates = []
+
+        reportDir.eachFileRecurse { File file ->
+            if (!file.isFile()) {
+                return
+            }
+
+            String lower = file.name.toLowerCase(Locale.ENGLISH)
+            if (lower.startsWith('execution') && lower.endsWith('.log')) {
+                candidates << file
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        candidates.sort { File left, File right ->
+            right.lastModified() <=> left.lastModified()
+        }
+
+        return candidates.first()
+    }
+
+    private List<String> readFileLines(File file) {
+        try {
+            return file.readLines(StandardCharsets.UTF_8.name())
+        } catch (Exception ignored) {
+            try {
+                return file.readLines()
+            } catch (Exception ignoredAgain) {
+                return []
+            }
+        }
+    }
+
+    private String normalizeText(List lines) {
+        if (lines == null || lines.isEmpty()) {
+            return ''
+        }
+
+        return lines.collect { safeValue(it) }.join('\n').trim()
+    }
+
+    private String resolveAssetUrl(File startDir, String relativePath) {
+        File assetFile = resolveProjectFile(startDir, relativePath)
+        if (assetFile == null || !assetFile.exists()) {
+            return ''
+        }
+        return assetFile.toURI().toString()
+    }
+
+    private File resolveProjectFile(File startDir, String relativePath) {
+        File current = startDir
+        while (current != null) {
+            File candidate = new File(current, relativePath)
+            if (candidate.exists()) {
+                return candidate
+            }
+            current = current.parentFile
+        }
+        return null
+    }
+
+    // =========================================================================
+    // GENERIC HELPERS
+    // =========================================================================
 
     private String resolveStepEmoji(String title) {
         String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
@@ -814,7 +1168,7 @@ class JiraGaiaReportBuilder {
         if (lower.contains('delete') || lower.contains('remove')) {
             return '🗑️'
         }
-        if (lower.contains('match') || lower.contains('validate') || lower.contains('assert')) {
+        if (lower.contains('validate') || lower.contains('assert') || lower.contains('match')) {
             return '✅'
         }
         if (lower.contains('portal') || lower.contains('page') || lower.contains('home')) {
@@ -823,12 +1177,1379 @@ class JiraGaiaReportBuilder {
         return '📝'
     }
 
-    private String normalizeLines(List lines) {
-        if (lines == null || lines.isEmpty()) {
-            return ''
+    private long toLong(def value) {
+        try {
+            return (value ?: 0L) as long
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    private String safeValue(def value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+
+    private boolean isBlank(def value) {
+        return safeValue(value).isEmpty()
+    }
+}
+
+
+
+
+
+
+
+
+
+Keywords/jiraIntegration/JiraGaiaHtmlTemplateBuilder.groovy
+package jiraIntegration
+
+import java.util.Locale
+
+class JiraGaiaHtmlTemplateBuilder {
+
+    private static final String APP_NAME = 'GAIA'
+    private static final String BANNER_GRADIENT = 'linear-gradient(90deg, #0d2d57 0%, #155c78 58%, #57c86d 100%)'
+
+    private static final String STATUS_PASS = '#61b55a'
+    private static final String STATUS_FAIL = '#d9534f'
+    private static final String STATUS_SKIP = '#d6b34a'
+    private static final String STATUS_INFO = '#4aa7cf'
+    private static final String STATUS_NEUTRAL = '#7d8ea3'
+
+    String build(Map model) {
+        List<Map> scenarios = (model.scenarios ?: []) as List<Map>
+        Map summary = (model.summary ?: [:]) as Map
+
+        String activeId = scenarios ? safeValue(scenarios.first().id) : ''
+
+        StringBuilder html = new StringBuilder()
+
+        html.append('<!DOCTYPE html>')
+        html.append('<html lang="en">')
+        html.append('<head>')
+        html.append('<meta charset="UTF-8">')
+        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">')
+        html.append('<title>')
+        html.append(htmlEscape(model.reportTitle))
+        html.append('</title>')
+        html.append('<style>')
+        html.append(buildCss())
+        html.append('</style>')
+        html.append('</head>')
+        html.append('<body>')
+
+        html.append('<div class="app-shell">')
+        html.append(buildHeader(model))
+        html.append('<div class="content-shell">')
+
+        html.append(buildSidebar(model, scenarios, summary, activeId))
+        html.append(buildMainContent(model, scenarios, summary, activeId))
+
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<script>')
+        html.append(buildJavascript(activeId))
+        html.append('</script>')
+
+        html.append('</body>')
+        html.append('</html>')
+
+        return html.toString()
+    }
+
+    // =========================================================================
+    // HEADER
+    // =========================================================================
+
+    private String buildHeader(Map model) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<header class="top-banner">')
+        html.append('<div class="brand-area">')
+
+        String logoSrc = safeValue(model.logoSrc)
+        if (!isBlank(logoSrc)) {
+            html.append('<div class="brand-logo-wrap">')
+            html.append('<img class="brand-logo-img" src="')
+            html.append(htmlEscape(logoSrc))
+            html.append('" alt="GAIA logo" onerror="this.style.display=\'none\'; this.parentNode.innerHTML=\'<span class=&quot;brand-logo-fallback&quot;>G</span>\';">')
+            html.append('</div>')
+        } else {
+            html.append('<div class="brand-logo-wrap">')
+            html.append('<span class="brand-logo-fallback">G</span>')
+            html.append('</div>')
         }
 
-        return lines.collect { safeValue(it) }.join('\n').trim()
+        html.append('<div class="brand-texts">')
+        html.append('<div class="report-title-top">')
+        html.append(htmlEscape(model.reportTitle))
+        html.append('</div>')
+        html.append('<div class="report-subtitle-top">')
+        html.append(htmlEscape(model.subtitle))
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('</div>')
+
+        html.append('<div class="header-meta">')
+        html.append('<div><strong>Generated:</strong> ')
+        html.append(htmlEscape(model.generatedAt))
+        html.append('</div>')
+        html.append('<div><strong>Project:</strong> ')
+        html.append(APP_NAME)
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('</header>')
+        return html.toString()
+    }
+
+    // =========================================================================
+    // SIDEBAR
+    // =========================================================================
+
+    private String buildSidebar(Map model, List<Map> scenarios, Map summary, String activeId) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<aside class="sidebar">')
+
+        html.append('<div class="sidebar-tabs">')
+        html.append('<button class="tab-button active" type="button" data-tab="tests">Tests</button>')
+        html.append('<button class="tab-button" type="button" data-tab="charts">Charts</button>')
+        html.append('</div>')
+
+        html.append('<div class="sidebar-view sidebar-tests-view active" data-view="tests">')
+        html.append('<div class="sidebar-search-wrap">')
+        html.append('<input id="scenarioSearch" class="sidebar-search" type="text" placeholder="Search test name, path, or status.">')
+        html.append('</div>')
+        html.append('<div class="scenario-list">')
+
+        scenarios.each { Map scenario ->
+            html.append(buildSidebarScenarioItem(scenario, activeId))
+        }
+
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div class="sidebar-view sidebar-charts-view" data-view="charts">')
+        html.append('<div class="sidebar-summary-title">Execution status</div>')
+        html.append('<div class="sidebar-summary-list">')
+        html.append(buildSidebarSummaryRow('Passed', toInt(summary.passed), STATUS_PASS))
+        html.append(buildSidebarSummaryRow('Failed', toInt(summary.failed), STATUS_FAIL))
+        html.append(buildSidebarSummaryRow('Skipped', toInt(summary.skipped), STATUS_SKIP))
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('</aside>')
+        return html.toString()
+    }
+
+    private String buildSidebarScenarioItem(Map scenario, String activeId) {
+        StringBuilder html = new StringBuilder()
+
+        String status = normalizeStatus(scenario.status)
+        String itemClass = 'scenario-item'
+        if (safeValue(scenario.id) == activeId) {
+            itemClass += ' active'
+        }
+
+        html.append('<button class="')
+        html.append(itemClass)
+        html.append('" type="button" data-scenario-id="')
+        html.append(htmlEscape(safeValue(scenario.id)))
+        html.append('" data-search="')
+        html.append(htmlEscape(buildScenarioSearchText(scenario)))
+        html.append('">')
+
+        html.append('<div class="scenario-item-top">')
+        html.append('<div class="scenario-item-title" title="')
+        html.append(htmlEscape(safeValue(scenario.title)))
+        html.append('">')
+        html.append(htmlEscape(oneLineText(scenario.title, 52)))
+        html.append('</div>')
+
+        html.append('<span class="status-pill small ')
+        html.append(status)
+        html.append('">')
+        html.append(htmlEscape(capitalize(status)))
+        html.append('</span>')
+        html.append('</div>')
+
+        html.append('<div class="scenario-item-subtitle" title="')
+        html.append(htmlEscape(safeValue(scenario.sidebarSubtitle)))
+        html.append('">')
+        html.append(htmlEscape(oneLineText(scenario.sidebarSubtitle, 62)))
+        html.append('</div>')
+
+        html.append('<div class="scenario-item-meta">')
+        html.append('<span>')
+        html.append(htmlEscape(safeValue(scenario.startLabel)))
+        html.append('</span>')
+        html.append('<span>')
+        html.append(htmlEscape(safeValue(scenario.durationLabel)))
+        html.append('</span>')
+        html.append('</div>')
+
+        html.append('</button>')
+
+        return html.toString()
+    }
+
+    private String buildScenarioSearchText(Map scenario) {
+        return [
+            safeValue(scenario.title),
+            safeValue(scenario.sidebarSubtitle),
+            safeValue(scenario.status),
+            safeValue(scenario.durationLabel)
+        ].join(' ')
+    }
+
+    private String buildSidebarSummaryRow(String label, int value, String color) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div class="summary-row">')
+        html.append('<div class="summary-row-left">')
+        html.append('<span class="summary-dot" style="background:')
+        html.append(color)
+        html.append(';"></span>')
+        html.append('<span>')
+        html.append(htmlEscape(label))
+        html.append('</span>')
+        html.append('</div>')
+        html.append('<div class="summary-row-right">')
+        html.append(String.valueOf(value))
+        html.append('</div>')
+        html.append('</div>')
+
+        return html.toString()
+    }
+
+    // =========================================================================
+    // MAIN CONTENT
+    // =========================================================================
+
+    private String buildMainContent(Map model, List<Map> scenarios, Map summary, String activeId) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<main class="main-content">')
+
+        html.append('<section id="testsView" class="main-view active" data-view="tests">')
+        scenarios.each { Map scenario ->
+            html.append(buildScenarioPanel(model, scenario, activeId))
+        }
+        html.append('</section>')
+
+        html.append('<section id="chartsView" class="main-view" data-view="charts">')
+        html.append(buildChartsPanel(model, summary))
+        html.append('</section>')
+
+        html.append('</main>')
+        return html.toString()
+    }
+
+    private String buildScenarioPanel(Map model, Map scenario, String activeId) {
+        StringBuilder html = new StringBuilder()
+
+        String panelClass = 'scenario-panel'
+        if (safeValue(scenario.id) == activeId) {
+            panelClass += ' active'
+        }
+
+        html.append('<section class="')
+        html.append(panelClass)
+        html.append('" data-panel-id="')
+        html.append(htmlEscape(safeValue(scenario.id)))
+        html.append('">')
+
+        html.append('<div class="scenario-heading">')
+        html.append('<div class="scenario-name" title="')
+        html.append(htmlEscape(safeValue(scenario.title)))
+        html.append('">')
+        html.append(htmlEscape(safeValue(scenario.title)))
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div class="scenario-meta-chips">')
+        html.append(buildMetaChip('Suite', model.suiteName, 'neutral'))
+        html.append(buildMetaChip('Status', capitalize(normalizeStatus(scenario.status)), normalizeStatus(scenario.status)))
+        html.append(buildMetaChip('Start', scenario.startLabel, 'neutral'))
+        html.append(buildMetaChip('End', scenario.endLabel, 'neutral'))
+        html.append(buildMetaChip('Duration', scenario.durationLabel, 'neutral'))
+        html.append('</div>')
+
+        html.append('<div class="section-title">Steps</div>')
+        html.append('<div class="steps-table-wrap">')
+        html.append('<table class="steps-table">')
+        html.append('<thead><tr><th class="status-col">STATUS</th><th class="time-col">TIMESTAMP</th><th>DETAILS</th></tr></thead>')
+        html.append('<tbody>')
+
+        List<Map> steps = (scenario.steps ?: []) as List<Map>
+        steps.each { Map step ->
+            html.append(buildStepRow(step))
+        }
+
+        html.append('</tbody>')
+        html.append('</table>')
+        html.append('</div>')
+
+        if (normalizeStatus(scenario.status) == 'failed' && !isBlank(scenario.errorShort)) {
+            html.append(buildVisualErrorSection(scenario))
+        }
+
+        if (normalizeStatus(scenario.status) == 'failed' && scenario.evidences && !scenario.evidences.isEmpty()) {
+            html.append(buildEvidenceSection(scenario))
+        }
+
+        html.append('</section>')
+        return html.toString()
+    }
+
+    private String buildMetaChip(String label, def value, String tone) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div class="meta-chip ')
+        html.append(htmlEscape(tone))
+        html.append('">')
+        html.append('<span class="meta-chip-label">')
+        html.append(htmlEscape(label))
+        html.append('</span>')
+        html.append('<span class="meta-chip-value">')
+        html.append(htmlEscape(safeValue(value)))
+        html.append('</span>')
+        html.append('</div>')
+
+        return html.toString()
+    }
+
+    private String buildStepRow(Map step) {
+        StringBuilder html = new StringBuilder()
+        String status = normalizeStatus(step.status)
+
+        html.append('<tr>')
+        html.append('<td class="status-col">')
+        html.append('<span class="status-pill ')
+        html.append(status)
+        html.append('">')
+        html.append(htmlEscape(capitalize(status)))
+        html.append('</span>')
+        html.append('</td>')
+
+        html.append('<td class="time-col">')
+        html.append(htmlEscape(isBlank(step.timeLabel) ? '—' : safeValue(step.timeLabel)))
+        html.append('</td>')
+
+        html.append('<td class="detail-col">')
+        html.append('<div class="step-main-line">')
+        html.append('<span class="step-emoji">')
+        html.append(htmlEscape(safeValue(step.emoji)))
+        html.append('</span>')
+        html.append('<span class="step-title">')
+        html.append(htmlEscape(safeValue(step.title)))
+        html.append('</span>')
+        html.append('</div>')
+
+        if (status == 'failed' && !isBlank(step.shortError)) {
+            html.append('<div class="step-inline-error">')
+            html.append(htmlEscape(safeValue(step.shortError)))
+            html.append('</div>')
+        }
+
+        String detailText = safeValue(step.detailText)
+        String errorText = safeValue(step.errorFull)
+        String expandedText = !isBlank(errorText) ? errorText : detailText
+
+        if (!isBlank(expandedText)) {
+            html.append('<details class="detail-toggle">')
+            html.append('<summary>🔎 View full detail</summary>')
+            html.append('<pre>')
+            html.append(htmlEscape(expandedText))
+            html.append('</pre>')
+            html.append('</details>')
+        }
+
+        html.append('</td>')
+        html.append('</tr>')
+
+        return html.toString()
+    }
+
+    private String buildVisualErrorSection(Map scenario) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div class="error-card">')
+        html.append('<div class="error-title">Visual Error Log</div>')
+        html.append('<div class="error-short">')
+        html.append(htmlEscape(safeValue(scenario.errorShort)))
+        html.append('</div>')
+
+        if (!isBlank(scenario.errorFull)) {
+            html.append('<details class="detail-toggle error-toggle">')
+            html.append('<summary>🔎 View full error</summary>')
+            html.append('<pre class="error-pre">')
+            html.append(htmlEscape(safeValue(scenario.errorFull)))
+            html.append('</pre>')
+            html.append('</details>')
+        }
+
+        html.append('</div>')
+        return html.toString()
+    }
+
+    private String buildEvidenceSection(Map scenario) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div class="evidence-section">')
+        html.append('<div class="section-title">Evidence</div>')
+
+        List<Map> evidences = (scenario.evidences ?: []) as List<Map>
+        evidences.each { Map evidence ->
+            html.append('<details class="evidence-item">')
+            html.append('<summary>📎 ')
+            html.append(htmlEscape(safeValue(evidence.name)))
+            html.append('</summary>')
+
+            html.append('<div class="evidence-actions">')
+            html.append('<a class="evidence-link" target="_blank" href="')
+            html.append(htmlEscape(safeValue(evidence.openUrl)))
+            html.append('">🔎 Open evidence</a>')
+            html.append('</div>')
+
+            String previewUrl = safeValue(evidence.previewUrl)
+            if (!isBlank(previewUrl)) {
+                html.append('<div class="evidence-preview-wrap">')
+                html.append('<img class="evidence-preview" src="')
+                html.append(htmlEscape(previewUrl))
+                html.append('" alt="Evidence image" loading="lazy">')
+                html.append('</div>')
+            }
+
+            html.append('</details>')
+        }
+
+        html.append('</div>')
+        return html.toString()
+    }
+
+    // =========================================================================
+    // CHARTS
+    // =========================================================================
+
+    private String buildChartsPanel(Map model, Map summary) {
+        int total = toInt(summary.total)
+        int passed = toInt(summary.passed)
+        int failed = toInt(summary.failed)
+        int skipped = toInt(summary.skipped)
+
+        String donutStyle = buildDonutStyle(passed, failed, skipped, total)
+
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div class="charts-layout">')
+
+        html.append('<div class="chart-card chart-donut-card">')
+        html.append('<div class="section-title">Global Overview</div>')
+        html.append('<div class="donut-wrap">')
+        html.append('<div class="donut-chart" style="background:')
+        html.append(donutStyle)
+        html.append(';">')
+        html.append('<div class="donut-center">')
+        html.append('<div class="donut-total">')
+        html.append(String.valueOf(total))
+        html.append('</div>')
+        html.append('<div class="donut-label">Tests</div>')
+        html.append('</div>')
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div class="chart-legend">')
+        html.append(buildLegendItem('Passed', passed, STATUS_PASS))
+        html.append(buildLegendItem('Failed', failed, STATUS_FAIL))
+        html.append(buildLegendItem('Skipped', skipped, STATUS_SKIP))
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div class="chart-card chart-bars-card">')
+        html.append('<div class="section-title">Execution status</div>')
+        html.append(buildChartBar('Passed', passed, total, STATUS_PASS))
+        html.append(buildChartBar('Failed', failed, total, STATUS_FAIL))
+        html.append(buildChartBar('Skipped', skipped, total, STATUS_SKIP))
+        html.append('</div>')
+
+        html.append('</div>')
+        return html.toString()
+    }
+
+    private String buildDonutStyle(int passed, int failed, int skipped, int total) {
+        double passDeg = total > 0 ? (passed * 360d / total) : 0d
+        double failDeg = total > 0 ? (failed * 360d / total) : 0d
+        double skipDeg = total > 0 ? (skipped * 360d / total) : 0d
+
+        double endPass = passDeg
+        double endFail = passDeg + failDeg
+        double endSkip = passDeg + failDeg + skipDeg
+
+        return "conic-gradient(${STATUS_PASS} 0deg ${endPass}deg, ${STATUS_FAIL} ${endPass}deg ${endFail}deg, ${STATUS_SKIP} ${endFail}deg ${endSkip}deg, #edf2f7 ${endSkip}deg 360deg)"
+    }
+
+    private String buildLegendItem(String label, int value, String color) {
+        StringBuilder html = new StringBuilder()
+
+        html.append('<div class="legend-item">')
+        html.append('<span class="legend-dot" style="background:')
+        html.append(color)
+        html.append(';"></span>')
+        html.append('<span class="legend-label">')
+        html.append(htmlEscape(label))
+        html.append('</span>')
+        html.append('<span class="legend-value">')
+        html.append(String.valueOf(value))
+        html.append('</span>')
+        html.append('</div>')
+
+        return html.toString()
+    }
+
+    private String buildChartBar(String label, int value, int total, String color) {
+        int percent = total > 0 ? Math.round((value * 100f) / total) : 0
+
+        StringBuilder html = new StringBuilder()
+        html.append('<div class="chart-bar-block">')
+        html.append('<div class="chart-bar-header">')
+        html.append('<span>')
+        html.append(htmlEscape(label))
+        html.append('</span>')
+        html.append('<span>')
+        html.append(String.valueOf(value))
+        html.append('</span>')
+        html.append('</div>')
+        html.append('<div class="chart-bar-track">')
+        html.append('<div class="chart-bar-fill" style="width:')
+        html.append(String.valueOf(percent))
+        html.append('%; background:')
+        html.append(color)
+        html.append(';"></div>')
+        html.append('</div>')
+        html.append('<div class="chart-bar-percent">')
+        html.append(String.valueOf(percent))
+        html.append('% of execution</div>')
+        html.append('</div>')
+
+        return html.toString()
+    }
+
+    // =========================================================================
+    // CSS / JS
+    // =========================================================================
+
+    private String buildCss() {
+        return '''
+            :root {
+                --gaia-blue-dark: #0d2d57;
+                --gaia-blue: #155c78;
+                --gaia-green: #57c86d;
+                --text-main: #26323d;
+                --text-soft: #6d7986;
+                --line: #e7edf3;
+                --panel: #ffffff;
+                --bg: #f7fafc;
+                --shadow: 0 8px 24px rgba(17, 24, 39, 0.06);
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            html, body {
+                margin: 0;
+                padding: 0;
+                font-family: Arial, Helvetica, sans-serif;
+                background: var(--bg);
+                color: var(--text-main);
+            }
+
+            body {
+                min-height: 100vh;
+            }
+
+            .app-shell {
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+            }
+
+            .top-banner {
+                background: ''' + BANNER_GRADIENT + ''';
+                color: #ffffff;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 18px 26px;
+                min-height: 92px;
+                box-shadow: var(--shadow);
+            }
+
+            .brand-area {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+            }
+
+            .brand-logo-wrap {
+                width: 44px;
+                height: 44px;
+                border-radius: 12px;
+                background: rgba(255, 255, 255, 0.12);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: hidden;
+                flex-shrink: 0;
+            }
+
+            .brand-logo-img {
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+            }
+
+            .brand-logo-fallback {
+                font-weight: 700;
+                font-size: 20px;
+                color: #ffffff;
+            }
+
+            .report-title-top {
+                font-size: 15px;
+                font-weight: 700;
+                line-height: 1.2;
+            }
+
+            .report-subtitle-top {
+                font-size: 12px;
+                opacity: 0.9;
+                margin-top: 4px;
+            }
+
+            .header-meta {
+                text-align: right;
+                font-size: 12px;
+                line-height: 1.8;
+                opacity: 0.95;
+            }
+
+            .content-shell {
+                display: flex;
+                min-height: calc(100vh - 92px);
+            }
+
+            .sidebar {
+                width: 430px;
+                min-width: 430px;
+                background: #ffffff;
+                border-right: 1px solid var(--line);
+                display: flex;
+                flex-direction: column;
+            }
+
+            .sidebar-tabs {
+                display: flex;
+                gap: 0;
+                border-bottom: 1px solid var(--line);
+                padding: 0 18px;
+                background: #fbfcfe;
+            }
+
+            .tab-button {
+                background: transparent;
+                border: none;
+                padding: 16px 14px 14px 14px;
+                color: var(--text-soft);
+                font-size: 13px;
+                cursor: pointer;
+                border-bottom: 2px solid transparent;
+            }
+
+            .tab-button.active {
+                color: var(--text-main);
+                border-bottom-color: var(--gaia-blue);
+                font-weight: 700;
+            }
+
+            .sidebar-view {
+                display: none;
+                padding: 18px;
+                overflow-y: auto;
+            }
+
+            .sidebar-view.active {
+                display: block;
+            }
+
+            .sidebar-search-wrap {
+                margin-bottom: 12px;
+            }
+
+            .sidebar-search {
+                width: 100%;
+                border: 1px solid #d7e1ea;
+                border-radius: 8px;
+                padding: 11px 12px;
+                font-size: 13px;
+                outline: none;
+                background: #ffffff;
+            }
+
+            .sidebar-search:focus {
+                border-color: var(--gaia-blue);
+                box-shadow: 0 0 0 3px rgba(21, 92, 120, 0.08);
+            }
+
+            .scenario-list {
+                display: flex;
+                flex-direction: column;
+            }
+
+            .scenario-item {
+                width: 100%;
+                text-align: left;
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid var(--line);
+                padding: 14px 6px;
+                cursor: pointer;
+            }
+
+            .scenario-item:hover {
+                background: #f8fbfd;
+            }
+
+            .scenario-item.active {
+                background: #f3f9fc;
+                box-shadow: inset 3px 0 0 var(--gaia-blue);
+            }
+
+            .scenario-item-top {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+            }
+
+            .scenario-item-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: var(--text-main);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                max-width: 280px;
+            }
+
+            .scenario-item-subtitle {
+                margin-top: 6px;
+                font-size: 12px;
+                color: var(--text-soft);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .scenario-item-meta {
+                margin-top: 8px;
+                display: flex;
+                justify-content: space-between;
+                font-size: 11px;
+                color: #8693a1;
+            }
+
+            .sidebar-summary-title {
+                font-size: 13px;
+                font-weight: 700;
+                margin-bottom: 14px;
+                text-transform: uppercase;
+                color: var(--text-soft);
+                letter-spacing: 0.04em;
+            }
+
+            .sidebar-summary-list {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            .summary-row {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 10px 0;
+                border-bottom: 1px solid var(--line);
+                font-size: 13px;
+            }
+
+            .summary-row-left {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+
+            .summary-dot {
+                width: 10px;
+                height: 10px;
+                border-radius: 999px;
+                display: inline-block;
+            }
+
+            .main-content {
+                flex: 1;
+                padding: 22px 28px;
+                overflow-y: auto;
+            }
+
+            .main-view {
+                display: none;
+            }
+
+            .main-view.active {
+                display: block;
+            }
+
+            .scenario-panel {
+                display: none;
+            }
+
+            .scenario-panel.active {
+                display: block;
+            }
+
+            .scenario-heading {
+                margin-bottom: 12px;
+            }
+
+            .scenario-name {
+                font-size: 18px;
+                font-weight: 700;
+                color: var(--text-main);
+                line-height: 1.4;
+            }
+
+            .scenario-meta-chips {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px;
+                margin-bottom: 22px;
+            }
+
+            .meta-chip {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                border-radius: 999px;
+                padding: 8px 14px;
+                font-size: 12px;
+                font-weight: 700;
+                border: 1px solid transparent;
+            }
+
+            .meta-chip.neutral {
+                background: #f4f8fb;
+                border-color: #dce7ef;
+                color: var(--text-main);
+            }
+
+            .meta-chip.passed {
+                background: rgba(97, 181, 90, 0.15);
+                color: #347a32;
+                border-color: rgba(97, 181, 90, 0.25);
+            }
+
+            .meta-chip.failed {
+                background: rgba(217, 83, 79, 0.12);
+                color: #ad3835;
+                border-color: rgba(217, 83, 79, 0.22);
+            }
+
+            .meta-chip.skipped {
+                background: rgba(214, 179, 74, 0.18);
+                color: #8b6f1a;
+                border-color: rgba(214, 179, 74, 0.28);
+            }
+
+            .meta-chip.info {
+                background: rgba(74, 167, 207, 0.14);
+                color: #2f7f9f;
+                border-color: rgba(74, 167, 207, 0.22);
+            }
+
+            .meta-chip-label {
+                opacity: 0.78;
+            }
+
+            .section-title {
+                font-size: 13px;
+                font-weight: 700;
+                margin: 18px 0 12px 0;
+                color: var(--text-main);
+            }
+
+            .steps-table-wrap {
+                background: #ffffff;
+                border: 1px solid var(--line);
+                border-radius: 12px;
+                overflow: hidden;
+                box-shadow: var(--shadow);
+            }
+
+            .steps-table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+
+            .steps-table thead th {
+                text-align: left;
+                font-size: 12px;
+                color: var(--text-soft);
+                padding: 14px 16px;
+                background: #fbfdff;
+                border-bottom: 1px solid var(--line);
+                letter-spacing: 0.03em;
+            }
+
+            .steps-table tbody td {
+                padding: 14px 16px;
+                border-bottom: 1px solid #eef3f7;
+                vertical-align: top;
+                font-size: 13px;
+            }
+
+            .steps-table tbody tr:last-child td {
+                border-bottom: none;
+            }
+
+            .status-col {
+                width: 98px;
+            }
+
+            .time-col {
+                width: 138px;
+                white-space: nowrap;
+                color: var(--text-soft);
+            }
+
+            .detail-col {
+                width: auto;
+            }
+
+            .step-main-line {
+                display: flex;
+                align-items: flex-start;
+                gap: 8px;
+                font-weight: 600;
+                color: var(--text-main);
+                line-height: 1.45;
+            }
+
+            .step-emoji {
+                min-width: 20px;
+            }
+
+            .step-inline-error {
+                margin-top: 6px;
+                color: #ad3835;
+                font-size: 12px;
+                line-height: 1.45;
+            }
+
+            .status-pill {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 72px;
+                padding: 6px 12px;
+                border-radius: 999px;
+                font-size: 11px;
+                font-weight: 700;
+                color: #ffffff;
+            }
+
+            .status-pill.small {
+                min-width: 64px;
+                padding: 5px 10px;
+            }
+
+            .status-pill.passed {
+                background: ''' + STATUS_PASS + ''';
+            }
+
+            .status-pill.failed {
+                background: ''' + STATUS_FAIL + ''';
+            }
+
+            .status-pill.skipped {
+                background: ''' + STATUS_SKIP + ''';
+                color: #ffffff;
+            }
+
+            .status-pill.info {
+                background: ''' + STATUS_INFO + ''';
+            }
+
+            .detail-toggle {
+                margin-top: 7px;
+            }
+
+            .detail-toggle summary {
+                cursor: pointer;
+                color: var(--gaia-blue);
+                font-size: 12px;
+                font-weight: 700;
+                list-style: none;
+            }
+
+            .detail-toggle summary::-webkit-details-marker {
+                display: none;
+            }
+
+            .detail-toggle pre {
+                margin: 10px 0 0 0;
+                background: #0f2137;
+                color: #eef4ff;
+                border-radius: 12px;
+                padding: 14px 16px;
+                font-size: 12px;
+                line-height: 1.55;
+                white-space: pre-wrap;
+                word-break: break-word;
+                overflow-x: auto;
+            }
+
+            .error-card {
+                margin-top: 20px;
+                background: #fffafa;
+                border: 1px solid #f0d3d2;
+                border-left: 4px solid ''' + STATUS_FAIL + ''';
+                border-radius: 12px;
+                padding: 16px 18px;
+            }
+
+            .error-title {
+                font-size: 13px;
+                font-weight: 700;
+                color: #912f2c;
+                margin-bottom: 8px;
+            }
+
+            .error-short {
+                font-size: 13px;
+                color: #7d3d39;
+                line-height: 1.5;
+            }
+
+            .error-toggle {
+                margin-top: 10px;
+            }
+
+            .evidence-section {
+                margin-top: 20px;
+            }
+
+            .evidence-item {
+                background: #ffffff;
+                border: 1px solid var(--line);
+                border-radius: 12px;
+                padding: 14px 16px;
+                margin-bottom: 12px;
+                box-shadow: var(--shadow);
+            }
+
+            .evidence-item summary {
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: 700;
+                color: var(--text-main);
+                list-style: none;
+            }
+
+            .evidence-item summary::-webkit-details-marker {
+                display: none;
+            }
+
+            .evidence-actions {
+                margin-top: 10px;
+            }
+
+            .evidence-link {
+                color: var(--gaia-blue);
+                text-decoration: none;
+                font-size: 12px;
+                font-weight: 700;
+            }
+
+            .evidence-link:hover {
+                text-decoration: underline;
+            }
+
+            .evidence-preview-wrap {
+                margin-top: 12px;
+            }
+
+            .evidence-preview {
+                max-width: 100%;
+                max-height: 420px;
+                border: 1px solid #dbe7f0;
+                border-radius: 10px;
+                display: block;
+                background: #ffffff;
+            }
+
+            .charts-layout {
+                display: grid;
+                grid-template-columns: 360px 1fr;
+                gap: 20px;
+            }
+
+            .chart-card {
+                background: #ffffff;
+                border: 1px solid var(--line);
+                border-radius: 14px;
+                padding: 22px;
+                box-shadow: var(--shadow);
+            }
+
+            .donut-wrap {
+                display: flex;
+                justify-content: center;
+                padding: 16px 0 20px 0;
+            }
+
+            .donut-chart {
+                width: 220px;
+                height: 220px;
+                border-radius: 999px;
+                position: relative;
+            }
+
+            .donut-center {
+                position: absolute;
+                inset: 28px;
+                background: #ffffff;
+                border-radius: 999px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                box-shadow: inset 0 0 0 1px #edf2f7;
+            }
+
+            .donut-total {
+                font-size: 34px;
+                font-weight: 700;
+                color: var(--text-main);
+            }
+
+            .donut-label {
+                font-size: 12px;
+                color: var(--text-soft);
+                margin-top: 4px;
+            }
+
+            .chart-legend {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+                margin-top: 10px;
+            }
+
+            .legend-item {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                font-size: 13px;
+                border-bottom: 1px solid var(--line);
+                padding-bottom: 10px;
+            }
+
+            .legend-dot {
+                width: 10px;
+                height: 10px;
+                border-radius: 999px;
+                display: inline-block;
+                margin-right: 8px;
+            }
+
+            .legend-label {
+                flex: 1;
+                color: var(--text-main);
+            }
+
+            .legend-value {
+                font-weight: 700;
+            }
+
+            .chart-bar-block {
+                margin-bottom: 18px;
+            }
+
+            .chart-bar-header {
+                display: flex;
+                justify-content: space-between;
+                font-size: 13px;
+                font-weight: 700;
+                margin-bottom: 8px;
+            }
+
+            .chart-bar-track {
+                height: 10px;
+                background: #edf2f7;
+                border-radius: 999px;
+                overflow: hidden;
+            }
+
+            .chart-bar-fill {
+                height: 100%;
+                border-radius: 999px;
+            }
+
+            .chart-bar-percent {
+                margin-top: 6px;
+                font-size: 12px;
+                color: var(--text-soft);
+            }
+
+            @media (max-width: 1280px) {
+                .sidebar {
+                    width: 360px;
+                    min-width: 360px;
+                }
+
+                .charts-layout {
+                    grid-template-columns: 1fr;
+                }
+            }
+
+            @media (max-width: 980px) {
+                .content-shell {
+                    flex-direction: column;
+                }
+
+                .sidebar {
+                    width: 100%;
+                    min-width: 100%;
+                    border-right: none;
+                    border-bottom: 1px solid var(--line);
+                }
+            }
+        '''
+    }
+
+    private String buildJavascript(String activeId) {
+        String firstId = safeValue(activeId)
+
+        return '''
+            (function () {
+                var tabs = document.querySelectorAll('.tab-button');
+                var sidebarViews = document.querySelectorAll('.sidebar-view');
+                var mainViews = document.querySelectorAll('.main-view');
+                var scenarioItems = document.querySelectorAll('.scenario-item');
+                var scenarioPanels = document.querySelectorAll('.scenario-panel');
+                var search = document.getElementById('scenarioSearch');
+
+                function activateScenario(id) {
+                    scenarioItems.forEach(function (item) {
+                        item.classList.toggle('active', item.getAttribute('data-scenario-id') === id);
+                    });
+
+                    scenarioPanels.forEach(function (panel) {
+                        panel.classList.toggle('active', panel.getAttribute('data-panel-id') === id);
+                    });
+                }
+
+                function activateTab(tabName) {
+                    tabs.forEach(function (button) {
+                        button.classList.toggle('active', button.getAttribute('data-tab') === tabName);
+                    });
+
+                    sidebarViews.forEach(function (view) {
+                        view.classList.toggle('active', view.getAttribute('data-view') === tabName);
+                    });
+
+                    mainViews.forEach(function (view) {
+                        view.classList.toggle('active', view.getAttribute('data-view') === tabName);
+                    });
+                }
+
+                scenarioItems.forEach(function (item) {
+                    item.addEventListener('click', function () {
+                        activateScenario(item.getAttribute('data-scenario-id'));
+                    });
+                });
+
+                tabs.forEach(function (button) {
+                    button.addEventListener('click', function () {
+                        activateTab(button.getAttribute('data-tab'));
+                    });
+                });
+
+                if (search) {
+                    search.addEventListener('input', function () {
+                        var value = (search.value || '').toLowerCase();
+
+                        scenarioItems.forEach(function (item) {
+                            var text = (item.getAttribute('data-search') || '').toLowerCase();
+                            var visible = value === '' || text.indexOf(value) >= 0;
+                            item.style.display = visible ? '' : 'none';
+                        });
+                    });
+                }
+
+                activateTab('tests');
+        ''' + (isBlank(firstId) ? '' : "activateScenario('${escapeForJs(firstId)}');") + '''
+            })();
+        '''
+    }
+
+    // =========================================================================
+    // HELPERS
+    // =========================================================================
+
+    private String normalizeStatus(def value) {
+        String status = safeValue(value).toLowerCase(Locale.ENGLISH)
+        if (status == 'passed') {
+            return 'passed'
+        }
+        if (status == 'failed') {
+            return 'failed'
+        }
+        if (status == 'skipped') {
+            return 'skipped'
+        }
+        return 'info'
+    }
+
+    private String capitalize(String value) {
+        String text = safeValue(value)
+        if (isBlank(text)) {
+            return ''
+        }
+        return text.substring(0, 1).toUpperCase(Locale.ENGLISH) + text.substring(1)
+    }
+
+    private int toInt(def value) {
+        try {
+            return Integer.parseInt(safeValue(value))
+        } catch (Exception ignored) {
+            return 0
+        }
+    }
+
+    private String oneLineText(def value, int size) {
+        String text = safeValue(value)
+        if (text.length() <= size) {
+            return text
+        }
+        return text.substring(0, Math.max(0, size - 3)) + '...'
     }
 
     private String safeValue(def value) {
@@ -839,23 +2560,19 @@ class JiraGaiaReportBuilder {
         return safeValue(value).isEmpty()
     }
 
-    private String resolveAssetUrl(File startDir, String relativePath) {
-        File assetFile = resolveProjectFile(startDir, relativePath)
-        if (assetFile == null || !assetFile.exists()) {
-            return ''
-        }
-        return assetFile.toURI().toString()
+    private String htmlEscape(def value) {
+        String text = safeValue(value)
+        return text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&#39;')
     }
 
-    private File resolveProjectFile(File startDir, String relativePath) {
-        File current = startDir
-        while (current != null) {
-            File candidate = new File(current, relativePath)
-            if (candidate.exists()) {
-                return candidate
-            }
-            current = current.parentFile
-        }
-        return null
+    private String escapeForJs(String value) {
+        return safeValue(value)
+            .replace('\\', '\\\\')
+            .replace("'", "\\'")
     }
 }
