@@ -1,17 +1,525 @@
-package keywords
+package jiraIntegration
 
-import com.kms.katalon.core.annotation.Keyword
-import jiraIntegration.JiraFlowCoordinator
+import java.io.File
+import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-class JiraIntegration {
+import org.apache.poi.xssf.usermodel.XSSFRow
+import org.apache.poi.xssf.usermodel.XSSFSheet
+import org.apache.poi.xssf.usermodel.XSSFWorkbook
 
-    @Keyword
-    def jiraImport() {
-        return new JiraFlowCoordinator().jiraImport('')
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraFlowCoordinator {
+
+    // ============================================================
+    // REQUIRED CONFIGURATION
+    // ============================================================
+
+    String JIRA_TOKEN    = 'PUT_YOUR_TOKEN_HERE'
+    String PROJECT_KEY   = 'L96B2C'
+    String EPIC_KEY      = 'L96B2C-8234'
+    String JIRA_BASE_URL = 'https://jira-mut.d.bbg'
+
+    // ============================================================
+    // OPTIONAL CONFIGURATION
+    // ============================================================
+
+    String ENVIRONMENT                 = 'REC'
+    String LABELS                      = 'automate'
+    String MANUAL_TEST_PLAN_KEY        = ''
+
+    boolean FORCE_CREATE_NEW_TEST_PLAN = false
+    boolean RESET_SAVED_TEST_PLAN_KEY  = false
+
+    String TEST_PLAN_SUFFIX            = ' Test Plan'
+    String PRIMARY_XML_FILE_NAME       = 'cucumber.xml'
+    String SECONDARY_XML_FILE_NAME     = 'JUnit_Report.xml'
+    String GAIA_REPORT_FILE_NAME       = 'gaiaReport.html'
+    String RESULT_ZIP_NAME             = 'Results.zip'
+    String EVIDENCE_FOLDER_NAME        = 'Evidences'
+    String EVIDENCE_ZIP_NAME           = 'Evidences.zip'
+
+    // ============================================================
+    // BASIC HELPERS
+    // ============================================================
+
+    String safe(def value) {
+        return value == null ? '' : value.toString().trim()
     }
 
-    @Keyword
+    boolean isBlank(def value) {
+        return safe(value).isEmpty()
+    }
+
+    boolean isTimestampFolderName(String name) {
+        String value = safe(name)
+        return value ==~ /\d{8}_\d{6}/ || value ==~ /\d{14}/
+    }
+
+    String sanitizeFileName(String value) {
+        return safe(value).replaceAll(/[\\\/:*?"<>|]/, '_').trim()
+    }
+
+    String nowExecution() {
+        return new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+    }
+
+    String formatHeaderDate(Date date) {
+        return new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy', Locale.ENGLISH).format(date)
+    }
+
+    String formatDurationMillis(long millis) {
+        long totalSeconds = (long) (millis / 1000)
+        long minutes = (long) (totalSeconds / 60)
+        long seconds = (long) (totalSeconds % 60)
+        long remainingMillis = (long) (millis % 1000)
+        return "${minutes}m ${seconds}s ${remainingMillis}ms"
+    }
+
+    String htmlEscape(def value) {
+        String text = safe(value)
+        return text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&#39;')
+    }
+
+    String relativeUri(File baseDir, File file) {
+        String basePath = baseDir.toURI().toString()
+        String filePath = file.toURI().toString()
+        return filePath.replace(basePath, '')
+    }
+
+    String normalizeTitle(String value) {
+        return safe(value)
+            .replace('\u00A0', ' ')
+            .replaceAll(/\s+/, ' ')
+            .trim()
+            .toLowerCase()
+    }
+
+    long toMillis(def secondsValue) {
+        try {
+            BigDecimal seconds = new BigDecimal(safe(secondsValue))
+            return (long) (seconds * 1000)
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    String readCellAsString(def cell) {
+        if (cell == null) {
+            return ''
+        }
+        try {
+            cell.setCellType(org.apache.poi.ss.usermodel.CellType.STRING)
+        } catch (Exception ignored) {
+        }
+        return safe(cell.toString())
+    }
+
+    // ============================================================
+    // REPORT PATH AND SUITE NAME
+    // ============================================================
+
+    String getReportPathFromLastRunFile() {
+        File file = new File(RunConfiguration.projectDir + File.separator + 'LastRun.xlsx')
+        if (!file.exists()) {
+            return ''
+        }
+
+        FileInputStream fis = null
+        XSSFWorkbook wb = null
+
+        try {
+            fis = new FileInputStream(file)
+            wb = new XSSFWorkbook(fis)
+            XSSFSheet sheet = wb.getSheetAt(0)
+            XSSFRow row = sheet.getRow(0)
+            if (row == null) {
+                return ''
+            }
+            return readCellAsString(row.getCell(0))
+        } catch (Exception e) {
+            KeywordUtil.logInfo("LastRun.xlsx read skipped: ${e.message}")
+            return ''
+        } finally {
+            try { wb?.close() } catch (Exception ignored) {}
+            try { fis?.close() } catch (Exception ignored) {}
+        }
+    }
+
+    String getLatestLeafReportFolderFromReportsRoot() {
+        File reportsRoot = new File(RunConfiguration.projectDir + File.separator + 'Reports')
+        if (!reportsRoot.exists() || !reportsRoot.isDirectory()) {
+            return ''
+        }
+
+        List<File> candidates = new ArrayList<File>()
+        collectLeafReportFolders(reportsRoot, candidates)
+
+        if (candidates.isEmpty()) {
+            return ''
+        }
+
+        candidates = candidates.unique()
+        candidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
+        return candidates[0].absolutePath
+    }
+
+    void collectLeafReportFolders(File currentDir, List<File> candidates) {
+        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+            return
+        }
+
+        if (containsXmlReport(currentDir)) {
+            candidates.add(currentDir)
+            return
+        }
+
+        File[] children = currentDir.listFiles()
+        if (children == null || children.length == 0) {
+            return
+        }
+
+        for (File child : children) {
+            if (child != null && child.isDirectory()) {
+                collectLeafReportFolders(child, candidates)
+            }
+        }
+    }
+
+    boolean containsXmlReport(File dir) {
+        if (dir == null || !dir.exists() || !dir.isDirectory()) {
+            return false
+        }
+
+        File[] files = dir.listFiles()
+        if (files == null || files.length == 0) {
+            return false
+        }
+
+        String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
+        String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
+
+        for (File file : files) {
+            if (file != null && file.isFile()) {
+                String lowerName = safe(file.name).toLowerCase()
+
+                if (lowerName == primaryName) {
+                    return true
+                }
+
+                if (lowerName == secondaryName) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    String getResolvedReportFolder() {
+        String current = safe(RunConfiguration.getReportFolder())
+        if (!isBlank(current) && new File(current).exists()) {
+            return current
+        }
+
+        String fromLastRun = getReportPathFromLastRunFile()
+        if (!isBlank(fromLastRun) && new File(fromLastRun).exists()) {
+            return fromLastRun
+        }
+
+        String latest = getLatestLeafReportFolderFromReportsRoot()
+        if (!isBlank(latest) && new File(latest).exists()) {
+            return latest
+        }
+
+        return ''
+    }
+
+    String getCurrentSuiteName() {
+        String reportFolder = getResolvedReportFolder()
+        if (isBlank(reportFolder)) {
+            return ''
+        }
+
+        File currentFolder = new File(reportFolder)
+        String currentName = safe(currentFolder.name)
+
+        if (isTimestampFolderName(currentName) && currentFolder.parentFile != null) {
+            return safe(currentFolder.parentFile.name)
+        }
+
+        return currentName
+    }
+
+    String getExecutionSummary() {
+        return getCurrentSuiteName() + ' ' + nowExecution()
+    }
+
+    String getTestPlanName() {
+        return getCurrentSuiteName() + TEST_PLAN_SUFFIX
+    }
+
+    // ============================================================
+    // SAVED TEST PLAN KEY
+    // ============================================================
+
+    String getTestPlanKeysFolderPath() {
+        File folder = new File(RunConfiguration.projectDir + File.separator + 'TestPlanKeys')
+        if (!folder.exists()) {
+            folder.mkdirs()
+        }
+        return folder.absolutePath
+    }
+
+    String getSuiteTestPlanFilePath() {
+        String suiteName = sanitizeFileName(getCurrentSuiteName())
+        return getTestPlanKeysFolderPath() + File.separator + suiteName + '.txt'
+    }
+
+    void saveSuiteTestPlanKey(String testPlanKey) {
+        if (isBlank(testPlanKey)) {
+            return
+        }
+
+        File file = new File(getSuiteTestPlanFilePath())
+        file.parentFile?.mkdirs()
+        file.setText(testPlanKey, 'UTF-8')
+    }
+
+    String readSavedSuiteTestPlanKey() {
+        if (RESET_SAVED_TEST_PLAN_KEY) {
+            return ''
+        }
+
+        File file = new File(getSuiteTestPlanFilePath())
+        if (!file.exists()) {
+            return ''
+        }
+
+        return safe(file.text)
+    }
+
+    // ============================================================
+    // XML AND SCREENSHOTS
+    // ============================================================
+
+    String findXmlFile(String reportFolder) {
+        if (isBlank(reportFolder)) {
+            return ''
+        }
+
+        File root = new File(reportFolder)
+        if (!root.exists() || !root.isDirectory()) {
+            return ''
+        }
+
+        List<File> preferred = new ArrayList<File>()
+        List<File> fallback = new ArrayList<File>()
+        collectXmlFiles(root, preferred, fallback)
+
+        if (!preferred.isEmpty()) {
+            preferred.sort { a, b -> b.lastModified() <=> a.lastModified() }
+            return preferred[0].absolutePath
+        }
+
+        if (!fallback.isEmpty()) {
+            fallback.sort { a, b -> b.lastModified() <=> a.lastModified() }
+            return fallback[0].absolutePath
+        }
+
+        return ''
+    }
+
+    void collectXmlFiles(File currentDir, List<File> preferred, List<File> fallback) {
+        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+            return
+        }
+
+        File[] children = currentDir.listFiles()
+        if (children == null || children.length == 0) {
+            return
+        }
+
+        String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
+        String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
+
+        for (File child : children) {
+            if (child == null) {
+                continue
+            }
+
+            if (child.isDirectory()) {
+                collectXmlFiles(child, preferred, fallback)
+                continue
+            }
+
+            String lowerName = safe(child.name).toLowerCase()
+            if (lowerName == primaryName) {
+                preferred.add(child)
+            } else if (lowerName == secondaryName) {
+                fallback.add(child)
+            }
+        }
+    }
+
+    boolean isVisualEvidence(File file) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return false
+        }
+
+        String lower = safe(file.name).toLowerCase()
+        return lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')
+    }
+
+    boolean shouldSkipVisualEvidence(File file) {
+        if (!isVisualEvidence(file)) {
+            return true
+        }
+
+        String path = safe(file.absolutePath).toLowerCase()
+        if (path.contains(File.separator + 'requests' + File.separator)) return true
+        if (path.contains(File.separator + 'videos' + File.separator)) return true
+        if (path.endsWith(File.separator + GAIA_REPORT_FILE_NAME.toLowerCase())) return true
+
+        return false
+    }
+
+    List<File> collectFailureImages(String reportFolder) {
+        List<File> images = new ArrayList<File>()
+        File root = new File(reportFolder)
+
+        if (!root.exists() || !root.isDirectory()) {
+            return images
+        }
+
+        collectFailureImagesRecursive(root, images)
+        images.sort { a, b -> a.lastModified() <=> b.lastModified() }
+        return images
+    }
+
+    void collectFailureImagesRecursive(File currentDir, List<File> images) {
+        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+            return
+        }
+
+        File[] children = currentDir.listFiles()
+        if (children == null || children.length == 0) {
+            return
+        }
+
+        for (File child : children) {
+            if (child == null) {
+                continue
+            }
+
+            if (child.isDirectory()) {
+                collectFailureImagesRecursive(child, images)
+                continue
+            }
+
+            if (!shouldSkipVisualEvidence(child)) {
+                images.add(child)
+            }
+        }
+    }
+
+    // ============================================================
+    // MAIN FLOW
+    // ============================================================
+
+    def jiraImport() {
+        return jiraImport('')
+    }
+
     def jiraImport(String epicKeyOverride) {
-        return new JiraFlowCoordinator().jiraImport(epicKeyOverride)
+        if (!isBlank(epicKeyOverride)) {
+            EPIC_KEY = safe(epicKeyOverride)
+        }
+
+        JiraGateway gateway = new JiraGateway(this)
+        JiraTestPlanManager testPlanManager = new JiraTestPlanManager(this, gateway)
+        JiraGaiaReportBuilder reportBuilder = new JiraGaiaReportBuilder(this)
+        JiraExecutionPublisher executionPublisher = new JiraExecutionPublisher(this, gateway)
+
+        gateway.validateRequiredConfiguration()
+
+        KeywordUtil.logInfo("============================================================")
+        KeywordUtil.logInfo("Starting Jira import flow")
+        KeywordUtil.logInfo("============================================================")
+
+        String reportFolder = getResolvedReportFolder()
+        if (isBlank(reportFolder)) {
+            KeywordUtil.markFailed("Report folder could not be resolved.")
+            return
+        }
+
+        KeywordUtil.logInfo("Using report folder: ${reportFolder}")
+
+        String suiteName = getCurrentSuiteName()
+        if (isBlank(suiteName)) {
+            KeywordUtil.markFailed("Suite name could not be resolved from report path.")
+            return
+        }
+
+        KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
+
+        String executionSummary = getExecutionSummary()
+        String testPlanSummary = getTestPlanName()
+
+        KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+        KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+
+        String xmlPath = findXmlFile(reportFolder)
+        if (isBlank(xmlPath)) {
+            KeywordUtil.markFailed("JUnit or Cucumber XML file was not found in report folder.")
+            return
+        }
+
+        KeywordUtil.logInfo("XML file found: ${xmlPath}")
+
+        String gaiaReportPath = reportBuilder.createGaiaHtmlReport(reportFolder, suiteName, xmlPath)
+        if (isBlank(gaiaReportPath)) {
+            KeywordUtil.markWarning("Gaia report could not be created.")
+        } else {
+            KeywordUtil.logInfo("Gaia report created: ${gaiaReportPath}")
+        }
+
+        String testPlanKey = testPlanManager.getOrCreateTestPlanKey()
+        if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
+            KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+            return
+        }
+
+        Map executionResult = executionPublisher.publishExecution(xmlPath, executionSummary, testPlanKey)
+
+        String executionKey = safe(executionResult.executionKey)
+        if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+            KeywordUtil.markFailed("Execution import failed: ${executionKey}")
+            return
+        }
+
+        KeywordUtil.logInfo("============================================================")
+        KeywordUtil.logInfo("Jira import finished")
+        KeywordUtil.logInfo("============================================================")
+        KeywordUtil.logInfo("Execution key: ${executionKey}")
+        KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+        KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+        KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+        KeywordUtil.logInfo("Gaia report attachment status: ${executionResult.gaiaReportStatus}")
+        KeywordUtil.logInfo("Evidences.zip attachment status: ${executionResult.evidencesStatus}")
+        KeywordUtil.logInfo("Results.zip attachment status: ${executionResult.resultsStatus}")
+        KeywordUtil.logInfo("Add execution to Test Plan status: ${executionResult.addExecutionStatus}")
+        KeywordUtil.logInfo("Update Test Execution status: ${executionResult.updateExecutionStatus}")
+
+        return executionKey
     }
 }
