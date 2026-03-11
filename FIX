@@ -1,241 +1,558 @@
-extent report
- 
-https://docs.katalon.com/katalon-studio/integrations/test-analysis/extent-reports-integration
-Extent Reports integration | Katalon Docs
-Extent Reports is a customizable HTML reporting library for Java and .NET that provides interactive and detailed test reports. It offers features such as pie charts, logs, screenshots, and more, ma...
- 
-Os estilos do report estão nesta classe
- 
-package reporting
- 
-import com.aventstack.extentreports.reporter.ExtentSparkReporter
-import com.aventstack.extentreports.reporter.configuration.Theme
- 
-public class ReportTheme {
- 
-	/**
-	 * Apply common Spark configuration + custom CSS for a LIGHT theme.
-	 * Called from the Test Listener.
-	 */
-	static void apply(ExtentSparkReporter spark) {
- 
-		def cfg = spark.config()
- 
-		// 1. Set the base theme to STANDARD (which is the light theme)
-		cfg.setTheme(Theme.STANDARD)
-		cfg.setDocumentTitle("Grasp EBA Retail – Test Report")
-		cfg.setReportName("Grasp EBA Retail – Execution")
-		cfg.enableOfflineMode(true)   // 🔒 makes report usable offline
-		cfg.setTimelineEnabled(true)  // donut + timeline
- 
-		// 2. Custom CSS rewritten for a light theme with purple accents
-		String css = """
-            /* Define a primary color variable for easy customization */
-            :root {
-                --primary-color: #5a2b7e;
-            }
- 
-            /* Top bar - Use the brand's purple color */
-            .nav-wrapper {
-                background-color: var(--primary-color) !important;
-            }
- 
-            .brand-logo, .report-name {
-                font-weight: 600;
-                letter-spacing: 0.03em;
-            }
-            
-            /* Main content background for a softer look than pure white */
-            .test-wrapper, .test-content, .test-info {
-                background-color: #f9f9f9 !important;
-            }
- 
-            /* Cards and test list background */
-            .card-panel, .collection, .test-list-wrapper, .test-list {
-                background-color: #ffffff !important;
-				box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); /* Add subtle shadow */
-            }
- 
-            /* Status badges */
-            .badge.log.pass, .test-status.pass {
-                background-color: #00af87 !important; /* A slightly softer green */
-            }
-            .badge.log.fail, .test-status.fail {
-                background-color: #dc3545 !important;
-            }
-            .badge.log.skip, .test-status.skip {
-                background-color: #ffc107 !important;
-				color: #212529 !important; /* Add dark text for better contrast */
-            }
-			.badge.log.info {
-				background-color: #17a2b8 !important; /* A nice info blue */
-			}
- 
-            /* Use primary color for active/selected items */
-            .test-list .test-item.active {
-                background-color: #e9e5ee !important; /* A light lavender */
-                border-left: 3px solid var(--primary-color);
-            }
- 
-            /* Step rows hover effect */
-            .collection .collection-item:hover {
-                background-color: #f5f5f5 !important;
-            }
-        """
- 
-		cfg.setCss(css)
-	}
-}
- 
- 
-Extent Report e Spark
- 
-colca é o nome GAIA em vez de GRASP...
+package jiraIntegration
 
-package reporting
+import java.io.File
+import java.nio.file.Files
+import java.text.SimpleDateFormat
+import java.util.Base64
+import java.util.Date
+import java.util.Locale
 
 import com.aventstack.extentreports.ExtentReports
 import com.aventstack.extentreports.ExtentTest
-
-/**
- * Shared Extent context accessible from Listeners (no package) and Keywords (packaged).
- * The listener sets these; keywords read them.
- */
-
-class ExtentContext {
-	static ExtentReports extent
-	static ExtentTest test
-
-	// Collapsible step group node (for Log.step)
-	static ExtentTest currentStepGroup
-
-	// Failure tracking
-	static boolean failed = false
-	static String failMessage = null
-	static String failAt = null
-}
-
- package reporting
-
-import org.openqa.selenium.OutputType
-import org.openqa.selenium.TakesScreenshot
-
 import com.aventstack.extentreports.MediaEntityBuilder
-import com.kms.katalon.core.context.TestCaseContext
-import com.kms.katalon.core.webui.driver.DriverFactory
-
-
-public class ReportHelpers {
-
-	/**
-	 * Takes a screenshot and attaches it to the current Extent test
-	 * by embedding it as a Base64 string.
-	 *
-	 * The resulting HTML report is fully self-contained and does not
-	 * require any external image files.
-	 */
-	static void attachFailureScreenshot(TestCaseContext ctx) {
-		if (ExtentContext.test == null) return
-
-			try {
-				// 1. Get the current WebDriver instance from Katalon.
-				def driver = DriverFactory.getWebDriver()
-
-				// 2. Use the underlying Selenium 'TakesScreenshot' interface to get Base64 data.
-				String base64Image = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BASE64)
-
-				// 3. Attach the Base64 string to the Extent report.
-				ExtentContext.test.fail(
-						"📷 Screenshot on failure",
-						MediaEntityBuilder
-						.createScreenCaptureFromBase64String(base64Image)
-						.build()
-						)
-			} catch (Exception e) {
-				// Fallback if screenshot fails for any reason
-				ExtentContext.test.warning("⚠ Could not capture screenshot: " + e.message)
-			}
-	}
-}
-
-
-package reporting
-
 import com.aventstack.extentreports.reporter.ExtentSparkReporter
 import com.aventstack.extentreports.reporter.configuration.Theme
 
-public class ReportTheme {
+import groovy.xml.XmlSlurper
 
-	/**
-	 * Apply common Spark configuration + custom CSS for a LIGHT theme.
-	 * Called from the Test Listener.
-	 */
-	static void apply(ExtentSparkReporter spark) {
+class JiraGaiaReportBuilder {
 
-		def cfg = spark.config()
+    JiraFlowCoordinator flow
 
-		// 1. Set the base theme to STANDARD (which is the light theme)
-		cfg.setTheme(Theme.STANDARD)
-		cfg.setDocumentTitle("Grasp EBA Retail – Test Report")
-		cfg.setReportName("Grasp EBA Retail – Execution")
-		cfg.enableOfflineMode(true)   // 🔒 makes report usable offline
-		cfg.setTimelineEnabled(true)  // donut + timeline
+    JiraGaiaReportBuilder(JiraFlowCoordinator flow) {
+        this.flow = flow
+    }
 
-		// 2. Custom CSS rewritten for a light theme with purple accents
-		String css = """
-            /* Define a primary color variable for easy customization */
+    private String safeValue(def value) {
+        if (value == null) {
+            return ''
+        }
+        return String.valueOf(value).trim()
+    }
+
+    private boolean isBlank(def value) {
+        return safeValue(value).isEmpty()
+    }
+
+    private long toMillis(def secondsValue) {
+        String raw = safeValue(secondsValue)
+        if (raw.isEmpty()) {
+            return 0L
+        }
+
+        try {
+            BigDecimal seconds = new BigDecimal(raw.replace(',', '.'))
+            return (seconds * 1000G).longValue()
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    private String formatDurationMillis(long durationMs) {
+        long totalMs = Math.max(durationMs, 0L)
+        long minutes = (long) (totalMs / 60000L)
+        long seconds = (long) ((totalMs % 60000L) / 1000L)
+        long millis = (long) (totalMs % 1000L)
+
+        return "${minutes}m ${seconds}s ${millis}ms"
+    }
+
+    private String formatHeaderDate(Date date) {
+        if (date == null) {
+            return ''
+        }
+        return new SimpleDateFormat("EEE MMM dd HH:mm:ss z yyyy", Locale.ENGLISH).format(date)
+    }
+
+    private String htmlEscape(def value) {
+        String text = safeValue(value)
+        if (text.isEmpty()) {
+            return ''
+        }
+
+        return text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&#39;')
+    }
+
+    private String getGaiaReportFileName() {
+        try {
+            String configured = safeValue(flow?.GAIA_REPORT_FILE_NAME)
+            return configured.isEmpty() ? 'gaiaReport.html' : configured
+        } catch (Exception ignored) {
+            return 'gaiaReport.html'
+        }
+    }
+
+    private List<File> collectFallbackImages(String reportFolder) {
+        List<File> images = []
+
+        if (isBlank(reportFolder)) {
+            return images
+        }
+
+        File root = new File(reportFolder)
+        if (!root.exists()) {
+            return images
+        }
+
+        root.eachFileRecurse { File file ->
+            if (!file.isFile()) {
+                return
+            }
+
+            String name = file.name.toLowerCase(Locale.ENGLISH)
+            if (name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg')) {
+                images.add(file)
+            }
+        }
+
+        images.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+        return images
+    }
+
+    private List<File> collectFailureImages(String reportFolder) {
+        try {
+            List<File> result = flow?.collectFailureImages(reportFolder)
+            if (result != null) {
+                return result
+            }
+        } catch (Exception ignored) {
+        }
+
+        return collectFallbackImages(reportFolder)
+    }
+
+    private String fileToBase64(File file) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return ''
+        }
+
+        try {
+            byte[] bytes = Files.readAllBytes(file.toPath())
+            return Base64.getEncoder().encodeToString(bytes)
+        } catch (Exception ignored) {
+            return ''
+        }
+    }
+
+    private List<String> getFailureSummaryLines(String message, String details) {
+        List<String> lines = []
+
+        String safeMessage = safeValue(message)
+        String safeDetails = safeValue(details)
+
+        if (!safeMessage.isEmpty()) {
+            lines.add(safeMessage)
+        }
+
+        safeDetails.readLines().each { String raw ->
+            String line = safeValue(raw)
+
+            if (line.isEmpty()) {
+                return
+            }
+
+            if (line.startsWith('at ')) {
+                return
+            }
+
+            if (line.startsWith('Caused by: at ')) {
+                return
+            }
+
+            if (line.contains('com.kms.katalon') && line.length() > 120) {
+                return
+            }
+
+            if (line.contains('org.openqa.selenium') && line.length() > 120) {
+                return
+            }
+
+            lines.add(line)
+        }
+
+        List<String> cleaned = []
+        lines.each { String item ->
+            String normalized = safeValue(item).replaceAll(/\s+/, ' ').trim()
+            if (!normalized.isEmpty() && !cleaned.contains(normalized)) {
+                cleaned.add(normalized)
+            }
+        }
+
+        if (cleaned.isEmpty() && !safeDetails.isEmpty()) {
+            safeDetails.readLines().each { String raw ->
+                String line = safeValue(raw)
+                if (!line.isEmpty() && cleaned.size() < 3) {
+                    cleaned.add(line)
+                }
+            }
+        }
+
+        return cleaned.size() > 3 ? cleaned.subList(0, 3) : cleaned
+    }
+
+    private void applyGaiaTheme(ExtentSparkReporter spark) {
+        def cfg = spark.config()
+
+        cfg.setTheme(Theme.DARK)
+        cfg.setDocumentTitle('GAIA - Test Report')
+        cfg.setReportName('GAIA - Execution')
+        cfg.enableOfflineMode(true)
+        cfg.setTimelineEnabled(true)
+
+        String css = """
             :root {
-                --primary-color: #5a2b7e;
+                --gaia-blue: #0b3d66;
+                --gaia-blue-2: #124f84;
+                --gaia-green: #29b36b;
+                --gaia-green-soft: #1f8f56;
+                --gaia-red: #d9534f;
+                --gaia-surface: #111827;
+                --gaia-surface-2: #18212f;
+                --gaia-card: #1f2937;
+                --gaia-border: #2f3b4c;
+                --gaia-text: #e5edf5;
+                --gaia-muted: #9fb0c3;
             }
 
-            /* Top bar - Use the brand's purple color */
+            body, .app, .test-content, .test-wrapper, .dashboard-view, .category-view, .exception-view {
+                background: linear-gradient(180deg, #0f172a 0%, #111827 100%) !important;
+                color: var(--gaia-text) !important;
+                font-family: "Segoe UI", Arial, sans-serif !important;
+            }
+
             .nav-wrapper {
-                background-color: var(--primary-color) !important;
+                background: linear-gradient(90deg, var(--gaia-blue) 0%, var(--gaia-blue-2) 100%) !important;
+                border-bottom: 1px solid rgba(255,255,255,0.08) !important;
             }
 
-            .brand-logo, .report-name {
-                font-weight: 600;
-                letter-spacing: 0.03em;
-            }
-            
-            /* Main content background for a softer look than pure white */
-            .test-wrapper, .test-content, .test-info {
-                background-color: #f9f9f9 !important;
+            .brand-logo, .report-name, .side-nav a, .dropdown-content li > a, .dropdown-content li > span {
+                color: #ffffff !important;
+                font-weight: 600 !important;
+                letter-spacing: 0.02em;
             }
 
-            /* Cards and test list background */
-            .card-panel, .collection, .test-list-wrapper, .test-list {
-                background-color: #ffffff !important;
-				box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); /* Add subtle shadow */
+            .card-panel, .test-list-wrapper, .test-list, .exception-card, .dashboard-card, .category-card, .view-summary, .table {
+                background: var(--gaia-card) !important;
+                border: 1px solid var(--gaia-border) !important;
+                border-radius: 10px !important;
+                box-shadow: 0 8px 20px rgba(0,0,0,0.28) !important;
             }
 
-            /* Status badges */
-            .badge.log.pass, .test-status.pass {
-                background-color: #00af87 !important; /* A slightly softer green */
+            .card .card-content, .card-panel, .test-content, .test-list, .test-node, .table, table, th, td, .exception-card .exception-message {
+                color: var(--gaia-text) !important;
             }
-            .badge.log.fail, .test-status.fail {
-                background-color: #dc3545 !important;
-            }
-            .badge.log.skip, .test-status.skip {
-                background-color: #ffc107 !important;
-				color: #212529 !important; /* Add dark text for better contrast */
-            }
-			.badge.log.info {
-				background-color: #17a2b8 !important; /* A nice info blue */
-			}
 
-            /* Use primary color for active/selected items */
+            .chip {
+                background-color: #243244 !important;
+                color: var(--gaia-text) !important;
+            }
+
+            .test-list .test-item {
+                background: transparent !important;
+                border-left: 3px solid transparent !important;
+            }
+
             .test-list .test-item.active {
-                background-color: #e9e5ee !important; /* A light lavender */
-                border-left: 3px solid var(--primary-color);
+                background: rgba(41, 179, 107, 0.10) !important;
+                border-left: 3px solid var(--gaia-green) !important;
             }
 
-            /* Step rows hover effect */
-            .collection .collection-item:hover {
-                background-color: #f5f5f5 !important;
+            .test-list .test-item:hover,
+            .collection .collection-item:hover,
+            .node:hover {
+                background: rgba(255,255,255,0.04) !important;
+            }
+
+            .badge.log.pass, .test-status.pass, .status.pass {
+                background-color: var(--gaia-green) !important;
+                color: #ffffff !important;
+            }
+
+            .badge.log.fail, .test-status.fail, .status.fail {
+                background-color: var(--gaia-red) !important;
+                color: #ffffff !important;
+            }
+
+            .badge.log.skip, .test-status.skip, .status.skip {
+                background-color: #d4a72c !important;
+                color: #111827 !important;
+            }
+
+            .badge.log.info, .test-status.info, .status.info {
+                background-color: #2a7bd3 !important;
+                color: #ffffff !important;
+            }
+
+            .badge.log.warning, .test-status.warning, .status.warning {
+                background-color: #f0ad4e !important;
+                color: #111827 !important;
+            }
+
+            .exception-card pre,
+            pre,
+            code,
+            .code-block,
+            .collapsible-body {
+                background: #0b1220 !important;
+                color: #d7e3f1 !important;
+                border: 1px solid #223045 !important;
+                border-radius: 8px !important;
+            }
+
+            .collapsible,
+            .collapsible-header,
+            .collapsible-body,
+            .collection,
+            .collection-item {
+                background: transparent !important;
+                color: var(--gaia-text) !important;
+                border-color: var(--gaia-border) !important;
+            }
+
+            .btn, .btn-small, .waves-effect {
+                background: var(--gaia-green-soft) !important;
+            }
+
+            a, .blue-text {
+                color: #7fc8ff !important;
+            }
+
+            .analysis-name, .exception-name, .category-name, .author-name, .device-name {
+                color: var(--gaia-text) !important;
+            }
+
+            .test-desc, .grey-text, .text-small, .timestamp, .test-time {
+                color: var(--gaia-muted) !important;
+            }
+
+            .step-details-toggle {
+                cursor: pointer;
+                color: #7fc8ff !important;
+                font-weight: 600 !important;
+            }
+
+            details.gaia-details {
+                margin-top: 8px;
+                border: 1px solid var(--gaia-border);
+                border-radius: 8px;
+                background: #0b1220;
+                padding: 8px 10px;
+            }
+
+            details.gaia-details summary {
+                cursor: pointer;
+                color: #cfe7ff;
+                font-weight: 600;
+                outline: none;
+            }
+
+            details.gaia-details pre {
+                margin-top: 10px;
+                white-space: pre-wrap;
+                word-break: break-word;
+                overflow-x: auto;
             }
         """
 
-		cfg.setCss(css)
-	}
+        cfg.setCss(css)
+    }
+
+    List<Map> parseXmlCases(String xmlPath) {
+        List<Map> result = []
+
+        if (isBlank(xmlPath)) {
+            return result
+        }
+
+        File xmlFile = new File(xmlPath)
+        if (!xmlFile.exists()) {
+            return result
+        }
+
+        def xml
+        try {
+            xml = new XmlSlurper().parse(xmlFile)
+        } catch (Exception ignored) {
+            return result
+        }
+
+        List testcaseNodes = []
+        String rootName = safeValue(xml.name())
+
+        if (rootName == 'testsuite') {
+            testcaseNodes.addAll(xml.testcase)
+        } else if (rootName == 'testsuites') {
+            xml.testsuite.each { suite ->
+                testcaseNodes.addAll(suite.testcase)
+            }
+        }
+
+        testcaseNodes.each { tc ->
+            String className = safeValue(tc.@classname?.text())
+            String testName = safeValue(tc.@name?.text())
+            long durationMs = toMillis(tc.@time?.text())
+
+            def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
+            def errorNode = tc.error?.size() > 0 ? tc.error[0] : null
+            def skippedNode = tc.skipped?.size() > 0 ? tc.skipped[0] : null
+
+            boolean failed = (failureNode != null) || (errorNode != null)
+            boolean skipped = skippedNode != null
+
+            String message = ''
+            String details = ''
+
+            if (failureNode != null) {
+                message = safeValue(failureNode.@message?.text())
+                details = safeValue(failureNode.text())
+            } else if (errorNode != null) {
+                message = safeValue(errorNode.@message?.text())
+                details = safeValue(errorNode.text())
+            } else if (skippedNode != null) {
+                message = safeValue(skippedNode.@message?.text())
+                details = safeValue(skippedNode.text())
+            }
+
+            String displayName = ''
+            if (!isBlank(className) && !isBlank(testName)) {
+                displayName = className + '/' + testName
+            } else if (!isBlank(testName)) {
+                displayName = testName
+            } else {
+                displayName = className
+            }
+
+            result.add([
+                name      : displayName,
+                shortName : isBlank(testName) ? displayName : testName,
+                durationMs: durationMs,
+                status    : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
+                message   : message,
+                details   : details
+            ])
+        }
+
+        return result
+    }
+
+    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
+        if (isBlank(reportFolder) || isBlank(xmlPath)) {
+            return ''
+        }
+
+        List<Map> cases = parseXmlCases(xmlPath)
+        List<Map> failedCases = cases.findAll { Map item -> safeValue(item.status) == 'failed' }
+        List<Map> passedCases = cases.findAll { Map item -> safeValue(item.status) == 'passed' }
+        List<Map> skippedCases = cases.findAll { Map item -> safeValue(item.status) == 'skipped' }
+
+        List<File> failureImages = collectFailureImages(reportFolder)
+
+        int imageIndex = 0
+        failedCases.each { Map item ->
+            if (imageIndex < failureImages.size()) {
+                item.image = failureImages[imageIndex]
+                imageIndex++
+            } else {
+                item.image = null
+            }
+        }
+
+        long totalDurationMs = 0L
+        cases.each { Map item ->
+            totalDurationMs += ((item.durationMs ?: 0L) as long)
+        }
+
+        File baseDir = new File(reportFolder)
+        Date endDate = new Date(baseDir.lastModified())
+        Date startDate = new Date(Math.max(0L, endDate.time - totalDurationMs))
+        int executed = cases.size()
+
+        String avgTest = executed > 0
+            ? formatDurationMillis((long) (totalDurationMs / executed))
+            : '0m 0s 0ms'
+
+        File htmlFile = new File(reportFolder + File.separator + getGaiaReportFileName())
+
+        ExtentSparkReporter spark = new ExtentSparkReporter(htmlFile.absolutePath)
+        applyGaiaTheme(spark)
+
+        ExtentReports extent = new ExtentReports()
+        extent.attachReporter(spark)
+
+        extent.setSystemInfo('Application', 'GAIA')
+        extent.setSystemInfo('Suite', safeValue(suiteName))
+        extent.setSystemInfo('Start', formatHeaderDate(startDate))
+        extent.setSystemInfo('End', formatHeaderDate(endDate))
+        extent.setSystemInfo('Suite Duration', formatDurationMillis(totalDurationMs))
+        extent.setSystemInfo('Executed', String.valueOf(executed))
+        extent.setSystemInfo('Passed', String.valueOf(passedCases.size()))
+        extent.setSystemInfo('Failed', String.valueOf(failedCases.size()))
+        extent.setSystemInfo('Skipped', String.valueOf(skippedCases.size()))
+        extent.setSystemInfo('Avg/Test', avgTest)
+
+        if (cases.isEmpty()) {
+            extent.createTest(safeValue(suiteName)).warning('No test cases found in XML report.')
+            extent.flush()
+            return htmlFile.absolutePath
+        }
+
+        cases.each { Map item ->
+            String itemName = safeValue(item.name)
+            String itemStatus = safeValue(item.status)
+            String itemDetails = safeValue(item.details)
+            String itemMessage = safeValue(item.message)
+            long itemDuration = (item.durationMs ?: 0L) as long
+
+            ExtentTest test = extent.createTest(itemName)
+            test.assignCategory(safeValue(suiteName))
+            test.info("Duration: ${formatDurationMillis(itemDuration)}")
+
+            if (itemStatus == 'failed') {
+                List<String> summaryLines = getFailureSummaryLines(itemMessage, itemDetails)
+
+                if (summaryLines.isEmpty()) {
+                    test.fail('Test failed')
+                } else {
+                    summaryLines.each { String line ->
+                        test.fail(line)
+                    }
+                }
+
+                if (!itemDetails.isEmpty()) {
+                    test.info("""
+                        <details class="gaia-details">
+                            <summary>See full error log</summary>
+                            <pre>${htmlEscape(itemDetails)}</pre>
+                        </details>
+                    """)
+                }
+
+                File imageFile = item.image as File
+                String base64Image = fileToBase64(imageFile)
+                if (!base64Image.isEmpty()) {
+                    test.fail(
+                        'Failure evidence',
+                        MediaEntityBuilder
+                            .createScreenCaptureFromBase64String(base64Image, imageFile.name)
+                            .build()
+                    )
+                }
+            } else if (itemStatus == 'skipped') {
+                test.skip('Test Skipped')
+                if (!itemMessage.isEmpty()) {
+                    test.skip(itemMessage)
+                }
+            } else {
+                test.pass('Test Passed')
+            }
+        }
+
+        extent.flush()
+        return htmlFile.absolutePath
+    }
 }
