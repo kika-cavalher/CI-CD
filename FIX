@@ -1,8 +1,9 @@
-Keywords/jiraIntegration/JiraGaiaReportBuilder.groovy
+1) Keywords/jiraIntegration/JiraGaiaReportBuilder.groovy
 package jiraIntegration
 
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -14,7 +15,7 @@ import org.w3c.dom.Element
 
 class JiraGaiaReportBuilder {
 
-    private static final String REPORT_FILE_NAME = 'gaiaReport.html'
+    private static final String DEFAULT_REPORT_FILE_NAME = 'gaiaReport.html'
     private static final String DEFAULT_LOGO_RELATIVE_PATH = 'Image/gaia-logo.png'
 
     JiraFlowCoordinator flow
@@ -33,7 +34,7 @@ class JiraGaiaReportBuilder {
             return ''
         }
 
-        String resolvedSuiteName = resolveSuiteName(reportDir, suiteName)
+        String resolvedSuiteName = resolveSuiteName(reportDir)
         List<Map> xmlCases = parseXmlCases(xmlPath)
         List<Map> scenarios = parseExecutionScenarios(reportDir)
 
@@ -44,6 +45,7 @@ class JiraGaiaReportBuilder {
         }
 
         normalizeScenarioSteps(scenarios)
+        applySequentialTimingFallback(reportDir, scenarios)
         attachEvidenceToFailedScenarios(reportDir, scenarios)
 
         Map summary = buildSummary(reportDir, scenarios)
@@ -61,26 +63,58 @@ class JiraGaiaReportBuilder {
 
         String html = new JiraGaiaHtmlTemplateBuilder().build(model)
 
-        File htmlFile = new File(reportDir, REPORT_FILE_NAME)
+        File htmlFile = new File(reportDir, resolveReportFileName())
         htmlFile.setText(html, 'UTF-8')
         return htmlFile.absolutePath
+    }
+
+    // =========================================================================
+    // BASIC HELPERS
+    // =========================================================================
+
+    private String resolveReportFileName() {
+        try {
+            String value = safeValue(flow?.GAIA_REPORT_FILE_NAME)
+            if (!isBlank(value)) {
+                return value
+            }
+        } catch (Exception ignored) {
+        }
+        return DEFAULT_REPORT_FILE_NAME
+    }
+
+    private String safeValue(def value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+
+    private boolean isBlank(def value) {
+        return safeValue(value).isEmpty()
+    }
+
+    private long toLong(def value) {
+        try {
+            return Long.parseLong(safeValue(value))
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    private String normalizeText(List<String> lines) {
+        if (lines == null || lines.isEmpty()) {
+            return ''
+        }
+        return lines.findAll { String item -> !isBlank(item) }.join('\n').trim()
     }
 
     // =========================================================================
     // SUITE / SUMMARY
     // =========================================================================
 
-    private String resolveSuiteName(File reportDir, String suiteName) {
-        String candidate = safeValue(suiteName)
-        if (!isBlank(candidate)) {
-            return candidate
-        }
-
+    private String resolveSuiteName(File reportDir) {
         File parent = reportDir.parentFile
         if (parent != null && !isBlank(parent.name)) {
             return safeValue(parent.name)
         }
-
         return 'GAIA Execution'
     }
 
@@ -278,7 +312,6 @@ class JiraGaiaReportBuilder {
 
             if (toLong(scenario.durationMs) <= 0L) {
                 scenario.durationMs = toLong(xmlCase.durationMs)
-                scenario.durationLabel = formatDurationFull(toLong(xmlCase.durationMs))
             }
 
             if (isBlank(scenario.errorShort)) {
@@ -292,6 +325,8 @@ class JiraGaiaReportBuilder {
             if (isBlank(scenario.sidebarSubtitle)) {
                 scenario.sidebarSubtitle = scenario.errorShort
             }
+
+            scenario.durationLabel = formatDurationFull(toLong(scenario.durationMs))
         }
     }
 
@@ -319,16 +354,12 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            if (currentStep.status == 'info' && currentStep.detailText.toLowerCase(Locale.ENGLISH).contains('skipped')) {
+            if (safeValue(currentStep.status) == 'pending') {
                 currentStep.status = 'skipped'
             }
 
-            if (currentStep.status == 'pending') {
-                currentStep.status = 'skipped'
-            }
-
-            currentStep.detailText = normalizeText(currentStep.detailLines)
-            currentStep.errorFull = normalizeText(currentStep.errorLines)
+            currentStep.detailText = normalizeText(currentStep.detailLines as List<String>)
+            currentStep.errorFull = normalizeText(currentStep.errorLines as List<String>)
 
             if (isBlank(currentStep.shortError)) {
                 currentStep.shortError = extractShortError(currentStep.errorFull ?: currentStep.detailText)
@@ -343,14 +374,20 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            if (currentScenario.steps.isEmpty()) {
+            List<Map> steps = (currentScenario.steps ?: []) as List<Map>
+            if (steps.isEmpty()) {
                 currentScenario = null
                 return
             }
 
-            currentScenario.status = resolveScenarioStatus(currentScenario.steps)
-            currentScenario.errorShort = resolveScenarioErrorShort(currentScenario.steps)
-            currentScenario.errorFull = resolveScenarioErrorFull(currentScenario.steps)
+            long stepTotal = sumStepDurations(steps)
+            if (stepTotal > toLong(currentScenario.durationMs)) {
+                currentScenario.durationMs = stepTotal
+            }
+
+            currentScenario.status = resolveScenarioStatus(steps)
+            currentScenario.errorShort = resolveScenarioErrorShort(steps)
+            currentScenario.errorFull = resolveScenarioErrorFull(steps)
             currentScenario.sidebarSubtitle = isBlank(currentScenario.errorShort)
                 ? safeValue(currentScenario.title)
                 : currentScenario.errorShort
@@ -359,32 +396,30 @@ class JiraGaiaReportBuilder {
             currentScenario = null
         }
 
-        lines.each { String rawLine ->
-            String line = safeValue(rawLine)
+        for (String rawLine : lines) {
+            String line = sanitizeLogLine(rawLine)
             if (isBlank(line)) {
-                return
+                continue
             }
 
             String scenarioTitleVerbose = extractScenarioTitleFromVerboseLine(line)
             if (!isBlank(scenarioTitleVerbose)) {
                 finalizeStep.call()
                 finalizeScenario.call()
-
                 currentScenario = newScenarioMap('scenario-' + (scenarios.size() + 1), scenarioTitleVerbose)
-                return
+                continue
             }
 
             Map scenarioCompact = parseCompactScenarioLine(line, scenarios.size() + 1)
             if (scenarioCompact != null) {
                 finalizeStep.call()
                 finalizeScenario.call()
-
                 currentScenario = scenarioCompact
-                return
+                continue
             }
 
             if (currentScenario == null) {
-                return
+                continue
             }
 
             if (line.startsWith('Start / End / Elapsed:')) {
@@ -393,85 +428,81 @@ class JiraGaiaReportBuilder {
                 } else {
                     applyTimingInfo(currentStep, line)
                 }
-                return
+                continue
             }
 
-            Map compactStep = parseCompactStepLine(line, currentScenario.steps.size() + 1)
+            String verboseStep = extractStepTitleFromVerboseLine(line)
+            if (!isBlank(verboseStep)) {
+                if (!shouldIgnoreStep(verboseStep)) {
+                    finalizeStep.call()
+                    currentStep = [
+                        id           : currentScenario.id + '-step-' + (((currentScenario.steps ?: []).size()) + 1),
+                        title        : cleanupStepTitle(verboseStep),
+                        status       : 'pending',
+                        timeLabel    : '',
+                        startLabel   : '',
+                        endLabel     : '',
+                        durationMs   : 0L,
+                        durationLabel: formatDurationFull(0L),
+                        detailLines  : [],
+                        errorLines   : [],
+                        detailText   : '',
+                        errorFull    : '',
+                        shortError   : '',
+                        emoji        : resolveStepEmoji(verboseStep)
+                    ]
+                    currentScenario.steps << currentStep
+                }
+                continue
+            }
+
+            Map compactStep = parseCompactStepLine(line, ((currentScenario.steps ?: []).size()) + 1)
             if (compactStep != null) {
                 finalizeStep.call()
                 currentStep = compactStep
+                currentStep.id = currentScenario.id + '-step-' + (((currentScenario.steps ?: []).size()) + 1)
                 currentScenario.steps << currentStep
-                return
-            }
-
-            String testStepTitle = extractStepTitleFromVerboseLine(line)
-            if (!isBlank(testStepTitle)) {
-                if (shouldIgnoreStep(testStepTitle)) {
-                    return
-                }
-
-                finalizeStep.call()
-
-                currentStep = [
-                    id           : currentScenario.id + '-step-' + (currentScenario.steps.size() + 1),
-                    title        : testStepTitle,
-                    status       : 'pending',
-                    timeLabel    : '',
-                    startLabel   : '',
-                    endLabel     : '',
-                    durationMs   : 0L,
-                    durationLabel: formatDurationFull(0L),
-                    detailLines  : [],
-                    errorLines   : [],
-                    detailText   : '',
-                    errorFull    : '',
-                    shortError   : '',
-                    emoji        : resolveStepEmoji(testStepTitle)
-                ]
-                currentScenario.steps << currentStep
-                return
+                continue
             }
 
             if (currentStep == null) {
-                return
+                continue
             }
 
             Map event = parseEventLine(line)
             if (event != null) {
                 if (isBlank(currentStep.timeLabel)) {
-                    currentStep.timeLabel = event.timeLabel
+                    currentStep.timeLabel = safeValue(event.timeLabel)
                 }
 
                 currentStep.detailLines << safeValue(event.message)
 
-                if (event.status == 'failed') {
+                if (safeValue(event.status) == 'failed') {
                     currentStep.status = 'failed'
                     currentStep.errorLines << safeValue(event.message)
                     currentStep.shortError = extractShortError(event.message)
-                } else if (event.status == 'passed') {
-                    if (currentStep.status != 'failed') {
+                } else if (safeValue(event.status) == 'passed') {
+                    if (safeValue(currentStep.status) != 'failed') {
                         currentStep.status = 'passed'
                     }
-                } else if (event.status == 'skipped') {
-                    if (currentStep.status != 'failed' && currentStep.status != 'passed') {
+                } else if (safeValue(event.status) == 'skipped') {
+                    if (safeValue(currentStep.status) != 'failed' && safeValue(currentStep.status) != 'passed') {
                         currentStep.status = 'skipped'
                     }
                 } else {
-                    if (currentStep.status == 'pending') {
+                    if (safeValue(currentStep.status) == 'pending') {
                         currentStep.status = 'info'
                     }
                 }
 
-                return
+                continue
             }
 
             currentStep.detailLines << line
 
             if (looksLikeErrorLine(line)) {
                 currentStep.errorLines << line
-                if (currentStep.status != 'failed') {
-                    currentStep.status = 'failed'
-                }
+                currentStep.status = 'failed'
                 if (isBlank(currentStep.shortError)) {
                     currentStep.shortError = extractShortError(line)
                 }
@@ -481,7 +512,6 @@ class JiraGaiaReportBuilder {
         finalizeStep.call()
         finalizeScenario.call()
 
-        applySequentialTimingFallback(reportDir, scenarios)
         return scenarios
     }
 
@@ -502,6 +532,56 @@ class JiraGaiaReportBuilder {
         ]
     }
 
+    private File findExecutionLog(File reportDir) {
+        List<File> candidates = []
+
+        File[] files = reportDir.listFiles()
+        if (files != null) {
+            files.each { File file ->
+                if (file.isFile() && file.name.toLowerCase(Locale.ENGLISH).startsWith('execution') && file.name.toLowerCase(Locale.ENGLISH).endsWith('.log')) {
+                    candidates << file
+                }
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        candidates.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+        return candidates.last()
+    }
+
+    private List<String> readFileLines(File file) {
+        try {
+            return Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)
+        } catch (Exception ignored) {
+            try {
+                return file.readLines()
+            } catch (Exception ignoredAgain) {
+                return []
+            }
+        }
+    }
+
+    private String sanitizeLogLine(String rawLine) {
+        String line = safeValue(rawLine)
+        if (isBlank(line)) {
+            return ''
+        }
+
+        line = line.replaceAll(/\u001B\[[;\d]*m/, '')
+        line = line.replace('\t', ' ')
+        line = line.replaceAll(/\s+/, ' ').trim()
+
+        def prefixed = (line =~ /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\s+[A-Z]+\s+.+?\s+-\s+(.*)$/)
+        if (prefixed.find()) {
+            line = safeValue(prefixed.group(1))
+        }
+
+        return line
+    }
+
     private String extractScenarioTitleFromVerboseLine(String line) {
         String marker = 'TEST STEP: Start Test Case : SCENARIO '
         if (!line.contains(marker)) {
@@ -513,7 +593,7 @@ class JiraGaiaReportBuilder {
     }
 
     private Map parseCompactScenarioLine(String line, int scenarioIndex) {
-        def matcher = (line =~ /^SCENARIO\s+(.+?)\s*\(([^)]*)\)$/)
+        def matcher = (line =~ /.*SCENARIO\s+(.+?)\s*\(([\d.,]+s)\)\s*$/)
         if (!matcher.find()) {
             return null
         }
@@ -537,14 +617,24 @@ class JiraGaiaReportBuilder {
         ]
     }
 
+    private String extractStepTitleFromVerboseLine(String line) {
+        String marker = 'TEST STEP: '
+        if (!line.contains(marker)) {
+            return ''
+        }
+
+        String text = line.substring(line.indexOf(marker) + marker.length()).trim()
+        return safeValue(text)
+    }
+
     private Map parseCompactStepLine(String line, int stepIndex) {
-        def matcher = (line =~ /^\d+\s*-\s*(.+?)\s*\(([^)]*)\)$/)
+        def matcher = (line =~ /.*?(\d+)\s*-\s*(.+?)\s*\(([\d.,]+s)\)\s*$/)
         if (!matcher.find()) {
             return null
         }
 
-        String stepTitle = safeValue(matcher.group(1))
-        long durationMs = toMillisFromCompactSeconds(matcher.group(2))
+        String stepTitle = cleanupStepTitle(safeValue(matcher.group(2)))
+        long durationMs = toMillisFromCompactSeconds(matcher.group(3))
 
         return [
             id           : 'step-' + stepIndex,
@@ -564,19 +654,8 @@ class JiraGaiaReportBuilder {
         ]
     }
 
-    private String extractStepTitleFromVerboseLine(String line) {
-        String marker = 'TEST STEP: '
-        if (!line.contains(marker)) {
-            return ''
-        }
-
-        String value = line.substring(line.indexOf(marker) + marker.length()).trim()
-        return safeValue(value)
-    }
-
     private String inferStatusFromCompactStepTitle(String title) {
         String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
-
         if (lower.contains('failed')) {
             return 'failed'
         }
@@ -586,7 +665,6 @@ class JiraGaiaReportBuilder {
         if (lower.contains('skipped')) {
             return 'skipped'
         }
-
         return 'info'
     }
 
@@ -624,7 +702,7 @@ class JiraGaiaReportBuilder {
         String message = safeValue(matcher.group(3))
 
         return [
-            timeLabel: formatTimeFromClock(matcher.group(1)),
+            timeLabel: formatTimeFromClock(safeValue(matcher.group(1))),
             status   : normalizeEventStatus(rawStatus),
             message  : message
         ]
@@ -665,57 +743,66 @@ class JiraGaiaReportBuilder {
 
     private void normalizeScenarioSteps(List<Map> scenarios) {
         scenarios.each { Map scenario ->
+            List<Map> currentSteps = (scenario.steps ?: []) as List<Map>
             List<Map> narrativeSteps = extractNarrativeSteps(safeValue(scenario.errorFull))
-            if (narrativeSteps.size() > scenario.steps.size()) {
-                Map failedOriginal = scenario.steps.find { Map item -> safeValue(item.status) == 'failed' }
 
-                narrativeSteps.eachWithIndex { Map item, int idx ->
-                    item.id = scenario.id + '-step-' + (idx + 1)
-                    item.emoji = resolveStepEmoji(item.title)
-                    item.durationMs = 0L
-                    item.durationLabel = formatDurationFull(0L)
-                    item.timeLabel = ''
-                    item.startLabel = ''
-                    item.endLabel = ''
-                    item.detailText = item.title
-                    item.errorFull = ''
-                    item.shortError = ''
+            if (!narrativeSteps.isEmpty()) {
+                Map<String, Map> existingByKey = [:]
+                currentSteps.each { Map step ->
+                    existingByKey[stepKey(step.title)] = step
+                }
 
-                    if (safeValue(item.status) == 'failed') {
-                        item.shortError = safeValue(scenario.errorShort)
-                        item.errorFull = safeValue(scenario.errorFull)
-                        if (isBlank(item.shortError) && failedOriginal != null) {
-                            item.shortError = safeValue(failedOriginal.shortError)
-                        }
-                        if (isBlank(item.errorFull) && failedOriginal != null) {
-                            item.errorFull = safeValue(failedOriginal.errorFull)
-                        }
+                List<Map> merged = []
+                narrativeSteps.eachWithIndex { Map narrative, int idx ->
+                    String key = stepKey(narrative.title)
+                    Map existing = existingByKey[key]
+
+                    Map step = [
+                        id           : scenario.id + '-step-' + (idx + 1),
+                        title        : cleanupStepTitle(narrative.title),
+                        status       : safeValue(narrative.status),
+                        timeLabel    : existing != null ? safeValue(existing.timeLabel) : '',
+                        startLabel   : existing != null ? safeValue(existing.startLabel) : '',
+                        endLabel     : existing != null ? safeValue(existing.endLabel) : '',
+                        durationMs   : existing != null ? toLong(existing.durationMs) : 0L,
+                        durationLabel: formatDurationFull(existing != null ? toLong(existing.durationMs) : 0L),
+                        detailText   : existing != null ? safeValue(existing.detailText) : safeValue(narrative.title),
+                        shortError   : existing != null ? safeValue(existing.shortError) : '',
+                        errorFull    : existing != null ? safeValue(existing.errorFull) : '',
+                        emoji        : resolveStepEmoji(narrative.title)
+                    ]
+
+                    if (safeValue(step.status) == 'failed' && isBlank(step.shortError)) {
+                        step.shortError = extractShortError(step.errorFull ?: scenario.errorShort ?: scenario.errorFull)
                     }
+                    if (safeValue(step.status) == 'failed' && isBlank(step.errorFull)) {
+                        step.errorFull = safeValue(scenario.errorFull)
+                    }
+
+                    merged << step
                 }
 
-                scenario.steps = narrativeSteps
-            }
-
-            scenario.steps.eachWithIndex { Map step, int index ->
-                step.id = isBlank(step.id) ? (scenario.id + '-step-' + (index + 1)) : step.id
-                step.title = cleanupStepTitle(step.title)
-                step.emoji = resolveStepEmoji(step.title)
-                step.durationMs = toLong(step.durationMs)
-                step.durationLabel = formatDurationFull(toLong(step.durationMs))
-                step.timeLabel = safeValue(step.timeLabel)
-                step.shortError = safeValue(step.shortError)
-                step.errorFull = safeValue(step.errorFull)
-                step.detailText = safeValue(step.detailText)
-
-                if (safeValue(step.status) == 'failed' && isBlank(step.shortError)) {
-                    step.shortError = extractShortError(step.errorFull ?: step.detailText)
+                scenario.steps = merged
+            } else {
+                currentSteps.eachWithIndex { Map step, int idx ->
+                    step.id = isBlank(step.id) ? (scenario.id + '-step-' + (idx + 1)) : step.id
+                    step.title = cleanupStepTitle(step.title)
+                    step.emoji = resolveStepEmoji(step.title)
+                    step.durationMs = toLong(step.durationMs)
+                    step.durationLabel = formatDurationFull(toLong(step.durationMs))
+                    step.timeLabel = safeValue(step.timeLabel)
+                    step.shortError = safeValue(step.shortError)
+                    step.errorFull = safeValue(step.errorFull)
+                    step.detailText = safeValue(step.detailText)
                 }
             }
 
-            scenario.status = resolveScenarioStatus(scenario.steps)
-            scenario.errorShort = resolveScenarioErrorShort(scenario.steps)
-            scenario.errorFull = resolveScenarioErrorFull(scenario.steps)
+            List<Map> steps = (scenario.steps ?: []) as List<Map>
+            scenario.status = resolveScenarioStatus(steps)
+            scenario.errorShort = resolveScenarioErrorShort(steps)
+            scenario.errorFull = resolveScenarioErrorFull(steps)
             scenario.sidebarSubtitle = isBlank(scenario.errorShort) ? safeValue(scenario.title) : scenario.errorShort
+            scenario.durationLabel = formatDurationFull(toLong(scenario.durationMs))
         }
     }
 
@@ -751,14 +838,14 @@ class JiraGaiaReportBuilder {
                 return
             }
 
-            boolean looksLikeGherkin = false
             String baseLower = base.toLowerCase(Locale.ENGLISH)
-            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('given ')
-            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('when ')
-            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('then ')
-            looksLikeGherkin = looksLikeGherkin || baseLower.startsWith('and ')
+            boolean looksLikeStep = false
+            looksLikeStep = looksLikeStep || baseLower.startsWith('given ')
+            looksLikeStep = looksLikeStep || baseLower.startsWith('when ')
+            looksLikeStep = looksLikeStep || baseLower.startsWith('then ')
+            looksLikeStep = looksLikeStep || baseLower.startsWith('and ')
 
-            if (!looksLikeGherkin) {
+            if (!looksLikeStep) {
                 return
             }
 
@@ -771,9 +858,17 @@ class JiraGaiaReportBuilder {
         return steps
     }
 
+    private String stepKey(String value) {
+        String text = safeValue(value).toLowerCase(Locale.ENGLISH)
+        text = text.replaceAll(/^(given|when|then|and)\s+/, '')
+        text = text.replaceAll(/[^a-z0-9]+/, '')
+        return text
+    }
+
     private String cleanupScenarioTitle(String value) {
         String text = safeValue(value)
         text = text.replaceAll(/\s+\(\d+[.,]\d+s\)$/, '').trim()
+        text = text.replaceAll(/^Start Test Case : SCENARIO /, '').trim()
         return text
     }
 
@@ -808,7 +903,6 @@ class JiraGaiaReportBuilder {
         if (failedStep == null) {
             return ''
         }
-
         return extractShortError(failedStep.shortError ?: failedStep.errorFull ?: failedStep.detailText)
     }
 
@@ -817,7 +911,6 @@ class JiraGaiaReportBuilder {
         if (failedStep == null) {
             return ''
         }
-
         return safeValue(failedStep.errorFull ?: failedStep.detailText)
     }
 
@@ -830,11 +923,16 @@ class JiraGaiaReportBuilder {
             return
         }
 
+        scenarios.each { Map scenario ->
+            long stepTotal = sumStepDurations((scenario.steps ?: []) as List<Map>)
+            if (stepTotal > toLong(scenario.durationMs)) {
+                scenario.durationMs = stepTotal
+            }
+            scenario.durationLabel = formatDurationFull(toLong(scenario.durationMs))
+        }
+
         long totalDurationMs = 0L
         scenarios.each { Map item ->
-            if (toLong(item.durationMs) <= 0L) {
-                item.durationMs = sumStepDurations(item.steps)
-            }
             totalDurationMs += toLong(item.durationMs)
         }
 
@@ -842,18 +940,70 @@ class JiraGaiaReportBuilder {
         Date suiteStart = new Date(suiteEnd.time - totalDurationMs)
 
         long cursor = suiteStart.time
-        scenarios.each { Map item ->
-            long scenarioDuration = toLong(item.durationMs)
 
-            if (isBlank(item.startLabel)) {
-                item.startLabel = formatTimeOnly(new Date(cursor))
-            }
-            if (isBlank(item.endLabel)) {
-                item.endLabel = formatTimeOnly(new Date(cursor + scenarioDuration))
+        scenarios.each { Map scenario ->
+            long scenarioDuration = toLong(scenario.durationMs)
+            if (scenarioDuration <= 0L) {
+                scenarioDuration = Math.max(1000L, sumStepDurations((scenario.steps ?: []) as List<Map>))
             }
 
-            item.durationLabel = formatDurationFull(scenarioDuration)
+            if (isBlank(scenario.startLabel)) {
+                scenario.startLabel = formatTimeOnly(new Date(cursor))
+            }
+
+            if (isBlank(scenario.endLabel)) {
+                scenario.endLabel = formatTimeOnly(new Date(cursor + scenarioDuration))
+            }
+
+            fillStepTimeLabels(scenario)
+            scenario.durationMs = scenarioDuration
+            scenario.durationLabel = formatDurationFull(scenarioDuration)
+
             cursor += scenarioDuration
+        }
+    }
+
+    private void fillStepTimeLabels(Map scenario) {
+        List<Map> steps = (scenario.steps ?: []) as List<Map>
+        if (steps.isEmpty()) {
+            return
+        }
+
+        Date scenarioStart = parseTimeOnly(safeValue(scenario.startLabel))
+        if (scenarioStart == null) {
+            return
+        }
+
+        long cursor = scenarioStart.time
+
+        steps.each { Map step ->
+            if (isBlank(step.timeLabel)) {
+                step.timeLabel = formatTimeOnly(new Date(cursor))
+            } else {
+                Date parsed = parseTimeOnly(safeValue(step.timeLabel))
+                if (parsed != null) {
+                    cursor = parsed.time
+                }
+            }
+
+            long stepDuration = toLong(step.durationMs)
+            if (stepDuration <= 0L) {
+                stepDuration = 1000L
+            }
+
+            cursor += stepDuration
+        }
+    }
+
+    private Date parseTimeOnly(String raw) {
+        if (isBlank(raw)) {
+            return null
+        }
+
+        try {
+            return new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH).parse(raw)
+        } catch (Exception ignored) {
+            return null
         }
     }
 
@@ -906,7 +1056,6 @@ class JiraGaiaReportBuilder {
         long hours = (long) Math.floor(totalSeconds / 3600L)
         long minutes = (long) Math.floor((totalSeconds % 3600L) / 60L)
         long seconds = totalSeconds % 60L
-
         return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
     }
 
@@ -952,6 +1101,19 @@ class JiraGaiaReportBuilder {
     // ERROR / EVIDENCE
     // =========================================================================
 
+    private boolean looksLikeErrorLine(String line) {
+        String lower = safeValue(line).toLowerCase(Locale.ENGLISH)
+
+        boolean error = false
+        error = error || lower.contains('exception')
+        error = error || lower.contains('root cause')
+        error = error || lower.contains('caused by:')
+        error = error || lower.contains('unable to ')
+        error = error || lower.contains('stacktrace')
+        error = error || lower.startsWith('at ')
+        return error
+    }
+
     private String extractShortError(def source) {
         String text = safeValue(source)
         if (isBlank(text)) {
@@ -976,221 +1138,128 @@ class JiraGaiaReportBuilder {
 
         String value = safeValue(preferred ?: lines.first())
         value = value.replace('com.kms.katalon.core.exception.StepFailedException:', '').trim()
-        value = value.replace('org.codehaus.groovy.runtime.InvokerInvocationException:', '').trim()
+        value = value.replace('(Root cause:', '').trim()
 
-        int rootCauseIndex = value.indexOf('(Root cause:')
-        if (rootCauseIndex > 0) {
-            value = value.substring(0, rootCauseIndex).trim()
+        int atIndex = value.indexOf(' at ')
+        if (atIndex > 0) {
+            value = value.substring(0, atIndex).trim()
         }
 
-        int stackIndex = value.indexOf(' at com.kms')
-        if (stackIndex > 0) {
-            value = value.substring(0, stackIndex).trim()
-        }
-
-        value = value.replaceAll(/\s+/, ' ').trim()
-
-        if (value.length() > 130) {
-            return value.substring(0, 127) + '...'
+        if (value.length() > 180) {
+            value = value.substring(0, 177) + '...'
         }
 
         return value
     }
 
-    private boolean looksLikeErrorLine(String line) {
-        String lower = safeValue(line).toLowerCase(Locale.ENGLISH)
-
-        boolean match = false
-        match = match || lower.startsWith('at ')
-        match = match || lower.startsWith('caused by:')
-        match = match || lower.contains('exception')
-        match = match || lower.contains('root cause')
-        match = match || lower.contains('webdriver')
-        match = match || lower.contains('session info')
-        match = match || lower.contains('build info')
-        match = match || lower.contains('driver info')
-        match = match || lower.contains('capabilities')
-        match = match || lower.contains('unable to ')
-        match = match || lower.contains('stacktrace')
-
-        return match
-    }
-
     private void attachEvidenceToFailedScenarios(File reportDir, List<Map> scenarios) {
-        List<File> images = collectEvidenceImages(reportDir)
-        if (images.isEmpty()) {
-            return
-        }
-
+        List<File> images = findEvidenceImages(reportDir)
         List<Map> failedScenarios = scenarios.findAll { Map item -> safeValue(item.status) == 'failed' }
-        if (failedScenarios.isEmpty()) {
+
+        if (images.isEmpty() || failedScenarios.isEmpty()) {
+            scenarios.each { Map scenario ->
+                scenario.evidences = []
+            }
             return
         }
 
-        int scenarioIndex = 0
-        images.each { File image ->
-            Map scenario = failedScenarios[scenarioIndex]
+        images.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
 
-            scenario.evidences << [
-                name      : image.name,
-                filePath  : image.absolutePath,
-                openUrl   : image.toURI().toString(),
-                previewUrl: image.toURI().toString()
-            ]
+        int imageCursor = images.size() - 1
+        failedScenarios.reverseEach { Map scenario ->
+            scenario.evidences = []
+            if (imageCursor >= 0) {
+                File chosen = images[imageCursor]
+                imageCursor--
 
-            if (scenarioIndex < failedScenarios.size() - 1) {
-                scenarioIndex++
+                scenario.evidences << [
+                    fileName : chosen.name,
+                    href     : chosen.toURI().toString(),
+                    imageSrc : chosen.toURI().toString()
+                ]
             }
         }
+
+        scenarios.findAll { Map item -> safeValue(item.status) != 'failed' }.each { Map scenario ->
+            scenario.evidences = []
+        }
     }
 
-    private List<File> collectEvidenceImages(File reportDir) {
+    private List<File> findEvidenceImages(File reportDir) {
         List<File> images = []
+        File[] files = reportDir.listFiles()
 
-        reportDir.eachFileRecurse { File file ->
+        if (files == null) {
+            return images
+        }
+
+        files.each { File file ->
             if (!file.isFile()) {
                 return
             }
 
             String lower = file.name.toLowerCase(Locale.ENGLISH)
-            boolean isImage = false
-            isImage = isImage || lower.endsWith('.png')
-            isImage = isImage || lower.endsWith('.jpg')
-            isImage = isImage || lower.endsWith('.jpeg')
-            isImage = isImage || lower.endsWith('.webp')
-
-            if (isImage) {
+            if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp')) {
                 images << file
             }
-        }
-
-        images.sort { File left, File right ->
-            left.lastModified() <=> right.lastModified()
         }
 
         return images
     }
 
-    // =========================================================================
-    // FILE / TEXT HELPERS
-    // =========================================================================
-
-    private File findExecutionLog(File reportDir) {
-        List<File> candidates = []
-
-        reportDir.eachFileRecurse { File file ->
-            if (!file.isFile()) {
-                return
-            }
-
-            String lower = file.name.toLowerCase(Locale.ENGLISH)
-            if (lower.startsWith('execution') && lower.endsWith('.log')) {
-                candidates << file
-            }
+    private String resolveAssetUrl(File reportDir, String relativePath) {
+        File projectRoot = findProjectRoot(reportDir)
+        File asset = new File(projectRoot, relativePath)
+        if (asset.exists()) {
+            return asset.toURI().toString()
         }
-
-        if (candidates.isEmpty()) {
-            return null
-        }
-
-        candidates.sort { File left, File right ->
-            right.lastModified() <=> left.lastModified()
-        }
-
-        return candidates.first()
+        return ''
     }
 
-    private List<String> readFileLines(File file) {
-        try {
-            return file.readLines(StandardCharsets.UTF_8.name())
-        } catch (Exception ignored) {
-            try {
-                return file.readLines()
-            } catch (Exception ignoredAgain) {
-                return []
-            }
-        }
-    }
-
-    private String normalizeText(List lines) {
-        if (lines == null || lines.isEmpty()) {
-            return ''
-        }
-
-        return lines.collect { safeValue(it) }.join('\n').trim()
-    }
-
-    private String resolveAssetUrl(File startDir, String relativePath) {
-        File assetFile = resolveProjectFile(startDir, relativePath)
-        if (assetFile == null || !assetFile.exists()) {
-            return ''
-        }
-        return assetFile.toURI().toString()
-    }
-
-    private File resolveProjectFile(File startDir, String relativePath) {
-        File current = startDir
+    private File findProjectRoot(File reportDir) {
+        File current = reportDir
         while (current != null) {
-            File candidate = new File(current, relativePath)
-            if (candidate.exists()) {
-                return candidate
+            if ('Reports'.equalsIgnoreCase(current.name)) {
+                return current.parentFile != null ? current.parentFile : current
             }
             current = current.parentFile
         }
-        return null
+        return reportDir
     }
 
     // =========================================================================
-    // GENERIC HELPERS
+    // STEP DECORATION
     // =========================================================================
 
     private String resolveStepEmoji(String title) {
         String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
 
-        if (lower.contains('wait') || lower.contains('search') || lower.contains('find')) {
+        boolean isSearch = lower.contains('search') || lower.contains('find') || lower.contains('wait')
+        if (isSearch) {
             return '🔎'
         }
-        if (lower.contains('click') || lower.contains('select') || lower.contains('open')) {
+
+        boolean isClick = lower.contains('click') || lower.contains('select') || lower.contains('open') || lower.contains('navigate')
+        if (isClick) {
             return '🖱️'
         }
-        if (lower.contains('fill') || lower.contains('type') || lower.contains('input')) {
+
+        boolean isFill = lower.contains('fill') || lower.contains('input') || lower.contains('type') || lower.contains('write')
+        if (isFill) {
             return '⌨️'
         }
-        if (lower.contains('import') || lower.contains('upload')) {
-            return '📥'
+
+        boolean isUpload = lower.contains('import') || lower.contains('upload') || lower.contains('file')
+        if (isUpload) {
+            return '📄'
         }
-        if (lower.contains('save')) {
-            return '💾'
-        }
-        if (lower.contains('reload') || lower.contains('refresh')) {
-            return '🔄'
-        }
-        if (lower.contains('delete') || lower.contains('remove')) {
-            return '🗑️'
-        }
-        if (lower.contains('validate') || lower.contains('assert') || lower.contains('match')) {
+
+        boolean isValidation = lower.contains('verify') || lower.contains('assert') || lower.contains('match') || lower.contains('contain')
+        if (isValidation) {
             return '✅'
         }
-        if (lower.contains('portal') || lower.contains('page') || lower.contains('home')) {
-            return '🌐'
-        }
-        return '📝'
-    }
 
-    private long toLong(def value) {
-        try {
-            return (value ?: 0L) as long
-        } catch (Exception ignored) {
-            return 0L
-        }
-    }
-
-    private String safeValue(def value) {
-        return value == null ? '' : String.valueOf(value).trim()
-    }
-
-    private boolean isBlank(def value) {
-        return safeValue(value).isEmpty()
+        return '🔹'
     }
 }
 
@@ -1202,7 +1271,10 @@ class JiraGaiaReportBuilder {
 
 
 
-Keywords/jiraIntegration/JiraGaiaHtmlTemplateBuilder.groovy
+
+
+
+2) Keywords/jiraIntegration/JiraGaiaHtmlTemplateBuilder.groovy
 package jiraIntegration
 
 import java.util.Locale
@@ -1210,19 +1282,18 @@ import java.util.Locale
 class JiraGaiaHtmlTemplateBuilder {
 
     private static final String APP_NAME = 'GAIA'
-    private static final String BANNER_GRADIENT = 'linear-gradient(90deg, #0d2d57 0%, #155c78 58%, #57c86d 100%)'
-
-    private static final String STATUS_PASS = '#61b55a'
-    private static final String STATUS_FAIL = '#d9534f'
-    private static final String STATUS_SKIP = '#d6b34a'
-    private static final String STATUS_INFO = '#4aa7cf'
-    private static final String STATUS_NEUTRAL = '#7d8ea3'
+    private static final String BANNER_GRADIENT = 'linear-gradient(90deg, #0d2d57 0%, #155c78 58%, #2ca06c 100%)'
+    private static final String STATUS_PASS = '#55b86a'
+    private static final String STATUS_FAIL = '#d85b52'
+    private static final String STATUS_SKIP = '#d8b54c'
+    private static final String STATUS_INFO = '#3ba9d6'
+    private static final String BORDER_COLOR = '#edf1f5'
+    private static final String TEXT_MUTED = '#7a8795'
 
     String build(Map model) {
         List<Map> scenarios = (model.scenarios ?: []) as List<Map>
         Map summary = (model.summary ?: [:]) as Map
-
-        String activeId = scenarios ? safeValue(scenarios.first().id) : ''
+        String firstScenarioId = scenarios.isEmpty() ? '' : safeValue(scenarios[0].id)
 
         StringBuilder html = new StringBuilder()
 
@@ -1240,18 +1311,51 @@ class JiraGaiaHtmlTemplateBuilder {
         html.append('</head>')
         html.append('<body>')
 
-        html.append('<div class="app-shell">')
-        html.append(buildHeader(model))
-        html.append('<div class="content-shell">')
+        html.append(buildTopBanner(model))
 
-        html.append(buildSidebar(model, scenarios, summary, activeId))
-        html.append(buildMainContent(model, scenarios, summary, activeId))
+        html.append('<div class="page-shell">')
+
+        html.append('<aside class="sidebar">')
+        html.append('<div class="sidebar-tabs">')
+        html.append('<button id="tab-tests" class="sidebar-tab active" type="button">Tests</button>')
+        html.append('<button id="tab-charts" class="sidebar-tab" type="button">Charts</button>')
+        html.append('</div>')
+
+        html.append('<div id="tests-sidebar-content" class="sidebar-content active">')
+        html.append('<div class="sidebar-search-wrap">')
+        html.append('<input id="scenario-search" class="sidebar-search" type="text" placeholder="Search test name, path, or status.">')
+        html.append('</div>')
+        html.append('<div id="scenario-list" class="scenario-list">')
+
+        scenarios.eachWithIndex { Map scenario, int index ->
+            html.append(buildScenarioSidebarItem(scenario, index == 0))
+        }
 
         html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div id="charts-sidebar-content" class="sidebar-content">')
+        html.append(buildChartsSidebar(summary))
+        html.append('</div>')
+        html.append('</aside>')
+
+        html.append('<main class="content-area">')
+
+        html.append('<section id="tests-panel" class="content-panel active">')
+        scenarios.eachWithIndex { Map scenario, int index ->
+            html.append(buildScenarioPanel(model, scenario, index == 0))
+        }
+        html.append('</section>')
+
+        html.append('<section id="charts-panel" class="content-panel">')
+        html.append(buildChartsPanel(summary))
+        html.append('</section>')
+
+        html.append('</main>')
         html.append('</div>')
 
         html.append('<script>')
-        html.append(buildJavascript(activeId))
+        html.append(buildJs(firstScenarioId))
         html.append('</script>')
 
         html.append('</body>')
@@ -1261,40 +1365,38 @@ class JiraGaiaHtmlTemplateBuilder {
     }
 
     // =========================================================================
-    // HEADER
+    // TOP BANNER
     // =========================================================================
 
-    private String buildHeader(Map model) {
+    private String buildTopBanner(Map model) {
         StringBuilder html = new StringBuilder()
 
         html.append('<header class="top-banner">')
-        html.append('<div class="brand-area">')
+        html.append('<div class="brand-box">')
 
+        html.append('<div class="brand-logo">')
         String logoSrc = safeValue(model.logoSrc)
         if (!isBlank(logoSrc)) {
-            html.append('<div class="brand-logo-wrap">')
-            html.append('<img class="brand-logo-img" src="')
+            html.append('<img src="')
             html.append(htmlEscape(logoSrc))
-            html.append('" alt="GAIA logo" onerror="this.style.display=\'none\'; this.parentNode.innerHTML=\'<span class=&quot;brand-logo-fallback&quot;>G</span>\';">')
-            html.append('</div>')
+            html.append('" alt="GAIA logo" onerror="this.style.display=\'none\'; this.parentNode.classList.add(\'logo-fallback\'); this.parentNode.innerHTML=\'G\';">')
         } else {
-            html.append('<div class="brand-logo-wrap">')
-            html.append('<span class="brand-logo-fallback">G</span>')
-            html.append('</div>')
+            html.append('G')
         }
+        html.append('</div>')
 
         html.append('<div class="brand-texts">')
-        html.append('<div class="report-title-top">')
+        html.append('<div class="brand-title">')
         html.append(htmlEscape(model.reportTitle))
         html.append('</div>')
-        html.append('<div class="report-subtitle-top">')
+        html.append('<div class="brand-subtitle">')
         html.append(htmlEscape(model.subtitle))
         html.append('</div>')
         html.append('</div>')
 
         html.append('</div>')
 
-        html.append('<div class="header-meta">')
+        html.append('<div class="brand-meta">')
         html.append('<div><strong>Generated:</strong> ')
         html.append(htmlEscape(model.generatedAt))
         html.append('</div>')
@@ -1311,67 +1413,30 @@ class JiraGaiaHtmlTemplateBuilder {
     // SIDEBAR
     // =========================================================================
 
-    private String buildSidebar(Map model, List<Map> scenarios, Map summary, String activeId) {
+    private String buildScenarioSidebarItem(Map scenario, boolean active) {
         StringBuilder html = new StringBuilder()
 
-        html.append('<aside class="sidebar">')
+        String scenarioId = safeValue(scenario.id)
+        String status = safeValue(scenario.status)
+        String sidebarDuration = safeValue(scenario.durationLabel)
+        String sidebarTime = safeValue(scenario.startLabel)
+        String subtitle = safeValue(scenario.sidebarSubtitle)
 
-        html.append('<div class="sidebar-tabs">')
-        html.append('<button class="tab-button active" type="button" data-tab="tests">Tests</button>')
-        html.append('<button class="tab-button" type="button" data-tab="charts">Charts</button>')
-        html.append('</div>')
-
-        html.append('<div class="sidebar-view sidebar-tests-view active" data-view="tests">')
-        html.append('<div class="sidebar-search-wrap">')
-        html.append('<input id="scenarioSearch" class="sidebar-search" type="text" placeholder="Search test name, path, or status.">')
-        html.append('</div>')
-        html.append('<div class="scenario-list">')
-
-        scenarios.each { Map scenario ->
-            html.append(buildSidebarScenarioItem(scenario, activeId))
+        html.append('<button type="button" class="scenario-item')
+        if (active) {
+            html.append(' active')
         }
-
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="sidebar-view sidebar-charts-view" data-view="charts">')
-        html.append('<div class="sidebar-summary-title">Execution status</div>')
-        html.append('<div class="sidebar-summary-list">')
-        html.append(buildSidebarSummaryRow('Passed', toInt(summary.passed), STATUS_PASS))
-        html.append(buildSidebarSummaryRow('Failed', toInt(summary.failed), STATUS_FAIL))
-        html.append(buildSidebarSummaryRow('Skipped', toInt(summary.skipped), STATUS_SKIP))
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('</aside>')
-        return html.toString()
-    }
-
-    private String buildSidebarScenarioItem(Map scenario, String activeId) {
-        StringBuilder html = new StringBuilder()
-
-        String status = normalizeStatus(scenario.status)
-        String itemClass = 'scenario-item'
-        if (safeValue(scenario.id) == activeId) {
-            itemClass += ' active'
-        }
-
-        html.append('<button class="')
-        html.append(itemClass)
-        html.append('" type="button" data-scenario-id="')
-        html.append(htmlEscape(safeValue(scenario.id)))
-        html.append('" data-search="')
-        html.append(htmlEscape(buildScenarioSearchText(scenario)))
+        html.append('" data-target="')
+        html.append(htmlEscape(scenarioId))
         html.append('">')
 
-        html.append('<div class="scenario-item-top">')
+        html.append('<div class="scenario-item-row">')
         html.append('<div class="scenario-item-title" title="')
         html.append(htmlEscape(safeValue(scenario.title)))
         html.append('">')
-        html.append(htmlEscape(oneLineText(scenario.title, 52)))
+        html.append(htmlEscape(safeValue(scenario.title)))
         html.append('</div>')
-
-        html.append('<span class="status-pill small ')
+        html.append('<span class="status-badge ')
         html.append(status)
         html.append('">')
         html.append(htmlEscape(capitalize(status)))
@@ -1379,17 +1444,17 @@ class JiraGaiaHtmlTemplateBuilder {
         html.append('</div>')
 
         html.append('<div class="scenario-item-subtitle" title="')
-        html.append(htmlEscape(safeValue(scenario.sidebarSubtitle)))
+        html.append(htmlEscape(subtitle))
         html.append('">')
-        html.append(htmlEscape(oneLineText(scenario.sidebarSubtitle, 62)))
+        html.append(htmlEscape(subtitle))
         html.append('</div>')
 
         html.append('<div class="scenario-item-meta">')
         html.append('<span>')
-        html.append(htmlEscape(safeValue(scenario.startLabel)))
+        html.append(htmlEscape(sidebarTime))
         html.append('</span>')
         html.append('<span>')
-        html.append(htmlEscape(safeValue(scenario.durationLabel)))
+        html.append(htmlEscape(sidebarDuration))
         html.append('</span>')
         html.append('</div>')
 
@@ -1398,198 +1463,229 @@ class JiraGaiaHtmlTemplateBuilder {
         return html.toString()
     }
 
-    private String buildScenarioSearchText(Map scenario) {
-        return [
-            safeValue(scenario.title),
-            safeValue(scenario.sidebarSubtitle),
-            safeValue(scenario.status),
-            safeValue(scenario.durationLabel)
-        ].join(' ')
-    }
-
-    private String buildSidebarSummaryRow(String label, int value, String color) {
+    private String buildChartsSidebar(Map summary) {
         StringBuilder html = new StringBuilder()
 
-        html.append('<div class="summary-row">')
-        html.append('<div class="summary-row-left">')
-        html.append('<span class="summary-dot" style="background:')
-        html.append(color)
-        html.append(';"></span>')
-        html.append('<span>')
+        int total = toInt(summary.total)
+        int passed = toInt(summary.passed)
+        int failed = toInt(summary.failed)
+        int skipped = toInt(summary.skipped)
+
+        html.append('<div class="charts-sidebar-wrap">')
+        html.append('<div class="sidebar-section-title">Execution Status</div>')
+
+        html.append('<div class="mini-donut-wrap">')
+        html.append('<div class="mini-donut" style="background:')
+        html.append(buildDonutGradient(passed, failed, skipped, total))
+        html.append(';">')
+        html.append('<div class="mini-donut-center">')
+        html.append('<div class="mini-donut-total">')
+        html.append(total)
+        html.append('</div>')
+        html.append('<div class="mini-donut-label">Tests</div>')
+        html.append('</div>')
+        html.append('</div>')
+        html.append('</div>')
+
+        html.append('<div class="legend-list">')
+        html.append(buildLegendRow('Passed', passed, 'passed'))
+        html.append(buildLegendRow('Failed', failed, 'failed'))
+        html.append(buildLegendRow('Skipped', skipped, 'skipped'))
+        html.append('</div>')
+
+        html.append('<div class="mini-bars">')
+        html.append(buildMiniBar('Passed', passed, total, 'passed'))
+        html.append(buildMiniBar('Failed', failed, total, 'failed'))
+        html.append(buildMiniBar('Skipped', skipped, total, 'skipped'))
+        html.append('</div>')
+
+        html.append('</div>')
+        return html.toString()
+    }
+
+    private String buildLegendRow(String label, int value, String statusClass) {
+        StringBuilder html = new StringBuilder()
+        html.append('<div class="legend-row">')
+        html.append('<span class="legend-dot ')
+        html.append(statusClass)
+        html.append('"></span>')
+        html.append('<span class="legend-label">')
         html.append(htmlEscape(label))
         html.append('</span>')
+        html.append('<span class="legend-value">')
+        html.append(value)
+        html.append('</span>')
         html.append('</div>')
-        html.append('<div class="summary-row-right">')
-        html.append(String.valueOf(value))
-        html.append('</div>')
-        html.append('</div>')
+        return html.toString()
+    }
 
+    private String buildMiniBar(String label, int value, int total, String statusClass) {
+        int percent = total > 0 ? Math.round((value * 100f) / total) : 0
+
+        StringBuilder html = new StringBuilder()
+        html.append('<div class="mini-bar-row">')
+        html.append('<div class="mini-bar-label">')
+        html.append(htmlEscape(label))
+        html.append('</div>')
+        html.append('<div class="mini-bar-track">')
+        html.append('<div class="mini-bar-fill ')
+        html.append(statusClass)
+        html.append('" style="width:')
+        html.append(percent)
+        html.append('%;"></div>')
+        html.append('</div>')
+        html.append('<div class="mini-bar-value">')
+        html.append(value)
+        html.append('</div>')
+        html.append('</div>')
         return html.toString()
     }
 
     // =========================================================================
-    // MAIN CONTENT
+    // RIGHT PANELS
     // =========================================================================
 
-    private String buildMainContent(Map model, List<Map> scenarios, Map summary, String activeId) {
+    private String buildScenarioPanel(Map model, Map scenario, boolean active) {
         StringBuilder html = new StringBuilder()
 
-        html.append('<main class="main-content">')
+        String scenarioId = safeValue(scenario.id)
+        String status = safeValue(scenario.status)
 
-        html.append('<section id="testsView" class="main-view active" data-view="tests">')
-        scenarios.each { Map scenario ->
-            html.append(buildScenarioPanel(model, scenario, activeId))
+        html.append('<section id="panel-')
+        html.append(htmlEscape(scenarioId))
+        html.append('" class="scenario-panel')
+        if (active) {
+            html.append(' active')
         }
-        html.append('</section>')
-
-        html.append('<section id="chartsView" class="main-view" data-view="charts">')
-        html.append(buildChartsPanel(model, summary))
-        html.append('</section>')
-
-        html.append('</main>')
-        return html.toString()
-    }
-
-    private String buildScenarioPanel(Map model, Map scenario, String activeId) {
-        StringBuilder html = new StringBuilder()
-
-        String panelClass = 'scenario-panel'
-        if (safeValue(scenario.id) == activeId) {
-            panelClass += ' active'
-        }
-
-        html.append('<section class="')
-        html.append(panelClass)
-        html.append('" data-panel-id="')
-        html.append(htmlEscape(safeValue(scenario.id)))
         html.append('">')
 
-        html.append('<div class="scenario-heading">')
-        html.append('<div class="scenario-name" title="')
+        html.append('<div class="scenario-header">')
+        html.append('<h2 class="scenario-title">')
         html.append(htmlEscape(safeValue(scenario.title)))
-        html.append('">')
-        html.append(htmlEscape(safeValue(scenario.title)))
+        html.append('</h2>')
+
+        html.append('<div class="scenario-meta-pills">')
+        html.append(buildMetaPill('Suite', safeValue(model.suiteName), 'neutral'))
+        html.append(buildMetaPill('Status', capitalize(status), status))
+        html.append(buildMetaPill('Start', safeValue(scenario.startLabel), 'time'))
+        html.append(buildMetaPill('End', safeValue(scenario.endLabel), 'time'))
+        html.append(buildMetaPill('Duration', safeValue(scenario.durationLabel), 'duration'))
         html.append('</div>')
         html.append('</div>')
 
-        html.append('<div class="scenario-meta-chips">')
-        html.append(buildMetaChip('Suite', model.suiteName, 'neutral'))
-        html.append(buildMetaChip('Status', capitalize(normalizeStatus(scenario.status)), normalizeStatus(scenario.status)))
-        html.append(buildMetaChip('Start', scenario.startLabel, 'neutral'))
-        html.append(buildMetaChip('End', scenario.endLabel, 'neutral'))
-        html.append(buildMetaChip('Duration', scenario.durationLabel, 'neutral'))
-        html.append('</div>')
-
+        html.append('<div class="steps-block">')
         html.append('<div class="section-title">Steps</div>')
-        html.append('<div class="steps-table-wrap">')
-        html.append('<table class="steps-table">')
-        html.append('<thead><tr><th class="status-col">STATUS</th><th class="time-col">TIMESTAMP</th><th>DETAILS</th></tr></thead>')
-        html.append('<tbody>')
+        html.append('<div class="steps-table">')
+        html.append('<div class="steps-head">')
+        html.append('<div class="col-status">Status</div>')
+        html.append('<div class="col-time">Timestamp</div>')
+        html.append('<div class="col-detail">Details</div>')
+        html.append('</div>')
 
         List<Map> steps = (scenario.steps ?: []) as List<Map>
         steps.each { Map step ->
             html.append(buildStepRow(step))
         }
 
-        html.append('</tbody>')
-        html.append('</table>')
+        html.append('</div>')
         html.append('</div>')
 
-        if (normalizeStatus(scenario.status) == 'failed' && !isBlank(scenario.errorShort)) {
-            html.append(buildVisualErrorSection(scenario))
-        }
-
-        if (normalizeStatus(scenario.status) == 'failed' && scenario.evidences && !scenario.evidences.isEmpty()) {
-            html.append(buildEvidenceSection(scenario))
+        if (safeValue(scenario.status) == 'failed') {
+            html.append(buildErrorSection(scenario))
+            html.append(buildEvidenceSection((scenario.evidences ?: []) as List<Map>))
         }
 
         html.append('</section>')
         return html.toString()
     }
 
-    private String buildMetaChip(String label, def value, String tone) {
+    private String buildMetaPill(String label, String value, String cssType) {
         StringBuilder html = new StringBuilder()
-
-        html.append('<div class="meta-chip ')
-        html.append(htmlEscape(tone))
+        html.append('<div class="meta-pill ')
+        html.append(htmlEscape(cssType))
         html.append('">')
-        html.append('<span class="meta-chip-label">')
+        html.append('<span class="meta-pill-label">')
         html.append(htmlEscape(label))
-        html.append('</span>')
-        html.append('<span class="meta-chip-value">')
-        html.append(htmlEscape(safeValue(value)))
+        html.append(':</span>')
+        html.append('<span class="meta-pill-value">')
+        html.append(htmlEscape(value))
         html.append('</span>')
         html.append('</div>')
-
         return html.toString()
     }
 
     private String buildStepRow(Map step) {
         StringBuilder html = new StringBuilder()
-        String status = normalizeStatus(step.status)
 
-        html.append('<tr>')
-        html.append('<td class="status-col">')
-        html.append('<span class="status-pill ')
-        html.append(status)
+        String status = safeValue(step.status)
+        String timeLabel = safeValue(step.timeLabel)
+        String title = safeValue(step.title)
+        String emoji = safeValue(step.emoji)
+        String shortError = safeValue(step.shortError)
+        String detailText = safeValue(step.detailText)
+        String errorFull = safeValue(step.errorFull)
+
+        html.append('<div class="step-row">')
+
+        html.append('<div class="col-status">')
+        html.append('<span class="status-badge ')
+        html.append(htmlEscape(status))
         html.append('">')
         html.append(htmlEscape(capitalize(status)))
         html.append('</span>')
-        html.append('</td>')
+        html.append('</div>')
 
-        html.append('<td class="time-col">')
-        html.append(htmlEscape(isBlank(step.timeLabel) ? '—' : safeValue(step.timeLabel)))
-        html.append('</td>')
+        html.append('<div class="col-time">')
+        html.append(htmlEscape(timeLabel))
+        html.append('</div>')
 
-        html.append('<td class="detail-col">')
+        html.append('<div class="col-detail">')
         html.append('<div class="step-main-line">')
         html.append('<span class="step-emoji">')
-        html.append(htmlEscape(safeValue(step.emoji)))
+        html.append(htmlEscape(emoji))
         html.append('</span>')
-        html.append('<span class="step-title">')
-        html.append(htmlEscape(safeValue(step.title)))
+        html.append('<span class="step-text">')
+        html.append(htmlEscape(title))
         html.append('</span>')
         html.append('</div>')
 
-        if (status == 'failed' && !isBlank(step.shortError)) {
-            html.append('<div class="step-inline-error">')
-            html.append(htmlEscape(safeValue(step.shortError)))
+        if (status == 'failed' && !isBlank(shortError)) {
+            html.append('<div class="step-error-short">')
+            html.append(htmlEscape(shortError))
             html.append('</div>')
         }
 
-        String detailText = safeValue(step.detailText)
-        String errorText = safeValue(step.errorFull)
-        String expandedText = !isBlank(errorText) ? errorText : detailText
-
-        if (!isBlank(expandedText)) {
-            html.append('<details class="detail-toggle">')
+        if (status == 'failed' && !isBlank(errorFull)) {
+            html.append('<details class="step-detail-box">')
             html.append('<summary>🔎 View full detail</summary>')
             html.append('<pre>')
-            html.append(htmlEscape(expandedText))
+            html.append(htmlEscape(errorFull))
             html.append('</pre>')
             html.append('</details>')
         }
 
-        html.append('</td>')
-        html.append('</tr>')
+        html.append('</div>')
+        html.append('</div>')
 
         return html.toString()
     }
 
-    private String buildVisualErrorSection(Map scenario) {
-        StringBuilder html = new StringBuilder()
+    private String buildErrorSection(Map scenario) {
+        String shortError = safeValue(scenario.errorShort)
+        String fullError = safeValue(scenario.errorFull)
 
-        html.append('<div class="error-card">')
+        StringBuilder html = new StringBuilder()
+        html.append('<div class="error-block">')
         html.append('<div class="error-title">Visual Error Log</div>')
         html.append('<div class="error-short">')
-        html.append(htmlEscape(safeValue(scenario.errorShort)))
+        html.append(htmlEscape(shortError))
         html.append('</div>')
 
-        if (!isBlank(scenario.errorFull)) {
-            html.append('<details class="detail-toggle error-toggle">')
+        if (!isBlank(fullError)) {
+            html.append('<details class="error-detail-box">')
             html.append('<summary>🔎 View full error</summary>')
-            html.append('<pre class="error-pre">')
-            html.append(htmlEscape(safeValue(scenario.errorFull)))
+            html.append('<pre>')
+            html.append(htmlEscape(fullError))
             html.append('</pre>')
             html.append('</details>')
         }
@@ -1598,35 +1694,37 @@ class JiraGaiaHtmlTemplateBuilder {
         return html.toString()
     }
 
-    private String buildEvidenceSection(Map scenario) {
-        StringBuilder html = new StringBuilder()
+    private String buildEvidenceSection(List<Map> evidences) {
+        if (evidences == null || evidences.isEmpty()) {
+            return ''
+        }
 
-        html.append('<div class="evidence-section">')
+        StringBuilder html = new StringBuilder()
+        html.append('<div class="evidence-block">')
         html.append('<div class="section-title">Evidence</div>')
 
-        List<Map> evidences = (scenario.evidences ?: []) as List<Map>
         evidences.each { Map evidence ->
-            html.append('<details class="evidence-item">')
-            html.append('<summary>📎 ')
-            html.append(htmlEscape(safeValue(evidence.name)))
-            html.append('</summary>')
+            String href = safeValue(evidence.href)
+            String imageSrc = safeValue(evidence.imageSrc)
+            String fileName = safeValue(evidence.fileName)
 
-            html.append('<div class="evidence-actions">')
-            html.append('<a class="evidence-link" target="_blank" href="')
-            html.append(htmlEscape(safeValue(evidence.openUrl)))
-            html.append('">🔎 Open evidence</a>')
+            html.append('<div class="evidence-item">')
+            html.append('<div class="evidence-name">')
+            html.append(htmlEscape(fileName))
             html.append('</div>')
+            html.append('<a class="evidence-link" target="_blank" rel="noopener noreferrer" href="')
+            html.append(htmlEscape(href))
+            html.append('">🔎 Open evidence</a>')
 
-            String previewUrl = safeValue(evidence.previewUrl)
-            if (!isBlank(previewUrl)) {
-                html.append('<div class="evidence-preview-wrap">')
-                html.append('<img class="evidence-preview" src="')
-                html.append(htmlEscape(previewUrl))
-                html.append('" alt="Evidence image" loading="lazy">')
+            if (!isBlank(imageSrc)) {
+                html.append('<div class="evidence-image-wrap">')
+                html.append('<img class="evidence-image" src="')
+                html.append(htmlEscape(imageSrc))
+                html.append('" alt="Evidence" onerror="this.style.display=\'none\';">')
                 html.append('</div>')
             }
 
-            html.append('</details>')
+            html.append('</div>')
         }
 
         html.append('</div>')
@@ -1637,107 +1735,85 @@ class JiraGaiaHtmlTemplateBuilder {
     // CHARTS
     // =========================================================================
 
-    private String buildChartsPanel(Map model, Map summary) {
+    private String buildChartsPanel(Map summary) {
         int total = toInt(summary.total)
         int passed = toInt(summary.passed)
         int failed = toInt(summary.failed)
         int skipped = toInt(summary.skipped)
 
-        String donutStyle = buildDonutStyle(passed, failed, skipped, total)
-
         StringBuilder html = new StringBuilder()
 
-        html.append('<div class="charts-layout">')
+        html.append('<section class="charts-main">')
+        html.append('<div class="charts-header">Global Overview</div>')
 
-        html.append('<div class="chart-card chart-donut-card">')
-        html.append('<div class="section-title">Global Overview</div>')
-        html.append('<div class="donut-wrap">')
-        html.append('<div class="donut-chart" style="background:')
-        html.append(donutStyle)
+        html.append('<div class="charts-grid">')
+
+        html.append('<div class="charts-donut-card">')
+        html.append('<div class="charts-donut" style="background:')
+        html.append(buildDonutGradient(passed, failed, skipped, total))
         html.append(';">')
-        html.append('<div class="donut-center">')
-        html.append('<div class="donut-total">')
-        html.append(String.valueOf(total))
+        html.append('<div class="charts-donut-center">')
+        html.append('<div class="charts-donut-total">')
+        html.append(total)
         html.append('</div>')
-        html.append('<div class="donut-label">Tests</div>')
+        html.append('<div class="charts-donut-label">Tests</div>')
         html.append('</div>')
-        html.append('</div>')
-        html.append('</div>')
-
-        html.append('<div class="chart-legend">')
-        html.append(buildLegendItem('Passed', passed, STATUS_PASS))
-        html.append(buildLegendItem('Failed', failed, STATUS_FAIL))
-        html.append(buildLegendItem('Skipped', skipped, STATUS_SKIP))
         html.append('</div>')
         html.append('</div>')
 
-        html.append('<div class="chart-card chart-bars-card">')
-        html.append('<div class="section-title">Execution status</div>')
-        html.append(buildChartBar('Passed', passed, total, STATUS_PASS))
-        html.append(buildChartBar('Failed', failed, total, STATUS_FAIL))
-        html.append(buildChartBar('Skipped', skipped, total, STATUS_SKIP))
+        html.append('<div class="charts-stats">')
+        html.append(buildMainBar('Passed', passed, total, 'passed'))
+        html.append(buildMainBar('Failed', failed, total, 'failed'))
+        html.append(buildMainBar('Skipped', skipped, total, 'skipped'))
         html.append('</div>')
 
         html.append('</div>')
-        return html.toString()
-    }
-
-    private String buildDonutStyle(int passed, int failed, int skipped, int total) {
-        double passDeg = total > 0 ? (passed * 360d / total) : 0d
-        double failDeg = total > 0 ? (failed * 360d / total) : 0d
-        double skipDeg = total > 0 ? (skipped * 360d / total) : 0d
-
-        double endPass = passDeg
-        double endFail = passDeg + failDeg
-        double endSkip = passDeg + failDeg + skipDeg
-
-        return "conic-gradient(${STATUS_PASS} 0deg ${endPass}deg, ${STATUS_FAIL} ${endPass}deg ${endFail}deg, ${STATUS_SKIP} ${endFail}deg ${endSkip}deg, #edf2f7 ${endSkip}deg 360deg)"
-    }
-
-    private String buildLegendItem(String label, int value, String color) {
-        StringBuilder html = new StringBuilder()
-
-        html.append('<div class="legend-item">')
-        html.append('<span class="legend-dot" style="background:')
-        html.append(color)
-        html.append(';"></span>')
-        html.append('<span class="legend-label">')
-        html.append(htmlEscape(label))
-        html.append('</span>')
-        html.append('<span class="legend-value">')
-        html.append(String.valueOf(value))
-        html.append('</span>')
-        html.append('</div>')
+        html.append('</section>')
 
         return html.toString()
     }
 
-    private String buildChartBar(String label, int value, int total, String color) {
+    private String buildMainBar(String label, int value, int total, String statusClass) {
         int percent = total > 0 ? Math.round((value * 100f) / total) : 0
 
         StringBuilder html = new StringBuilder()
-        html.append('<div class="chart-bar-block">')
-        html.append('<div class="chart-bar-header">')
-        html.append('<span>')
+        html.append('<div class="main-bar-card">')
+        html.append('<div class="main-bar-top">')
+        html.append('<span class="main-bar-label">')
         html.append(htmlEscape(label))
         html.append('</span>')
-        html.append('<span>')
-        html.append(String.valueOf(value))
+        html.append('<span class="main-bar-value">')
+        html.append(value)
         html.append('</span>')
         html.append('</div>')
-        html.append('<div class="chart-bar-track">')
-        html.append('<div class="chart-bar-fill" style="width:')
-        html.append(String.valueOf(percent))
-        html.append('%; background:')
-        html.append(color)
-        html.append(';"></div>')
+        html.append('<div class="main-bar-track">')
+        html.append('<div class="main-bar-fill ')
+        html.append(statusClass)
+        html.append('" style="width:')
+        html.append(percent)
+        html.append('%;"></div>')
         html.append('</div>')
-        html.append('<div class="chart-bar-percent">')
-        html.append(String.valueOf(percent))
+        html.append('<div class="main-bar-percent">')
+        html.append(percent)
         html.append('% of execution</div>')
         html.append('</div>')
-
         return html.toString()
+    }
+
+    private String buildDonutGradient(int passed, int failed, int skipped, int total) {
+        if (total <= 0) {
+            return 'conic-gradient(#e8edf2 0deg 360deg)'
+        }
+
+        double passedDeg = (passed * 360d) / total
+        double failedDeg = (failed * 360d) / total
+        double skippedDeg = (skipped * 360d) / total
+
+        double a = passedDeg
+        double b = a + failedDeg
+        double c = b + skippedDeg
+
+        return "conic-gradient(${STATUS_PASS} 0deg ${a}deg, ${STATUS_FAIL} ${a}deg ${b}deg, ${STATUS_SKIP} ${b}deg ${c}deg, #e8edf2 ${c}deg 360deg)"
     }
 
     // =========================================================================
@@ -1746,811 +1822,806 @@ class JiraGaiaHtmlTemplateBuilder {
 
     private String buildCss() {
         return '''
-            :root {
-                --gaia-blue-dark: #0d2d57;
-                --gaia-blue: #155c78;
-                --gaia-green: #57c86d;
-                --text-main: #26323d;
-                --text-soft: #6d7986;
-                --line: #e7edf3;
-                --panel: #ffffff;
-                --bg: #f7fafc;
-                --shadow: 0 8px 24px rgba(17, 24, 39, 0.06);
-            }
-
-            * {
-                box-sizing: border-box;
-            }
-
-            html, body {
-                margin: 0;
-                padding: 0;
-                font-family: Arial, Helvetica, sans-serif;
-                background: var(--bg);
-                color: var(--text-main);
-            }
-
-            body {
-                min-height: 100vh;
-            }
-
-            .app-shell {
-                min-height: 100vh;
-                display: flex;
-                flex-direction: column;
-            }
-
-            .top-banner {
-                background: ''' + BANNER_GRADIENT + ''';
-                color: #ffffff;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                padding: 18px 26px;
-                min-height: 92px;
-                box-shadow: var(--shadow);
-            }
-
-            .brand-area {
-                display: flex;
-                align-items: center;
-                gap: 14px;
-            }
-
-            .brand-logo-wrap {
-                width: 44px;
-                height: 44px;
-                border-radius: 12px;
-                background: rgba(255, 255, 255, 0.12);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                overflow: hidden;
-                flex-shrink: 0;
-            }
-
-            .brand-logo-img {
-                width: 100%;
-                height: 100%;
-                object-fit: contain;
-            }
-
-            .brand-logo-fallback {
-                font-weight: 700;
-                font-size: 20px;
-                color: #ffffff;
-            }
-
-            .report-title-top {
-                font-size: 15px;
-                font-weight: 700;
-                line-height: 1.2;
-            }
-
-            .report-subtitle-top {
-                font-size: 12px;
-                opacity: 0.9;
-                margin-top: 4px;
-            }
-
-            .header-meta {
-                text-align: right;
-                font-size: 12px;
-                line-height: 1.8;
-                opacity: 0.95;
-            }
-
-            .content-shell {
-                display: flex;
-                min-height: calc(100vh - 92px);
-            }
-
-            .sidebar {
-                width: 430px;
-                min-width: 430px;
-                background: #ffffff;
-                border-right: 1px solid var(--line);
-                display: flex;
-                flex-direction: column;
-            }
-
-            .sidebar-tabs {
-                display: flex;
-                gap: 0;
-                border-bottom: 1px solid var(--line);
-                padding: 0 18px;
-                background: #fbfcfe;
-            }
-
-            .tab-button {
-                background: transparent;
-                border: none;
-                padding: 16px 14px 14px 14px;
-                color: var(--text-soft);
-                font-size: 13px;
-                cursor: pointer;
-                border-bottom: 2px solid transparent;
-            }
-
-            .tab-button.active {
-                color: var(--text-main);
-                border-bottom-color: var(--gaia-blue);
-                font-weight: 700;
-            }
-
-            .sidebar-view {
-                display: none;
-                padding: 18px;
-                overflow-y: auto;
-            }
-
-            .sidebar-view.active {
-                display: block;
-            }
-
-            .sidebar-search-wrap {
-                margin-bottom: 12px;
-            }
-
-            .sidebar-search {
-                width: 100%;
-                border: 1px solid #d7e1ea;
-                border-radius: 8px;
-                padding: 11px 12px;
-                font-size: 13px;
-                outline: none;
-                background: #ffffff;
-            }
-
-            .sidebar-search:focus {
-                border-color: var(--gaia-blue);
-                box-shadow: 0 0 0 3px rgba(21, 92, 120, 0.08);
-            }
-
-            .scenario-list {
-                display: flex;
-                flex-direction: column;
-            }
-
-            .scenario-item {
-                width: 100%;
-                text-align: left;
-                background: transparent;
-                border: none;
-                border-bottom: 1px solid var(--line);
-                padding: 14px 6px;
-                cursor: pointer;
-            }
-
-            .scenario-item:hover {
-                background: #f8fbfd;
-            }
-
-            .scenario-item.active {
-                background: #f3f9fc;
-                box-shadow: inset 3px 0 0 var(--gaia-blue);
-            }
-
-            .scenario-item-top {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 10px;
-            }
-
-            .scenario-item-title {
-                font-size: 13px;
-                font-weight: 700;
-                color: var(--text-main);
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                max-width: 280px;
-            }
-
-            .scenario-item-subtitle {
-                margin-top: 6px;
-                font-size: 12px;
-                color: var(--text-soft);
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-
-            .scenario-item-meta {
-                margin-top: 8px;
-                display: flex;
-                justify-content: space-between;
-                font-size: 11px;
-                color: #8693a1;
-            }
-
-            .sidebar-summary-title {
-                font-size: 13px;
-                font-weight: 700;
-                margin-bottom: 14px;
-                text-transform: uppercase;
-                color: var(--text-soft);
-                letter-spacing: 0.04em;
-            }
-
-            .sidebar-summary-list {
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-            }
-
-            .summary-row {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 10px 0;
-                border-bottom: 1px solid var(--line);
-                font-size: 13px;
-            }
-
-            .summary-row-left {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-
-            .summary-dot {
-                width: 10px;
-                height: 10px;
-                border-radius: 999px;
-                display: inline-block;
-            }
-
-            .main-content {
-                flex: 1;
-                padding: 22px 28px;
-                overflow-y: auto;
-            }
-
-            .main-view {
-                display: none;
-            }
-
-            .main-view.active {
-                display: block;
-            }
-
-            .scenario-panel {
-                display: none;
-            }
-
-            .scenario-panel.active {
-                display: block;
-            }
-
-            .scenario-heading {
-                margin-bottom: 12px;
-            }
-
-            .scenario-name {
-                font-size: 18px;
-                font-weight: 700;
-                color: var(--text-main);
-                line-height: 1.4;
-            }
-
-            .scenario-meta-chips {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px;
-                margin-bottom: 22px;
-            }
-
-            .meta-chip {
-                display: inline-flex;
-                align-items: center;
-                gap: 8px;
-                border-radius: 999px;
-                padding: 8px 14px;
-                font-size: 12px;
-                font-weight: 700;
-                border: 1px solid transparent;
-            }
-
-            .meta-chip.neutral {
-                background: #f4f8fb;
-                border-color: #dce7ef;
-                color: var(--text-main);
-            }
-
-            .meta-chip.passed {
-                background: rgba(97, 181, 90, 0.15);
-                color: #347a32;
-                border-color: rgba(97, 181, 90, 0.25);
-            }
-
-            .meta-chip.failed {
-                background: rgba(217, 83, 79, 0.12);
-                color: #ad3835;
-                border-color: rgba(217, 83, 79, 0.22);
-            }
-
-            .meta-chip.skipped {
-                background: rgba(214, 179, 74, 0.18);
-                color: #8b6f1a;
-                border-color: rgba(214, 179, 74, 0.28);
-            }
-
-            .meta-chip.info {
-                background: rgba(74, 167, 207, 0.14);
-                color: #2f7f9f;
-                border-color: rgba(74, 167, 207, 0.22);
-            }
-
-            .meta-chip-label {
-                opacity: 0.78;
-            }
-
-            .section-title {
-                font-size: 13px;
-                font-weight: 700;
-                margin: 18px 0 12px 0;
-                color: var(--text-main);
-            }
-
-            .steps-table-wrap {
-                background: #ffffff;
-                border: 1px solid var(--line);
-                border-radius: 12px;
-                overflow: hidden;
-                box-shadow: var(--shadow);
-            }
-
-            .steps-table {
-                width: 100%;
-                border-collapse: collapse;
-            }
-
-            .steps-table thead th {
-                text-align: left;
-                font-size: 12px;
-                color: var(--text-soft);
-                padding: 14px 16px;
-                background: #fbfdff;
-                border-bottom: 1px solid var(--line);
-                letter-spacing: 0.03em;
-            }
-
-            .steps-table tbody td {
-                padding: 14px 16px;
-                border-bottom: 1px solid #eef3f7;
-                vertical-align: top;
-                font-size: 13px;
-            }
-
-            .steps-table tbody tr:last-child td {
-                border-bottom: none;
-            }
-
-            .status-col {
-                width: 98px;
-            }
-
-            .time-col {
-                width: 138px;
-                white-space: nowrap;
-                color: var(--text-soft);
-            }
-
-            .detail-col {
-                width: auto;
-            }
-
-            .step-main-line {
-                display: flex;
-                align-items: flex-start;
-                gap: 8px;
-                font-weight: 600;
-                color: var(--text-main);
-                line-height: 1.45;
-            }
-
-            .step-emoji {
-                min-width: 20px;
-            }
-
-            .step-inline-error {
-                margin-top: 6px;
-                color: #ad3835;
-                font-size: 12px;
-                line-height: 1.45;
-            }
-
-            .status-pill {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                min-width: 72px;
-                padding: 6px 12px;
-                border-radius: 999px;
-                font-size: 11px;
-                font-weight: 700;
-                color: #ffffff;
-            }
-
-            .status-pill.small {
-                min-width: 64px;
-                padding: 5px 10px;
-            }
-
-            .status-pill.passed {
-                background: ''' + STATUS_PASS + ''';
-            }
-
-            .status-pill.failed {
-                background: ''' + STATUS_FAIL + ''';
-            }
-
-            .status-pill.skipped {
-                background: ''' + STATUS_SKIP + ''';
-                color: #ffffff;
-            }
-
-            .status-pill.info {
-                background: ''' + STATUS_INFO + ''';
-            }
-
-            .detail-toggle {
-                margin-top: 7px;
-            }
-
-            .detail-toggle summary {
-                cursor: pointer;
-                color: var(--gaia-blue);
-                font-size: 12px;
-                font-weight: 700;
-                list-style: none;
-            }
-
-            .detail-toggle summary::-webkit-details-marker {
-                display: none;
-            }
-
-            .detail-toggle pre {
-                margin: 10px 0 0 0;
-                background: #0f2137;
-                color: #eef4ff;
-                border-radius: 12px;
-                padding: 14px 16px;
-                font-size: 12px;
-                line-height: 1.55;
-                white-space: pre-wrap;
-                word-break: break-word;
-                overflow-x: auto;
-            }
-
-            .error-card {
-                margin-top: 20px;
-                background: #fffafa;
-                border: 1px solid #f0d3d2;
-                border-left: 4px solid ''' + STATUS_FAIL + ''';
-                border-radius: 12px;
-                padding: 16px 18px;
-            }
-
-            .error-title {
-                font-size: 13px;
-                font-weight: 700;
-                color: #912f2c;
-                margin-bottom: 8px;
-            }
-
-            .error-short {
-                font-size: 13px;
-                color: #7d3d39;
-                line-height: 1.5;
-            }
-
-            .error-toggle {
-                margin-top: 10px;
-            }
-
-            .evidence-section {
-                margin-top: 20px;
-            }
-
-            .evidence-item {
-                background: #ffffff;
-                border: 1px solid var(--line);
-                border-radius: 12px;
-                padding: 14px 16px;
-                margin-bottom: 12px;
-                box-shadow: var(--shadow);
-            }
-
-            .evidence-item summary {
-                cursor: pointer;
-                font-size: 13px;
-                font-weight: 700;
-                color: var(--text-main);
-                list-style: none;
-            }
-
-            .evidence-item summary::-webkit-details-marker {
-                display: none;
-            }
-
-            .evidence-actions {
-                margin-top: 10px;
-            }
-
-            .evidence-link {
-                color: var(--gaia-blue);
-                text-decoration: none;
-                font-size: 12px;
-                font-weight: 700;
-            }
-
-            .evidence-link:hover {
-                text-decoration: underline;
-            }
-
-            .evidence-preview-wrap {
-                margin-top: 12px;
-            }
-
-            .evidence-preview {
-                max-width: 100%;
-                max-height: 420px;
-                border: 1px solid #dbe7f0;
-                border-radius: 10px;
-                display: block;
-                background: #ffffff;
-            }
-
-            .charts-layout {
-                display: grid;
-                grid-template-columns: 360px 1fr;
-                gap: 20px;
-            }
-
-            .chart-card {
-                background: #ffffff;
-                border: 1px solid var(--line);
-                border-radius: 14px;
-                padding: 22px;
-                box-shadow: var(--shadow);
-            }
-
-            .donut-wrap {
-                display: flex;
-                justify-content: center;
-                padding: 16px 0 20px 0;
-            }
-
-            .donut-chart {
-                width: 220px;
-                height: 220px;
-                border-radius: 999px;
-                position: relative;
-            }
-
-            .donut-center {
-                position: absolute;
-                inset: 28px;
-                background: #ffffff;
-                border-radius: 999px;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                box-shadow: inset 0 0 0 1px #edf2f7;
-            }
-
-            .donut-total {
-                font-size: 34px;
-                font-weight: 700;
-                color: var(--text-main);
-            }
-
-            .donut-label {
-                font-size: 12px;
-                color: var(--text-soft);
-                margin-top: 4px;
-            }
-
-            .chart-legend {
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-                margin-top: 10px;
-            }
-
-            .legend-item {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                font-size: 13px;
-                border-bottom: 1px solid var(--line);
-                padding-bottom: 10px;
-            }
-
-            .legend-dot {
-                width: 10px;
-                height: 10px;
-                border-radius: 999px;
-                display: inline-block;
-                margin-right: 8px;
-            }
-
-            .legend-label {
-                flex: 1;
-                color: var(--text-main);
-            }
-
-            .legend-value {
-                font-weight: 700;
-            }
-
-            .chart-bar-block {
-                margin-bottom: 18px;
-            }
-
-            .chart-bar-header {
-                display: flex;
-                justify-content: space-between;
-                font-size: 13px;
-                font-weight: 700;
-                margin-bottom: 8px;
-            }
-
-            .chart-bar-track {
-                height: 10px;
-                background: #edf2f7;
-                border-radius: 999px;
-                overflow: hidden;
-            }
-
-            .chart-bar-fill {
-                height: 100%;
-                border-radius: 999px;
-            }
-
-            .chart-bar-percent {
-                margin-top: 6px;
-                font-size: 12px;
-                color: var(--text-soft);
-            }
-
-            @media (max-width: 1280px) {
-                .sidebar {
-                    width: 360px;
-                    min-width: 360px;
-                }
-
-                .charts-layout {
-                    grid-template-columns: 1fr;
-                }
-            }
-
-            @media (max-width: 980px) {
-                .content-shell {
-                    flex-direction: column;
-                }
-
-                .sidebar {
-                    width: 100%;
-                    min-width: 100%;
-                    border-right: none;
-                    border-bottom: 1px solid var(--line);
-                }
-            }
-        '''
+html, body {
+    margin: 0;
+    padding: 0;
+    background: #f7f9fc;
+    color: #1f2d3d;
+    font-family: Arial, Helvetica, sans-serif;
+    min-height: 100%;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+.top-banner {
+    height: 92px;
+    background: linear-gradient(90deg, #0d2d57 0%, #155c78 58%, #2ca06c 100%);
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 22px;
+}
+
+.brand-box {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.brand-logo {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.10);
+    border: 1px solid rgba(255,255,255,0.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    font-weight: 700;
+    font-size: 18px;
+    color: #ffffff;
+    flex-shrink: 0;
+}
+
+.brand-logo img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    padding: 6px;
+    display: block;
+}
+
+.brand-title {
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.brand-subtitle {
+    font-size: 12px;
+    opacity: 0.92;
+}
+
+.brand-meta {
+    text-align: right;
+    font-size: 11px;
+    line-height: 1.7;
+    opacity: 0.96;
+}
+
+.page-shell {
+    display: grid;
+    grid-template-columns: 390px 1fr;
+    min-height: calc(100vh - 92px);
+}
+
+.sidebar {
+    background: #ffffff;
+    border-right: 1px solid #e8edf2;
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar-tabs {
+    display: flex;
+    border-bottom: 1px solid #edf1f5;
+}
+
+.sidebar-tab {
+    flex: 1;
+    border: none;
+    background: #ffffff;
+    padding: 14px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    color: #3a4652;
+}
+
+.sidebar-tab.active {
+    background: #f6f9fc;
+    font-weight: 700;
+}
+
+.sidebar-content {
+    display: none;
+    padding: 14px 14px 18px 14px;
+    height: 100%;
+}
+
+.sidebar-content.active {
+    display: block;
+}
+
+.sidebar-search-wrap {
+    margin-bottom: 12px;
+}
+
+.sidebar-search {
+    width: 100%;
+    height: 38px;
+    border: 1px solid #d8e1ea;
+    border-radius: 8px;
+    padding: 0 12px;
+    font-size: 13px;
+    background: #ffffff;
+    outline: none;
+}
+
+.sidebar-search:focus {
+    border-color: #7aa6d9;
+    box-shadow: 0 0 0 3px rgba(73, 132, 204, 0.10);
+}
+
+.scenario-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.scenario-item {
+    text-align: left;
+    width: 100%;
+    border: none;
+    background: #ffffff;
+    padding: 13px 12px 12px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid #eef2f6;
+}
+
+.scenario-item:hover {
+    background: #fafcff;
+}
+
+.scenario-item.active {
+    background: #f7fbff;
+    border-left: 3px solid #2f7dd1;
+    padding-left: 9px;
+}
+
+.scenario-item-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.scenario-item-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #22303d;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 245px;
+}
+
+.scenario-item-subtitle {
+    font-size: 12px;
+    color: #7a8795;
+    margin-top: 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.scenario-item-meta {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 7px;
+    font-size: 11px;
+    color: #8a96a3;
+}
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 68px;
+    height: 28px;
+    padding: 0 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    flex-shrink: 0;
+    color: #ffffff;
+}
+
+.status-badge.passed {
+    background: #55b86a;
+}
+
+.status-badge.failed {
+    background: #d85b52;
+    color: #ffffff;
+}
+
+.status-badge.skipped {
+    background: #d8b54c;
+    color: #ffffff;
+}
+
+.status-badge.info {
+    background: #3ba9d6;
+    color: #ffffff;
+}
+
+.content-area {
+    background: #ffffff;
+    min-width: 0;
+}
+
+.content-panel {
+    display: none;
+    height: 100%;
+}
+
+.content-panel.active {
+    display: block;
+}
+
+.scenario-panel {
+    display: none;
+    padding: 22px 26px 28px 26px;
+}
+
+.scenario-panel.active {
+    display: block;
+}
+
+.scenario-header {
+    margin-bottom: 18px;
+}
+
+.scenario-title {
+    margin: 0 0 12px 0;
+    font-size: 19px;
+    font-weight: 700;
+    line-height: 1.35;
+    color: #1d2a37;
+}
+
+.scenario-meta-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.meta-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 40px;
+    padding: 0 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    border: 1px solid #e6edf3;
+    background: #f8fbfd;
+    color: #213041;
+}
+
+.meta-pill.neutral {
+    background: #f7f9fc;
+}
+
+.meta-pill.failed {
+    background: #fdeae7;
+    border-color: #f4c3bb;
+    color: #a93b30;
+}
+
+.meta-pill.passed {
+    background: #ebf8ef;
+    border-color: #c8e8d1;
+    color: #2f7d46;
+}
+
+.meta-pill.skipped {
+    background: #fff6da;
+    border-color: #f0df98;
+    color: #91720d;
+}
+
+.meta-pill.time,
+.meta-pill.duration {
+    background: #eef7f2;
+    border-color: #cfe8d8;
+    color: #2d6d4c;
+}
+
+.meta-pill-label {
+    opacity: 0.84;
+}
+
+.steps-block {
+    margin-top: 18px;
+}
+
+.section-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #243241;
+    margin-bottom: 10px;
+}
+
+.steps-table {
+    border-top: 1px solid #edf1f5;
+}
+
+.steps-head,
+.step-row {
+    display: grid;
+    grid-template-columns: 92px 120px 1fr;
+    gap: 12px;
+    align-items: start;
+}
+
+.steps-head {
+    padding: 10px 0;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: #7c8997;
+    letter-spacing: 0.03em;
+    border-bottom: 1px solid #edf1f5;
+}
+
+.step-row {
+    padding: 10px 0;
+    border-bottom: 1px solid #f0f3f7;
+}
+
+.col-status {
+    min-width: 0;
+}
+
+.col-time {
+    min-width: 0;
+    font-size: 12px;
+    color: #556272;
+    padding-top: 5px;
+}
+
+.col-detail {
+    min-width: 0;
+}
+
+.step-main-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 13px;
+    color: #1f2b38;
+    line-height: 1.45;
+}
+
+.step-emoji {
+    width: 18px;
+    flex-shrink: 0;
+}
+
+.step-text {
+    min-width: 0;
+}
+
+.step-error-short {
+    margin-top: 5px;
+    font-size: 12px;
+    color: #b14840;
+}
+
+.step-detail-box,
+.error-detail-box {
+    margin-top: 6px;
+}
+
+.step-detail-box summary,
+.error-detail-box summary {
+    cursor: pointer;
+    color: #2f7dd1;
+    font-size: 12px;
+    font-weight: 600;
+    outline: none;
+}
+
+.step-detail-box pre,
+.error-detail-box pre {
+    margin-top: 8px;
+    background: #102033;
+    color: #eef5ff;
+    padding: 14px;
+    border-radius: 10px;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+}
+
+.error-block {
+    margin-top: 18px;
+    padding: 14px 16px;
+    border-left: 3px solid #d85b52;
+    background: #fffaf9;
+}
+
+.error-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: #a93b30;
+    margin-bottom: 8px;
+}
+
+.error-short {
+    font-size: 13px;
+    color: #4d5a68;
+}
+
+.evidence-block {
+    margin-top: 20px;
+}
+
+.evidence-item {
+    margin-bottom: 18px;
+}
+
+.evidence-name {
+    font-size: 13px;
+    color: #394654;
+    margin-bottom: 5px;
+}
+
+.evidence-link {
+    color: #2f7dd1;
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.evidence-link:hover {
+    text-decoration: underline;
+}
+
+.evidence-image-wrap {
+    margin-top: 10px;
+}
+
+.evidence-image {
+    max-width: 720px;
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.charts-sidebar-wrap {
+    padding-top: 4px;
+}
+
+.sidebar-section-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #304050;
+    margin-bottom: 14px;
+}
+
+.mini-donut-wrap {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 18px;
+}
+
+.mini-donut {
+    width: 170px;
+    height: 170px;
+    border-radius: 50%;
+    position: relative;
+}
+
+.mini-donut-center {
+    position: absolute;
+    inset: 22px;
+    border-radius: 50%;
+    background: #ffffff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.mini-donut-total {
+    font-size: 30px;
+    font-weight: 700;
+    color: #25313f;
+}
+
+.mini-donut-label {
+    font-size: 12px;
+    color: #7d8996;
+}
+
+.legend-list {
+    margin-bottom: 18px;
+}
+
+.legend-row {
+    display: grid;
+    grid-template-columns: 14px 1fr auto;
+    gap: 8px;
+    align-items: center;
+    padding: 4px 0;
+    font-size: 13px;
+}
+
+.legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.legend-dot.passed {
+    background: #55b86a;
+}
+
+.legend-dot.failed {
+    background: #d85b52;
+}
+
+.legend-dot.skipped {
+    background: #d8b54c;
+}
+
+.legend-value {
+    font-weight: 700;
+}
+
+.mini-bar-row {
+    display: grid;
+    grid-template-columns: 58px 1fr 28px;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.mini-bar-label,
+.mini-bar-value {
+    font-size: 12px;
+    color: #546170;
+}
+
+.mini-bar-track {
+    height: 6px;
+    border-radius: 999px;
+    background: #ecf1f5;
+    overflow: hidden;
+}
+
+.mini-bar-fill {
+    height: 100%;
+    border-radius: 999px;
+}
+
+.mini-bar-fill.passed {
+    background: #55b86a;
+}
+
+.mini-bar-fill.failed {
+    background: #d85b52;
+}
+
+.mini-bar-fill.skipped {
+    background: #d8b54c;
+}
+
+.charts-main {
+    padding: 24px 28px 28px 28px;
+}
+
+.charts-header {
+    font-size: 28px;
+    font-weight: 700;
+    color: #1d2b39;
+    margin-bottom: 22px;
+}
+
+.charts-grid {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 30px;
+    align-items: start;
+}
+
+.charts-donut-card {
+    display: flex;
+    justify-content: center;
+}
+
+.charts-donut {
+    width: 230px;
+    height: 230px;
+    border-radius: 50%;
+    position: relative;
+}
+
+.charts-donut-center {
+    position: absolute;
+    inset: 28px;
+    border-radius: 50%;
+    background: #ffffff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.charts-donut-total {
+    font-size: 40px;
+    font-weight: 700;
+    color: #213041;
+}
+
+.charts-donut-label {
+    font-size: 13px;
+    color: #7c8997;
+}
+
+.charts-stats {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(180px, 1fr));
+    gap: 18px;
+}
+
+.main-bar-card {
+    padding: 12px 0;
+}
+
+.main-bar-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.main-bar-label {
+    font-size: 22px;
+    font-weight: 700;
+    color: #253240;
+}
+
+.main-bar-value {
+    font-size: 34px;
+    font-weight: 700;
+    color: #243140;
+}
+
+.main-bar-track {
+    height: 6px;
+    border-radius: 999px;
+    background: #ecf1f5;
+    overflow: hidden;
+}
+
+.main-bar-fill {
+    height: 100%;
+    border-radius: 999px;
+}
+
+.main-bar-fill.passed {
+    background: #55b86a;
+}
+
+.main-bar-fill.failed {
+    background: #d85b52;
+}
+
+.main-bar-fill.skipped {
+    background: #d8b54c;
+}
+
+.main-bar-percent {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #8693a0;
+}
+
+.hidden {
+    display: none !important;
+}
+
+@media (max-width: 1280px) {
+    .page-shell {
+        grid-template-columns: 340px 1fr;
     }
 
-    private String buildJavascript(String activeId) {
-        String firstId = safeValue(activeId)
+    .steps-head,
+    .step-row {
+        grid-template-columns: 84px 100px 1fr;
+    }
+}
+'''
+    }
+
+    private String buildJs(String firstScenarioId) {
+        String initialPanelId = isBlank(firstScenarioId) ? '' : 'panel-' + firstScenarioId
 
         return '''
-            (function () {
-                var tabs = document.querySelectorAll('.tab-button');
-                var sidebarViews = document.querySelectorAll('.sidebar-view');
-                var mainViews = document.querySelectorAll('.main-view');
-                var scenarioItems = document.querySelectorAll('.scenario-item');
-                var scenarioPanels = document.querySelectorAll('.scenario-panel');
-                var search = document.getElementById('scenarioSearch');
+document.addEventListener('DOMContentLoaded', function () {
+    var tabTests = document.getElementById('tab-tests');
+    var tabCharts = document.getElementById('tab-charts');
 
-                function activateScenario(id) {
-                    scenarioItems.forEach(function (item) {
-                        item.classList.toggle('active', item.getAttribute('data-scenario-id') === id);
-                    });
+    var testsSidebarContent = document.getElementById('tests-sidebar-content');
+    var chartsSidebarContent = document.getElementById('charts-sidebar-content');
 
-                    scenarioPanels.forEach(function (panel) {
-                        panel.classList.toggle('active', panel.getAttribute('data-panel-id') === id);
-                    });
-                }
+    var testsPanel = document.getElementById('tests-panel');
+    var chartsPanel = document.getElementById('charts-panel');
 
-                function activateTab(tabName) {
-                    tabs.forEach(function (button) {
-                        button.classList.toggle('active', button.getAttribute('data-tab') === tabName);
-                    });
+    var scenarioSearch = document.getElementById('scenario-search');
+    var scenarioItems = Array.prototype.slice.call(document.querySelectorAll('.scenario-item'));
+    var scenarioPanels = Array.prototype.slice.call(document.querySelectorAll('.scenario-panel'));
 
-                    sidebarViews.forEach(function (view) {
-                        view.classList.toggle('active', view.getAttribute('data-view') === tabName);
-                    });
+    function activateTab(name) {
+        var testsActive = name === 'tests';
 
-                    mainViews.forEach(function (view) {
-                        view.classList.toggle('active', view.getAttribute('data-view') === tabName);
-                    });
-                }
+        tabTests.classList.toggle('active', testsActive);
+        tabCharts.classList.toggle('active', !testsActive);
 
-                scenarioItems.forEach(function (item) {
-                    item.addEventListener('click', function () {
-                        activateScenario(item.getAttribute('data-scenario-id'));
-                    });
-                });
+        testsSidebarContent.classList.toggle('active', testsActive);
+        chartsSidebarContent.classList.toggle('active', !testsActive);
 
-                tabs.forEach(function (button) {
-                    button.addEventListener('click', function () {
-                        activateTab(button.getAttribute('data-tab'));
-                    });
-                });
+        testsPanel.classList.toggle('active', testsActive);
+        chartsPanel.classList.toggle('active', !testsActive);
+    }
 
-                if (search) {
-                    search.addEventListener('input', function () {
-                        var value = (search.value || '').toLowerCase();
+    function openScenario(targetId) {
+        scenarioItems.forEach(function (item) {
+            item.classList.toggle('active', item.getAttribute('data-target') === targetId);
+        });
 
-                        scenarioItems.forEach(function (item) {
-                            var text = (item.getAttribute('data-search') || '').toLowerCase();
-                            var visible = value === '' || text.indexOf(value) >= 0;
-                            item.style.display = visible ? '' : 'none';
-                        });
-                    });
-                }
+        scenarioPanels.forEach(function (panel) {
+            panel.classList.toggle('active', panel.getAttribute('id') === 'panel-' + targetId);
+        });
+    }
 
-                activateTab('tests');
-        ''' + (isBlank(firstId) ? '' : "activateScenario('${escapeForJs(firstId)}');") + '''
-            })();
-        '''
+    scenarioItems.forEach(function (item) {
+        item.addEventListener('click', function () {
+            openScenario(item.getAttribute('data-target'));
+        });
+    });
+
+    if (scenarioSearch) {
+        scenarioSearch.addEventListener('input', function () {
+            var term = scenarioSearch.value.toLowerCase();
+
+            scenarioItems.forEach(function (item) {
+                var text = item.textContent.toLowerCase();
+                var visible = text.indexOf(term) >= 0;
+                item.style.display = visible ? '' : 'none';
+            });
+        });
+    }
+
+    tabTests.addEventListener('click', function () {
+        activateTab('tests');
+    });
+
+    tabCharts.addEventListener('click', function () {
+        activateTab('charts');
+    });
+
+    activateTab('tests');
+'''+(isBlank(firstScenarioId) ? '' : '''
+    openScenario("'''+jsEscape(firstScenarioId)+'''");
+''')+'''
+});
+'''
     }
 
     // =========================================================================
     // HELPERS
     // =========================================================================
-
-    private String normalizeStatus(def value) {
-        String status = safeValue(value).toLowerCase(Locale.ENGLISH)
-        if (status == 'passed') {
-            return 'passed'
-        }
-        if (status == 'failed') {
-            return 'failed'
-        }
-        if (status == 'skipped') {
-            return 'skipped'
-        }
-        return 'info'
-    }
-
-    private String capitalize(String value) {
-        String text = safeValue(value)
-        if (isBlank(text)) {
-            return ''
-        }
-        return text.substring(0, 1).toUpperCase(Locale.ENGLISH) + text.substring(1)
-    }
-
-    private int toInt(def value) {
-        try {
-            return Integer.parseInt(safeValue(value))
-        } catch (Exception ignored) {
-            return 0
-        }
-    }
-
-    private String oneLineText(def value, int size) {
-        String text = safeValue(value)
-        if (text.length() <= size) {
-            return text
-        }
-        return text.substring(0, Math.max(0, size - 3)) + '...'
-    }
 
     private String safeValue(def value) {
         return value == null ? '' : String.valueOf(value).trim()
@@ -2570,9 +2641,27 @@ class JiraGaiaHtmlTemplateBuilder {
             .replace("'", '&#39;')
     }
 
-    private String escapeForJs(String value) {
-        return safeValue(value)
+    private String jsEscape(def value) {
+        String text = safeValue(value)
+        return text
             .replace('\\', '\\\\')
+            .replace('"', '\\"')
             .replace("'", "\\'")
+    }
+
+    private int toInt(def value) {
+        try {
+            return Integer.parseInt(safeValue(value))
+        } catch (Exception ignored) {
+            return 0
+        }
+    }
+
+    private String capitalize(String value) {
+        String text = safeValue(value)
+        if (isBlank(text)) {
+            return ''
+        }
+        return text.substring(0, 1).toUpperCase(Locale.ENGLISH) + text.substring(1).toLowerCase(Locale.ENGLISH)
     }
 }
