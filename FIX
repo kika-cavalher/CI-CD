@@ -1,8 +1,1789 @@
-.meta-chip.gradient {
-    background: linear-gradient(
-        90deg,
-        rgba(6, 58, 122, 0.82) 0%,
-        rgba(38, 227, 108, 0.82) 100%
-    );
-    color: #ffffff;
+package jiraIntegration
+
+import java.io.File
+import java.nio.file.Files
+import java.text.SimpleDateFormat
+import java.util.Base64
+import java.util.Date
+import java.util.Locale
+
+import groovy.xml.XmlSlurper
+
+class JiraGaiaReportBuilder {
+
+    JiraFlowCoordinator flow
+
+    JiraGaiaReportBuilder(JiraFlowCoordinator flow) {
+        this.flow = flow
+    }
+
+    private String safeValue(def value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+
+    private boolean isBlank(def value) {
+        return safeValue(value).isEmpty()
+    }
+
+    private String firstNonBlank(def... values) {
+        if (values == null) {
+            return ''
+        }
+
+        values.each { value ->
+            String text = safeValue(value)
+            if (!text.isEmpty()) {
+                return text
+            }
+        }
+
+        return ''
+    }
+
+    private String normalizeKey(String text) {
+        return safeValue(text)
+            .toLowerCase(Locale.ENGLISH)
+            .replaceAll(/[^a-z0-9]+/, '')
+    }
+
+    private String cleanScenarioTitle(String text) {
+        return safeValue(text)
+            .replaceFirst(/^SCENARIO\s*/i, '')
+            .replaceFirst(/^[:\-]\s*/, '')
+            .trim()
+    }
+
+    private String cleanStepTitle(String text) {
+        return safeValue(text)
+            .replaceFirst(/^TEST STEP:\s*/i, '')
+            .trim()
+    }
+
+    private String shortError(String text) {
+        String value = safeValue(text)
+        if (value.isEmpty()) {
+            return ''
+        }
+
+        List<String> lines = value.readLines()
+        String firstMeaningful = lines.find { String line ->
+            String current = safeValue(line)
+            return !current.isEmpty() && !current.startsWith('at ') && !current.startsWith('Caused by:')
+        }
+
+        String result = safeValue(firstMeaningful ?: lines[0])
+
+        int unableIndex = result.toLowerCase(Locale.ENGLISH).indexOf('unable ')
+        if (unableIndex >= 0) {
+            result = result.substring(unableIndex).trim()
+        }
+
+        result = result
+            .replaceAll(/\s+/, ' ')
+            .replaceAll(/^\d{2}:\d{2}:\d{2}(\.\d{3})?\s+(PASSED|FAILED|ERROR|INFO|WARN|WARNING|SKIPPED)\s+/i, '')
+            .trim()
+
+        if (result.length() > 180) {
+            result = result.substring(0, 177) + '...'
+        }
+
+        return result
+    }
+
+    private long toMillis(def secondsValue) {
+        String raw = safeValue(secondsValue).replace(',', '.')
+        if (raw.isEmpty()) {
+            return 0L
+        }
+
+        try {
+            BigDecimal seconds = new BigDecimal(raw)
+            return seconds.multiply(new BigDecimal('1000')).longValue()
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    private long toMillisFromElapsed(String raw) {
+        String value = safeValue(raw)
+        if (value.isEmpty()) {
+            return 0L
+        }
+
+        def matcher = (value =~ /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/)
+        if (matcher.find()) {
+            long hours = matcher.group(1).toLong()
+            long minutes = matcher.group(2).toLong()
+            long seconds = matcher.group(3).toLong()
+            long millis = safeValue(matcher.group(4)).isEmpty()
+                ? 0L
+                : matcher.group(4).padRight(3, '0' as char).toLong()
+
+            return (((hours * 60L) + minutes) * 60L + seconds) * 1000L + millis
+        }
+
+        return 0L
+    }
+
+    private String formatDuration(long millis) {
+        long totalSeconds = Math.max(0L, millis / 1000L)
+        long hours = totalSeconds / 3600L
+        long minutes = (totalSeconds % 3600L) / 60L
+        long seconds = totalSeconds % 60L
+
+        return String.format('%02dh %02dm %02ds', hours, minutes, seconds)
+    }
+
+    private String formatClock(String rawDate) {
+        String value = safeValue(rawDate)
+        if (value.isEmpty()) {
+            return ''
+        }
+
+        def matcher = (value =~ /(\d{2}):(\d{2}):(\d{2})/)
+        if (matcher.find()) {
+            return matcher.group(1) + ':' + matcher.group(2) + ':' + matcher.group(3)
+        }
+
+        return value
+    }
+
+    private String formatGeneratedDate(Date date) {
+        if (date == null) {
+            return ''
+        }
+
+        return new SimpleDateFormat('dd.MM.yyyy hh:mm:ss a', Locale.ENGLISH).format(date)
+    }
+
+    private String resolveSuiteName(String reportFolder, String suiteName) {
+        if (!isBlank(suiteName)) {
+            return safeValue(suiteName)
+        }
+
+        File currentFolder = new File(reportFolder)
+        File parentFolder = currentFolder.parentFile
+        return parentFolder != null ? safeValue(parentFolder.name) : 'GAIA Execution'
+    }
+
+    private String resolveReportFileName() {
+        try {
+            def meta = flow?.metaClass?.getMetaProperty('GAIA_REPORT_FILE_NAME')
+            if (meta != null) {
+                String value = safeValue(meta.getProperty(flow))
+                if (!value.isEmpty()) {
+                    return value
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        return 'gaiaReport.html'
+    }
+
+    private File findConsoleLogFile(File reportDir) {
+        if (reportDir == null || !reportDir.exists()) {
+            return null
+        }
+
+        List<File> logs = (reportDir.listFiles() ?: [] as File[])
+            .findAll { File file ->
+                file.isFile() && file.name.toLowerCase(Locale.ENGLISH).matches(/^execution\d+\.log$/)
+            }
+            .sort { File file -> file.lastModified() }
+
+        return logs ? logs.last() : null
+    }
+
+    private List<Map> collectEvidenceFiles(File reportDir) {
+        if (reportDir == null || !reportDir.exists()) {
+            return []
+        }
+
+        List<File> evidenceFiles = (reportDir.listFiles() ?: [] as File[])
+            .findAll { File file ->
+                if (!file.isFile()) {
+                    return false
+                }
+
+                String name = file.name.toLowerCase(Locale.ENGLISH)
+                return name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.webp')
+            }
+            .sort { File file -> file.lastModified() }
+
+        List<Map> result = []
+        evidenceFiles.each { File file ->
+            try {
+                String lower = file.name.toLowerCase(Locale.ENGLISH)
+                String mimeType = 'image/png'
+                if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+                    mimeType = 'image/jpeg'
+                } else if (lower.endsWith('.webp')) {
+                    mimeType = 'image/webp'
+                }
+
+                byte[] bytes = Files.readAllBytes(file.toPath())
+                String base64 = Base64.encoder.encodeToString(bytes)
+
+                result << [
+                    name   : file.name,
+                    dataUri: 'data:' + mimeType + ';base64,' + base64
+                ]
+            } catch (Exception ignored) {
+            }
+        }
+
+        return result
+    }
+
+    private List<Map> parseXmlCases(String xmlPath) {
+        List<Map> result = []
+
+        if (isBlank(xmlPath)) {
+            return result
+        }
+
+        File xmlFile = new File(xmlPath)
+        if (!xmlFile.exists()) {
+            return result
+        }
+
+        def xml
+        try {
+            xml = new XmlSlurper().parse(xmlFile)
+        } catch (Exception ignored) {
+            return result
+        }
+
+        List testcaseNodes = []
+        String rootName = safeValue(xml.name())
+
+        if (rootName == 'testsuite') {
+            testcaseNodes.addAll(xml.testcase)
+        } else if (rootName == 'testsuites') {
+            xml.testsuite.each { suite ->
+                testcaseNodes.addAll(suite.testcase)
+            }
+        }
+
+        int counter = 1
+        testcaseNodes.each { tc ->
+            String className = safeValue(String.valueOf(tc.@classname))
+            String testName = safeValue(String.valueOf(tc.@name))
+            long durationMs = toMillis(String.valueOf(tc.@time))
+
+            def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : null
+            def errorNode = tc.error?.size() > 0 ? tc.error[0] : null
+            def skippedNode = tc.skipped?.size() > 0 ? tc.skipped[0] : null
+
+            String status = 'passed'
+            String message = ''
+            String details = ''
+
+            if (failureNode != null) {
+                status = 'failed'
+                message = safeValue(String.valueOf(failureNode.@message))
+                details = safeValue(failureNode.text())
+            } else if (errorNode != null) {
+                status = 'failed'
+                message = safeValue(String.valueOf(errorNode.@message))
+                details = safeValue(errorNode.text())
+            } else if (skippedNode != null) {
+                status = 'skipped'
+                message = safeValue(String.valueOf(skippedNode.@message))
+                details = safeValue(skippedNode.text())
+            }
+
+            String displayName = !isBlank(testName) ? testName : className
+            if (isBlank(displayName)) {
+                displayName = 'Scenario ' + counter
+            }
+
+            result << [
+                id             : 'xml_' + counter,
+                key            : normalizeKey(displayName),
+                name           : displayName,
+                className      : className,
+                status         : status,
+                durationMs     : durationMs,
+                durationText   : formatDuration(durationMs),
+                message        : message,
+                details        : details,
+                summary        : shortError(firstNonBlank(message, details)),
+                startClock     : '',
+                endClock       : '',
+                startFull      : '',
+                endFull        : '',
+                steps          : [],
+                evidences      : [],
+                failedStepIndex: -1
+            ]
+
+            counter++
+        }
+
+        return result
+    }
+
+    private boolean shouldIgnoreStep(String title) {
+        String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
+        return lower.startsWith('start listener action') ||
+            lower.startsWith('glue') ||
+            lower.startsWith('runfeaturefile') ||
+            lower.startsWith('exportkatalonreports') ||
+            lower.startsWith('sampleaftertestcase') ||
+            lower.startsWith('video') ||
+            lower.startsWith('beforetestcase')
+    }
+
+    private Map newScenario(int index, String title) {
+        return [
+            id                 : 'scenario_' + index,
+            key                : normalizeKey(title),
+            name               : title,
+            status             : 'passed',
+            startClock         : '',
+            endClock           : '',
+            startFull          : '',
+            endFull            : '',
+            durationMs         : 0L,
+            durationText       : formatDuration(0L),
+            summary            : '',
+            errorSummary       : '',
+            errorDetails       : '',
+            errorDetailsBuilder: new StringBuilder(),
+            steps              : [],
+            failureEncountered : false,
+            failedStepIndex    : -1,
+            evidences          : []
+        ]
+    }
+
+    private Map newStep(int index, String title) {
+        return [
+            id              : 'step_' + index,
+            title           : title,
+            status          : 'info',
+            timestamp       : '',
+            startClock      : '',
+            endClock        : '',
+            durationMs      : 0L,
+            durationText    : '',
+            fullDetail      : '',
+            fullDetailBuilder: new StringBuilder()
+        ]
+    }
+
+    private void applyTimingInfo(Map target, String start, String end, String elapsed) {
+        if (target == null) {
+            return
+        }
+
+        target.startFull = safeValue(start)
+        target.endFull = safeValue(end)
+        target.startClock = formatClock(start)
+        target.endClock = formatClock(end)
+        target.durationMs = toMillisFromElapsed(elapsed)
+        target.durationText = formatDuration((target.durationMs ?: 0L) as long)
+    }
+
+    private void fillMissingStepTimestamps(Map scenario) {
+        if (scenario == null || !(scenario.steps instanceof List) || scenario.steps.isEmpty()) {
+            return
+        }
+
+        if (scenario.steps.every { Map step -> !isBlank(step.timestamp) }) {
+            return
+        }
+
+        String baseClock = safeValue(scenario.startClock)
+        if (baseClock.isEmpty()) {
+            return
+        }
+
+        def matcher = (baseClock =~ /^(\d{2}):(\d{2}):(\d{2})$/)
+        if (!matcher.find()) {
+            return
+        }
+
+        int baseSeconds = matcher.group(1).toInteger() * 3600 +
+            matcher.group(2).toInteger() * 60 +
+            matcher.group(3).toInteger()
+
+        int totalSteps = scenario.steps.size()
+        long scenarioDurationSeconds = Math.max(1L, ((scenario.durationMs ?: 0L) as long) / 1000L)
+        double increment = totalSteps > 1 ? (scenarioDurationSeconds / (double) totalSteps) : 1d
+
+        scenario.steps.eachWithIndex { Map step, int index ->
+            if (isBlank(step.timestamp)) {
+                int value = baseSeconds + Math.round(index * increment) as int
+                int hh = (value / 3600) % 24
+                int mm = (value % 3600) / 60
+                int ss = value % 60
+                step.timestamp = String.format('%02d:%02d:%02d', hh, mm, ss)
+            }
+        }
+    }
+
+    private void settleScenario(Map scenario) {
+        if (scenario == null) {
+            return
+        }
+
+        List<Map> steps = scenario.steps ?: []
+
+        int failedIndex = steps.findIndexOf { Map step ->
+            safeValue(step.status) == 'failed'
+        }
+
+        if (failedIndex >= 0) {
+            steps.eachWithIndex { Map step, int index ->
+                if (safeValue(step.status) == 'info') {
+                    step.status = index < failedIndex ? 'passed' : 'skipped'
+                }
+            }
+            scenario.status = 'failed'
+            scenario.failedStepIndex = failedIndex
+        } else {
+            steps.each { Map step ->
+                if (safeValue(step.status) == 'info') {
+                    step.status = scenario.status == 'skipped' ? 'skipped' : 'passed'
+                }
+            }
+
+            if (safeValue(scenario.status).isEmpty()) {
+                scenario.status = 'passed'
+            }
+        }
+
+        steps.each { Map step ->
+            step.fullDetail = safeValue(step.fullDetailBuilder?.toString())
+            step.remove('fullDetailBuilder')
+        }
+
+        scenario.errorDetails = safeValue(scenario.errorDetailsBuilder?.toString())
+        scenario.remove('errorDetailsBuilder')
+
+        if (isBlank(scenario.summary) && scenario.status == 'failed') {
+            scenario.summary = shortError(firstNonBlank(scenario.errorSummary, scenario.errorDetails))
+        }
+
+        if (isBlank(scenario.durationText)) {
+            scenario.durationText = formatDuration((scenario.durationMs ?: 0L) as long)
+        }
+
+        fillMissingStepTimestamps(scenario)
+    }
+
+    private List<Map> parseExecutionLog(File logFile) {
+        List<Map> scenarios = []
+
+        if (logFile == null || !logFile.exists()) {
+            return scenarios
+        }
+
+        List<String> lines
+        try {
+            lines = logFile.readLines('UTF-8')
+        } catch (Exception ignored) {
+            lines = logFile.readLines()
+        }
+
+        Map currentScenario = null
+        Map currentStep = null
+        Map pendingTimingTarget = null
+        int scenarioCounter = 1
+        int stepCounter = 1
+
+        Closure finalizeScenario = {
+            if (currentScenario != null) {
+                settleScenario(currentScenario)
+                scenarios << currentScenario
+            }
+            currentScenario = null
+            currentStep = null
+            pendingTimingTarget = null
+        }
+
+        lines.each { String raw ->
+            String line = raw == null ? '' : raw
+
+            def scenarioMatcher = (line =~ /TEST STEP:\s*Start Test Case\s*:\s*SCENARIO\s*(.+)$/)
+            if (scenarioMatcher.find()) {
+                finalizeScenario.call()
+                currentScenario = newScenario(scenarioCounter++, cleanScenarioTitle(scenarioMatcher.group(1)))
+                pendingTimingTarget = currentScenario
+                return
+            }
+
+            if (currentScenario == null) {
+                return
+            }
+
+            def timingMatcher = (line =~ /Start\s*\/\s*End\s*\/\s*Elapsed:\s*(.+?)\s*\/\s*(.+?)\s*\/\s*(.+)$/)
+            if (timingMatcher.find()) {
+                applyTimingInfo(pendingTimingTarget, timingMatcher.group(1), timingMatcher.group(2), timingMatcher.group(3))
+                return
+            }
+
+            def stepMatcher = (line =~ /TEST STEP:\s*(.+)$/)
+            if (stepMatcher.find()) {
+                String title = cleanStepTitle(stepMatcher.group(1))
+                if (title.toLowerCase(Locale.ENGLISH).startsWith('start test case')) {
+                    return
+                }
+
+                if (shouldIgnoreStep(title)) {
+                    return
+                }
+
+                currentStep = newStep(stepCounter++, title)
+                if (currentScenario.failureEncountered) {
+                    currentStep.status = 'skipped'
+                }
+
+                currentScenario.steps << currentStep
+                pendingTimingTarget = currentStep
+                return
+            }
+
+            def statusMatcher = (line =~ /^(\d{2}:\d{2}:\d{2}(?:\.\d{3})?)\s+(PASSED|FAILED|ERROR|SKIPPED|INFO|WARN|WARNING)\s+(.*)$/)
+            if (statusMatcher.find()) {
+                if (currentStep == null) {
+                    return
+                }
+
+                String timestamp = formatClock(statusMatcher.group(1))
+                String status = safeValue(statusMatcher.group(2)).toUpperCase(Locale.ENGLISH)
+                String message = safeValue(statusMatcher.group(3))
+
+                if (isBlank(currentStep.timestamp)) {
+                    currentStep.timestamp = timestamp
+                }
+
+                currentStep.fullDetailBuilder << timestamp << ' ' << status << ' ' << message << '\n'
+
+                switch (status) {
+                    case 'PASSED':
+                        if (!currentScenario.failureEncountered) {
+                            currentStep.status = 'passed'
+                        }
+                        break
+
+                    case 'FAILED':
+                    case 'ERROR':
+                        currentStep.status = 'failed'
+                        currentScenario.status = 'failed'
+                        currentScenario.failureEncountered = true
+                        currentScenario.failedStepIndex = (currentScenario.steps?.size() ?: 1) - 1
+                        currentScenario.errorSummary = shortError(message)
+                        currentScenario.summary = shortError(message)
+                        currentScenario.errorDetailsBuilder << timestamp << ' ' << status << ' ' << message << '\n'
+                        break
+
+                    case 'SKIPPED':
+                        currentStep.status = 'skipped'
+                        break
+
+                    default:
+                        break
+                }
+
+                return
+            }
+
+            if (currentScenario.failureEncountered && currentScenario.failedStepIndex >= 0) {
+                Map failedStep = currentScenario.steps[currentScenario.failedStepIndex]
+                currentScenario.errorDetailsBuilder << line << '\n'
+                if (failedStep != null) {
+                    failedStep.fullDetailBuilder << line << '\n'
+                }
+            }
+        }
+
+        finalizeScenario.call()
+        return scenarios
+    }
+
+    private Map findLogMatch(String scenarioName, List<Map> logScenarios, Set<String> usedIds) {
+        if (!scenarioName || logScenarios == null || logScenarios.isEmpty()) {
+            return null
+        }
+
+        String targetKey = normalizeKey(scenarioName)
+
+        Map exact = logScenarios.find { Map item ->
+            !usedIds.contains(safeValue(item.id)) && safeValue(item.key) == targetKey
+        }
+        if (exact != null) {
+            return exact
+        }
+
+        Map loose = logScenarios.find { Map item ->
+            if (usedIds.contains(safeValue(item.id))) {
+                return false
+            }
+
+            String currentKey = safeValue(item.key)
+            return !currentKey.isEmpty() && (
+                currentKey.contains(targetKey) ||
+                targetKey.contains(currentKey)
+            )
+        }
+
+        return loose
+    }
+
+    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
+        if (isBlank(reportFolder)) {
+            return ''
+        }
+
+        File reportDir = new File(reportFolder)
+        if (!reportDir.exists()) {
+            return ''
+        }
+
+        String resolvedSuiteName = resolveSuiteName(reportFolder, suiteName)
+        List<Map> xmlCases = parseXmlCases(xmlPath)
+        List<Map> logScenarios = parseExecutionLog(findConsoleLogFile(reportDir))
+        List<Map> evidences = collectEvidenceFiles(reportDir)
+
+        Set<String> usedLogIds = new LinkedHashSet<String>()
+        List<Map> scenarios = []
+
+        if (!xmlCases.isEmpty()) {
+            xmlCases.eachWithIndex { Map xmlCase, int index ->
+                Map logCase = findLogMatch(xmlCase.name as String, logScenarios, usedLogIds)
+                if (logCase != null) {
+                    usedLogIds << safeValue(logCase.id)
+                }
+
+                Map merged = [
+                    id           : safeValue(firstNonBlank(logCase?.id, xmlCase.id, 'scenario_' + (index + 1))),
+                    name         : safeValue(firstNonBlank(logCase?.name, xmlCase.name)),
+                    status       : safeValue(firstNonBlank(logCase?.status, xmlCase.status, 'passed')),
+                    startClock   : safeValue(firstNonBlank(logCase?.startClock, '')),
+                    endClock     : safeValue(firstNonBlank(logCase?.endClock, '')),
+                    startFull    : safeValue(firstNonBlank(logCase?.startFull, '')),
+                    endFull      : safeValue(firstNonBlank(logCase?.endFull, '')),
+                    durationMs   : ((logCase?.durationMs ?: 0L) as long) > 0L
+                        ? (logCase.durationMs as long)
+                        : (xmlCase.durationMs as long),
+                    durationText : '',
+                    summary      : safeValue(firstNonBlank(logCase?.summary, xmlCase.summary, xmlCase.message)),
+                    errorSummary : safeValue(firstNonBlank(logCase?.errorSummary, xmlCase.message, xmlCase.summary)),
+                    errorDetails : safeValue(firstNonBlank(logCase?.errorDetails, xmlCase.details, xmlCase.message)),
+                    steps        : (logCase?.steps ?: []),
+                    evidences    : []
+                ]
+
+                merged.durationText = formatDuration((merged.durationMs ?: 0L) as long)
+
+                if (merged.status == 'failed') {
+                    merged.evidences = evidences
+                }
+
+                if (isBlank(merged.summary)) {
+                    merged.summary = merged.status == 'failed'
+                        ? shortError(merged.errorSummary)
+                        : (merged.status == 'skipped' ? 'Scenario skipped' : 'Scenario passed')
+                }
+
+                if (isBlank(merged.errorSummary) && merged.status == 'failed') {
+                    merged.errorSummary = shortError(firstNonBlank(merged.errorDetails, merged.summary))
+                }
+
+                fillMissingStepTimestamps(merged)
+                scenarios << merged
+            }
+        } else {
+            scenarios = logScenarios.collect { Map item ->
+                item.durationText = formatDuration((item.durationMs ?: 0L) as long)
+                if (item.status == 'failed') {
+                    item.evidences = evidences
+                }
+                item
+            }
+        }
+
+        int passedCount = scenarios.count { Map item -> safeValue(item.status) == 'passed' }
+        int failedCount = scenarios.count { Map item -> safeValue(item.status) == 'failed' }
+        int skippedCount = scenarios.count { Map item -> safeValue(item.status) == 'skipped' }
+
+        String defaultScenarioId = safeValue(
+            firstNonBlank(
+                scenarios.find { Map item -> safeValue(item.status) == 'failed' }?.id,
+                scenarios ? scenarios[0].id : ''
+            )
+        )
+
+        List<Map> logoEvidence = collectEvidenceFiles(new File(reportFolder).parentFile ?: reportDir)
+        Map model = [
+            appName         : 'GAIA',
+            suiteName       : resolvedSuiteName,
+            reportTitle     : 'Test report - ' + resolvedSuiteName,
+            reportSubtitle  : 'GAIA execution overview',
+            generatedAt     : formatGeneratedDate(new Date()),
+            scenarios       : scenarios,
+            defaultScenarioId: defaultScenarioId,
+            stats           : [
+                total  : scenarios.size(),
+                passed : passedCount,
+                failed : failedCount,
+                skipped: skippedCount
+            ],
+            logoDataUri     : ''
+        ]
+
+        File logo1 = new File(reportDir.parentFile ?: reportDir, 'Image' + File.separator + 'gaia-logo.png')
+        File logo2 = new File(reportDir.parentFile ?: reportDir, 'gaia-logo.png')
+        File logo3 = new File(reportDir, 'gaia-logo.png')
+        File logoFile = [logo1, logo2, logo3].find { File current -> current != null && current.exists() }
+
+        if (logoFile != null) {
+            try {
+                byte[] logoBytes = Files.readAllBytes(logoFile.toPath())
+                model.logoDataUri = 'data:image/png;base64,' + Base64.encoder.encodeToString(logoBytes)
+            } catch (Exception ignored) {
+                model.logoDataUri = ''
+            }
+        }
+
+        File htmlFile = new File(reportDir, resolveReportFileName())
+        String html = new JiraGaiaHtmlTemplateBuilder().build(model)
+        htmlFile.setText(html, 'UTF-8')
+
+        return htmlFile.absolutePath
+    }
+}
+
+
+
+
+
+
+
+package jiraIntegration
+
+import groovy.json.JsonOutput
+
+class JiraGaiaHtmlTemplateBuilder {
+
+    static String firstNonBlank(def... values) {
+        if (values == null) {
+            return ''
+        }
+
+        values.each { value ->
+            String text = value == null ? '' : String.valueOf(value).trim()
+            if (!text.isEmpty()) {
+                return text
+            }
+        }
+
+        return ''
+    }
+
+    private String safeValue(def value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+
+    private String jsonForHtml(Map model) {
+        return JsonOutput.toJson(model).replace('</', '<\\/')
+    }
+
+    String build(Map model) {
+        String modelJson = jsonForHtml(model ?: [:])
+
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${safeValue(model?.reportTitle)}</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            background: #f5f7fb;
+            color: #111827;
+            font-family: Arial, Helvetica, sans-serif;
+        }
+
+        body {
+            min-height: 100vh;
+        }
+
+        .top-banner {
+            height: 110px;
+            padding: 22px 28px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: linear-gradient(90deg, #08346f 0%, #1462a6 45%, #5fe06f 100%);
+            color: #ffffff;
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.16);
+        }
+
+        .banner-left {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+        }
+
+        .brand-logo {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 72px;
+        }
+
+        .brand-logo img {
+            display: block;
+            width: auto;
+            height: 54px;
+            max-width: 180px;
+            object-fit: contain;
+        }
+
+        .brand-logo-fallback {
+            font-size: 24px;
+            font-weight: 700;
+            color: #ffffff;
+            line-height: 1;
+        }
+
+        .report-title {
+            font-size: 18px;
+            font-weight: 700;
+            line-height: 1.2;
+            margin-bottom: 6px;
+            color: #ffffff;
+        }
+
+        .report-subtitle {
+            font-size: 13px;
+            font-weight: 600;
+            color: rgba(255, 255, 255, 0.92);
+        }
+
+        .banner-right {
+            text-align: right;
+            font-size: 11px;
+            line-height: 1.55;
+            color: rgba(255, 255, 255, 0.96);
+        }
+
+        .page {
+            display: grid;
+            grid-template-columns: 470px minmax(0, 1fr);
+            min-height: calc(100vh - 110px);
+        }
+
+        .sidebar {
+            background: #ffffff;
+            border-right: 1px solid #dbe3ee;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            min-height: calc(100vh - 110px);
+        }
+
+        .tabs {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            border-bottom: 1px solid #e5e7eb;
+        }
+
+        .tab-button {
+            height: 54px;
+            border: 0;
+            background: #ffffff;
+            color: #374151;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+        }
+
+        .tab-button.active {
+            color: #111827;
+            border-bottom-color: #5b92ff;
+            background: #fbfdff;
+        }
+
+        .sidebar-body {
+            padding: 16px 18px 18px 18px;
+            flex: 1;
+            overflow: auto;
+        }
+
+        .search-box {
+            width: 100%;
+            height: 42px;
+            border: 1px solid #d0d7e2;
+            border-radius: 8px;
+            padding: 0 14px;
+            font-size: 14px;
+            outline: none;
+            color: #111827;
+            background: #ffffff;
+            box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.03);
+            margin-bottom: 16px;
+        }
+
+        .search-box:focus {
+            border-color: #7aa7ff;
+            box-shadow: 0 0 0 3px rgba(91, 146, 255, 0.12);
+        }
+
+        .scenario-list {
+            border-top: 1px solid #edf1f7;
+        }
+
+        .scenario-item {
+            width: 100%;
+            padding: 16px 12px 16px 16px;
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 16px;
+            background: #ffffff;
+            border: 0;
+            border-bottom: 1px solid #edf1f7;
+            text-align: left;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .scenario-item.active::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 12px;
+            bottom: 12px;
+            width: 3px;
+            border-radius: 999px;
+            background: #4b82f0;
+        }
+
+        .scenario-item:hover {
+            background: #fafcff;
+        }
+
+        .scenario-name {
+            font-size: 14px;
+            font-weight: 700;
+            color: #111827;
+            line-height: 1.35;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 8px;
+        }
+
+        .scenario-summary {
+            font-size: 13px;
+            color: #6b7280;
+            line-height: 1.35;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-bottom: 8px;
+        }
+
+        .scenario-meta-line {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        .scenario-right {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            justify-content: center;
+            gap: 10px;
+            min-width: 96px;
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 30px;
+            padding: 0 14px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            line-height: 1;
+            white-space: nowrap;
+        }
+
+        .chip.failed {
+            background: #df644e;
+            color: #ffffff;
+        }
+
+        .chip.passed {
+            background: #78b83a;
+            color: #ffffff;
+        }
+
+        .chip.skipped {
+            background: #d5b31c;
+            color: #ffffff;
+        }
+
+        .chip.info {
+            background: #3b82f6;
+            color: #ffffff;
+        }
+
+        .chip.gradient {
+            background: linear-gradient(90deg, rgba(8, 52, 111, 0.88) 0%, rgba(95, 224, 111, 0.88) 100%);
+            color: #ffffff;
+        }
+
+        .chip.suite {
+            background: #f3f4f6;
+            color: #111827;
+        }
+
+        .scenario-duration {
+            font-size: 12px;
+            color: #6b7280;
+        }
+
+        .sidebar-empty {
+            padding: 26px 8px;
+            font-size: 13px;
+            color: #6b7280;
+        }
+
+        .main {
+            background: #ffffff;
+            padding: 20px 28px 30px 28px;
+            overflow: auto;
+        }
+
+        .main-card {
+            max-width: 100%;
+        }
+
+        .main-scenario-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: #111827;
+            margin: 4px 0 16px 0;
+            line-height: 1.35;
+        }
+
+        .meta-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 22px;
+        }
+
+        .section-title {
+            font-size: 15px;
+            font-weight: 700;
+            color: #111827;
+            margin: 0 0 12px 0;
+        }
+
+        .steps-table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin-bottom: 20px;
+        }
+
+        .steps-table thead th {
+            text-align: left;
+            font-size: 12px;
+            color: #6b7280;
+            font-weight: 700;
+            padding: 0 12px 10px 0;
+            letter-spacing: 0.02em;
+        }
+
+        .steps-table tbody tr {
+            border-bottom: 1px solid #ebeff5;
+        }
+
+        .steps-table tbody td {
+            vertical-align: middle;
+            padding: 12px 12px 12px 0;
+            font-size: 13px;
+            color: #111827;
+        }
+
+        .steps-table .status-cell {
+            width: 112px;
+        }
+
+        .steps-table .time-cell {
+            width: 120px;
+            color: #4b5563;
+            font-weight: 600;
+        }
+
+        .step-detail {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+        }
+
+        .step-icon {
+            font-size: 16px;
+            line-height: 1;
+            flex: 0 0 auto;
+        }
+
+        .step-text {
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .error-panel,
+        .evidence-panel {
+            margin-top: 20px;
+            padding: 14px 16px 16px 16px;
+            border-left: 3px solid #d64f43;
+            background: #fffefe;
+            border-radius: 8px;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.05);
+        }
+
+        .evidence-panel {
+            border-left-color: #3b82f6;
+        }
+
+        .error-panel .panel-title,
+        .evidence-panel .panel-title {
+            font-size: 14px;
+            font-weight: 700;
+            margin-bottom: 8px;
+            color: #7c2d12;
+        }
+
+        .evidence-panel .panel-title {
+            color: #1d4ed8;
+        }
+
+        .error-summary-line {
+            font-size: 13px;
+            color: #111827;
+            margin-bottom: 10px;
+            line-height: 1.45;
+        }
+
+        .detail-toggle {
+            display: inline-block;
+            margin-bottom: 10px;
+            color: #2563eb;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .detail-box {
+            display: none;
+            margin-top: 8px;
+            background: #06162f;
+            color: #f8fafc;
+            border-radius: 8px;
+            padding: 14px;
+            overflow: auto;
+            font-size: 12px;
+            line-height: 1.55;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .detail-box.open {
+            display: block;
+        }
+
+        .evidence-item {
+            margin-top: 10px;
+        }
+
+        .evidence-image {
+            display: block;
+            width: 100%;
+            max-width: 980px;
+            height: auto;
+            margin-top: 10px;
+            border-radius: 8px;
+            background: transparent;
+            box-shadow: none;
+        }
+
+        .charts-wrap {
+            display: grid;
+            grid-template-columns: 360px minmax(0, 1fr);
+            gap: 28px;
+            align-items: start;
+        }
+
+        .chart-donut-panel,
+        .chart-bars-panel {
+            background: #ffffff;
+            border: 1px solid #edf1f7;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.04);
+        }
+
+        .donut-wrap {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .donut {
+            width: 300px;
+            height: 300px;
+            border-radius: 50%;
+            position: relative;
+            background: #e5e7eb;
+        }
+
+        .donut::after {
+            content: '';
+            position: absolute;
+            inset: 44px;
+            border-radius: 50%;
+            background: #ffffff;
+        }
+
+        .donut-center {
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            color: #111827;
+        }
+
+        .donut-center .big {
+            font-size: 32px;
+            line-height: 1;
+            margin-bottom: 6px;
+        }
+
+        .donut-center .small {
+            font-size: 14px;
+            color: #6b7280;
+        }
+
+        .legend-list {
+            width: 100%;
+            margin-top: 8px;
+        }
+
+        .legend-row {
+            display: grid;
+            grid-template-columns: 18px 1fr auto;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 12px;
+            font-size: 14px;
+            color: #111827;
+        }
+
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        .bars-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 22px;
+            margin-top: 16px;
+        }
+
+        .bar-row {
+            display: grid;
+            grid-template-columns: 90px 1fr 52px;
+            gap: 16px;
+            align-items: center;
+        }
+
+        .bar-label {
+            font-size: 15px;
+            font-weight: 700;
+            color: #111827;
+        }
+
+        .bar-track {
+            width: 100%;
+            height: 6px;
+            border-radius: 999px;
+            background: #e5e7eb;
+            overflow: hidden;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: 999px;
+        }
+
+        .bar-value {
+            text-align: right;
+            font-size: 14px;
+            font-weight: 700;
+            color: #111827;
+        }
+
+        .main-empty {
+            padding: 38px 12px;
+            color: #6b7280;
+            font-size: 14px;
+        }
+
+        @media (max-width: 1400px) {
+            .page {
+                grid-template-columns: 420px minmax(0, 1fr);
+            }
+
+            .charts-wrap {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 1024px) {
+            .page {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar {
+                min-height: auto;
+                border-right: 0;
+                border-bottom: 1px solid #dbe3ee;
+            }
+
+            .main {
+                padding: 18px;
+            }
+
+            .donut {
+                width: 240px;
+                height: 240px;
+            }
+
+            .donut::after {
+                inset: 34px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="top-banner">
+        <div class="banner-left">
+            <div class="brand-logo" id="brandLogo"></div>
+            <div>
+                <div class="report-title" id="reportTitle"></div>
+                <div class="report-subtitle" id="reportSubtitle"></div>
+            </div>
+        </div>
+        <div class="banner-right">
+            <div id="generatedText"></div>
+            <div id="projectText"></div>
+        </div>
+    </header>
+
+    <div class="page">
+        <aside class="sidebar">
+            <div class="tabs">
+                <button id="tabTests" class="tab-button active" type="button">Tests</button>
+                <button id="tabCharts" class="tab-button" type="button">Charts</button>
+            </div>
+
+            <div class="sidebar-body">
+                <input id="scenarioSearch" class="search-box" type="text" placeholder="Search test name, path, or status.">
+                <div id="sidebarList" class="scenario-list"></div>
+            </div>
+        </aside>
+
+        <main class="main">
+            <div id="mainContent"></div>
+        </main>
+    </div>
+
+    <script id="reportModel" type="application/json">${modelJson}</script>
+    <script>
+        const reportModel = JSON.parse(document.getElementById('reportModel').textContent);
+        let currentTab = 'tests';
+        let currentScenarioId = reportModel.defaultScenarioId || (reportModel.scenarios && reportModel.scenarios.length ? reportModel.scenarios[0].id : '');
+
+        function escapeHtml(value) {
+            if (value === null || value === undefined) {
+                return '';
+            }
+
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function safe(value) {
+            return value === null || value === undefined ? '' : String(value);
+        }
+
+        function statusClass(status) {
+            const current = safe(status).toLowerCase();
+            if (current === 'passed') return 'passed';
+            if (current === 'failed') return 'failed';
+            if (current === 'skipped') return 'skipped';
+            return 'info';
+        }
+
+        function statusText(status) {
+            const current = safe(status).toLowerCase();
+            if (current === 'passed') return 'Passed';
+            if (current === 'failed') return 'Failed';
+            if (current === 'skipped') return 'Skipped';
+            return 'Info';
+        }
+
+        function stepIcon(step) {
+            const title = safe(step && step.title).toLowerCase();
+            const status = safe(step && step.status).toLowerCase();
+
+            if (status === 'failed') return '❌';
+            if (status === 'passed' && (title.indexOf('open') >= 0 || title.indexOf('portal') >= 0 || title.indexOf('navigate') >= 0)) return '🌐';
+            if (title.indexOf('wait') >= 0 || title.indexOf('search') >= 0 || title.indexOf('find') >= 0) return '🔎';
+            if (title.indexOf('click') >= 0 || title.indexOf('select') >= 0 || title.indexOf('reload') >= 0) return '🖱️';
+            if (title.indexOf('import') >= 0 || title.indexOf('file') >= 0) return '📄';
+            if (title.indexOf('excel') >= 0 || title.indexOf('table') >= 0) return '🧾';
+            if (status === 'passed') return '✅';
+            if (status === 'skipped') return '⏭️';
+            return 'ℹ️';
+        }
+
+        function filteredScenarios() {
+            const query = safe(document.getElementById('scenarioSearch').value).toLowerCase().trim();
+            if (!query) {
+                return reportModel.scenarios || [];
+            }
+
+            return (reportModel.scenarios || []).filter(function(item) {
+                const text = [
+                    safe(item.name),
+                    safe(item.summary),
+                    safe(item.status),
+                    safe(item.startClock)
+                ].join(' ').toLowerCase();
+
+                return text.indexOf(query) >= 0;
+            });
+        }
+
+        function renderHeader() {
+            const logoContainer = document.getElementById('brandLogo');
+            const logo = safe(reportModel.logoDataUri);
+
+            if (logo) {
+                logoContainer.innerHTML = '<img src="' + escapeHtml(logo) + '" alt="GAIA">';
+            } else {
+                logoContainer.innerHTML = '<div class="brand-logo-fallback">Gaia</div>';
+            }
+
+            document.getElementById('reportTitle').textContent = safe(reportModel.reportTitle);
+            document.getElementById('reportSubtitle').textContent = safe(reportModel.reportSubtitle);
+            document.getElementById('generatedText').textContent = 'Generated ' + safe(reportModel.generatedAt);
+            document.getElementById('projectText').textContent = 'Project ' + safe(reportModel.appName);
+        }
+
+        function renderSidebar() {
+            const list = document.getElementById('sidebarList');
+            const search = document.getElementById('scenarioSearch');
+
+            if (currentTab !== 'tests') {
+                search.style.display = 'none';
+                list.innerHTML = '';
+                return;
+            }
+
+            search.style.display = 'block';
+
+            const items = filteredScenarios();
+            if (!items.length) {
+                list.innerHTML = '<div class="sidebar-empty">No scenarios found.</div>';
+                return;
+            }
+
+            let html = '';
+            items.forEach(function(item) {
+                const activeClass = item.id === currentScenarioId ? ' active' : '';
+                html += ''
+                    + '<button type="button" class="scenario-item' + activeClass + '" data-id="' + escapeHtml(item.id) + '">'
+                    +   '<div>'
+                    +       '<div class="scenario-name">' + escapeHtml(item.name) + '</div>'
+                    +       '<div class="scenario-summary">' + escapeHtml(item.summary || '') + '</div>'
+                    +       '<div class="scenario-meta-line">'
+                    +           '<span>' + escapeHtml(item.startClock || '') + '</span>'
+                    +       '</div>'
+                    +   '</div>'
+                    +   '<div class="scenario-right">'
+                    +       '<span class="chip ' + statusClass(item.status) + '">' + escapeHtml(statusText(item.status)) + '</span>'
+                    +       '<div class="scenario-duration">' + escapeHtml(item.durationText || '') + '</div>'
+                    +   '</div>'
+                    + '</button>';
+            });
+
+            list.innerHTML = html;
+
+            Array.prototype.slice.call(document.querySelectorAll('.scenario-item')).forEach(function(button) {
+                button.addEventListener('click', function() {
+                    currentScenarioId = button.getAttribute('data-id');
+                    renderSidebar();
+                    renderMain();
+                });
+            });
+        }
+
+        function findScenario() {
+            const scenarios = reportModel.scenarios || [];
+            for (let i = 0; i < scenarios.length; i++) {
+                if (safe(scenarios[i].id) === safe(currentScenarioId)) {
+                    return scenarios[i];
+                }
+            }
+            return scenarios.length ? scenarios[0] : null;
+        }
+
+        function renderStepsTable(scenario) {
+            const steps = scenario && scenario.steps ? scenario.steps : [];
+            if (!steps.length) {
+                return '<div class="main-empty">No step details available.</div>';
+            }
+
+            let rows = '';
+            steps.forEach(function(step) {
+                rows += ''
+                    + '<tr>'
+                    +   '<td class="status-cell"><span class="chip ' + statusClass(step.status) + '">' + escapeHtml(statusText(step.status)) + '</span></td>'
+                    +   '<td class="time-cell">' + escapeHtml(step.timestamp || '') + '</td>'
+                    +   '<td>'
+                    +       '<div class="step-detail">'
+                    +           '<span class="step-icon">' + escapeHtml(stepIcon(step)) + '</span>'
+                    +           '<span class="step-text" title="' + escapeHtml(step.title || '') + '">' + escapeHtml(step.title || '') + '</span>'
+                    +       '</div>'
+                    +   '</td>'
+                    + '</tr>';
+            });
+
+            return ''
+                + '<table class="steps-table">'
+                +   '<thead>'
+                +       '<tr>'
+                +           '<th class="status-cell">STATUS</th>'
+                +           '<th class="time-cell">TIMESTAMP</th>'
+                +           '<th>DETAILS</th>'
+                +       '</tr>'
+                +   '</thead>'
+                +   '<tbody>' + rows + '</tbody>'
+                + '</table>';
+        }
+
+        function renderErrorPanel(scenario) {
+            if (!scenario || safe(scenario.status).toLowerCase() !== 'failed') {
+                return '';
+            }
+
+            const summary = escapeHtml(safe(scenario.errorSummary || scenario.summary));
+            const full = escapeHtml(safe(scenario.errorDetails));
+
+            return ''
+                + '<section class="error-panel">'
+                +   '<div class="panel-title">Visual Error Log</div>'
+                +   '<div class="error-summary-line">' + summary + '</div>'
+                +   '<div class="detail-toggle" onclick="toggleDetail(\\'error_' + escapeHtml(scenario.id) + '\\')">🔎 View full error</div>'
+                +   '<div id="error_' + escapeHtml(scenario.id) + '" class="detail-box">' + full + '</div>'
+                + '</section>';
+        }
+
+        function renderEvidencePanel(scenario) {
+            const evidences = scenario && scenario.evidences ? scenario.evidences : [];
+            if (!evidences.length) {
+                return '';
+            }
+
+            let blocks = '';
+            evidences.forEach(function(item, index) {
+                const targetId = 'evidence_' + safe(scenario.id) + '_' + index;
+                blocks += ''
+                    + '<div class="evidence-item">'
+                    +   '<div class="detail-toggle" onclick="toggleDetail(\\'' + escapeHtml(targetId) + '\\')">🖼 ' + escapeHtml(item.name || 'Evidence') + '</div>'
+                    +   '<div id="' + escapeHtml(targetId) + '" class="detail-box">'
+                    +       '<img class="evidence-image" src="' + escapeHtml(item.dataUri || '') + '" alt="Evidence">'
+                    +   '</div>'
+                    + '</div>';
+            });
+
+            return ''
+                + '<section class="evidence-panel">'
+                +   '<div class="panel-title">Evidence</div>'
+                +   blocks
+                + '</section>';
+        }
+
+        function renderScenarioPanel(scenario) {
+            if (!scenario) {
+                return '<div class="main-empty">No scenario selected.</div>';
+            }
+
+            let html = ''
+                + '<div class="main-card">'
+                +   '<div class="main-scenario-title">' + escapeHtml(scenario.name || '') + '</div>'
+                +   '<div class="meta-row">'
+                +       '<span class="chip suite">Suite: ' + escapeHtml(reportModel.suiteName || '') + '</span>'
+                +       '<span class="chip failed' + (safe(scenario.status).toLowerCase() === 'failed' ? '' : ' ' + statusClass(scenario.status)) + '">Status: ' + escapeHtml(statusText(scenario.status)) + '</span>'
+                +       '<span class="chip gradient">Start: ' + escapeHtml(scenario.startClock || '') + '</span>'
+                +       '<span class="chip gradient">End: ' + escapeHtml(scenario.endClock || '') + '</span>'
+                +       '<span class="chip gradient">Duration: ' + escapeHtml(scenario.durationText || '') + '</span>'
+                +   '</div>'
+                +   '<div class="section-title">Steps</div>'
+                +   renderStepsTable(scenario)
+                +   renderErrorPanel(scenario)
+                +   renderEvidencePanel(scenario)
+                + '</div>';
+
+            return html;
+        }
+
+        function donutBackground() {
+            const stats = reportModel.stats || {};
+            const total = Math.max(1, Number(stats.total || 0));
+            const passed = Number(stats.passed || 0);
+            const failed = Number(stats.failed || 0);
+            const skipped = Number(stats.skipped || 0);
+
+            const passedDeg = (passed / total) * 360;
+            const failedDeg = (failed / total) * 360;
+            const skippedDeg = (skipped / total) * 360;
+
+            const a = passedDeg;
+            const b = passedDeg + failedDeg;
+            const c = passedDeg + failedDeg + skippedDeg;
+
+            return 'conic-gradient('
+                + '#78b83a 0deg ' + a + 'deg, '
+                + '#df644e ' + a + 'deg ' + b + 'deg, '
+                + '#d5b31c ' + b + 'deg ' + c + 'deg, '
+                + '#e5e7eb ' + c + 'deg 360deg)';
+        }
+
+        function barRow(label, value, total, color) {
+            const percent = total > 0 ? ((value / total) * 100) : 0;
+            return ''
+                + '<div class="bar-row">'
+                +   '<div class="bar-label">' + escapeHtml(label) + '</div>'
+                +   '<div class="bar-track"><div class="bar-fill" style="width:' + percent + '%; background:' + color + ';"></div></div>'
+                +   '<div class="bar-value">' + escapeHtml(String(value)) + '</div>'
+                + '</div>';
+        }
+
+        function renderChartsPanel() {
+            const stats = reportModel.stats || {};
+            const total = Number(stats.total || 0);
+            const passed = Number(stats.passed || 0);
+            const failed = Number(stats.failed || 0);
+            const skipped = Number(stats.skipped || 0);
+
+            return ''
+                + '<div class="charts-wrap">'
+                +   '<section class="chart-donut-panel">'
+                +       '<div class="section-title">Execution Status</div>'
+                +       '<div class="donut-wrap">'
+                +           '<div class="donut" style="background:' + donutBackground() + ';">'
+                +               '<div class="donut-center"><div class="big">' + escapeHtml(String(total)) + '</div><div class="small">Tests</div></div>'
+                +           '</div>'
+                +           '<div class="legend-list">'
+                +               '<div class="legend-row"><span class="legend-dot" style="background:#78b83a;"></span><span>Passed</span><strong>' + escapeHtml(String(passed)) + '</strong></div>'
+                +               '<div class="legend-row"><span class="legend-dot" style="background:#df644e;"></span><span>Failed</span><strong>' + escapeHtml(String(failed)) + '</strong></div>'
+                +               '<div class="legend-row"><span class="legend-dot" style="background:#d5b31c;"></span><span>Skipped</span><strong>' + escapeHtml(String(skipped)) + '</strong></div>'
+                +           '</div>'
+                +       '</div>'
+                +   '</section>'
+                +   '<section class="chart-bars-panel">'
+                +       '<div class="section-title">Global Overview</div>'
+                +       '<div class="bars-stack">'
+                +           barRow('Passed', passed, total, '#78b83a')
+                +           + barRow('Failed', failed, total, '#df644e')
+                +           + barRow('Skipped', skipped, total, '#d5b31c')
+                +       '</div>'
+                +   '</section>'
+                + '</div>';
+        }
+
+        function renderMain() {
+            const main = document.getElementById('mainContent');
+            if (currentTab === 'charts') {
+                main.innerHTML = renderChartsPanel();
+                return;
+            }
+
+            main.innerHTML = renderScenarioPanel(findScenario());
+        }
+
+        function toggleDetail(id) {
+            const box = document.getElementById(id);
+            if (!box) {
+                return;
+            }
+            box.classList.toggle('open');
+        }
+
+        function activateTab(tab) {
+            currentTab = tab;
+            document.getElementById('tabTests').classList.toggle('active', tab === 'tests');
+            document.getElementById('tabCharts').classList.toggle('active', tab === 'charts');
+            renderSidebar();
+            renderMain();
+        }
+
+        document.getElementById('tabTests').addEventListener('click', function() {
+            activateTab('tests');
+        });
+
+        document.getElementById('tabCharts').addEventListener('click', function() {
+            activateTab('charts');
+        });
+
+        document.getElementById('scenarioSearch').addEventListener('input', function() {
+            renderSidebar();
+        });
+
+        renderHeader();
+        renderSidebar();
+        renderMain();
+    </script>
+</body>
+</html>"""
+    }
 }
