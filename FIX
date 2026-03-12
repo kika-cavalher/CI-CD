@@ -1,418 +1,159 @@
-/*
- * Responsibility:
- * This is the main Jenkins pipeline entry point for Gaia Corrections.
- * Jenkins must call this file directly from SCM.
- *
- * Important:
- * This file must be a plain Groovy script.
- * Do not add package declaration.
- * Do not wrap it in a class.
- */
-
-def getSuites() {
-    /*
-     * Responsibility:
-     * Define the suites that belong to this pipeline.
-     * Clone this file and change only this section for another pipeline.
-     */
-    return [
-        [name: 'PreLoad', path: 'Test Suites/PreLoad'],
-        [name: 'Help',    path: 'Test Suites/Help']
-    ]
-}
-
-def bootstrapSupportFiles(script) {
-    /*
-     * Responsibility:
-     * Checkout only the support folders first.
-     * This allows Gaia start support files to be available before full checkout.
-     */
-    script.deleteDir()
-
-    script.checkout([
-        $class: 'GitSCM',
-        branches: [[name: script.env.GIT_BRANCH]],
-        userRemoteConfigs: [[url: script.env.GIT_URL, credentialsId: script.env.GIT_CRED]],
-        extensions: [
-            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30],
-            [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [
-                [path: 'Keywords/jenkinsPipelines'],
-                [path: 'Keywords/jenkinsIntegration']
-            ]]
-        ]
-    ])
-}
-
-def fullCheckout(script) {
-    /*
-     * Responsibility:
-     * Replace the bootstrap checkout with the full repository checkout.
-     */
-    script.deleteDir()
-
-    script.checkout([
-        $class: 'GitSCM',
-        branches: [[name: script.env.GIT_BRANCH]],
-        userRemoteConfigs: [[url: script.env.GIT_URL, credentialsId: script.env.GIT_CRED]],
-        extensions: [
-            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-        ]
-    ])
-}
-
-def loadPaths(script) {
-    return script.load('Keywords/jenkinsIntegration/JenkinsPaths.groovy')
-}
-
-def loadBatManager(script) {
-    return script.load('Keywords/jenkinsIntegration/JenkinsBatManager.groovy')
-}
-
-def loadLiveLogger(script) {
-    return script.load('Keywords/jenkinsIntegration/JenkinsLiveLogger.groovy')
-}
-
-def loadConsoleView(script) {
-    return script.load('Keywords/jenkinsIntegration/JenkinsConsoleView.groovy')
-}
-
-def loadResultStore(script) {
-    return script.load('Keywords/jenkinsIntegration/JenkinsResultStore.groovy')
-}
-
-def emergencyStopGaia(script) {
-    /*
-     * Responsibility:
-     * Fallback stop in case support files cannot be loaded in post actions.
-     */
-    script.withEnv([
-        "BACK_PORT=${script.env.BACK_PORT}",
-        "FRONT_PORT=${script.env.FRONT_PORT}"
-    ]) {
-        script.powershell(
-            returnStatus: true,
-            script: '''
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
-
-function Stop-ProcessListeningOnPort {
-    param([int]$Port)
-
-    try {
-        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty OwningProcess -Unique
-
-        foreach ($ownerPid in $owners) {
-            if ($ownerPid) {
-                Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-    catch {
-    }
-}
-
-Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
-Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
-
-$targets = Get-CimInstance Win32_Process | Where-Object {
-    $cmd = [string]$_.CommandLine
-    $name = [string]$_.Name
-
-    ($cmd -match 'gaia-start-back\\.bat') -or
-    ($cmd -match 'gaia-start-front\\.bat') -or
-    ($cmd -match 'gaia-start\\.bat') -or
-    ($cmd -match 'web_portal_back') -or
-    ($cmd -match 'web_portal') -or
-    (($name -match 'cmd\\.exe|java\\.exe|node\\.exe|notepad\\.exe') -and ($cmd -match 'gaia'))
-}
-
-foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
-    try {
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    catch {
-    }
-}
-
-exit 0
-'''
-        )
-    }
-}
-
-pipeline {
-    agent {
-        node {
-            label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        }
-    }
-
-    options {
-        timestamps()
-        ansiColor('xterm')
-        disableConcurrentBuilds()
-        skipDefaultCheckout(true)
-        timeout(time: 95, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '20'))
-    }
-
-    parameters {
-        string(name: 'STARTUP_WAIT_SECONDS',  defaultValue: '40', description: 'Seconds to wait after Gaia startup')
-        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for each suite')
-        string(name: 'BROWSER',               defaultValue: 'Chrome', description: 'Katalon browser type')
-    }
-
-    environment {
-        KATALON_EXE = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        GIT_URL     = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        GIT_BRANCH  = '*/master'
-        GIT_CRED    = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-        START_TASK  = 'GaiaBackFrontSetup'
-        BACK_PORT   = '8020'
-        FRONT_PORT  = '4200'
-    }
-
-    stages {
-        stage('Bootstrap Support Files') {
-            steps {
-                script {
-                    bootstrapSupportFiles(this)
-
-                    echo '============================================================'
-                    echo '✅ BOOTSTRAP CHECKOUT COMPLETED'
-                    echo "📁 Workspace: ${pwd()}"
-                    echo '============================================================'
-                }
-            }
-        }
-
-        stage('Validate Tools') {
-            steps {
-                script {
-                    bat """
-@echo off
-echo ============================================================
-echo VALIDATING TOOLS AND SUPPORT FILES
-echo ============================================================
-
-if not exist "${env.KATALON_EXE}" (
-    echo [ERROR] Katalon executable not found
-    echo ${env.KATALON_EXE}
-    exit /b 1
-)
-
-if not exist "${pwd()}\\Keywords\\jenkinsIntegration\\JenkinsBatManager.groovy" (
-    echo [ERROR] JenkinsBatManager.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\Keywords\\jenkinsIntegration\\JenkinsLiveLogger.groovy" (
-    echo [ERROR] JenkinsLiveLogger.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\Keywords\\jenkinsIntegration\\JenkinsPaths.groovy" (
-    echo [ERROR] JenkinsPaths.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\Keywords\\jenkinsIntegration\\JenkinsConsoleView.groovy" (
-    echo [ERROR] JenkinsConsoleView.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\Keywords\\jenkinsIntegration\\JenkinsResultStore.groovy" (
-    echo [ERROR] JenkinsResultStore.groovy not found
-    exit /b 1
-)
-
-echo [OK] Katalon executable found
-echo [OK] Jenkins support files found
-echo ============================================================
-"""
-                }
-            }
-        }
-
-        stage('Start Gaia') {
-            steps {
-                script {
-                    def batManager = loadBatManager(this)
-
-                    batManager.start(this, [
-                        taskName   : env.START_TASK,
-                        waitSeconds: params.STARTUP_WAIT_SECONDS.toInteger()
-                    ])
-                }
-            }
-        }
-
-        stage('Full Checkout Repository') {
-            steps {
-                script {
-                    fullCheckout(this)
-
-                    echo '============================================================'
-                    echo '✅ FULL CHECKOUT COMPLETED'
-                    echo "📁 Workspace: ${pwd()}"
-                    echo '============================================================'
-                }
-            }
-        }
-
-        stage('Prepare Useful Artifacts') {
-            steps {
-                script {
-                    def paths = loadPaths(this)
-                    def resultStore = loadResultStore(this)
-
-                    bat """
-@echo off
-if exist "${paths.reportsRoot(this)}" rmdir /s /q "${paths.reportsRoot(this)}"
-mkdir "${paths.reportsRoot(this)}"
-mkdir "${paths.logsRoot(this)}"
-"""
-
-                    resultStore.saveSuiteResults(this, paths.reportsRoot(this), [])
-                }
-            }
-        }
-
-        stage('Execute Suites') {
-            steps {
-                script {
-                    def paths = loadPaths(this)
-                    def consoleView = loadConsoleView(this)
-                    def resultStore = loadResultStore(this)
-                    def liveLogger = loadLiveLogger(this)
-
-                    def suiteResults = []
-                    def suites = getSuites()
-
-                    suites.each { suite ->
-                        stage("Suite • ${suite.name}") {
-                            consoleView.printSuiteHeader(this, suite.name, suite.path, params.SUITE_TIMEOUT_MINUTES)
-
-                            int exitCode = liveLogger.runSuite(this, [
-                                katalonExe         : env.KATALON_EXE,
-                                projectPath        : paths.projectPath(this),
-                                reportsRoot        : paths.reportsRoot(this),
-                                browser            : params.BROWSER,
-                                suiteTimeoutMinutes: params.SUITE_TIMEOUT_MINUTES.toInteger()
-                            ], suite)
-
-                            def meta = resultStore.readSuiteMeta(this, paths.reportsRoot(this), suite.name)
-
-                            def result = [
-                                name         : suite.name,
-                                path         : suite.path,
-                                status       : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
-                                icon         : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
-                                exitCode     : meta['EXIT_CODE'] ?: "${exitCode}",
-                                executed     : meta['EXECUTED'] ?: '0',
-                                passed       : meta['PASSED'] ?: '0',
-                                failed       : meta['FAILED'] ?: '0',
-                                skipped      : meta['SKIPPED'] ?: '0',
-                                reason       : meta['REASON'] ?: '',
-                                screenshotRel: meta['SCREENSHOT_REL'] ?: '',
-                                logRel       : meta['LOG_REL'] ?: '',
-                                caseSummary  : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
-                                stepSummary  : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
-                            ]
-
-                            suiteResults << result
-                            resultStore.saveSuiteResults(this, paths.reportsRoot(this), suiteResults)
-
-                            consoleView.printSuiteResult(this, result)
-                            consoleView.printRunningSummary(this, suiteResults)
-
-                            if (result.status != 'PASSED') {
-                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                    error("${result.name} finished with status ${result.status}")
-                                }
-                            }
-                        }
-                    }
-
-                    if (suiteResults.any { it.status != 'PASSED' }) {
-                        currentBuild.result = 'FAILURE'
-                    }
-                }
-            }
-        }
-    }
-
-    post {
-        always {
-            script {
-                def suiteResults = []
-                def reportsRoot = "${pwd()}\\Reports"
-
-                try {
-                    if (fileExists('Keywords/jenkinsIntegration/JenkinsPaths.groovy') && fileExists('Keywords/jenkinsIntegration/JenkinsResultStore.groovy')) {
-                        def paths = loadPaths(this)
-                        def resultStore = loadResultStore(this)
-                        reportsRoot = paths.reportsRoot(this)
-                        suiteResults = resultStore.loadSuiteResults(this, reportsRoot)
-                    }
-                }
-                catch (Throwable ignored) {
-                    suiteResults = []
-                }
-
-                try {
-                    if (fileExists('Keywords/jenkinsIntegration/JenkinsBatManager.groovy')) {
-                        def batManager = loadBatManager(this)
-                        batManager.stop(this, [
-                            backPort : env.BACK_PORT.toInteger(),
-                            frontPort: env.FRONT_PORT.toInteger()
-                        ])
-                    }
-                    else {
-                        emergencyStopGaia(this)
-                    }
-                }
-                catch (Throwable ignored) {
-                    emergencyStopGaia(this)
-                }
-
-                try {
-                    if (fileExists('Keywords/jenkinsIntegration/JenkinsConsoleView.groovy')) {
-                        def consoleView = loadConsoleView(this)
-                        consoleView.printFinalSummary(this, suiteResults, currentBuild.currentResult)
-                    }
-                }
-                catch (Throwable ignored) {
-                    echo '============================================================'
-                    echo '❌ PIPELINE FINISHED WITH ERRORS'
-                    echo '============================================================'
-                }
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                archiveArtifacts(
-                    artifacts: 'Reports/**/*.png,Reports/**/JUnit_Report.xml,Reports/logs/*.log,Reports/logs/*.err.log,Reports/logs/*.meta.properties,Reports/logs/*.junit.xml',
-                    allowEmptyArchive: true
-                )
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml,Reports/logs/*.junit.xml'
-            }
-        }
-
-        success {
-            echo '✅ PIPELINE FINISHED SUCCESSFULLY'
-        }
-
-        failure {
-            echo '❌ PIPELINE FINISHED WITH ERRORS'
-        }
-
-        aborted {
-            echo '🛑 PIPELINE ABORTED'
-        }
-    }
-}
+Started by user erica.cavalher-ext@natixis.com
+Running as erica.cavalher-ext@natixis.com
+Obtained jenkinsPipelines/JenkinsfileGaiaCorrections.groovy from git https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git
+[Pipeline] Start of Pipeline
+[Pipeline] node
+Running on GI5_SWDCFRNXGI55817 in D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections
+[Pipeline] {
+[Pipeline] ws
+Running in D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections@2
+[Pipeline] {
+[Pipeline] withEnv
+[Pipeline] {
+[Pipeline] timestamps
+[Pipeline] {
+[Pipeline] ansiColor
+[Pipeline] {
+18:45:52  
+[Pipeline] timeout
+18:45:53  Timeout set to expire in 1 hr 35 min
+[Pipeline] {
+[Pipeline] stage
+[Pipeline] { (Bootstrap Support Files)
+[Pipeline] script
+[Pipeline] {
+[Pipeline] deleteDir
+[Pipeline] checkout
+18:45:54  The recommended git tool is: git
+18:45:54  using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+18:45:54  Cloning the remote Git repository
+18:45:54  Using no checkout clone with sparse checkout.
+18:45:54  Cloning repository https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git
+18:45:54   > git init D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections@2 # timeout=10
+18:45:54  Fetching upstream changes from https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git
+18:45:54   > git --version # timeout=10
+18:45:54   > git --version # 'git version 2.53.0.windows.1'
+18:45:54  using GIT_ASKPASS to set credentials 
+18:45:54   > git fetch --tags --force --progress -- https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git +refs/heads/*:refs/remotes/origin/* # timeout=30
+18:46:17  Avoid second fetch
+18:46:17  Checking out Revision 652fcd61556d55a5af2d8b54e7b1c8e5d0696662 (refs/remotes/origin/master)
+18:46:17   > git config remote.origin.url https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git # timeout=10
+18:46:17   > git config --add remote.origin.fetch +refs/heads/*:refs/remotes/origin/* # timeout=10
+18:46:17   > git rev-parse "refs/remotes/origin/master^{commit}" # timeout=10
+18:46:17   > git config core.sparsecheckout # timeout=10
+18:46:18  Commit message: "Pull request #3: change the folder's place"
+18:46:17   > git config core.sparsecheckout true # timeout=10
+18:46:17   > git read-tree -mu HEAD # timeout=10
+18:46:17   > git checkout -f 652fcd61556d55a5af2d8b54e7b1c8e5d0696662 # timeout=10
+18:46:18   > git rev-list --no-walk ff42204d41d2a9a8f8fd8e91cccf6b78ae527992 # timeout=10
+18:46:18  The recommended git tool is: git
+18:46:18  using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+18:46:18  The recommended git tool is: git
+18:46:18  using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+18:46:18  [GitCheckoutListener] Recording commits of 'git https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+18:46:18  [GitCheckoutListener] Found previous build 'GI5/Gaia/Gaia_Corrections #56' that contains recorded Git commits
+18:46:18  [GitCheckoutListener] -> Starting recording of new commits since 'ff42204'
+18:46:18  [GitCheckoutListener] -> Using head commit '652fcd6' as starting point
+18:46:18  [GitCheckoutListener] -> Git commit decorator could not be created for SCM 'hudson.plugins.git.GitSCM@21739f79'
+18:46:18  [GitCheckoutListener] -> Recorded 4 new commits
+[Pipeline] echo
+18:46:18  ============================================================
+[Pipeline] echo
+18:46:18  ✅ BOOTSTRAP CHECKOUT COMPLETED
+[Pipeline] pwd
+[Pipeline] echo
+18:46:18  📁 Workspace: D:\jenkins\work\workspace\GI5\Gaia\Gaia_Corrections@2
+[Pipeline] echo
+18:46:18  ============================================================
+[Pipeline] }
+[Pipeline] // script
+[Pipeline] }
+[Pipeline] // stage
+18:46:18   > git rev-parse "HEAD^{commit}" # timeout=10
+[Pipeline] stage
+[Pipeline] { (Validate Tools)
+[Pipeline] script
+[Pipeline] {
+[Pipeline] pwd
+[Pipeline] pwd
+[Pipeline] pwd
+[Pipeline] pwd
+[Pipeline] pwd
+[Pipeline] bat
+18:46:20  ============================================================
+18:46:20  VALIDATING TOOLS AND SUPPORT FILES
+18:46:20  ============================================================
+18:46:20  [ERROR] JenkinsBatManager.groovy not found
+[Pipeline] }
+[Pipeline] // script
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Start Gaia)
+Stage "Start Gaia" skipped due to earlier failure(s)
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Full Checkout Repository)
+Stage "Full Checkout Repository" skipped due to earlier failure(s)
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Prepare Useful Artifacts)
+Stage "Prepare Useful Artifacts" skipped due to earlier failure(s)
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Execute Suites)
+Stage "Execute Suites" skipped due to earlier failure(s)
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Declarative: Post Actions)
+[Pipeline] script
+[Pipeline] {
+[Pipeline] pwd
+[Pipeline] fileExists
+[Pipeline] fileExists
+[Pipeline] withEnv
+[Pipeline] {
+[Pipeline] powershell
+[Pipeline] }
+[Pipeline] // withEnv
+[Pipeline] fileExists
+[Pipeline] }
+[Pipeline] // script
+[Pipeline] catchError
+[Pipeline] {
+[Pipeline] archiveArtifacts
+18:46:26  Archiving artifacts
+[Pipeline] }
+[Pipeline] // catchError
+[Pipeline] catchError
+[Pipeline] {
+[Pipeline] junit
+18:46:27  Recording test results
+18:46:27  [Checks API] No suitable checks publisher found.
+[Pipeline] }
+[Pipeline] // catchError
+[Pipeline] echo
+18:46:27  ❌ PIPELINE FINISHED WITH ERRORS
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // timeout
+[Pipeline] }
+18:46:28  
+[Pipeline] // ansiColor
+[Pipeline] }
+18:46:27  No test report files were found. Configuration error?
+[Pipeline] // timestamps
+[Pipeline] }
+[Pipeline] // withEnv
+[Pipeline] }
+[Pipeline] // ws
+[Pipeline] }
+[Pipeline] // node
+[Pipeline] End of Pipeline
+ERROR: script returned exit code 1
+Finished: FAILURE
