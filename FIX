@@ -1,1220 +1,790 @@
 pipeline {
-    agent {
-        node {
-            label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-        }
-    }
+    agent { label 'GI5_SWDCFRNXGI55817' }
 
     options {
+        buildDiscarder(logRotator(
+            numToKeepStr: '5',
+            daysToKeepStr: '7',
+            artifactNumToKeepStr: '3'
+        ))
         timestamps()
-        ansiColor('xterm')
         disableConcurrentBuilds()
-        skipDefaultCheckout(true)
-        timeout(time: 95, unit: 'MINUTES')
-        buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '20'))
-    }
-
-    parameters {
-        string(name: 'STARTUP_WAIT_SECONDS',  defaultValue: '40', description: 'Seconds to wait after backend/frontend startup')
-        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for each suite')
-        string(name: 'BROWSER',               defaultValue: 'Chrome', description: 'Katalon browser type')
+        timeout(time: 10, unit: 'HOURS')
+        ansiColor('xterm')
+        skipDefaultCheckout(false)
     }
 
     environment {
-        KATALON_EXE = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        GIT_URL     = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-        GIT_BRANCH  = '*/master'
-        GIT_CRED    = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-        START_TASK  = 'GaiaBackFrontSetup'
-        REPORT_MENU = 'Gaia Test Reports'
-        BACK_PORT   = '8020'
-        FRONT_PORT  = '4200'
+        KATALON_HOME = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0'
+        EXECUTION_PROFILE = 'prepevol05'
+        BROWSER_TYPE = 'Chrome (headless)'
+        PROJECT_FILE = 'P2P.prj'
+        LOCK_DIR = 'C:\\JenkinsLocks'
+        STALE_LOCK_HOURS = '12'
+        SUITE_TIMEOUT = '110'
+        MAX_CONCURRENT_KATALON = '1'
+        DISPLAY_WIDTH = '1920'
+        DISPLAY_HEIGHT = '1080'
+        FORCE_HEADLESS = 'true'
+        CI_MODE = 'true'
     }
 
     stages {
-        stage('✨ Validate Base Paths') {
+        stage('Environment Setup') {
             steps {
                 script {
-                    validateBasePaths(this)
+                    echo "Starting P2P Test Execution Pipeline (HEADLESS MODE)"
+                    echo "Build: ${env.BUILD_NUMBER}"
+                    echo "Node: ${env.NODE_NAME}"
+                    echo "Workspace: ${env.WORKSPACE}"
+                    echo "Profile: ${env.EXECUTION_PROFILE}"
+                    echo "Browser: ${env.BROWSER_TYPE}"
+                    echo "Headless Mode: ${env.FORCE_HEADLESS}"
+                    echo "Virtual Display: ${env.DISPLAY_WIDTH}x${env.DISPLAY_HEIGHT}"
+                    echo "Max Concurrent Katalon: ${env.MAX_CONCURRENT_KATALON}"
+                    
+                    // Clean and prepare reports directory
+                    bat """
+                        @echo off
+                        echo Preparing reports directory...
+                        if exist "Reports" (
+                            echo   Cleaning existing reports...
+                            rmdir /s /q "Reports"
+                        )
+                        mkdir "Reports"
+                        mkdir "Reports\\_jenkins_summary"
+                        echo Reports directory ready
+                    """
+                    
+                    writeFile file: "Reports\\_jenkins_summary\\build_description.txt", text: ""
+                    echo "Environment setup completed"
                 }
             }
         }
 
-        stage('🚀 Start Gaia Backend and Frontend') {
+        stage('Clean Katalon Sessions') {
             steps {
                 script {
-                    startGaiaProcesses(this)
-                }
-            }
-        }
+                    echo "Cleaning any existing Katalon sessions to free licenses..."
 
-        stage('📥 Checkout Repository') {
-            steps {
-                script {
-                    checkoutRepository(this)
-                }
-            }
-        }
+                    powershell """
+                        \$ErrorActionPreference = 'SilentlyContinue'
+                        \$allProcesses = Get-CimInstance Win32_Process
 
-        stage('🧹 Prepare Reports Folder') {
-            steps {
-                script {
-                    prepareReportsFolder(this)
-                }
-            }
-        }
+                        \$katalonProcesses = \$allProcesses | Where-Object { \$_.Name -match 'katalon|katalonc' -or (\$_.Name -eq 'java.exe' -and \$_.CommandLine -like '*katalon*') }
+                        \$driverProcesses = \$allProcesses | Where-Object { \$_.Name -in @('chromedriver.exe','msedgedriver.exe','geckodriver.exe') }
+                        \$browserProcesses = \$allProcesses | Where-Object { \$_.Name -in @('chrome.exe','msedge.exe','firefox.exe') }
 
-        stage('🧪 Execute Test Suites') {
-            steps {
-                script {
-                    def suiteResults = []
-                    def suites = getTestSuites()
-
-                    suites.each { suite ->
-                        stage("Suite • ${suite.name}") {
-                            def result = null
-
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                result = runSuite(this, suite)
-                                suiteResults << result
-
-                                saveSuiteResults(this, suiteResults)
-                                printSuiteResult(this, result)
-                                printRunningSummary(this, suiteResults)
-
-                                if (result.status != 'PASSED') {
-                                    error("${result.name} finished with status ${result.status}")
-                                }
-                            }
-
-                            if (result == null) {
-                                result = [
-                                    name        : suite.name,
-                                    path        : suite.path,
-                                    status      : 'FAILED',
-                                    icon        : '❌',
-                                    executed    : '0',
-                                    passed      : '0',
-                                    failed      : '0',
-                                    skipped     : '0',
-                                    line1       : 'Pipeline execution failed before report parsing',
-                                    line2       : 'Suite ended unexpectedly inside Jenkins',
-                                    line3       : 'Check console log for technical details',
-                                    reason      : 'Unexpected pipeline interruption',
-                                    reportRel   : '',
-                                    logRel      : '',
-                                    caseSummary : [],
-                                    stepSummary : []
-                                ]
-
-                                suiteResults << result
-                                saveSuiteResults(this, suiteResults)
-                                printSuiteResult(this, result)
-                                printRunningSummary(this, suiteResults)
+                        @(\$browserProcesses, \$driverProcesses, \$katalonProcesses) | ForEach-Object { 
+                            if (\$_) { 
+                                \$_ | ForEach-Object { try { Stop-Process -Id \$_.ProcessId -Force } catch {} }
                             }
                         }
-                    }
 
-                    if (suiteResults.any { it.status != 'PASSED' }) {
-                        currentBuild.result = 'FAILURE'
-                    }
+                        Start-Sleep -Seconds 15
+
+                        \$remaining = Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'katalon|katalonc' -or (\$_.Name -eq 'java.exe' -and \$_.CommandLine -like '*katalon*') }
+                    """
+                }
+            }
+        }
+        stage('LOGIN') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'LOGIN', path: 'Test Suites/LOGIN_GENERIC/login_suite'])
+                }
+            }
+        }
+        stage('CATALOGS') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'CATALOGS', path: 'Test Suites/CATALOGS/catalogs_suite'])
+                }
+            }
+        }
+        
+        stage('NATIXIS_INVOICES') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_INVOICES', path: 'Test Suites/NATIXIS_INVOICES/invoices_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_LONDON') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_LONDON', path: 'Test Suites/NATIXIS_LONDON/natixis_london_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PURCHASE_MODIFY') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PURCHASE_MODIFY', path: 'Test Suites/NATIXIS_PURCHASE_ORDER/POs_approver_can_or_not_modify_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PURCHASE_CLOSE') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PURCHASE_CLOSE', path: 'Test Suites/NATIXIS_PURCHASE_ORDER/POs_approvers_cant_cancel_or_close_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PURCHASE_CANCEL') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PURCHASE_CANCEL', path: 'Test Suites/NATIXIS_PURCHASE_ORDER/POs_business_support_and_PR_preparer_can_cancel_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PURCHASE_CLOSE_ALL') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PURCHASE_CLOSE_ALL', path: 'Test Suites/NATIXIS_PURCHASE_ORDER/POs_business_support_and_PR_preparer_can_close_all_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PURCHASE_RECEIPT') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PURCHASE_RECEIPT', path: 'Test Suites/NATIXIS_PURCHASE_ORDER/POs_receipt_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PURCHASE_PERIMETER') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PURCHASE_PERIMETER', path: 'Test Suites/NATIXIS_PURCHASE_ORDER/POs_users_have_access_of_PO_of_own_perimeter_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PR') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PR', path: 'Test Suites/NATIXIS_PURCHASE_REQUEST/PRs_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_PR_2PHASE') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_PR_2PHASE', path: 'Test Suites/NATIXIS_PURCHASE_REQUEST/PRs_2nd_phase_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_RECEPTION_REC') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_RECEPTION_REC', path: 'Test Suites/NATIXIS_RECEPTION/receipt_rec_collection_suite'])
+                }
+            }
+        }
+        stage('NATIXIS_RECEPTION_ETL') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'NATIXIS_RECEPTION_ETL', path: 'Test Suites/NATIXIS_RECEPTION/reception_etl_suite'])
+                }
+            }
+        }
+        stage('BPCE_SI_DAHAT1') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'BPCE_SI_DAHAT1', path: 'Test Suites/BPCE_SI/bpce_si_pr_dahat01_suite'])
+                }
+            }
+        }
+        stage('BPCE_SI_DAHAT2') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'BPCE_SI_DAHAT2', path: 'Test Suites/BPCE_SI/bpce_si_pr_dahat02_suite'])
+                }
+            }
+        }
+        stage('BPCE_SI') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'BPCE_SI', path: 'Test Suites/BPCE_SI/bpcesi_suite'])
+                }
+            }
+        }
+        stage('BPCE_ACHATS') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'BPCE_ACHATS', path: 'Test Suites/BPCE_ACHATS/bpce_achats_suite'])
+                }
+            }
+        }
+        stage('BPCE_ACHATS_GS_BANK_INFO') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'BPCE_ACHATS_GS_BANK_INFO', path: 'Test Suites/BPCE_ACHATS/bpce_goldenSource_bankingInfo'])
+                }
+            }
+        }
+        stage('OPS_ACCEPT_TERMS') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'OPS_ACCEPT_TERMS', path: 'Test Suites/OPS_AUTOMATION/accept_terms_suite'])
+                }
+            }
+        }
+        stage('OPS_AFTER_REFRESH') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'OPS_AFTER_REFRESH', path: 'Test Suites/OPS_AUTOMATION/afterRefreshEnvoirment'])
+                }
+            }
+        }
+        stage('TS_COLLECTION_OTHERS') {
+            steps {
+                script {
+                    executeSingleSuiteHeadless([name: 'TS_COLLECTION_OTHERS', path: 'Test Suites/TEST_SUITE_COLLECTIONS/without_group'])
                 }
             }
         }
 
-        stage('📊 Build Reports Dashboard') {
+        stage('Final Summary') {
             steps {
                 script {
-                    def suiteResults = loadSuiteResults(this)
-                    buildReportsDashboard(this, suiteResults)
+                    echo "PIPELINE EXECUTION COMPLETED! (HEADLESS MODE)"
+                    echo "Check individual stages above for detailed results"
+                    echo "Build summary will be available in the build description"
                 }
             }
         }
     }
-
     post {
         always {
             script {
-                def suiteResults = loadSuiteResults(this)
-
-                safeBuildReportsDashboard(this, suiteResults)
-                stopGaiaProcesses(this, currentBuild.currentResult == 'ABORTED' ? 'Build aborted by user' : 'Build finished')
-                printFinalSummary(this, suiteResults, currentBuild.currentResult)
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                archiveArtifacts(
-                    artifacts: 'Reports/**/*',
-                    excludes: '**/broken-test-objects-v2.json,**/Self-healing/**',
-                    allowEmptyArchive: true
-                )
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
-            }
-
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                publishHTML(target: [
-                    allowMissing         : true,
-                    alwaysLinkToLastBuild: true,
-                    keepAll              : true,
-                    reportDir            : 'Reports/dashboard',
-                    reportFiles          : 'index.html',
-                    reportName           : "${env.REPORT_MENU}",
-                    reportTitles         : 'Gaia Corrections Dashboard'
-                ])
-            }
-        }
-
-        success {
-            echo '✅ PIPELINE FINISHED SUCCESSFULLY'
-        }
-
-        failure {
-            echo '❌ PIPELINE FINISHED WITH ERRORS'
-        }
-
-        aborted {
-            echo '🛑 PIPELINE ABORTED'
-        }
-    }
-}
-
-def getTestSuites() {
-    return [
-        [name: 'PreLoad', path: 'Test Suites/PreLoad'],
-        [name: 'Help',    path: 'Test Suites/Help']
-    ]
-}
-
-def currentWorkspace(script) {
-    return script.pwd()
-}
-
-def currentProjectPath(script) {
-    return "${currentWorkspace(script)}\\gaia-portal.prj"
-}
-
-def currentReportsRoot(script) {
-    return "${currentWorkspace(script)}\\Reports"
-}
-
-def validateBasePaths(script) {
-    def workDir = currentWorkspace(script)
-    def reportsRoot = currentReportsRoot(script)
-
-    script.bat """
-@echo off
-echo ============================================================
-echo ✨ VALIDATING BASE PATHS
-echo ============================================================
-
-if not exist "${workDir}" mkdir "${workDir}"
-if not exist "${reportsRoot}" mkdir "${reportsRoot}"
-
-if not exist "${script.env.KATALON_EXE}" (
-    echo ❌ Katalon executable not found:
-    echo ${script.env.KATALON_EXE}
-    exit /b 1
-)
-
-echo ✅ Base paths are valid
-echo ============================================================
-"""
-}
-
-def startGaiaProcesses(script) {
-    script.bat """
-@echo off
-echo ============================================================
-echo 🚀 STARTING BACKEND AND FRONTEND
-echo ============================================================
-schtasks /run /tn "${script.env.START_TASK}"
-"""
-    script.sleep(time: script.params.STARTUP_WAIT_SECONDS.toInteger(), unit: 'SECONDS')
-}
-
-def checkoutRepository(script) {
-    script.deleteDir()
-
-    script.checkout([
-        $class: 'GitSCM',
-        branches: [[name: script.env.GIT_BRANCH]],
-        userRemoteConfigs: [[url: script.env.GIT_URL, credentialsId: script.env.GIT_CRED]],
-        extensions: [
-            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-        ]
-    ])
-
-    script.echo '============================================================'
-    script.echo '✅ CHECKOUT COMPLETED'
-    script.echo "📁 Workspace: ${currentWorkspace(script)}"
-    script.echo '============================================================'
-}
-
-def prepareReportsFolder(script) {
-    def reportsRoot = currentReportsRoot(script)
-
-    script.bat """
-@echo off
-if exist "${reportsRoot}" rmdir /s /q "${reportsRoot}"
-mkdir "${reportsRoot}"
-mkdir "${reportsRoot}\\logs"
-mkdir "${reportsRoot}\\dashboard"
-"""
-
-    script.writeFile(
-        file: "${reportsRoot}\\suite-results.json",
-        text: '[]',
-        encoding: 'UTF-8'
-    )
-
-    script.writeFile(
-        file: "${reportsRoot}\\dashboard\\index.html",
-        text: getInitialDashboardHtml(),
-        encoding: 'UTF-8'
-    )
-}
-
-def runSuite(script, Map suite) {
-    printSuiteHeader(script, suite.name, suite.path, script.params.SUITE_TIMEOUT_MINUTES)
-
-    def suiteKey = safeFileName(suite.name)
-    def suiteStartedAt = new Date().format("yyyy-MM-dd'T'HH:mm:ss")
-    def projectPath = currentProjectPath(script)
-    def reportsRoot = currentReportsRoot(script)
-
-    def exitCode = script.withEnv([
-        "SUITE_NAME=${suite.name}",
-        "SUITE_PATH=${suite.path}",
-        "SUITE_KEY=${suiteKey}",
-        "BROWSER=${script.params.BROWSER}",
-        "SUITE_TIMEOUT_MINUTES=${script.params.SUITE_TIMEOUT_MINUTES}",
-        "PROJECT_PATH=${projectPath}",
-        "REPORTS_ROOT=${reportsRoot}"
-    ]) {
-        script.powershell(
-            returnStatus: true,
-            script: '''
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-
-function Stop-ProcessTree {
-    param([int]$ProcessId)
-
-    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
-    foreach ($child in $children) {
-        Stop-ProcessTree -ProcessId $child.ProcessId
-    }
-
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-}
-
-function Read-NewContent {
-    param(
-        [string]$Path,
-        [ref]$Offset
-    )
-
-    if (-not (Test-Path $Path)) {
-        return @()
-    }
-
-    $fs = $null
-    $sr = $null
-
-    try {
-        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
-        $sr = New-Object System.IO.StreamReader($fs)
-        $content = $sr.ReadToEnd()
-        $Offset.Value = $fs.Position
-
-        if ([string]::IsNullOrWhiteSpace($content)) {
-            return @()
-        }
-
-        return @($content -split "`r?`n")
-    }
-    catch {
-        return @()
-    }
-    finally {
-        if ($sr) { $sr.Close() }
-        if ($fs) { $fs.Close() }
-    }
-}
-
-function Emit-NewLines {
-    param(
-        [string]$Path,
-        [ref]$Offset,
-        [string]$Prefix
-    )
-
-    $lines = Read-NewContent -Path $Path -Offset $Offset
-    foreach ($line in $lines) {
-        if (-not [string]::IsNullOrWhiteSpace($line)) {
-            Write-Host ($Prefix + $line)
-        }
-    }
-}
-
-function Find-ExecutionLog {
-    param([string]$Root)
-
-    $candidate = Get-ChildItem -Path $Root -Filter 'execution0.log' -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.FullName -notmatch '\\\\logs\\\\' -and
-            $_.FullName -notmatch '\\\\dashboard\\\\' -and
-            $_.FullName -notmatch '\\\\Self-healing\\\\'
-        } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($candidate) {
-        return $candidate.FullName
-    }
-
-    return ''
-}
-
-$stdoutLog = Join-Path $env:REPORTS_ROOT ("logs\\" + $env:SUITE_KEY + ".log")
-$stderrLog = Join-Path $env:REPORTS_ROOT ("logs\\" + $env:SUITE_KEY + ".err.log")
-
-if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force -ErrorAction SilentlyContinue }
-if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force -ErrorAction SilentlyContinue }
-
-$argString = @(
-    '-noSplash',
-    '-runMode=console',
-    '-consoleLog',
-    ('-projectPath="' + $env:PROJECT_PATH + '"'),
-    '-retry=0',
-    ('-testSuitePath="' + $env:SUITE_PATH + '"'),
-    ('-browserType="' + $env:BROWSER + '"'),
-    ('-reportFolder="' + $env:REPORTS_ROOT + '"')
-) -join ' '
-
-Write-Host '============================================================'
-Write-Host ('🚀 KATALON START | ' + $env:SUITE_NAME)
-Write-Host ('📁 Project      | ' + $env:PROJECT_PATH)
-Write-Host ('🧪 Suite        | ' + $env:SUITE_PATH)
-Write-Host ('🌐 Browser      | ' + $env:BROWSER)
-Write-Host ('📂 Reports      | ' + $env:REPORTS_ROOT)
-Write-Host '============================================================'
-
-$process = Start-Process `
-    -FilePath $env:KATALON_EXE `
-    -ArgumentList $argString `
-    -PassThru `
-    -NoNewWindow `
-    -RedirectStandardOutput $stdoutLog `
-    -RedirectStandardError $stderrLog
-
-$stdoutOffset = 0L
-$stderrOffset = 0L
-$executionOffset = 0L
-$executionFile = ''
-$timeoutAt = (Get-Date).AddMinutes([int]$env:SUITE_TIMEOUT_MINUTES)
-
-while (-not $process.HasExited) {
-    Emit-NewLines -Path $stdoutLog -Offset ([ref]$stdoutOffset) -Prefix '[KATALON] '
-    Emit-NewLines -Path $stderrLog -Offset ([ref]$stderrOffset) -Prefix '[STDERR] '
-
-    if (-not $executionFile) {
-        $executionFile = Find-ExecutionLog -Root $env:REPORTS_ROOT
-        if ($executionFile) {
-            Write-Host ('[EXECUTION0] File detected: ' + $executionFile)
-        }
-    }
-
-    if ($executionFile) {
-        Emit-NewLines -Path $executionFile -Offset ([ref]$executionOffset) -Prefix '[EXECUTION0] '
-    }
-
-    if ((Get-Date) -ge $timeoutAt) {
-        Write-Host '[TIMEOUT] Suite exceeded configured timeout'
-        Stop-ProcessTree -ProcessId $process.Id
-
-        Emit-NewLines -Path $stdoutLog -Offset ([ref]$stdoutOffset) -Prefix '[KATALON] '
-        Emit-NewLines -Path $stderrLog -Offset ([ref]$stderrOffset) -Prefix '[STDERR] '
-        if ($executionFile) {
-            Emit-NewLines -Path $executionFile -Offset ([ref]$executionOffset) -Prefix '[EXECUTION0] '
-        }
-
-        if (Test-Path $stderrLog) {
-            Add-Content -Path $stdoutLog -Value ''
-            Add-Content -Path $stdoutLog -Value '==== STDERR ===='
-            Get-Content $stderrLog | Add-Content -Path $stdoutLog
-            Remove-Item $stderrLog -Force -ErrorAction SilentlyContinue
-        }
-
-        exit 124
-    }
-
-    Start-Sleep -Seconds 2
-    try { $process.Refresh() } catch {}
-}
-
-Emit-NewLines -Path $stdoutLog -Offset ([ref]$stdoutOffset) -Prefix '[KATALON] '
-Emit-NewLines -Path $stderrLog -Offset ([ref]$stderrOffset) -Prefix '[STDERR] '
-if ($executionFile) {
-    Emit-NewLines -Path $executionFile -Offset ([ref]$executionOffset) -Prefix '[EXECUTION0] '
-}
-
-if (Test-Path $stderrLog) {
-    Add-Content -Path $stdoutLog -Value ''
-    Add-Content -Path $stdoutLog -Value '==== STDERR ===='
-    Get-Content $stderrLog | Add-Content -Path $stdoutLog
-    Remove-Item $stderrLog -Force -ErrorAction SilentlyContinue
-}
-
-exit $process.ExitCode
-'''
-        )
-    }
-
-    def metaText = script.withEnv([
-        "SUITE_NAME=${suite.name}",
-        "SUITE_KEY=${suiteKey}",
-        "RUN_EXIT=${exitCode}",
-        "SUITE_STARTED_AT=${suiteStartedAt}",
-        "REPORTS_ROOT=${reportsRoot}"
-    ]) {
-        script.powershell(
-            returnStdout: true,
-            script: '''
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
-
-function Clean-Text {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-
-    $text = $Value -replace '[\\r\\n]+', ' '
-    $text = $text -replace '\\s+', ' '
-    $text = $text -replace '\\|', '/'
-    return $text.Trim()
-}
-
-function Short-Text {
-    param([string]$Value, [int]$Max = 150)
-
-    $text = Clean-Text $Value
-    if ($text.Length -gt $Max) {
-        return $text.Substring(0, $Max - 3) + '...'
-    }
-
-    return $text
-}
-
-function To-RelPath {
-    param(
-        [string]$Root,
-        [string]$FullPath
-    )
-
-    if ([string]::IsNullOrWhiteSpace($FullPath)) { return '' }
-    if (-not $FullPath.StartsWith($Root)) { return '' }
-
-    $rel = $FullPath.Substring($Root.Length)
-    if ($rel.StartsWith('\\')) {
-        $rel = $rel.Substring(1)
-    }
-
-    return $rel.Replace('\\', '/')
-}
-
-$root = $env:REPORTS_ROOT
-$suiteName = $env:SUITE_NAME
-$suiteKey = $env:SUITE_KEY
-$runExit = [int]$env:RUN_EXIT
-$suiteStartedAt = Get-Date $env:SUITE_STARTED_AT
-
-$logFile = Join-Path $root ("logs\\" + $suiteKey + ".log")
-$reportDir = ''
-$junitFile = ''
-$htmlFile = ''
-$executionFile = ''
-$executed = 0
-$passed = 0
-$failed = 0
-$skipped = 0
-$reason = ''
-$caseLines = @()
-$stepLines = @()
-
-$candidates = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.FullName -notmatch '\\\\dashboard($|\\\\)' -and
-        $_.FullName -notmatch '\\\\logs($|\\\\)' -and
-        $_.FullName -notmatch '\\\\Self-healing($|\\\\)' -and
-        $_.LastWriteTime -ge $suiteStartedAt.AddMinutes(-1) -and
-        (
-            (Test-Path (Join-Path $_.FullName 'execution0.log')) -or
-            (Get-ChildItem -Path $_.FullName -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1) -or
-            (Get-ChildItem -Path $_.FullName -Filter '*.html' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
-        )
-    } |
-    Sort-Object LastWriteTime -Descending
-
-if ($candidates) {
-    $reportDir = $candidates[0].FullName
-}
-
-if ($reportDir -and (Test-Path $reportDir)) {
-    $executionCandidate = Get-ChildItem -Path $reportDir -Filter 'execution0.log' -File -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($executionCandidate) {
-        $executionFile = $executionCandidate.FullName
-    }
-
-    $junitCandidate = Get-ChildItem -Path $reportDir -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($junitCandidate) {
-        $junitFile = $junitCandidate.FullName
-    }
-
-    $htmlCandidates = @(
-        (Join-Path $reportDir 'report.html'),
-        (Join-Path $reportDir 'index.html'),
-        (Join-Path $reportDir 'cucumber_report\\cucumber-html-reports\\overview-features.html'),
-        (Join-Path $reportDir 'cucumber_report\\cucumber-html-reports\\overview-tags.html')
-    )
-
-    foreach ($candidate in $htmlCandidates) {
-        if ($candidate -and (Test-Path $candidate)) {
-            $htmlFile = $candidate
-            break
-        }
-    }
-
-    if (-not $htmlFile) {
-        $htmlCandidate = Get-ChildItem -Path $reportDir -Filter '*.html' -File -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-
-        if ($htmlCandidate) {
-            $htmlFile = $htmlCandidate.FullName
-        }
-    }
-}
-
-if ($junitFile -and (Test-Path $junitFile)) {
-    try {
-        [xml]$xml = Get-Content $junitFile
-
-        $testcases = @()
-
-        if ($xml.testsuite) {
-            $testcases = @($xml.testsuite.testcase)
-        }
-        elseif ($xml.testsuites) {
-            foreach ($ts in @($xml.testsuites.testsuite)) {
-                $testcases += @($ts.testcase)
-            }
-        }
-
-        $testcases = @($testcases | Where-Object { $_ })
-        $executed = $testcases.Count
-
-        $failedNodes = @($testcases | Where-Object { $_.failure -or $_.error })
-        $skippedNodes = @($testcases | Where-Object { $_.skipped })
-
-        $failed = $failedNodes.Count
-        $skipped = $skippedNodes.Count
-        $passed = $executed - $failed - $skipped
-
-        foreach ($tc in ($testcases | Select-Object -First 3)) {
-            $caseName = Short-Text $tc.name 85
-
-            if ($tc.failure -or $tc.error) {
-                $msg = ''
-                if ($tc.failure) {
-                    $msg = Short-Text (($tc.failure.message + ' ' + $tc.failure.InnerText)) 70
+                echo "Generating build summary..."
+                
+                def summaryText = ""
+                try {
+                    summaryText = readFile("Reports\\_jenkins_summary\\build_description.txt")
+                } catch (Exception e) {
+                    summaryText = "No summary file generated"
+                    echo "Warning: Could not read summary file: ${e.message}"
                 }
-                elseif ($tc.error) {
-                    $msg = Short-Text (($tc.error.message + ' ' + $tc.error.InnerText)) 70
+    
+                if (summaryText.trim()) {
+                    def escapedText = summaryText
+                        .replace("&", "&amp;")
+                        .replace("<", "&lt;")
+                        .replace(">", "&gt;")
+                    
+                    currentBuild.description = "<pre style='margin:0; white-space:pre-wrap; font-family:monospace; font-size:12px;'>" + escapedText + "</pre>"
+                } else {
+                    currentBuild.description = "No test results available"
                 }
-
-                $caseLines += ('❌ ' + $caseName + ' | ' + $msg)
-            }
-            elseif ($tc.skipped) {
-                $caseLines += ('⏭️ ' + $caseName + ' | skipped')
-            }
-            else {
-                $caseLines += ('✅ ' + $caseName + ' | passed')
-            }
-        }
-
-        if ($failedNodes.Count -gt 0) {
-            $firstBad = $failedNodes[0]
-
-            if ($firstBad.failure) {
-                $reason = Short-Text (($firstBad.failure.message + ' ' + $firstBad.failure.InnerText)) 150
-            }
-            elseif ($firstBad.error) {
-                $reason = Short-Text (($firstBad.error.message + ' ' + $firstBad.error.InnerText)) 150
-            }
-        }
-    }
-    catch {
-        $reason = Short-Text $_.Exception.Message 150
-    }
-}
-
-if ($executionFile -and (Test-Path $executionFile)) {
-    $lastLine = ''
-
-    foreach ($line in (Get-Content $executionFile -ErrorAction SilentlyContinue)) {
-        $text = Clean-Text $line
-        if (-not $text) { continue }
-
-        if ($text -match '(?i)Scenario(?: Outline)?\\s*[:\\-]?\\s*(.+)$') {
-            $formatted = '🎬 ' + (Short-Text $Matches[1] 120)
-            if ($formatted -ne $lastLine -and $stepLines.Count -lt 10) {
-                $stepLines += $formatted
-                $lastLine = $formatted
-            }
-            continue
-        }
-
-        if ($text -match '(?i)\\b(Given|When|Then|And|But)\\b\\s+(.+)$') {
-            $step = ($Matches[1] + ' ' + $Matches[2]).Trim()
-            $step = $step -replace '(?i)\\s*(PASSED|FAILED|SKIPPED|ERROR|SUCCESS).*$', ''
-            $step = Short-Text $step 130
-
-            $prefix = '➡️ '
-            if ($text -match '(?i)\\bFAILED\\b|\\bERROR\\b|\\bEXCEPTION\\b|TIMED OUT|TIMEOUT|NOT FOUND') {
-                $prefix = '❌ '
-            }
-            elseif ($text -match '(?i)\\bSKIPPED\\b') {
-                $prefix = '⏭️ '
-            }
-            elseif ($text -match '(?i)\\bPASSED\\b|\\bSUCCESS\\b') {
-                $prefix = '✅ '
-            }
-
-            $formatted = $prefix + $step
-            if ($formatted -ne $lastLine -and $stepLines.Count -lt 10) {
-                $stepLines += $formatted
-                $lastLine = $formatted
-            }
-        }
-    }
-}
-
-if (-not $reason -and (Test-Path $logFile)) {
-    $logHints = Get-Content $logFile -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_ -match 'StepFailedException|ERROR|Caused by|Unable to|not found|timed out|Timeout|failed|InvalidConsoleArgumentException'
-        } |
-        Select-Object -Last 3
-
-    if ($logHints) {
-        $reason = Short-Text (($logHints -join ' ')) 150
-    }
-}
-
-$status = 'PASSED'
-$icon = '✅'
-$line1 = 'Suite finished successfully'
-$line2 = 'All reported checks passed'
-$line3 = 'Open the detailed report for execution evidence'
-
-if ($runExit -eq 124) {
-    $status = 'TIMEOUT'
-    $icon = '⏰'
-    $line1 = 'Execution timed out'
-    $line2 = 'Suite exceeded the configured time limit'
-    $line3 = 'Review slow steps or increase suite timeout'
-}
-elseif ($failed -gt 0 -or $runExit -ne 0) {
-    $status = 'FAILED'
-    $icon = '❌'
-    $line1 = 'One or more checks failed'
-    if ([string]::IsNullOrWhiteSpace($reason)) {
-        $line2 = 'A failing step was detected during execution'
-    }
-    else {
-        $line2 = $reason
-    }
-    $line3 = 'Open the detailed report for error evidence'
-}
-elseif ($executed -eq 0 -and $runExit -eq 0) {
-    $status = 'PASSED'
-    $icon = '✅'
-    $line1 = 'Execution finished without technical errors'
-    $line2 = 'No structured JUnit counters were found'
-    $line3 = 'Open the detailed report for execution evidence'
-}
-
-$reportRel = To-RelPath -Root $root -FullPath $htmlFile
-$logRel = To-RelPath -Root $root -FullPath $logFile
-
-Write-Output ('SUITE_NAME=' + $suiteName)
-Write-Output ('STATUS=' + $status)
-Write-Output ('ICON=' + $icon)
-Write-Output ('EXIT_CODE=' + $runExit)
-Write-Output ('EXECUTED=' + $executed)
-Write-Output ('PASSED=' + $passed)
-Write-Output ('FAILED=' + $failed)
-Write-Output ('SKIPPED=' + $skipped)
-Write-Output ('LINE1=' + (Short-Text $line1 150))
-Write-Output ('LINE2=' + (Short-Text $line2 150))
-Write-Output ('LINE3=' + (Short-Text $line3 150))
-Write-Output ('REASON=' + (Short-Text $reason 150))
-Write-Output ('REPORT_REL=' + $reportRel)
-Write-Output ('LOG_REL=' + $logRel)
-Write-Output ('CASE_SUMMARY=' + (($caseLines -join ' || ')))
-Write-Output ('STEP_SUMMARY=' + (($stepLines -join ' || ')))
-'''
-        ).trim()
-    }
-
-    def meta = parseKeyValue(metaText)
-
-    return [
-        name       : suite.name,
-        path       : suite.path,
-        status     : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
-        icon       : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
-        exitCode   : meta['EXIT_CODE'] ?: "${exitCode}",
-        executed   : meta['EXECUTED'] ?: '0',
-        passed     : meta['PASSED'] ?: '0',
-        failed     : meta['FAILED'] ?: '0',
-        skipped    : meta['SKIPPED'] ?: '0',
-        line1      : meta['LINE1'] ?: '',
-        line2      : meta['LINE2'] ?: '',
-        line3      : meta['LINE3'] ?: '',
-        reason     : meta['REASON'] ?: '',
-        reportRel  : meta['REPORT_REL'] ?: '',
-        logRel     : meta['LOG_REL'] ?: '',
-        caseSummary: splitSummary(meta['CASE_SUMMARY'] ?: ''),
-        stepSummary: splitSummary(meta['STEP_SUMMARY'] ?: '')
-    ]
-}
-
-def saveSuiteResults(script, List results) {
-    def reportsRoot = currentReportsRoot(script)
-    def json = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(results))
-    script.writeFile(file: "${reportsRoot}\\suite-results.json", text: json, encoding: 'UTF-8')
-}
-
-def loadSuiteResults(script) {
-    def filePath = "${currentReportsRoot(script)}\\suite-results.json"
-
-    if (!script.fileExists(filePath)) {
-        return []
-    }
-
-    def text = script.readFile(file: filePath, encoding: 'UTF-8')
-    if (!text?.trim()) {
-        return []
-    }
-
-    return new groovy.json.JsonSlurperClassic().parseText(text)
-}
-
-def safeBuildReportsDashboard(script, List results) {
-    try {
-        buildReportsDashboard(script, results)
-    } catch (Throwable ignored) {
-        script.echo '⚠️ Dashboard generation skipped'
-    }
-}
-
-def buildReportsDashboard(script, List results) {
-    def reportsRoot = currentReportsRoot(script)
-    def buildUrl = script.env.BUILD_URL ?: ''
-    def passedCount = results.count { it.status == 'PASSED' }
-    def failedCount = results.count { it.status == 'FAILED' }
-    def timeoutCount = results.count { it.status == 'TIMEOUT' }
-
-    def cards = results.collect { r ->
-        def reportUrl = r.reportRel ? "${buildUrl}artifact/Reports/${r.reportRel}" : ''
-        def logUrl    = r.logRel ? "${buildUrl}artifact/Reports/${r.logRel}" : ''
-        def statusCls = r.status == 'PASSED' ? 'ok' : (r.status == 'TIMEOUT' ? 'timeout' : 'fail')
-
-        return """
-<div class="card ${statusCls}">
-  <div class="card-header">
-    <div class="title">${escapeHtml(r.icon)} ${escapeHtml(r.name)}</div>
-    <div class="badge">${escapeHtml(r.status)}</div>
-  </div>
-
-  <div class="meta">${escapeHtml(r.path)}</div>
-
-  <div class="counts">
-    <span>Executed: <b>${escapeHtml(r.executed.toString())}</b></span>
-    <span>Passed: <b>${escapeHtml(r.passed.toString())}</b></span>
-    <span>Failed: <b>${escapeHtml(r.failed.toString())}</b></span>
-    <span>Skipped: <b>${escapeHtml(r.skipped.toString())}</b></span>
-  </div>
-
-  <div class="summary">
-    <div>${escapeHtml(r.line1 ?: '')}</div>
-    <div>${escapeHtml(r.line2 ?: '')}</div>
-    <div>${escapeHtml(r.line3 ?: '')}</div>
-  </div>
-
-  <div class="cases">
-    ${(r.caseSummary ?: []).take(3).collect { "<div>${escapeHtml(it.toString())}</div>" }.join('')}
-  </div>
-
-  <div class="steps">
-    ${(r.stepSummary ?: []).take(10).collect { "<div>${escapeHtml(it.toString())}</div>" }.join('')}
-  </div>
-
-  <div class="links">
-    ${reportUrl ? "<a href='${reportUrl}' target='_blank'>📄 Open suite report</a>" : "<span class='disabled'>📄 Report not found</span>"}
-    ${logUrl ? "<a href='${logUrl}' target='_blank'>🧾 Open suite log</a>" : "<span class='disabled'>🧾 Log not found</span>"}
-  </div>
-</div>
-"""
-    }.join('\n')
-
-    def html = """
+    
+                echo "Archiving test reports..."
+                archiveArtifacts artifacts: "Reports/**/*", allowEmptyArchive: true
+    
+                echo "Converting CSV reports to JUnit XML and publishing..."
+                convertCsvToJunitAndPublish()
+                
+                echo "Consolidating Harmoni reports..."
+                
+                // ✅ CONSOLIDAR REPORTS HTML usando PowerShell com estrutura corrigida
+                powershell """
+                    \$ErrorActionPreference = 'SilentlyContinue'
+                    
+                    Write-Host "Consolidating Harmoni reports..."
+                    
+                    \$buildNumber = "${env.BUILD_NUMBER}"
+                    \$reportsDir = "${env.WORKSPACE}\\Reports"
+                    
+                    \$allSuiteReports = @()
+                    
+                    
+                    \$executedSuites = @('LOGIN', 'CATALOGS', 'NATIXIS_INVOICES', 'NATIXIS_LONDON', 'NATIXIS_PURCHASE_MODIFY', 'NATIXIS_PURCHASE_CLOSE', 'NATIXIS_PURCHASE_CANCEL', 'NATIXIS_PURCHASE_CLOSE_ALL', 'NATIXIS_PURCHASE_RECEIPT', 'NATIXIS_PURCHASE_PERIMETER', 'NATIXIS_PR', 'NATIXIS_PR_2PHASE', 'NATIXIS_RECEPTION_REC', 'NATIXIS_RECEPTION_ETL', 'BPCE_SI_DAHAT1', 'BPCE_SI_DAHAT2', 'BPCE_SI', 'BPCE_ACHATS', 'BPCE_ACHATS_GS_BANK_INFO', 'OPS_ACCEPT_TERMS', 'OPS_AFTER_REFRESH', 'TS_COLLECTION_OTHERS')
+                    
+                    foreach (\$suite in \$executedSuites) {
+                        Write-Host "Searching reports for suite: \$suite"
+                        
+                        \$suiteDir = "\$reportsDir\\\$suite\\\$buildNumber"
+                        
+                        if (Test-Path \$suiteDir) {
+                            
+                            \$harmoniReports = Get-ChildItem -Path \$suiteDir -Filter "HarmoniReport.html" -Recurse
+                            
+                            if (\$harmoniReports) {
+                                
+                                \$reportFile = \$harmoniReports | Select-Object -First 1
+                                \$relativePath = \$reportFile.FullName -replace [regex]::Escape(\$reportsDir + "\\"), ""
+                                
+                                \$allSuiteReports += [PSCustomObject]@{
+                                    Suite = \$suite
+                                    Path = \$reportFile.FullName
+                                    RelativePath = \$relativePath
+                                }
+                                Write-Host "  ✅ Found report for \$suite at: \$relativePath"
+                            } else {
+                                Write-Host "  ❌ No HarmoniReport.html found in: \$suiteDir"
+                                
+                                
+                                \$allFiles = Get-ChildItem -Path \$suiteDir -Recurse -File
+                                Write-Host "    Files found in \$suite directory:"
+                                foreach (\$file in \$allFiles) {
+                                    \$fileRelPath = \$file.FullName -replace [regex]::Escape(\$suiteDir), ""
+                                    Write-Host "      \$fileRelPath"
+                                }
+                            }
+                        } else {
+                            Write-Host "  ❌ Suite directory not found: \$suiteDir"
+                        }
+                    }
+                    
+                    Write-Host "Found \$(\$allSuiteReports.Count) suite reports total"
+                    
+                    
+                    \$indexContent = @'
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Gaia Corrections Dashboard</title>
-<style>
-body {
-  font-family: Arial, sans-serif;
-  background: #f7f8fc;
-  color: #1f2937;
-  margin: 0;
-  padding: 24px;
-}
-h1 {
-  margin: 0 0 6px 0;
-  font-size: 28px;
-}
-.sub {
-  color: #6b7280;
-  margin-bottom: 24px;
-}
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(180px, 1fr));
-  gap: 12px;
-  margin-bottom: 24px;
-}
-.summary-box {
-  background: white;
-  border-radius: 14px;
-  padding: 16px;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-}
-.summary-box .label {
-  color: #6b7280;
-  font-size: 13px;
-}
-.summary-box .value {
-  font-size: 28px;
-  font-weight: bold;
-  margin-top: 8px;
-}
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
-  gap: 16px;
-}
-.card {
-  background: white;
-  border-radius: 16px;
-  padding: 18px;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.06);
-  border-left: 8px solid #d1d5db;
-}
-.card.ok { border-left-color: #16a34a; }
-.card.fail { border-left-color: #dc2626; }
-.card.timeout { border-left-color: #d97706; }
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-}
-.title {
-  font-weight: bold;
-  font-size: 18px;
-}
-.badge {
-  background: #111827;
-  color: white;
-  border-radius: 999px;
-  padding: 6px 10px;
-  font-size: 12px;
-}
-.meta {
-  color: #6b7280;
-  margin: 8px 0 14px 0;
-  font-size: 13px;
-}
-.counts {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  font-size: 13px;
-  margin-bottom: 14px;
-}
-.summary, .cases, .steps {
-  background: #f9fafb;
-  border-radius: 10px;
-  padding: 12px;
-  line-height: 1.6;
-  font-size: 13px;
-  margin-top: 12px;
-}
-.links {
-  margin-top: 14px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-.links a {
-  text-decoration: none;
-  color: #2563eb;
-  font-weight: bold;
-}
-.links .disabled {
-  color: #9ca3af;
-}
-</style>
+    <title>P2P Test Execution Reports - Build ${env.BUILD_NUMBER}</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 20px; 
+            background-color: #f5f5f5; 
+        }
+        .header { 
+            background-color: #2c3e50; 
+            color: white; 
+            padding: 20px; 
+            border-radius: 5px; 
+            margin-bottom: 20px; 
+        }
+        .suite-list { 
+            background-color: white; 
+            border-radius: 5px; 
+            padding: 20px; 
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1); 
+        }
+        .suite-item { 
+            border: 1px solid #ddd; 
+            border-radius: 5px; 
+            margin: 10px 0; 
+            padding: 15px; 
+            background-color: #f9f9f9; 
+        }
+        .suite-item:hover { 
+            background-color: #e8f4f8; 
+        }
+        .suite-link { 
+            text-decoration: none; 
+            color: #2c3e50; 
+            font-size: 18px; 
+            font-weight: bold; 
+        }
+        .suite-link:hover { 
+            color: #3498db; 
+        }
+        .no-reports { 
+            color: #e74c3c; 
+            font-style: italic; 
+        }
+        .build-info {
+            color: #7f8c8d;
+            font-size: 14px;
+        }
+        .suite-path {
+            color: #95a5a6;
+            font-size: 11px;
+            margin-top: 5px;
+            font-family: monospace;
+        }
+    </style>
 </head>
 <body>
-  <h1>🧪 Gaia Corrections Dashboard</h1>
-  <div class="sub">Build ${escapeHtml(script.env.BUILD_NUMBER ?: '')}</div>
+    <div class="header">
+        <h1>🚀 P2P Test Execution Reports</h1>
+        <div class="build-info">
+            Build: ${env.BUILD_NUMBER} | Node: ${env.NODE_NAME} | Profile: ${env.EXECUTION_PROFILE} | Mode: HEADLESS
+        </div>
+    </div>
+    
+    <div class="suite-list">
+        <h2>📊 Test Suite Reports</h2>
+'@
 
-  <div class="summary-grid">
-    <div class="summary-box">
-      <div class="label">Suites</div>
-      <div class="value">${results.size()}</div>
-    </div>
-    <div class="summary-box">
-      <div class="label">Passed</div>
-      <div class="value">${passedCount}</div>
-    </div>
-    <div class="summary-box">
-      <div class="label">Failed</div>
-      <div class="value">${failedCount}</div>
-    </div>
-    <div class="summary-box">
-      <div class="label">Timeout</div>
-      <div class="value">${timeoutCount}</div>
-    </div>
-  </div>
+                    if (\$allSuiteReports.Count -gt 0) {
+                        foreach (\$report in \$allSuiteReports) {
+                            \$indexContent += @"
+        <div class="suite-item">
+            <a href="\$(\$report.RelativePath)" class="suite-link" target="_blank">
+                📋 \$(\$report.Suite) Test Report
+            </a>
+            <div style="color: #7f8c8d; font-size: 12px; margin-top: 5px;">
+                Click to view detailed test results for \$(\$report.Suite) suite
+            </div>
+            <div class="suite-path">Path: \$(\$report.RelativePath)</div>
+        </div>
+"@
+                        }
+                    } else {
+                        \$indexContent += @'
+        <div class="no-reports">
+            ❌ No test reports found for this build
+        </div>
+        <div style="margin-top: 15px; padding: 10px; background-color: #fff3cd; border: 1px solid #ffeaa7; border-radius: 3px;">
+            <strong>Expected structure:</strong><br>
+            Reports/SUITE_NAME/BUILD_NUMBER/.../HarmoniReport.html
+        </div>
+'@
+                    }
 
-  <div class="grid">
-    ${cards}
-  </div>
+                    \$indexContent += @'
+    </div>
+    
+    <div style="margin-top: 20px; padding: 10px; background-color: white; border-radius: 5px; font-size: 12px; color: #7f8c8d;">
+        <strong>Note:</strong> Each report opens in a new tab. Reports are generated automatically after test execution.
+    </div>
 </body>
 </html>
-"""
+'@
 
-    script.writeFile(
-        file: "${reportsRoot}\\dashboard\\index.html",
-        text: html,
-        encoding: 'UTF-8'
-    )
-}
-
-def stopGaiaProcesses(script, String reason) {
-    script.echo "🧹 Stopping Gaia processes | ${reason}"
-
-    script.withEnv([
-        "BACK_PORT=${script.env.BACK_PORT}",
-        "FRONT_PORT=${script.env.FRONT_PORT}"
-    ]) {
-        script.powershell(
-            returnStatus: true,
-            script: '''
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
-
-function Stop-ProcessListeningOnPort {
-    param([int]$Port)
-
-    try {
-        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty OwningProcess -Unique
-
-        foreach ($ownerPid in $owners) {
-            if ($ownerPid) {
-                Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
+                    # Salvar o index.html como arquivo principal
+                    Set-Content -Path "\$reportsDir\\index.html" -Value \$indexContent -Encoding UTF8
+                    Write-Host "Created consolidated index.html with \$(\$allSuiteReports.Count) suite reports"
+                    
+                    # Manter compatibilidade - copiar o primeiro report como HarmoniReport.html se não existir
+                    \$mainReport = "\$reportsDir\\HarmoniReport.html"
+                    if (!(Test-Path \$mainReport) -and \$allSuiteReports.Count -gt 0) {
+                        Copy-Item \$allSuiteReports[0].Path \$mainReport -Force
+                        Write-Host "Created fallback HarmoniReport.html from: \$(\$allSuiteReports[0].Suite)"
+                    }
+                    
+                    Write-Host "Harmoni reports consolidation completed"
+                """
+                
+                echo "Publishing Harmoni HTML Report..."
+                publishHTML([
+                    allowMissing: true,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: 'Reports',
+                    reportFiles: 'index.html',
+                    reportName: 'Harmoni Test Report',
+                    reportTitles: 'Test Execution Report'
+                ])
+                
+                echo "Final headless cleanup..."
+                powershell """
+                    \$ErrorActionPreference = 'SilentlyContinue'
+                    
+                    Get-CimInstance Win32_Process | Where-Object {
+                        \$_.Name -match 'katalon|katalonc|chrome|chromedriver' -or
+                        (\$_.Name -eq 'java.exe' -and \$_.CommandLine -like '*katalon*')
+                    } | ForEach-Object {
+                        try { Stop-Process -Id \$_.ProcessId -Force } catch {}
+                    }
+                    
+                    Start-Sleep -Seconds 3
+                    Write-Host "Headless cleanup completed"
+                """
+    
+                echo "Pipeline execution completed (HEADLESS MODE)"
             }
         }
-    } catch {
-    }
-}
-
-Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
-Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
-
-$targets = Get-CimInstance Win32_Process | Where-Object {
-    $cmd = [string]$_.CommandLine
-    $name = [string]$_.Name
-
-    ($cmd -match 'gaia-start-back\\.bat') -or
-    ($cmd -match 'gaia-start-front\\.bat') -or
-    ($cmd -match 'gaia-start\\.bat') -or
-    ($cmd -match 'web_portal_back') -or
-    ($cmd -match 'web_portal') -or
-    (($name -match 'cmd\\.exe|java\\.exe|node\\.exe|notepad\\.exe') -and ($cmd -match 'gaia'))
-}
-
-foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
-    try {
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-    } catch {
-    }
-}
-
-exit 0
-'''
-        )
-    }
-}
-
-def printSuiteHeader(script, String suiteName, String suitePath, String timeoutMinutes) {
-    script.echo '╔════════════════════════════════════════════════════════════╗'
-    script.echo "║ ${fitText('🚀 STARTING SUITE', 58)} ║"
-    script.echo "║ ${fitText(suiteName, 58)} ║"
-    script.echo "║ ${fitText('📁 ' + suitePath, 58)} ║"
-    script.echo "║ ${fitText('⏱️ ' + timeoutMinutes + ' min timeout', 58)} ║"
-    script.echo '╚════════════════════════════════════════════════════════════╝'
-}
-
-def printSuiteResult(script, Map result) {
-    script.echo '╔════════════════════════════════════════════════════════════╗'
-    script.echo "║ ${fitText((result.icon ?: '') + ' ' + (result.name ?: ''), 58)} ║"
-    script.echo "║ ${fitText(result.line1 ?: '', 58)} ║"
-    script.echo "║ ${fitText(result.line2 ?: '', 58)} ║"
-    script.echo "║ ${fitText(result.line3 ?: '', 58)} ║"
-    script.echo "║ ${fitText('Executed: ' + result.executed + ' | Passed: ' + result.passed + ' | Failed: ' + result.failed + ' | Skipped: ' + result.skipped, 58)} ║"
-
-    (result.caseSummary ?: []).take(3).each { line ->
-        script.echo "║ ${fitText(line.toString(), 58)} ║"
-    }
-
-    (result.stepSummary ?: []).take(6).each { line ->
-        script.echo "║ ${fitText(line.toString(), 58)} ║"
-    }
-
-    script.echo '╚════════════════════════════════════════════════════════════╝'
-}
-
-def printRunningSummary(script, List results) {
-    def passed = results.count { it.status == 'PASSED' }
-    def failed = results.count { it.status == 'FAILED' }
-    def timeout = results.count { it.status == 'TIMEOUT' }
-
-    script.currentBuild.description = "✅ ${passed} | ❌ ${failed} | ⏰ ${timeout}"
-
-    script.echo '============================================================'
-    script.echo "📌 EXECUTION SUMMARY | Passed: ${passed} | Failed: ${failed} | Timeout: ${timeout}"
-    script.echo '============================================================'
-}
-
-def printFinalSummary(script, List results, String currentResult) {
-    def passed = results.count { it.status == 'PASSED' }
-    def failed = results.count { it.status == 'FAILED' }
-    def timeout = results.count { it.status == 'TIMEOUT' }
-
-    script.currentBuild.description = "✅ ${passed} | ❌ ${failed} | ⏰ ${timeout}"
-
-    script.echo '============================================================'
-
-    if (currentResult == 'ABORTED') {
-        script.echo '🛑 PIPELINE ABORTED'
-    } else if (failed > 0 || timeout > 0) {
-        script.echo '❌ PIPELINE FINISHED WITH ERRORS'
-    } else {
-        script.echo '✅ PIPELINE FINISHED SUCCESSFULLY'
-    }
-
-    script.echo "📌 FINAL SUMMARY | Passed: ${passed} | Failed: ${failed} | Timeout: ${timeout}"
-    script.echo '============================================================'
-}
-
-def parseKeyValue(String text) {
-    def map = [:]
-
-    if (!text) {
-        return map
-    }
-
-    text.readLines().each { line ->
-        int idx = line.indexOf('=')
-        if (idx > 0) {
-            def key = line.substring(0, idx).trim()
-            def value = line.substring(idx + 1).trim()
-            map[key] = value
+        
+        success {
+            echo "Pipeline completed successfully! (HEADLESS MODE)"
+        }
+        
+        failure {
+            echo "Pipeline failed! (HEADLESS MODE)"
+        }
+        
+        unstable {
+            echo "Pipeline completed with test failures (HEADLESS MODE)"
         }
     }
 
-    return map
 }
 
-def splitSummary(String value) {
-    if (!value?.trim()) {
-        return []
+def executeSingleSuiteHeadless(suiteConfig) {
+    def projectPath = "${env.WORKSPACE}\\${env.PROJECT_FILE}"
+    def reportDir = "${env.WORKSPACE}\\Reports\\${suiteConfig.name}\\${env.BUILD_NUMBER}"
+    
+    echo "Starting execution of suite: ${suiteConfig.name}"
+    
+    bat "if not exist \"${reportDir}\" mkdir \"${reportDir}\""
+    def chromeArgs = "--config -webui.chrome.args='--headless=new --window-size=${env.DISPLAY_WIDTH},${env.DISPLAY_HEIGHT} --no-sandbox --disable-gpu'"
+    
+    def katalonArgs = "-projectPath=\"${projectPath}\" " +
+                      "-executionProfile=\"${env.EXECUTION_PROFILE}\" " +
+                      "-browserType=\"${env.BROWSER_TYPE}\" " +
+                      "-testSuitePath=\"${suiteConfig.path}\" " +
+                      "-consoleLog " +
+                      chromeArgs
+
+    def katalonError = null
+    try {
+        executeKatalon(
+            location: "${env.KATALON_HOME}",
+            executeArgs: katalonArgs,
+            version: '', x11Display: '', xvfbConfiguration: ''
+        )
+    } catch (Exception e) {
+        katalonError = e.getMessage()
+        echo "Katalon execution error: ${katalonError}"
     }
-
-    return value.split('\\|\\|').collect { it.trim() }.findAll { it }
+    
+    sleep(time: 3, unit: 'SECONDS')
+    
+    bat """
+        @echo off
+        echo.
+        echo ========================================
+        echo Moving generated files to suite folder: ${suiteConfig.name}
+        echo ========================================
+        
+        REM Move CSV files
+        echo Moving CSV files...
+        for %%f in ("${env.WORKSPACE}\\ExecutionResults_*.csv") do (
+            if exist "%%f" (
+                echo   Moving CSV: %%~nxf
+                move "%%f" "${reportDir}\\"
+            )
+        )
+        
+        REM Move any report folders with timestamps to the suite folder
+        echo Moving report folders...
+        for /d %%d in ("${env.WORKSPACE}\\Reports\\202*") do (
+            if exist "%%d" (
+                echo   Moving report folder: %%~nxd
+                robocopy "%%d" "${reportDir}" /E /MOVE /NFL /NDL /NJH /NJS >nul 2>&1
+                if exist "%%d" rmdir "%%d" 2>nul
+            )
+        )
+        
+        REM Move any other files that might be generated
+        echo Moving other generated files...
+        for %%f in ("${env.WORKSPACE}\\*.log" "${env.WORKSPACE}\\*.html" "${env.WORKSPACE}\\*.json") do (
+            if exist "%%f" (
+                echo   Moving: %%~nxf
+                move "%%f" "${reportDir}\\" >nul 2>&1
+            )
+        )
+        
+        echo.
+        echo Files in suite report directory:
+        dir "${reportDir}" 2>nul || echo   (No files found)
+        echo ========================================
+    """
+    
+    generateSummary(suiteConfig, reportDir, katalonError)
 }
 
-def safeFileName(String value) {
-    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
+def buildHeadlessChromeArgs() {
+    def args = [
+        '--headless=new',
+        "--window-size=${env.DISPLAY_WIDTH},${env.DISPLAY_HEIGHT}",
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage'
+    ]
+    
+    return "--config -webui.chrome.args='${args.join(' ')}'"
 }
 
-def fitText(String value, int width) {
-    def text = (value ?: '').replaceAll(/\s+/, ' ').trim()
+def generateSummary(suiteConfig, reportDir, katalonError) {
+    def threwVal = katalonError ? "1" : "0"
+    def errVal = (katalonError ?: "").replace("'", "''")
+    def suiteName = suiteConfig.name
 
-    if (text.size() > width) {
-        return text.take(width - 3) + '...'
+    powershell """
+        \$ErrorActionPreference = 'SilentlyContinue'
+
+        \$reportDir = '${reportDir}'
+        \$suiteName = '${suiteName}'
+        \$threw = ${threwVal}
+        \$fallback = '${errVal}'
+        \$globalFile = '${env.WORKSPACE}\\\\Reports\\\\_jenkins_summary\\\\build_description.txt'
+
+        if (!(Test-Path (Split-Path \$globalFile))) {
+            New-Item -ItemType Directory -Path (Split-Path \$globalFile) -Force | Out-Null
+        }
+
+        Write-Host "Analyzing CSV reports for: \$suiteName (HEADLESS MODE)"
+        
+        \$suiteIcon = "?"
+        \$statusText = "UNKNOWN"
+        
+        if (\$threw -eq 1) {
+            \$suiteIcon = "SYSTEM ERROR"
+            \$statusText = "SYSTEM ERROR"
+        } else {
+            \$csvFiles = Get-ChildItem -Path "${env.WORKSPACE}" -Filter "ExecutionResults_*.csv" -Recurse -ErrorAction SilentlyContinue
+            \$logFiles = Get-ChildItem -Path \$reportDir -Filter "*.log" -Recurse -ErrorAction SilentlyContinue
+            
+            Write-Host "Found files:"
+            Write-Host "  - CSV files: \$(\$csvFiles.Count)"
+            Write-Host "  - LOG files: \$(\$logFiles.Count)"
+            
+            if (\$csvFiles) {
+                \$testsPassed = 0
+                \$testsFailed = 0
+                \$testsTotal = 0
+                \$hasResults = \$false
+                
+                \$latestCsv = \$csvFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                Write-Host "Reading CSV: \$(\$latestCsv.Name)"
+                
+                try {
+                    \$csvContent = Get-Content \$latestCsv.FullName -Encoding UTF8
+                    \$suiteLines = \$csvContent | Where-Object { 
+                        \$_ -like "*\$suiteName*" -and \$_ -notlike "Timestamp,*" 
+                    }
+                    
+                    Write-Host "Found \$(\$suiteLines.Count) test records for suite '\$suiteName'"
+                    
+                    if (\$suiteLines) {
+                        \$hasResults = \$true
+                        \$testsTotal = \$suiteLines.Count
+                        
+                        foreach (\$line in \$suiteLines) {
+                            \$columns = \$line -split ','
+                            if (\$columns.Count -ge 4) {
+                                \$status = \$columns[3].Trim()
+                                if (\$status -eq 'PASSED') {
+                                    \$testsPassed++
+                                } else {
+                                    \$testsFailed++
+                                }
+                            }
+                        }
+                        
+                        Write-Host "Results: Total=\$testsTotal, Passed=\$testsPassed, Failed=\$testsFailed"
+                    }
+                } catch {
+                    Write-Host "Error reading CSV: \$(\$_.Exception.Message)"
+                }
+                
+                if (\$hasResults) {
+                    if (\$testsFailed -eq 0 -and \$testsTotal -gt 0) {
+                        \$suiteIcon = "PASSED"
+                        \$statusText = "PASSED (\$testsPassed/\$testsTotal) - HEADLESS"
+                    } elseif (\$testsFailed -gt 0) {
+                        \$suiteIcon = "FAILED"
+                        \$statusText = "FAILED (\$testsPassed/\$testsTotal) - HEADLESS"
+                    } else {
+                        \$suiteIcon = "NO TESTS"
+                        \$statusText = "NO TESTS - HEADLESS"
+                    }
+                } else {
+                    \$suiteIcon = "EXECUTED"
+                    \$statusText = "EXECUTED - HEADLESS"
+                }
+            } else {
+                \$suiteIcon = "NO CSV"
+                \$statusText = "NO CSV REPORTS - HEADLESS"
+            }
+        }
+        
+        \$summaryLines = New-Object System.Collections.Generic.List[string]
+        \$summaryLines.Add("\$suiteIcon \$suiteName - \$statusText")
+        
+        if (\$threw -eq 1 -and ![string]::IsNullOrWhiteSpace(\$fallback)) {
+            \$summaryLines.Add("   ERROR: \$fallback")
+        }
+        
+        \$summaryLines.Add("")
+
+        Add-Content -Path \$globalFile -Value (\$summaryLines -join "`n") -Encoding UTF8
+        Write-Host "\$suiteIcon \$suiteName - \$statusText"
+    """
+}
+
+def convertCsvToJunitAndPublish() {
+    powershell '''
+        $ErrorActionPreference = 'SilentlyContinue'
+        
+        Write-Host "Converting CSV reports to JUnit XML format (HEADLESS MODE)..."
+        
+        $csvFiles = Get-ChildItem -Path "${env:WORKSPACE}" -Filter "ExecutionResults_*.csv" -Recurse
+        
+        if ($csvFiles) {
+            Write-Host "Found $($csvFiles.Count) CSV files"
+            
+            $junitDir = "${env:WORKSPACE}\\Reports\\junit"
+            if (!(Test-Path $junitDir)) {
+                New-Item -ItemType Directory -Path $junitDir -Force | Out-Null
+            }
+            
+            foreach ($csvFile in $csvFiles) {
+                try {
+                    Write-Host "Processing: $($csvFile.Name)"
+                    $csvContent = Get-Content $csvFile.FullName -Encoding UTF8
+                    $testLines = $csvContent | Select-Object -Skip 1
+                    
+                    if ($testLines) {
+                        $suiteGroups = $testLines | ForEach-Object {
+                            $columns = $_ -split ','
+                            if ($columns.Count -ge 4) {
+                                [PSCustomObject]@{
+                                    TestSuite = $columns[1].Trim()
+                                    TestCase = $columns[2].Trim()
+                                    Status = $columns[3].Trim()
+                                    FailureReason = if ($columns.Count -gt 4) { $columns[4].Trim() } else { "" }
+                                    Timestamp = $columns[0].Trim()
+                                }
+                            }
+                        } | Group-Object TestSuite
+                        
+                        foreach ($suiteGroup in $suiteGroups) {
+                            $suiteName = $suiteGroup.Name
+                            $tests = $suiteGroup.Group
+                            
+                            $totalTests = $tests.Count
+                            $failedTests = ($tests | Where-Object { $_.Status -ne 'PASSED' }).Count
+                            $passedTests = $totalTests - $failedTests
+                            
+                            $timestamp = Get-Date -Format 'yyyy-MM-ddTHH:mm:ss'
+                            $junitXml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="$suiteName (HEADLESS)" tests="$totalTests" failures="$failedTests" errors="0" time="0" timestamp="$timestamp">
+"@
+                            
+                            foreach ($test in $tests) {
+                                $testCaseName = $test.TestCase -replace '.*/', ''
+                                $testCaseNameEscaped = $testCaseName -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace "'", '&apos;'
+                                $suiteNameEscaped = $suiteName -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace "'", '&apos;'
+                                
+                                $junitXml += "`n  <testcase name=`"$testCaseNameEscaped (HEADLESS)`" classname=`"$suiteNameEscaped`" time=`"0`">"
+                                
+                                if ($test.Status -ne 'PASSED') {
+                                    $reason = $test.FailureReason -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace "'", '&apos;'
+                                    $statusEscaped = $test.Status -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;' -replace "'", '&apos;'
+                                    $junitXml += "`n    <failure message=`"$statusEscaped (HEADLESS)`" type=`"AssertionError`">$reason</failure>"
+                                }
+                                
+                                $junitXml += "`n  </testcase>"
+                            }
+                            
+                            $junitXml += "`n</testsuite>"
+                            
+                            $junitFileName = "TEST-$suiteName-HEADLESS.xml" -replace '[\\/:*?"<>|]', '_'
+                            $junitFilePath = Join-Path $junitDir $junitFileName
+                            Set-Content -Path $junitFilePath -Value $junitXml -Encoding UTF8
+                            
+                            Write-Host "Generated JUnit XML: $junitFileName ($totalTests tests, $failedTests failures) - HEADLESS"
+                        }
+                    }
+                } catch {
+                    Write-Host "Error processing $($csvFile.Name): $($_.Exception.Message)"
+                }
+            }
+        } else {
+            Write-Host "No CSV files found for conversion"
+        }
+    '''
+    
+    catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+        junit allowEmptyResults: true, testResults: "Reports/junit/*.xml"
+        echo "JUnit XML files published successfully (HEADLESS MODE)"
     }
-
-    return text.padRight(width)
-}
-
-def escapeHtml(Object value) {
-    def text = value == null ? '' : value.toString()
-    text = text.replace('&', '&amp;')
-    text = text.replace('<', '&lt;')
-    text = text.replace('>', '&gt;')
-    text = text.replace('"', '&quot;')
-    text = text.replace("'", '&#39;')
-    return text
-}
-
-def getInitialDashboardHtml() {
-    return '''<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>Gaia Corrections Dashboard</title>
-<style>
-body { font-family: Arial, sans-serif; background: #f7f8fc; color: #1f2937; padding: 24px; }
-.card { background: white; border-radius: 16px; padding: 18px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>🧪 Gaia Corrections Dashboard</h1>
-    <p>Execution started. Final report will be available after suite processing.</p>
-  </div>
-</body>
-</html>'''
 }
