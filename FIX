@@ -1,3 +1,7 @@
+BACK_CMD_TITLE  = 'GAIA_BACK_CMD_JENKINS'
+FRONT_CMD_TITLE = 'GAIA_FRONT_CMD_JENKINS'
+
+
 pipeline {
     agent {
         node {
@@ -16,10 +20,10 @@ pipeline {
     }
 
     parameters {
-        string(name: 'STARTUP_WAIT_SECONDS',  defaultValue: '40', description: 'Seconds to wait after backend/frontend startup')
-        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for each suite')
+        string(name: 'STARTUP_WAIT_SECONDS',  defaultValue: '45', description: 'Max seconds to wait for Gaia services')
+        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '12', description: 'Timeout in minutes for each suite')
+        string(name: 'HEARTBEAT_SECONDS',     defaultValue: '25', description: 'Seconds between execution heartbeat logs')
         string(name: 'BROWSER',               defaultValue: 'Chrome', description: 'Katalon browser type')
-        string(name: 'HEARTBEAT_SECONDS',     defaultValue: '20', description: 'Seconds between running heartbeat logs')
     }
 
     environment {
@@ -27,10 +31,19 @@ pipeline {
         PROJECT_PATH   = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\gaia-portal.prj'
         REPORTS_ROOT   = 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections\\Reports'
         KATALON_EXE    = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+
         GIT_URL        = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
         GIT_BRANCH     = '*/master'
         GIT_CRED       = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-        START_TASK     = 'GaiaBackFrontSetup'
+
+        BACK_BAT       = 'C:\\Users\\adgi5appjenkins\\Desktop\\gaia-start-back.bat'
+        FRONT_BAT      = 'C:\\Users\\adgi5appjenkins\\Desktop\\gaia-start-front.bat'
+        BACK_PORT      = '8020'
+        FRONT_PORT     = '4200'
+
+        BACK_CMD_TITLE  = 'GAIA_BACK_CMD_JENKINS'
+        FRONT_CMD_TITLE = 'GAIA_FRONT_CMD_JENKINS'
+
         REPORT_MENU    = 'Gaia Test Reports'
     }
 
@@ -39,6 +52,14 @@ pipeline {
             steps {
                 script {
                     validateBasePaths(this)
+                }
+            }
+        }
+
+        stage('🚀 Start Gaia Backend and Frontend') {
+            steps {
+                script {
+                    startGaiaProcesses(this)
                 }
             }
         }
@@ -67,14 +88,6 @@ pipeline {
             }
         }
 
-        stage('🚀 Start Gaia Backend and Frontend') {
-            steps {
-                script {
-                    startGaiaProcesses(this)
-                }
-            }
-        }
-
         stage('🧪 Execute Test Suites') {
             steps {
                 script {
@@ -83,50 +96,22 @@ pipeline {
 
                     suites.each { suite ->
                         stage("Suite • ${suite.name}") {
-                            def result = null
+                            def result = runSuite(this, suite)
+                            suiteResults << result
 
-                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                result = runSuite(this, suite)
-                                suiteResults << result
+                            saveSuiteResults(this, suiteResults)
+                            printSuiteResult(this, result)
+                            printRunningSummary(this, suiteResults)
 
-                                saveSuiteResults(this, suiteResults)
-                                printSuiteResult(this, result)
-                                printRunningSummary(this, suiteResults)
-
-                                if (result.status != 'PASSED') {
+                            if (result.status != 'PASSED') {
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                     error("${result.name} finished with status ${result.status}")
                                 }
-                            }
-
-                            if (result == null) {
-                                result = [
-                                    name        : suite.name,
-                                    path        : suite.path,
-                                    status      : 'FAILED',
-                                    icon        : '❌',
-                                    executed    : '0',
-                                    passed      : '0',
-                                    failed      : '0',
-                                    skipped     : '0',
-                                    line1       : 'Pipeline execution failed before report parsing',
-                                    line2       : 'Suite ended unexpectedly inside Jenkins',
-                                    line3       : 'Check console log for technical details',
-                                    reason      : 'Unexpected pipeline interruption',
-                                    reportRel   : '',
-                                    logRel      : '',
-                                    caseSummary : []
-                                ]
-
-                                suiteResults << result
-                                saveSuiteResults(this, suiteResults)
-                                printSuiteResult(this, result)
-                                printRunningSummary(this, suiteResults)
                             }
                         }
                     }
 
-                    def hasErrors = suiteResults.any { it.status != 'PASSED' }
-                    if (hasErrors) {
+                    if (suiteResults.any { it.status != 'PASSED' }) {
                         currentBuild.result = 'FAILURE'
                     }
                 }
@@ -149,12 +134,13 @@ pipeline {
                 def suiteResults = loadSuiteResults(this)
 
                 safeBuildReportsDashboard(this, suiteResults)
+                cleanupStrayArtifacts(this)
                 stopGaiaProcesses(this, currentBuild.currentResult == 'ABORTED' ? 'Build aborted by user' : 'Build finished')
                 printFinalSummary(this, suiteResults, currentBuild.currentResult)
             }
 
             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'Reports/**/*', excludes: '**/broken-test-objects-v2.json', allowEmptyArchive: true
             }
 
             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
@@ -163,7 +149,7 @@ pipeline {
 
             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                 publishHTML(target: [
-                    allowMissing         : false,
+                    allowMissing         : true,
                     alwaysLinkToLastBuild: true,
                     keepAll              : true,
                     reportDir            : 'Reports/dashboard',
@@ -199,42 +185,111 @@ def validateBasePaths(script) {
     script.bat """
 @echo off
 echo ============================================================
-echo ✨ VALIDATING BASE PATHS
+echo VALIDATING BASE PATHS
 echo ============================================================
 
 if not exist "${script.env.WORK_DIR}" mkdir "${script.env.WORK_DIR}"
-if not exist "${script.env.REPORTS_ROOT}" mkdir "${script.env.REPORTS_ROOT}"
 
 if not exist "${script.env.KATALON_EXE}" (
-    echo ❌ Katalon executable not found
+    echo [ERROR] Katalon executable not found
     echo ${script.env.KATALON_EXE}
     exit /b 1
 )
 
-echo ✅ Katalon executable found
-echo ✅ Workspace path ready
-echo ✅ Reports root path ready
+if not exist "${script.env.BACK_BAT}" (
+    echo [ERROR] Backend BAT not found
+    echo ${script.env.BACK_BAT}
+    exit /b 1
+)
+
+if not exist "${script.env.FRONT_BAT}" (
+    echo [ERROR] Frontend BAT not found
+    echo ${script.env.FRONT_BAT}
+    exit /b 1
+)
+
+echo [OK] Katalon executable found
+echo [OK] Backend BAT found
+echo [OK] Frontend BAT found
 echo ============================================================
 """
 }
 
-def validateProjectFiles(script) {
-    script.bat """
-@echo off
-echo ============================================================
-echo 🔎 VALIDATING PROJECT FILES
-echo ============================================================
+def startGaiaProcesses(script) {
+    script.echo '============================================================'
+    script.echo '🚀 STARTING GAIA BACKEND AND FRONTEND'
+    script.echo '🪟 BACK and FRONT CMD windows will stay open during the whole pipeline'
+    script.echo "⏳ Waiting up to ${script.params.STARTUP_WAIT_SECONDS}s for ports ${script.env.BACK_PORT} and ${script.env.FRONT_PORT}"
+    script.echo '============================================================'
 
-if not exist "${script.env.PROJECT_PATH}" (
-    echo ❌ Project file not found
-    echo ${script.env.PROJECT_PATH}
-    exit /b 1
-)
+    def exitCode = script.withEnv([
+        "BACK_BAT=${script.env.BACK_BAT}",
+        "FRONT_BAT=${script.env.FRONT_BAT}",
+        "BACK_PORT=${script.env.BACK_PORT}",
+        "FRONT_PORT=${script.env.FRONT_PORT}",
+        "BACK_CMD_TITLE=${script.env.BACK_CMD_TITLE}",
+        "FRONT_CMD_TITLE=${script.env.FRONT_CMD_TITLE}",
+        "STARTUP_WAIT_SECONDS=${script.params.STARTUP_WAIT_SECONDS}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
-echo ✅ Project file found
-echo ${script.env.PROJECT_PATH}
-echo ============================================================
-"""
+function Stop-CmdTreeByTitle {
+    param([string]$Title)
+    cmd /c "taskkill /FI ""WINDOWTITLE eq $Title"" /T /F" | Out-Null 2>&1
+}
+
+function Test-PortListening {
+    param([int]$Port)
+
+    try {
+        $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+        return $null -ne $conn
+    }
+    catch {
+        return $false
+    }
+}
+
+Stop-CmdTreeByTitle -Title $env:BACK_CMD_TITLE
+Stop-CmdTreeByTitle -Title $env:FRONT_CMD_TITLE
+Start-Sleep -Seconds 1
+
+Start-Process -FilePath 'cmd.exe' -ArgumentList "/k title $env:BACK_CMD_TITLE && call `"$env:BACK_BAT`"" -WindowStyle Normal
+Start-Process -FilePath 'cmd.exe' -ArgumentList "/k title $env:FRONT_CMD_TITLE && call `"$env:FRONT_BAT`"" -WindowStyle Normal
+
+$timeoutAt = (Get-Date).AddSeconds([int]$env:STARTUP_WAIT_SECONDS)
+$backReady = $false
+$frontReady = $false
+
+while ((Get-Date) -lt $timeoutAt) {
+    $backReady = Test-PortListening -Port ([int]$env:BACK_PORT)
+    $frontReady = Test-PortListening -Port ([int]$env:FRONT_PORT)
+
+    if ($backReady -and $frontReady) {
+        Write-Host '[OK] Backend and frontend are ready'
+        exit 0
+    }
+
+    Start-Sleep -Seconds 3
+}
+
+Write-Host '[ERROR] Gaia services did not become ready in time'
+Write-Host ('[INFO] Backend ready: ' + $backReady)
+Write-Host ('[INFO] Frontend ready: ' + $frontReady)
+exit 1
+'''
+        )
+    }
+
+    if (exitCode != 0) {
+        script.error('Gaia backend/frontend did not start correctly')
+    }
+
+    script.echo '✅ Gaia backend/frontend started'
 }
 
 def checkoutRepository(script) {
@@ -252,15 +307,33 @@ def checkoutRepository(script) {
     script.echo '============================================================'
     script.echo '✅ CHECKOUT COMPLETED'
     script.echo "📁 Workspace: ${script.env.WORK_DIR}"
-    script.echo "🌿 Branch: ${script.env.GIT_BRANCH}"
     script.echo '============================================================'
+}
+
+def validateProjectFiles(script) {
+    script.bat """
+@echo off
+echo ============================================================
+echo VALIDATING PROJECT FILES
+echo ============================================================
+
+if not exist "${script.env.PROJECT_PATH}" (
+    echo [ERROR] Project file not found
+    echo ${script.env.PROJECT_PATH}
+    exit /b 1
+)
+
+echo [OK] Project file found
+echo ${script.env.PROJECT_PATH}
+echo ============================================================
+"""
 }
 
 def prepareReportsFolder(script) {
     script.bat """
 @echo off
 echo ============================================================
-echo 🧹 PREPARING REPORTS FOLDER
+echo PREPARING REPORTS FOLDER
 echo ============================================================
 
 if exist "${script.env.REPORTS_ROOT}" rmdir /s /q "${script.env.REPORTS_ROOT}"
@@ -268,7 +341,7 @@ mkdir "${script.env.REPORTS_ROOT}"
 mkdir "${script.env.REPORTS_ROOT}\\logs"
 mkdir "${script.env.REPORTS_ROOT}\\dashboard"
 
-echo ✅ Reports folder recreated
+echo [OK] Reports folder recreated
 echo ============================================================
 """
 
@@ -285,56 +358,24 @@ echo ============================================================
     )
 }
 
-def startGaiaProcesses(script) {
-    script.bat """
-@echo off
-echo ============================================================
-echo 🚀 STARTING GAIA BACKEND AND FRONTEND
-echo ============================================================
-
-schtasks /query /tn "${script.env.START_TASK}" >nul 2>&1
-if errorlevel 1 (
-    echo ❌ Scheduled task not found: ${script.env.START_TASK}
-    exit /b 1
-)
-
-schtasks /run /tn "${script.env.START_TASK}"
-if errorlevel 1 (
-    echo ❌ Failed to start scheduled task: ${script.env.START_TASK}
-    exit /b 1
-)
-
-echo ✅ Scheduled task started: ${script.env.START_TASK}
-echo ============================================================
-"""
-
-    def total = script.params.STARTUP_WAIT_SECONDS.toInteger()
-    for (int i = total; i > 0; i--) {
-        if (i == total || i % 10 == 0 || i <= 5) {
-            script.echo "⏳ Waiting Gaia startup... ${i}s remaining"
-        }
-        script.sleep(time: 1, unit: 'SECONDS')
-    }
-
-    script.echo '✅ Gaia startup wait finished'
-}
-
 def runSuite(script, Map suite) {
-    printSuiteHeader(script, suite.name, suite.path, script.params.SUITE_TIMEOUT_MINUTES)
+    try {
+        printSuiteHeader(script, suite.name, suite.path, script.params.SUITE_TIMEOUT_MINUTES)
 
-    def suiteKey = safeFileName(suite.name)
+        def suiteKey = safeFileName(suite.name)
+        def suiteStartedAt = new Date().format("yyyy-MM-dd'T'HH:mm:ss")
 
-    def exitCode = script.withEnv([
-        "SUITE_NAME=${suite.name}",
-        "SUITE_PATH=${suite.path}",
-        "SUITE_KEY=${suiteKey}",
-        "BROWSER=${script.params.BROWSER}",
-        "SUITE_TIMEOUT_MINUTES=${script.params.SUITE_TIMEOUT_MINUTES}",
-        "HEARTBEAT_SECONDS=${script.params.HEARTBEAT_SECONDS}"
-    ]) {
-        script.powershell(
-            returnStatus: true,
-            script: '''
+        def exitCode = script.withEnv([
+            "SUITE_NAME=${suite.name}",
+            "SUITE_PATH=${suite.path}",
+            "SUITE_KEY=${suiteKey}",
+            "BROWSER=${script.params.BROWSER}",
+            "SUITE_TIMEOUT_MINUTES=${script.params.SUITE_TIMEOUT_MINUTES}",
+            "HEARTBEAT_SECONDS=${script.params.HEARTBEAT_SECONDS}"
+        ]) {
+            script.powershell(
+                returnStatus: true,
+                script: '''
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -407,15 +448,15 @@ function Read-NewLines {
 
 $script:CurrentScenario = ''
 $script:CurrentStep = ''
+$script:LastScenario = ''
 $script:LastStepSignature = ''
-$script:LastRawSignature = ''
+$script:LastDetail = ''
 $script:SuiteStartedAt = Get-Date
 $script:LastHeartbeatAt = Get-Date
-$script:DiscoveredExecutionLog = ''
+$script:ExecutionLogPath = ''
 
-function Write-VisualLine {
+function Print-Line {
     param([string]$Text)
-
     if (-not [string]::IsNullOrWhiteSpace($Text)) {
         Write-Host $Text
     }
@@ -427,100 +468,47 @@ function Emit-Scenario {
     $scenario = Short-Text $Scenario 170
     if (-not $scenario) { return }
 
-    if ($script:CurrentScenario -ne $scenario) {
+    if ($script:LastScenario -ne $scenario) {
         $script:CurrentScenario = $scenario
+        $script:LastScenario = $scenario
         $script:CurrentStep = ''
         $script:LastStepSignature = ''
-        Write-VisualLine ("🎬 SCENARIO      | " + $scenario)
+        Print-Line ("🎬 SCENARIO | " + $scenario)
     }
 }
 
-function Emit-StepStarted {
-    param([string]$Step)
+function Emit-Step {
+    param(
+        [string]$Prefix,
+        [string]$Step
+    )
 
     $step = Short-Text $Step 170
     if (-not $step) { return }
 
-    $signature = 'START|' + $step
-    if ($script:LastStepSignature -ne $signature) {
-        $script:CurrentStep = $step
-        $script:LastStepSignature = $signature
-        Write-VisualLine ("➡️ STEP STARTED | " + $step)
-    }
-}
-
-function Emit-StepPassed {
-    param([string]$Step)
-
-    $step = Short-Text $Step 170
-    if (-not $step) { return }
-
+    $signature = $Prefix + '|' + $step
     $script:CurrentStep = $step
-    $signature = 'PASS|' + $step
+
     if ($script:LastStepSignature -ne $signature) {
         $script:LastStepSignature = $signature
-        Write-VisualLine ("✅ STEP PASSED  | " + $step)
+        Print-Line ($Prefix + ' ' + $step)
     }
 }
 
-function Emit-StepFailed {
-    param(
-        [string]$Step,
-        [string]$Reason
-    )
+function Emit-Detail {
+    param([string]$Text)
 
-    $step = Short-Text $Step 170
-    $reason = Short-Text $Reason 220
+    $detail = Short-Text $Text 220
+    if (-not $detail) { return }
 
-    if (-not $step) { return }
-
-    $script:CurrentStep = $step
-    $signature = 'FAIL|' + $step + '|' + $reason
-    if ($script:LastStepSignature -ne $signature) {
-        $script:LastStepSignature = $signature
-        if ($reason) {
-            Write-VisualLine ("❌ STEP FAILED  | " + $step + " | " + $reason)
-        } else {
-            Write-VisualLine ("❌ STEP FAILED  | " + $step)
-        }
+    if ($script:LastDetail -ne $detail) {
+        $script:LastDetail = $detail
+        Print-Line ("❌ DETAIL   | " + $detail)
     }
 }
 
-function Emit-TestCase {
-    param([string]$TestCase)
-
-    $name = Short-Text $TestCase 170
-    if ($name) {
-        Write-VisualLine ("🧩 TEST CASE    | " + $name)
-    }
-}
-
-function Emit-RawImportant {
-    param(
-        [string]$Source,
-        [string]$Line
-    )
-
-    $text = Short-Text $Line 220
-    if (-not $text) { return }
-
-    if ($text -eq $script:LastRawSignature) { return }
-
-    if (
-        $text -match '(?i)error|failed|exception|timeout|timed out|warning|cannot|unable to|not found|start suite|end suite|start test case|browser|chrome|report folder|execution0\\.log'
-        -or $text -match '(?i)Scenario'
-        -or $text -match '(?i)\\b(Given|When|Then|And|But)\\b'
-    ) {
-        $script:LastRawSignature = $text
-        Write-VisualLine ("📝 " + $Source.PadRight(12) + " | " + $text)
-    }
-}
-
-function Parse-ExecutionLine {
-    param(
-        [string]$Line,
-        [string]$Source
-    )
+function Parse-LiveLine {
+    param([string]$Line)
 
     $text = Clean-Text $Line
     if (-not $text) { return }
@@ -530,73 +518,72 @@ function Parse-ExecutionLine {
         return
     }
 
-    if ($text -match '(?i)(Test Cases[\\\\/][^\\s]+)') {
-        Emit-TestCase $Matches[1]
-    }
-
     if ($text -match '(?i)\\b(Given|When|Then|And|But)\\b\\s+(.+)$') {
         $step = ($Matches[1] + ' ' + $Matches[2]).Trim()
-        $step = $step -replace '(?i)\\s*(PASSED|FAILED|ERROR|SUCCESS).*$', ''
+        $step = $step -replace '(?i)\\s*(PASSED|FAILED|SKIPPED|ERROR|SUCCESS).*$', ''
         $step = Short-Text $step 170
 
-        if ($text -match '(?i)\\b(PASSED|PASS|SUCCESS)\\b') {
-            Emit-StepPassed $step
+        if ($text -match '(?i)\\bFAILED\\b|\\bERROR\\b|\\bEXCEPTION\\b|STEPFAILEDEXCEPTION|ASSERTIONFAILEDERROR|TIMED OUT|TIMEOUT|NOT FOUND') {
+            Emit-Step '❌ STEP     |' $step
             return
         }
 
-        if ($text -match '(?i)\\b(FAILED|FAIL|ERROR|EXCEPTION|NOT FOUND|TIMED OUT|TIMEOUT)\\b') {
-            Emit-StepFailed $step $text
+        if ($text -match '(?i)\\bSKIPPED\\b') {
+            Emit-Step '⏭️ STEP     |' $step
             return
         }
 
-        Emit-StepStarted $step
+        if ($text -match '(?i)\\bPASSED\\b|\\bSUCCESS\\b') {
+            Emit-Step '✅ STEP     |' $step
+            return
+        }
+
+        Emit-Step '➡️ STEP     |' $step
         return
     }
 
-    if ($script:CurrentStep -and $text -match '(?i)\\b(PASSED|PASS|SUCCESS)\\b') {
-        if ($text -match '(?i)keyword|step|gherkin|cucumber|Scenario|Given|When|Then|And|But') {
-            Emit-StepPassed $script:CurrentStep
-            return
-        }
-    }
-
-    if ($script:CurrentStep -and $text -match '(?i)\\b(FAILED|FAIL|ERROR|EXCEPTION|NOT FOUND|TIMED OUT|TIMEOUT|STEPFAILEDEXCEPTION|ASSERTIONFAILEDERROR)\\b') {
-        Emit-StepFailed $script:CurrentStep $text
+    if ($script:CurrentStep -and $text -match '(?i)StepFailedException|AssertionFailedError|Unable to|not found|timed out|Timeout|ERROR|FAILED|Exception') {
+        Emit-Detail $text
         return
     }
 
-    Emit-RawImportant $Source $text
+    if ($text -match '(?i)Start Test Cases|End Test Cases|Start action|Start application|browser|Chrome|execution0\\.log|JUnit_Report|report\\.html') {
+        Print-Line ("📝 INFO     | " + (Short-Text $text 220))
+        return
+    }
 }
 
 function Flush-File {
     param(
         [string]$Path,
-        [ref]$Offset,
-        [string]$Source
+        [ref]$Offset
     )
 
     $lines = Read-NewLines -Path $Path -Offset $Offset
     foreach ($line in $lines) {
-        Parse-ExecutionLine -Line $line -Source $Source
+        Parse-LiveLine -Line $line
     }
 }
 
 function Discover-ExecutionLog {
     param([string]$Root)
 
-    if ($script:DiscoveredExecutionLog -and (Test-Path $script:DiscoveredExecutionLog)) {
-        return $script:DiscoveredExecutionLog
+    if ($script:ExecutionLogPath -and (Test-Path $script:ExecutionLogPath)) {
+        return $script:ExecutionLogPath
     }
 
     $candidate = Get-ChildItem -Path $Root -Filter 'execution0.log' -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -like ("*" + $env:SUITE_NAME + "*") } |
+        Where-Object {
+            $_.FullName -notmatch '\\\\dashboard\\\\' -and
+            $_.FullName -notmatch '\\\\logs\\\\'
+        } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
 
     if ($candidate) {
-        $script:DiscoveredExecutionLog = $candidate.FullName
-        Write-VisualLine ("📄 EXECUTION LOG | " + $script:DiscoveredExecutionLog)
-        return $script:DiscoveredExecutionLog
+        $script:ExecutionLogPath = $candidate.FullName
+        Print-Line ("📄 EXECUTION | " + $script:ExecutionLogPath)
+        return $script:ExecutionLogPath
     }
 
     return ''
@@ -604,10 +591,6 @@ function Discover-ExecutionLog {
 
 $stdoutLog = Join-Path $env:REPORTS_ROOT ("logs\\" + $env:SUITE_KEY + ".log")
 $stderrLog = Join-Path $env:REPORTS_ROOT ("logs\\" + $env:SUITE_KEY + ".err.log")
-
-if (-not (Test-Path (Split-Path $stdoutLog -Parent))) {
-    New-Item -Path (Split-Path $stdoutLog -Parent) -ItemType Directory -Force | Out-Null
-}
 
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force -ErrorAction SilentlyContinue }
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force -ErrorAction SilentlyContinue }
@@ -623,14 +606,12 @@ $args = @(
     ('-reportFolder=' + $env:REPORTS_ROOT)
 )
 
-Write-VisualLine '════════════════════════════════════════════════════════════'
-Write-VisualLine ('🚀 SUITE         | ' + $env:SUITE_NAME)
-Write-VisualLine ('📁 SUITE PATH    | ' + $env:SUITE_PATH)
-Write-VisualLine ('🌐 BROWSER       | ' + $env:BROWSER)
-Write-VisualLine ('⏱️ TIMEOUT       | ' + $env:SUITE_TIMEOUT_MINUTES + ' min')
-Write-VisualLine ('🧾 STDOUT LOG    | ' + $stdoutLog)
-Write-VisualLine ('🧾 STDERR LOG    | ' + $stderrLog)
-Write-VisualLine '════════════════════════════════════════════════════════════'
+Write-Host '════════════════════════════════════════════════════════════'
+Write-Host ('🚀 SUITE    | ' + $env:SUITE_NAME)
+Write-Host ('📁 PATH     | ' + $env:SUITE_PATH)
+Write-Host ('🌐 BROWSER  | ' + $env:BROWSER)
+Write-Host ('⏱️ TIMEOUT  | ' + $env:SUITE_TIMEOUT_MINUTES + ' min')
+Write-Host '════════════════════════════════════════════════════════════'
 
 $process = Start-Process `
     -FilePath $env:KATALON_EXE `
@@ -643,35 +624,34 @@ $process = Start-Process `
 $stdoutOffset = 0L
 $stderrOffset = 0L
 $execOffset = 0L
-$executionLog = ''
 $timeoutAt = (Get-Date).AddMinutes([int]$env:SUITE_TIMEOUT_MINUTES)
 $heartbeatSeconds = [int]$env:HEARTBEAT_SECONDS
 
 while (-not $process.HasExited) {
     $executionLog = Discover-ExecutionLog -Root $env:REPORTS_ROOT
 
-    Flush-File -Path $stdoutLog -Offset ([ref]$stdoutOffset) -Source 'STDOUT'
-    Flush-File -Path $stderrLog -Offset ([ref]$stderrOffset) -Source 'STDERR'
+    Flush-File -Path $stdoutLog -Offset ([ref]$stdoutOffset)
+    Flush-File -Path $stderrLog -Offset ([ref]$stderrOffset)
 
     if ($executionLog) {
-        Flush-File -Path $executionLog -Offset ([ref]$execOffset) -Source 'EXECUTION'
+        Flush-File -Path $executionLog -Offset ([ref]$execOffset)
     }
 
     if ((Get-Date) -ge $timeoutAt) {
-        Write-VisualLine '⏰ SUITE TIMEOUT | configured limit reached'
+        Write-Host '⏰ TIMEOUT  | Suite exceeded configured timeout'
         Stop-ProcessTree -ProcessId $process.Id
 
-        Flush-File -Path $stdoutLog -Offset ([ref]$stdoutOffset) -Source 'STDOUT'
-        Flush-File -Path $stderrLog -Offset ([ref]$stderrOffset) -Source 'STDERR'
+        Flush-File -Path $stdoutLog -Offset ([ref]$stdoutOffset)
+        Flush-File -Path $stderrLog -Offset ([ref]$stderrOffset)
+
         if ($executionLog) {
-            Flush-File -Path $executionLog -Offset ([ref]$execOffset) -Source 'EXECUTION'
+            Flush-File -Path $executionLog -Offset ([ref]$execOffset)
         }
 
         if (Test-Path $stderrLog) {
             Add-Content -Path $stdoutLog -Value ''
             Add-Content -Path $stdoutLog -Value '==== STDERR ===='
             Get-Content $stderrLog | Add-Content -Path $stdoutLog
-            Remove-Item $stderrLog -Force -ErrorAction SilentlyContinue
         }
 
         exit 124
@@ -679,54 +659,55 @@ while (-not $process.HasExited) {
 
     $now = Get-Date
     if (($now - $script:LastHeartbeatAt).TotalSeconds -ge $heartbeatSeconds) {
-        $elapsed = [int]($now - $script:SuiteStartedAt).TotalSeconds
-        $elapsedText = [TimeSpan]::FromSeconds($elapsed).ToString('hh\\:mm\\:ss')
-        $scenarioText = if ($script:CurrentScenario) { $script:CurrentScenario } else { 'not identified yet' }
-        $stepText = if ($script:CurrentStep) { $script:CurrentStep } else { 'not identified yet' }
+        $elapsed = [TimeSpan]::FromSeconds([int](($now - $script:SuiteStartedAt).TotalSeconds)).ToString('hh\\:mm\\:ss')
+        $scenario = if ($script:CurrentScenario) { $script:CurrentScenario } else { 'not identified yet' }
+        $step = if ($script:CurrentStep) { $script:CurrentStep } else { 'not identified yet' }
 
-        Write-VisualLine ("⏳ HEARTBEAT     | elapsed " + $elapsedText + " | scenario: " + (Short-Text $scenarioText 70) + " | step: " + (Short-Text $stepText 70))
+        Write-Host ("⏳ RUNNING  | " + $elapsed + " | Scenario: " + (Short-Text $scenario 60) + " | Step: " + (Short-Text $step 60))
         $script:LastHeartbeatAt = $now
     }
 
-    Start-Sleep -Seconds 2
+    Start-Sleep -Seconds 1
     try { $process.Refresh() } catch {}
 }
 
-Flush-File -Path $stdoutLog -Offset ([ref]$stdoutOffset) -Source 'STDOUT'
-Flush-File -Path $stderrLog -Offset ([ref]$stderrOffset) -Source 'STDERR'
+$executionLog = Discover-ExecutionLog -Root $env:REPORTS_ROOT
+
+Flush-File -Path $stdoutLog -Offset ([ref]$stdoutOffset)
+Flush-File -Path $stderrLog -Offset ([ref]$stderrOffset)
+
 if ($executionLog) {
-    Flush-File -Path $executionLog -Offset ([ref]$execOffset) -Source 'EXECUTION'
+    Flush-File -Path $executionLog -Offset ([ref]$execOffset)
 }
 
 if (Test-Path $stderrLog) {
     Add-Content -Path $stdoutLog -Value ''
     Add-Content -Path $stdoutLog -Value '==== STDERR ===='
     Get-Content $stderrLog | Add-Content -Path $stdoutLog
-    Remove-Item $stderrLog -Force -ErrorAction SilentlyContinue
 }
 
-$elapsedFinal = [int]((Get-Date) - $script:SuiteStartedAt).TotalSeconds
-$elapsedFinalText = [TimeSpan]::FromSeconds($elapsedFinal).ToString('hh\\:mm\\:ss')
+$elapsedFinal = [TimeSpan]::FromSeconds([int]((Get-Date) - $script:SuiteStartedAt).TotalSeconds).ToString('hh\\:mm\\:ss')
 
-Write-VisualLine '════════════════════════════════════════════════════════════'
-Write-VisualLine ('🏁 SUITE FINISHED| ' + $env:SUITE_NAME)
-Write-VisualLine ('⌛ ELAPSED       | ' + $elapsedFinalText)
-Write-VisualLine ('🔢 EXIT CODE     | ' + $process.ExitCode)
-Write-VisualLine '════════════════════════════════════════════════════════════'
+Write-Host '════════════════════════════════════════════════════════════'
+Write-Host ('🏁 FINISHED | ' + $env:SUITE_NAME)
+Write-Host ('⌛ ELAPSED  | ' + $elapsedFinal)
+Write-Host ('🔢 EXIT     | ' + $process.ExitCode)
+Write-Host '════════════════════════════════════════════════════════════'
 
 exit $process.ExitCode
 '''
-        )
-    }
+            )
+        }
 
-    def metaText = script.withEnv([
-        "SUITE_NAME=${suite.name}",
-        "SUITE_KEY=${suiteKey}",
-        "RUN_EXIT=${exitCode}"
-    ]) {
-        script.powershell(
-            returnStdout: true,
-            script: '''
+        def metaText = script.withEnv([
+            "SUITE_NAME=${suite.name}",
+            "SUITE_KEY=${suiteKey}",
+            "RUN_EXIT=${exitCode}",
+            "SUITE_STARTED_AT=${suiteStartedAt}"
+        ]) {
+            script.powershell(
+                returnStdout: true,
+                script: '''
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -742,7 +723,7 @@ function Clean-Text {
 }
 
 function Short-Text {
-    param([string]$Value, [int]$Max = 150)
+    param([string]$Value, [int]$Max = 170)
 
     $text = Clean-Text $Value
     if ($text.Length -gt $Max) {
@@ -756,61 +737,57 @@ $root = $env:REPORTS_ROOT
 $suiteName = $env:SUITE_NAME
 $suiteKey = $env:SUITE_KEY
 $runExit = [int]$env:RUN_EXIT
+$suiteStartedAt = Get-Date $env:SUITE_STARTED_AT
 
 $logFile = Join-Path $root ("logs\\" + $suiteKey + ".log")
-$reportDir = ''
 $junitFile = ''
 $htmlFile = ''
+$executionLog = ''
 $executed = 0
 $passed = 0
 $failed = 0
 $skipped = 0
 $reason = ''
 $caseLines = @()
+$stepLines = @()
 
-$candidates = Get-ChildItem -Path $root -Directory -Recurse -ErrorAction SilentlyContinue |
+$junitCandidate = Get-ChildItem -Path $root -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue |
     Where-Object {
-        $_.FullName -like ("*" + $suiteName + "*") -and
-        (Test-Path (Join-Path $_.FullName 'execution0.log'))
+        $_.FullName -notmatch '\\\\dashboard\\\\' -and
+        $_.FullName -notmatch '\\\\logs\\\\' -and
+        $_.LastWriteTime -ge $suiteStartedAt.AddMinutes(-1)
     } |
-    Sort-Object LastWriteTime -Descending
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
-if ($candidates) {
-    $reportDir = $candidates[0].FullName
+if ($junitCandidate) {
+    $junitFile = $junitCandidate.FullName
 }
 
-if ($reportDir -and (Test-Path $reportDir)) {
-    $junitCandidate = Get-ChildItem -Path $reportDir -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
+$htmlCandidate = Get-ChildItem -Path $root -Filter '*.html' -File -Recurse -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.FullName -notmatch '\\\\dashboard\\\\' -and
+        $_.FullName -notmatch '\\\\logs\\\\' -and
+        $_.LastWriteTime -ge $suiteStartedAt.AddMinutes(-1)
+    } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
-    if ($junitCandidate) {
-        $junitFile = $junitCandidate.FullName
-    }
+if ($htmlCandidate) {
+    $htmlFile = $htmlCandidate.FullName
+}
 
-    $htmlCandidates = @(
-        (Join-Path $reportDir 'report.html'),
-        (Join-Path $reportDir 'index.html'),
-        (Join-Path $reportDir 'cucumber_report\\cucumber-html-reports\\overview-features.html'),
-        (Join-Path $reportDir 'cucumber_report\\cucumber-html-reports\\overview-tags.html')
-    )
+$executionCandidate = Get-ChildItem -Path $root -Filter 'execution0.log' -File -Recurse -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.FullName -notmatch '\\\\dashboard\\\\' -and
+        $_.FullName -notmatch '\\\\logs\\\\' -and
+        $_.LastWriteTime -ge $suiteStartedAt.AddMinutes(-1)
+    } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
-    foreach ($candidate in $htmlCandidates) {
-        if ($candidate -and (Test-Path $candidate)) {
-            $htmlFile = $candidate
-            break
-        }
-    }
-
-    if (-not $htmlFile) {
-        $htmlCandidate = Get-ChildItem -Path $reportDir -Filter '*.html' -File -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-
-        if ($htmlCandidate) {
-            $htmlFile = $htmlCandidate.FullName
-        }
-    }
+if ($executionCandidate) {
+    $executionLog = $executionCandidate.FullName
 }
 
 if ($junitFile -and (Test-Path $junitFile)) {
@@ -876,10 +853,55 @@ if ($junitFile -and (Test-Path $junitFile)) {
     }
 }
 
+if ($executionLog -and (Test-Path $executionLog)) {
+    $lastStepSignature = ''
+    $lastScenario = ''
+
+    foreach ($line in (Get-Content $executionLog -ErrorAction SilentlyContinue)) {
+        $text = Clean-Text $line
+        if (-not $text) { continue }
+
+        if ($text -match '(?i)Scenario(?: Outline)?\\s*[:\\-]?\\s*(.+)$') {
+            $scenario = Short-Text $Matches[1] 120
+            if ($scenario -and $scenario -ne $lastScenario -and $stepLines.Count -lt 25) {
+                $stepLines += ('🎬 ' + $scenario)
+                $lastScenario = $scenario
+            }
+            continue
+        }
+
+        if ($text -match '(?i)\\b(Given|When|Then|And|But)\\b\\s+(.+)$') {
+            $step = ($Matches[1] + ' ' + $Matches[2]).Trim()
+            $step = $step -replace '(?i)\\s*(PASSED|FAILED|SKIPPED|ERROR|SUCCESS).*$', ''
+            $step = Short-Text $step 140
+
+            if (-not $step) { continue }
+
+            $prefix = '➡️ '
+
+            if ($text -match '(?i)\\bFAILED\\b|\\bERROR\\b|\\bEXCEPTION\\b|TIMED OUT|TIMEOUT|NOT FOUND') {
+                $prefix = '❌ '
+            }
+            elseif ($text -match '(?i)\\bSKIPPED\\b') {
+                $prefix = '⏭️ '
+            }
+            elseif ($text -match '(?i)\\bPASSED\\b|\\bSUCCESS\\b') {
+                $prefix = '✅ '
+            }
+
+            $signature = $prefix + $step
+            if ($signature -ne $lastStepSignature -and $stepLines.Count -lt 25) {
+                $stepLines += $signature
+                $lastStepSignature = $signature
+            }
+        }
+    }
+}
+
 if (-not $reason -and (Test-Path $logFile)) {
     $logHints = Get-Content $logFile -ErrorAction SilentlyContinue |
         Where-Object {
-            $_ -match 'StepFailedException|ERROR|Caused by|Unable to|not found|timed out|Timeout|failed|exception'
+            $_ -match 'StepFailedException|ERROR|Caused by|Unable to|not found|timed out|Timeout|failed|Exception'
         } |
         Select-Object -Last 5
 
@@ -920,9 +942,12 @@ $reportRel = ''
 if ($htmlFile -and $htmlFile.StartsWith($root)) {
     $reportRel = $htmlFile.Substring($root.Length).TrimStart('\\') -replace '\\', '/'
 }
+elseif ($junitFile -and $junitFile.StartsWith($root)) {
+    $reportRel = $junitFile.Substring($root.Length).TrimStart('\\') -replace '\\', '/'
+}
 
 $logRel = ''
-if ($logFile -and $logFile.StartsWith($root)) {
+if ($logFile -and (Test-Path $logFile) -and $logFile.StartsWith($root)) {
     $logRel = $logFile.Substring($root.Length).TrimStart('\\') -replace '\\', '/'
 }
 
@@ -941,30 +966,54 @@ Write-Output ('REASON=' + (Short-Text $reason 150))
 Write-Output ('REPORT_REL=' + $reportRel)
 Write-Output ('LOG_REL=' + $logRel)
 Write-Output ('CASE_SUMMARY=' + (($caseLines -join ' || ')))
+Write-Output ('STEP_SUMMARY=' + (($stepLines -join ' || ')))
 '''
-        ).trim()
+            ).trim()
+        }
+
+        def meta = parseKeyValue(metaText)
+
+        return [
+            name       : suite.name,
+            path       : suite.path,
+            status     : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
+            icon       : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
+            exitCode   : meta['EXIT_CODE'] ?: "${exitCode}",
+            executed   : meta['EXECUTED'] ?: '0',
+            passed     : meta['PASSED'] ?: '0',
+            failed     : meta['FAILED'] ?: '0',
+            skipped    : meta['SKIPPED'] ?: '0',
+            line1      : meta['LINE1'] ?: '',
+            line2      : meta['LINE2'] ?: '',
+            line3      : meta['LINE3'] ?: '',
+            reason     : meta['REASON'] ?: '',
+            reportRel  : meta['REPORT_REL'] ?: '',
+            logRel     : meta['LOG_REL'] ?: '',
+            caseSummary: splitSummary(meta['CASE_SUMMARY'] ?: ''),
+            stepSummary: splitSummary(meta['STEP_SUMMARY'] ?: '')
+        ]
     }
-
-    def meta = parseKeyValue(metaText)
-
-    return [
-        name       : suite.name,
-        path       : suite.path,
-        status     : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
-        icon       : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
-        exitCode   : meta['EXIT_CODE'] ?: "${exitCode}",
-        executed   : meta['EXECUTED'] ?: '0',
-        passed     : meta['PASSED'] ?: '0',
-        failed     : meta['FAILED'] ?: '0',
-        skipped    : meta['SKIPPED'] ?: '0',
-        line1      : meta['LINE1'] ?: '',
-        line2      : meta['LINE2'] ?: '',
-        line3      : meta['LINE3'] ?: '',
-        reason     : meta['REASON'] ?: '',
-        reportRel  : meta['REPORT_REL'] ?: '',
-        logRel     : meta['LOG_REL'] ?: '',
-        caseSummary: splitCaseSummary(meta['CASE_SUMMARY'] ?: '')
-    ]
+    catch (Throwable t) {
+        return [
+            name       : suite.name,
+            path       : suite.path,
+            status     : 'FAILED',
+            icon       : '❌',
+            exitCode   : '-1',
+            executed   : '0',
+            passed     : '0',
+            failed     : '0',
+            skipped    : '0',
+            line1      : 'Pipeline execution failed before report parsing',
+            line2      : 'Suite ended unexpectedly inside Jenkins',
+            line3      : 'Check console log for technical details',
+            reason     : (t?.message ?: 'Unexpected suite failure'),
+            reportRel  : '',
+            logRel     : '',
+            caseSummary: [],
+            stepSummary: []
+        ]
+    }
 }
 
 def saveSuiteResults(script, List results) {
@@ -990,7 +1039,8 @@ def loadSuiteResults(script) {
 def safeBuildReportsDashboard(script, List results) {
     try {
         buildReportsDashboard(script, results)
-    } catch (Throwable ignored) {
+    }
+    catch (Throwable ignored) {
         script.echo '⚠️ Dashboard generation skipped'
     }
 }
@@ -1030,6 +1080,10 @@ def buildReportsDashboard(script, List results) {
 
   <div class="cases">
     ${(r.caseSummary ?: []).take(5).collect { "<div>${escapeHtml(it.toString())}</div>" }.join('')}
+  </div>
+
+  <div class="steps">
+    ${(r.stepSummary ?: []).take(12).collect { "<div>${escapeHtml(it.toString())}</div>" }.join('')}
   </div>
 
   <div class="links">
@@ -1085,7 +1139,7 @@ h1 {
 }
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(390px, 1fr));
   gap: 16px;
 }
 .card {
@@ -1127,18 +1181,14 @@ h1 {
   font-size: 13px;
   margin-bottom: 14px;
 }
-.summary {
+.summary,
+.cases,
+.steps {
   background: #f9fafb;
   border-radius: 10px;
   padding: 12px;
   line-height: 1.6;
-}
-.cases {
   margin-top: 12px;
-  background: #f9fafb;
-  border-radius: 10px;
-  padding: 12px;
-  line-height: 1.6;
   font-size: 13px;
 }
 .links {
@@ -1194,36 +1244,101 @@ h1 {
     )
 }
 
-def stopGaiaProcesses(script, String reason) {
-    script.echo "🧹 Stopping Gaia processes | ${reason}"
+def cleanupStrayArtifacts(script) {
+    script.echo '🧹 Removing stray artifacts not meant for publish'
 
     script.powershell(
         returnStatus: true,
         script: '''
 $ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
 
-$targets = Get-CimInstance Win32_Process | Where-Object {
-    $cmd = [string]$_.CommandLine
-    $name = [string]$_.Name
-
-    ($cmd -match 'gaia-start-back\\.bat') -or
-    ($cmd -match 'gaia-start-front\\.bat') -or
-    ($cmd -match 'web_portal_back') -or
-    ($cmd -match 'web_portal') -or
-    (($name -match 'cmd\\.exe|java\\.exe|node\\.exe|notepad\\.exe') -and ($cmd -match 'gaia'))
-}
-
-foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
-    try {
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-    } catch {
-    }
-}
+Get-ChildItem -Path $env:WORK_DIR -Filter 'broken-test-objects-v2.json' -File -Recurse -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 
 exit 0
 '''
     )
+}
+
+def stopGaiaProcesses(script, String reason) {
+    script.echo "🧹 Stopping Gaia processes | ${reason}"
+
+    script.withEnv([
+        "BACK_CMD_TITLE=${script.env.BACK_CMD_TITLE}",
+        "FRONT_CMD_TITLE=${script.env.FRONT_CMD_TITLE}",
+        "BACK_PORT=${script.env.BACK_PORT}",
+        "FRONT_PORT=${script.env.FRONT_PORT}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+
+function Stop-CmdTreeByTitle {
+    param([string]$Title)
+    cmd /c "taskkill /FI ""WINDOWTITLE eq $Title"" /T /F" | Out-Null 2>&1
+}
+
+function Stop-ProcessListeningOnPort {
+    param([int]$Port)
+
+    try {
+        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique
+
+        foreach ($ownerPid in $owners) {
+            if ($ownerPid) {
+                Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+    }
+}
+
+function Stop-ExtraGaiaProcesses {
+    $targets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $cmd = [string]$_.CommandLine
+        $name = [string]$_.Name
+
+        ($cmd -match 'gaia-start-back\\.bat') -or
+        ($cmd -match 'gaia-start-front\\.bat') -or
+        ($cmd -match 'web_portal_back') -or
+        ($cmd -match 'web_portal') -or
+        ($cmd -match 'mvn spring-boot:run') -or
+        ($cmd -match 'npm start') -or
+        ($cmd -match $env:BACK_CMD_TITLE) -or
+        ($cmd -match $env:FRONT_CMD_TITLE) -or
+        (($name -match 'cmd\\.exe|java\\.exe|node\\.exe') -and ($cmd -match 'gaia'))
+    }
+
+    foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
+        try {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+    }
+}
+
+Stop-CmdTreeByTitle -Title $env:BACK_CMD_TITLE
+Stop-CmdTreeByTitle -Title $env:FRONT_CMD_TITLE
+
+Start-Sleep -Seconds 1
+
+Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
+Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
+
+Start-Sleep -Seconds 1
+
+Stop-ExtraGaiaProcesses
+
+Write-Host '[OK] Gaia CMD windows and child processes stopped'
+exit 0
+'''
+        )
+    }
 }
 
 def printSuiteHeader(script, String suiteName, String suitePath, String timeoutMinutes) {
@@ -1248,6 +1363,12 @@ def printSuiteResult(script, Map result) {
         script.echo "║ ${fitText(line.toString(), 58)} ║"
     }
 
+    (result.stepSummary ?: []).take(12).each { line ->
+        script.echo "║ ${fitText(line.toString(), 58)} ║"
+    }
+
+    script.echo "║ ${fitText('📄 Report: ' + (result.reportRel ?: 'not found'), 58)} ║"
+    script.echo "║ ${fitText('🧾 Log: ' + (result.logRel ?: 'not found'), 58)} ║"
     script.echo '╚════════════════════════════════════════════════════════════╝'
 }
 
@@ -1299,7 +1420,7 @@ def parseKeyValue(String text) {
     return map
 }
 
-def splitCaseSummary(String value) {
+def splitSummary(String value) {
     if (!value?.trim()) {
         return []
     }
