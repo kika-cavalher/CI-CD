@@ -1,8 +1,9 @@
 package jiraIntegration
 
-import com.kms.katalon.core.util.KeywordUtil
 import java.text.SimpleDateFormat
 import java.util.Locale
+
+import com.kms.katalon.core.util.KeywordUtil
 
 class JiraTestPlanManager {
 
@@ -20,53 +21,75 @@ class JiraTestPlanManager {
             return ''
         }
 
-        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
-            KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
-            return owner.MANUAL_TEST_PLAN_KEY
+        String expectedSummary = owner.normalizeTitle(summary)
+        List issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
+
+        if (!(issues instanceof List) || issues.isEmpty()) {
+            KeywordUtil.logInfo("No Test Plan returned by Jira search for summary: ${summary}")
+            return ''
         }
 
-        List issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
-        String expected = owner.normalizeTitle(summary)
+        List exactMatches = issues.findAll { issue ->
+            owner.normalizeTitle(issue?.fields?.summary) == expectedSummary
+        }
 
-        if (issues instanceof List && !issues.isEmpty()) {
-            List exactMatches = issues.findAll { issue ->
-                owner.normalizeTitle(issue?.fields?.summary) == expected
+        if (exactMatches.isEmpty()) {
+            KeywordUtil.logInfo("No exact Test Plan match found for summary: ${summary}")
+            return ''
+        }
+
+        exactMatches = exactMatches.sort { a, b ->
+            extractIssueSortMillis(b) <=> extractIssueSortMillis(a)
+        }
+
+        KeywordUtil.logInfo("Exact Test Plan matches found: ${exactMatches.size()}")
+        exactMatches.each { issue ->
+            KeywordUtil.logInfo(
+                "Candidate Test Plan -> key: ${owner.safe(issue?.key)}, " +
+                "summary: ${owner.safe(issue?.fields?.summary)}, " +
+                "updated: ${owner.safe(issue?.fields?.updated)}, " +
+                "created: ${owner.safe(issue?.fields?.created)}"
+            )
+        }
+
+        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
+            String manualKey = owner.safe(owner.MANUAL_TEST_PLAN_KEY)
+
+            def manualMatch = exactMatches.find { issue ->
+                owner.safe(issue?.key).equalsIgnoreCase(manualKey)
             }
 
-            if (!exactMatches.isEmpty()) {
-                List sortedExactMatches = sortIssuesByCreatedDesc(exactMatches)
-                def selected = sortedExactMatches[0]
-
-                String foundKey = owner.safe(selected?.key)
-                String foundSummary = owner.safe(selected?.fields?.summary)
-                String foundCreated = owner.safe(selected?.fields?.created)
-
-                if (!owner.isBlank(foundKey)) {
-                    owner.saveSuiteTestPlanKey(foundKey)
-                    KeywordUtil.logInfo("Existing Test Plan found by exact summary. Using most recent one: ${foundKey}")
-                    KeywordUtil.logInfo("Resolved summary: ${foundSummary}")
-                    KeywordUtil.logInfo("Resolved created date: ${foundCreated}")
-                    return foundKey
-                }
+            if (manualMatch != null) {
+                KeywordUtil.logInfo("Using manual Test Plan key after Jira validation: ${manualKey}")
+                owner.saveSuiteTestPlanKey(manualKey)
+                return manualKey
             }
 
-            List sortedIssues = sortIssuesByCreatedDesc(issues)
-            String fallbackKey = owner.safe(sortedIssues[0]?.key)
-
-            if (!owner.isBlank(fallbackKey)) {
-                owner.saveSuiteTestPlanKey(fallbackKey)
-                KeywordUtil.logInfo("No exact summary match found. Using most recent search result fallback: ${fallbackKey}")
-                return fallbackKey
-            }
+            KeywordUtil.logInfo("Manual Test Plan key ${manualKey} was ignored because it does not match the exact Jira search result.")
         }
 
         String savedKey = owner.readSavedSuiteTestPlanKey()
         if (!owner.isBlank(savedKey)) {
-            KeywordUtil.logInfo("No Jira match found. Falling back to saved Test Plan key for suite ${owner.getCurrentSuiteName()}: ${savedKey}")
-            return savedKey
+            def savedMatch = exactMatches.find { issue ->
+                owner.safe(issue?.key).equalsIgnoreCase(savedKey)
+            }
+
+            if (savedMatch != null) {
+                KeywordUtil.logInfo("Using saved Test Plan key after Jira validation: ${savedKey}")
+                owner.saveSuiteTestPlanKey(savedKey)
+                return savedKey
+            }
+
+            KeywordUtil.logInfo("Saved Test Plan key ${savedKey} was ignored because it no longer matches the exact Jira result for this suite.")
         }
 
-        KeywordUtil.logInfo("No existing Test Plan found for summary: ${summary}")
+        String newestExactKey = owner.safe(exactMatches[0]?.key)
+        if (!owner.isBlank(newestExactKey)) {
+            owner.saveSuiteTestPlanKey(newestExactKey)
+            KeywordUtil.logInfo("Using newest exact Jira Test Plan match: ${newestExactKey}")
+            return newestExactKey
+        }
+
         return ''
     }
 
@@ -88,274 +111,38 @@ class JiraTestPlanManager {
         return createdKey
     }
 
-    private List sortIssuesByCreatedDesc(List issues) {
-        List sorted = new ArrayList(issues ?: [])
-
-        sorted.sort { a, b ->
-            long aCreated = toCreatedMillis(owner.safe(a?.fields?.created))
-            long bCreated = toCreatedMillis(owner.safe(b?.fields?.created))
-
-            if (aCreated == bCreated) {
-                return owner.safe(a?.key) <=> owner.safe(b?.key)
-            }
-
-            return bCreated <=> aCreated
+    private long extractIssueSortMillis(def issue) {
+        long updatedMillis = parseJiraDateMillis(owner.safe(issue?.fields?.updated))
+        if (updatedMillis > 0L) {
+            return updatedMillis
         }
 
-        return sorted
-    }
-
-    private long toCreatedMillis(String rawCreated) {
-        String value = owner.safe(rawCreated)
-        if (owner.isBlank(value)) {
-            return 0L
-        }
-
-        List<String> patterns = [
-            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
-            "yyyy-MM-dd'T'HH:mm:ssZ",
-            "yyyy-MM-dd HH:mm:ss.SSS",
-            "yyyy-MM-dd HH:mm:ss"
-        ]
-
-        for (String pattern : patterns) {
-            try {
-                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(value).time
-            } catch (Exception ignored) {
-            }
+        long createdMillis = parseJiraDateMillis(owner.safe(issue?.fields?.created))
+        if (createdMillis > 0L) {
+            return createdMillis
         }
 
         return 0L
     }
-}
 
-
-
-
-
-package jiraIntegration
-
-import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
-
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Locale
-
-import com.kms.katalon.core.util.KeywordUtil
-import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
-
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurper
-
-class JiraGateway {
-
-    JiraFlowCoordinator owner
-
-    JiraGateway(JiraFlowCoordinator owner) {
-        this.owner = owner
-    }
-
-    void validateRequiredConfiguration() {
-        if (owner.isBlank(owner.JIRA_TOKEN)) {
-            KeywordUtil.markFailed("JIRA_TOKEN is empty.")
-        }
-
-        if (owner.isBlank(owner.PROJECT_KEY)) {
-            KeywordUtil.markFailed("PROJECT_KEY is empty.")
-        }
-
-        if (owner.isBlank(owner.EPIC_KEY)) {
-            KeywordUtil.markFailed("EPIC_KEY is empty.")
-        }
-
-        if (owner.isBlank(owner.JIRA_BASE_URL)) {
-            KeywordUtil.markFailed("JIRA_BASE_URL is empty.")
-        }
-    }
-
-    String importExecutionResults(String xmlPath) {
-        def response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
-            ('filePath'): xmlPath,
-            ('project') : owner.PROJECT_KEY,
-            ('baseUrl') : owner.JIRA_BASE_URL,
-            ('token')   : owner.JIRA_TOKEN
-        ]))
-
-        int status = WS.getResponseStatusCode(response)
-        String body = owner.safe(response.getResponseBodyContent())
-
-        KeywordUtil.logInfo("Import results status: ${status}")
-        KeywordUtil.logInfo("Import results response: ${body}")
-
-        if (!(status in [200, 201, 204])) {
-            return 'ERROR' + status
-        }
-
-        def parsed = new JsonSlurper().parseText(body)
-        String executionKey = owner.safe(parsed?.testExecIssue?.key)
-
-        if (owner.isBlank(executionKey)) {
-            return 'ERROR_NO_EXEC_KEY'
-        }
-
-        return executionKey
-    }
-
-    List searchTestPlans(String summary, String epicKey) {
-        String escapedSummary = owner.safe(summary)
-            .replace('\\', '\\\\')
-            .replace('"', '\\"')
-            .replace('[', '\\[')
-            .replace(']', '\\]')
-
-        def response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan', [
-            ('project'): owner.PROJECT_KEY,
-            ('token')  : owner.JIRA_TOKEN,
-            ('summary'): escapedSummary,
-            ('parent') : epicKey
-        ]))
-
-        int status = WS.getResponseStatusCode(response)
-        String body = owner.safe(response.getResponseBodyContent())
-
-        KeywordUtil.logInfo("Get Test Plan status: ${status}")
-        KeywordUtil.logInfo("Get Test Plan response: ${body}")
-
-        if (status != 200) {
-            return []
-        }
-
-        def parsed = new JsonSlurper().parseText(body)
-        List issues = parsed?.issues instanceof List ? parsed.issues : []
-
-        issues = sortIssuesByCreatedDesc(issues)
-
-        if (!issues.isEmpty()) {
-            KeywordUtil.logInfo("Test Plans found in Jira: ${issues.size()}")
-            issues.each { issue ->
-                KeywordUtil.logInfo(
-                    "Candidate Test Plan -> key: ${owner.safe(issue?.key)}, summary: ${owner.safe(issue?.fields?.summary)}, created: ${owner.safe(issue?.fields?.created)}"
-                )
-            }
-        } else {
-            KeywordUtil.logInfo("No Test Plans returned from Jira search.")
-        }
-
-        return issues
-    }
-
-    String createTestPlan(String summary, String epicKey) {
-        def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan', [
-            ('token')  : owner.JIRA_TOKEN,
-            ('project'): owner.PROJECT_KEY,
-            ('summary'): summary,
-            ('epic')   : epicKey
-        ]))
-
-        int status = WS.getResponseStatusCode(response)
-        String body = owner.safe(response.getResponseBodyContent())
-
-        KeywordUtil.logInfo("Create Test Plan status: ${status}")
-        KeywordUtil.logInfo("Create Test Plan response: ${body}")
-
-        if (!(status in [200, 201])) {
-            return 'ERROR' + status
-        }
-
-        def parsed = new JsonSlurper().parseText(body)
-        return owner.safe(parsed?.key)
-    }
-
-    int addExecutionToTestPlan(String testPlanKey, String executionKey) {
-        String jsonBody = JsonOutput.toJson([
-            addTestsToPlan: true,
-            add           : [executionKey]
-        ])
-
-        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan', [
-            ('token')      : owner.JIRA_TOKEN,
-            ('testPlanKey'): testPlanKey,
-            ('jsonBody')   : jsonBody
-        ]))
-
-        int status = WS.getResponseStatusCode(response)
-        KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
-        return status
-    }
-
-    int updateTestExecution(String executionKey, String executionSummary, String labels, String environment) {
-        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name', [
-            ('issueID'): executionKey,
-            ('token')  : owner.JIRA_TOKEN,
-            ('summary'): executionSummary,
-            ('labels') : labels,
-            ('env')    : environment
-        ]))
-
-        int status = WS.getResponseStatusCode(response)
-        KeywordUtil.logInfo("Update Test Execution status: ${status}")
-        return status
-    }
-
-    int uploadAttachment(String issueKey, String filePath) {
-        if (owner.isBlank(filePath)) {
-            return 0
-        }
-
-        File file = new File(filePath)
-        if (!file.exists() || !file.isFile() || file.length() <= 0) {
-            KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
-            return 0
-        }
-
-        def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
-            ('token')    : owner.JIRA_TOKEN,
-            ('evidences'): file,
-            ('execID')   : issueKey
-        ]))
-
-        int status = WS.getResponseStatusCode(response)
-        String body = owner.safe(response.getResponseBodyContent())
-
-        KeywordUtil.logInfo("Upload attachment status: ${status}")
-        KeywordUtil.logInfo("Upload attachment response: ${body}")
-
-        return status
-    }
-
-    private List sortIssuesByCreatedDesc(List issues) {
-        List sorted = new ArrayList(issues ?: [])
-
-        sorted.sort { a, b ->
-            long aCreated = toCreatedMillis(owner.safe(a?.fields?.created))
-            long bCreated = toCreatedMillis(owner.safe(b?.fields?.created))
-
-            if (aCreated == bCreated) {
-                return owner.safe(a?.key) <=> owner.safe(b?.key)
-            }
-
-            return bCreated <=> aCreated
-        }
-
-        return sorted
-    }
-
-    private long toCreatedMillis(String rawCreated) {
-        String value = owner.safe(rawCreated)
-        if (owner.isBlank(value)) {
+    private long parseJiraDateMillis(String rawValue) {
+        String raw = owner.safe(rawValue)
+        if (owner.isBlank(raw)) {
             return 0L
         }
 
         List<String> patterns = [
             "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
             "yyyy-MM-dd'T'HH:mm:ssZ",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSX",
+            "yyyy-MM-dd'T'HH:mm:ssX",
             "yyyy-MM-dd HH:mm:ss.SSS",
             "yyyy-MM-dd HH:mm:ss"
         ]
 
         for (String pattern : patterns) {
             try {
-                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(value).time
+                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(raw).time
             } catch (Exception ignored) {
             }
         }
