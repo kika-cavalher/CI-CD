@@ -1,1 +1,349 @@
+package jiraIntegration
+
+import java.text.SimpleDateFormat
+import java.util.Locale
+
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraTestPlanManager {
+
+    JiraFlowCoordinator owner
+    JiraGateway gateway
+
+    JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
+        this.owner = owner
+        this.gateway = gateway
+    }
+
+    String findExistingTestPlanKey(String summary) {
+        if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
+            KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
+            return ''
+        }
+
+        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
+            KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
+            return owner.MANUAL_TEST_PLAN_KEY
+        }
+
+        List issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
+
+        if (!(issues instanceof List) || issues.isEmpty()) {
+            KeywordUtil.logInfo("No existing Test Plan found for summary '${summary}' in epic '${owner.EPIC_KEY}'.")
+            return ''
+        }
+
+        String expectedSummary = owner.normalizeTitle(summary)
+
+        List exactMatches = issues.findAll { def issue ->
+            String issueSummary = owner.normalizeTitle(issue?.fields?.summary)
+            return issueSummary == expectedSummary
+        }
+
+        if (exactMatches.isEmpty()) {
+            KeywordUtil.logInfo("Search returned issues, but none matched the exact summary '${summary}'.")
+            return ''
+        }
+
+        Map selected = selectNewestIssue(exactMatches)
+        String foundKey = owner.safe(selected?.key)
+
+        if (!owner.isBlank(foundKey)) {
+            owner.saveSuiteTestPlanKey(foundKey)
+            KeywordUtil.logInfo("Existing Test Plan found by exact summary and epic link: ${foundKey}")
+            return foundKey
+        }
+
+        return ''
+    }
+
+    String getOrCreateTestPlanKey() {
+        String summary = owner.getTestPlanName()
+
+        String existingKey = findExistingTestPlanKey(summary)
+        if (!owner.isBlank(existingKey)) {
+            KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
+            return existingKey
+        }
+
+        String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
+        if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+            owner.saveSuiteTestPlanKey(createdKey)
+            KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
+        }
+
+        return createdKey
+    }
+
+    private Map selectNewestIssue(List issues) {
+        List sorted = new ArrayList(issues)
+
+        sorted.sort { def issue ->
+            [
+                parseJiraCreated(owner.safe(issue?.fields?.created)),
+                safeLong(issue?.id)
+            ]
+        }
+
+        return sorted.last()
+    }
+
+    private long parseJiraCreated(String value) {
+        if (owner.isBlank(value)) {
+            return 0L
+        }
+
+        List<String> patterns = [
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSX",
+            "yyyy-MM-dd'T'HH:mm:ssZ",
+            "yyyy-MM-dd'T'HH:mm:ssX"
+        ]
+
+        for (String pattern : patterns) {
+            try {
+                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(value).time
+            } catch (Exception ignored) {
+            }
+        }
+
+        return 0L
+    }
+
+    private long safeLong(def value) {
+        try {
+            return Long.parseLong(owner.safe(value))
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import java.io.File
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+class JiraGateway {
+
+    JiraFlowCoordinator owner
+
+    JiraGateway(JiraFlowCoordinator owner) {
+        this.owner = owner
+    }
+
+    void validateRequiredConfiguration() {
+        if (owner.isBlank(owner.JIRA_TOKEN)) {
+            KeywordUtil.markFailed("JIRA_TOKEN is empty.")
+        }
+
+        if (owner.isBlank(owner.PROJECT_KEY)) {
+            KeywordUtil.markFailed("PROJECT_KEY is empty.")
+        }
+
+        if (owner.isBlank(owner.EPIC_KEY)) {
+            KeywordUtil.markFailed("EPIC_KEY is empty.")
+        }
+
+        if (owner.isBlank(owner.JIRA_BASE_URL)) {
+            KeywordUtil.markFailed("JIRA_BASE_URL is empty.")
+        }
+    }
+
+    String importExecutionResults(String xmlPath) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
+            ('filePath'): xmlPath,
+            ('project') : owner.PROJECT_KEY,
+            ('baseUrl') : owner.JIRA_BASE_URL,
+            ('token')   : owner.JIRA_TOKEN
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Import results status: ${status}")
+        KeywordUtil.logInfo("Import results response: ${body}")
+
+        if (!(status in [200, 201, 204])) {
+            return 'ERROR' + status
+        }
+
+        def parsed = new JsonSlurper().parseText(body)
+        String executionKey = owner.safe(parsed?.testExecIssue?.key)
+
+        if (owner.isBlank(executionKey)) {
+            return 'ERROR_NO_EXEC_KEY'
+        }
+
+        return executionKey
+    }
+
+    List searchTestPlans(String summary, String epicKey) {
+        String jql = buildTestPlanSearchJql(summary, epicKey)
+
+        KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
+
+        def response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan', [
+            ('baseUrl')    : owner.JIRA_BASE_URL,
+            ('token')      : owner.JIRA_TOKEN,
+            ('jql')        : jql,
+            ('maxResults') : '50',
+            ('fields')     : 'summary,created'
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Get Test Plan status: ${status}")
+        KeywordUtil.logInfo("Get Test Plan response: ${body}")
+
+        if (status != 200) {
+            return []
+        }
+
+        def parsed = new JsonSlurper().parseText(body)
+        return parsed?.issues instanceof List ? parsed.issues : []
+    }
+
+    String createTestPlan(String summary, String epicKey) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan', [
+            ('token')  : owner.JIRA_TOKEN,
+            ('project'): owner.PROJECT_KEY,
+            ('summary'): summary,
+            ('epic')   : epicKey
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Create Test Plan status: ${status}")
+        KeywordUtil.logInfo("Create Test Plan response: ${body}")
+
+        if (!(status in [200, 201])) {
+            return 'ERROR' + status
+        }
+
+        def parsed = new JsonSlurper().parseText(body)
+        return owner.safe(parsed?.key)
+    }
+
+    int addExecutionToTestPlan(String testPlanKey, String executionKey) {
+        String jsonBody = JsonOutput.toJson([
+            addTestsToPlan: true,
+            add           : [executionKey]
+        ])
+
+        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan', [
+            ('token')      : owner.JIRA_TOKEN,
+            ('testPlanKey'): testPlanKey,
+            ('jsonBody')   : jsonBody
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
+        return status
+    }
+
+    int updateTestExecution(String executionKey, String executionSummary, String labels, String environment) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name', [
+            ('issueID'): executionKey,
+            ('token')  : owner.JIRA_TOKEN,
+            ('summary'): executionSummary,
+            ('labels') : labels,
+            ('env')    : environment
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        KeywordUtil.logInfo("Update Test Execution status: ${status}")
+        return status
+    }
+
+    int uploadAttachment(String issueKey, String filePath) {
+        if (owner.isBlank(filePath)) {
+            return 0
+        }
+
+        File file = new File(filePath)
+        if (!file.exists() || !file.isFile() || file.length() <= 0) {
+            KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
+            return 0
+        }
+
+        def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
+            ('token')    : owner.JIRA_TOKEN,
+            ('evidences'): file,
+            ('execID')   : issueKey
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Upload attachment status: ${status}")
+        KeywordUtil.logInfo("Upload attachment response: ${body}")
+
+        return status
+    }
+
+    private String buildTestPlanSearchJql(String summary, String epicKey) {
+        String escapedProject = escapeJqlValue(owner.PROJECT_KEY)
+        String escapedEpic = escapeJqlValue(epicKey)
+        String escapedSummary = escapeJqlValue(summary)
+
+        return 'project = "' + escapedProject + '"' +
+               ' AND issuetype = "Test Plan"' +
+               ' AND "Epic Link" = "' + escapedEpic + '"' +
+               ' AND summary ~ "\\"' + escapedSummary + '\\""' +
+               ' ORDER BY created DESC'
+    }
+
+    private String escapeJqlValue(String value) {
+        String text = owner.safe(value)
+        text = text.replace('\\', '\\\\')
+        text = text.replace('"', '\\"')
+        return text
+    }
+}
+
+
+
+
+
+
+
+
+
+
+boolean RESET_SAVED_TEST_PLAN_KEY  = true
+
+
+
+
+${baseUrl}/rest/api/2/search
+
+
 
