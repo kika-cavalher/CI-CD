@@ -2,6 +2,13 @@ package jiraIntegration
 
 import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
+import java.io.File
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+
+import com.kms.katalon.core.testobject.ConditionType
+import com.kms.katalon.core.testobject.RequestObject
+import com.kms.katalon.core.testobject.TestObjectProperty
 import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
 
@@ -63,37 +70,65 @@ class JiraGateway {
 	}
 
 	List searchTestPlans(String summary, String epicKey) {
-		String jql = buildExactSummarySearchJql(summary)
+		String safeSummary = owner.safe(summary)
+
+		if (owner.isBlank(safeSummary)) {
+			KeywordUtil.logInfo("Test Plan summary is empty. Search skipped.")
+			return []
+		}
+
+		String escapedSummary = safeSummary.replace('"', '\\"')
+
+		String jql =
+			'project = "' + owner.PROJECT_KEY + '" ' +
+			'AND issuetype = "Test Plan" ' +
+			'AND summary = "' + escapedSummary + '" ' +
+			'ORDER BY created DESC'
 
 		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
 
-		def response
 		try {
-			response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan', [
-				('baseUrl')   : owner.JIRA_BASE_URL,
-				('token')     : owner.JIRA_TOKEN,
-				('jql')       : jql,
-				('maxResults'): '20',
-				('fields')    : 'summary,created'
-			]))
+			String encodedJql = URLEncoder.encode(jql, StandardCharsets.UTF_8.toString())
+			String encodedFields = URLEncoder.encode('summary,created', StandardCharsets.UTF_8.toString())
+
+			String url =
+				owner.JIRA_BASE_URL +
+				'/rest/api/2/search' +
+				'?jql=' + encodedJql +
+				'&maxResults=20' +
+				'&fields=' + encodedFields
+
+			RequestObject request = new RequestObject('Runtime Search Test Plan')
+			request.setRestUrl(url)
+			request.setRestRequestMethod('GET')
+			request.setHttpHeaderProperties([
+				new TestObjectProperty('Authorization', ConditionType.EQUALS, 'Bearer ' + owner.JIRA_TOKEN),
+				new TestObjectProperty('Accept', ConditionType.EQUALS, 'application/json')
+			])
+
+			def response = WS.sendRequest(request)
+
+			int status = WS.getResponseStatusCode(response)
+			String body = owner.safe(response.getResponseBodyContent())
+
+			KeywordUtil.logInfo("Get Test Plan status: ${status}")
+			KeywordUtil.logInfo("Get Test Plan response: ${body}")
+
+			if (status != 200) {
+				KeywordUtil.logInfo("Search Test Plan failed. Status: ${status}. Error: ${body}")
+				return []
+			}
+
+			def parsed = new JsonSlurper().parseText(body)
+			List issues = parsed?.issues instanceof List ? parsed.issues : []
+
+			KeywordUtil.logInfo("Test Plans found: ${issues.size()}")
+
+			return issues
 		} catch (Exception e) {
 			KeywordUtil.logInfo("Get Test Plan request failed: ${e.message}")
-			throw new RuntimeException("ERROR_SEARCH_REQUEST")
+			return []
 		}
-
-		int status = WS.getResponseStatusCode(response)
-		String body = owner.safe(response.getResponseBodyContent())
-
-		KeywordUtil.logInfo("Get Test Plan status: ${status}")
-		KeywordUtil.logInfo("Get Test Plan response: ${body}")
-
-		if (status != 200) {
-			KeywordUtil.logInfo("Search Test Plan failed. Status: ${status}. Error: ${body}")
-			throw new RuntimeException("ERROR_SEARCH_${status}")
-		}
-
-		def parsed = new JsonSlurper().parseText(body)
-		return parsed?.issues instanceof List ? parsed.issues : []
 	}
 
 	String createTestPlan(String summary, String epicKey) {
@@ -174,226 +209,4 @@ class JiraGateway {
 
 		return status
 	}
-
-	private String buildExactSummarySearchJql(String summary) {
-		String escapedSummary = escapeJqlText(summary)
-		return "project = \"${owner.PROJECT_KEY}\" AND issuetype = \"Test Plan\" AND summary = \"${escapedSummary}\" ORDER BY created DESC"
-	}
-
-	private String escapeJqlText(String value) {
-		String text = owner.safe(value)
-		text = text.replace('\\', '\\\\')
-		text = text.replace('"', '\\"')
-		return text
-	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-package jiraIntegration
-
-import com.kms.katalon.core.util.KeywordUtil
-
-class JiraTestPlanManager {
-
-	JiraFlowCoordinator owner
-	JiraGateway gateway
-
-	JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
-		this.owner = owner
-		this.gateway = gateway
-	}
-
-	String findExistingTestPlanKey(String summary) {
-		if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
-			KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
-			return ''
-		}
-
-		if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
-			KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
-			return owner.MANUAL_TEST_PLAN_KEY
-		}
-
-		List issues
-		try {
-			issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
-		} catch (Exception e) {
-			String errorCode = owner.safe(e.message)
-			if (owner.isBlank(errorCode)) {
-				errorCode = 'ERROR_SEARCH_REQUEST'
-			}
-
-			KeywordUtil.logInfo("Search Test Plan failed: ${errorCode}")
-			return errorCode
-		}
-
-		if (!(issues instanceof List) || issues.isEmpty()) {
-			KeywordUtil.logInfo("No existing Test Plan found for summary: ${summary}")
-			return ''
-		}
-
-		KeywordUtil.logInfo("Existing Test Plans returned: ${issues.size()}")
-
-		String expected = owner.normalizeTitle(summary)
-
-		List exactMatches = issues.findAll { issue ->
-			owner.normalizeTitle(issue?.fields?.summary) == expected
-		}
-
-		if (exactMatches != null && !exactMatches.isEmpty()) {
-			def newestExact = exactMatches[0]
-			String foundKey = owner.safe(newestExact?.key)
-
-			if (!owner.isBlank(foundKey)) {
-				owner.saveSuiteTestPlanKey(foundKey)
-				KeywordUtil.logInfo("Existing Test Plan found by exact summary: ${foundKey}")
-				return foundKey
-			}
-		}
-
-		String firstKey = owner.safe(issues[0]?.key)
-		if (!owner.isBlank(firstKey)) {
-			owner.saveSuiteTestPlanKey(firstKey)
-			KeywordUtil.logInfo("Existing Test Plan found by first result fallback: ${firstKey}")
-			return firstKey
-		}
-
-		return ''
-	}
-
-	String getOrCreateTestPlanKey() {
-		String summary = owner.getTestPlanName()
-
-		String existingKey = findExistingTestPlanKey(summary)
-
-		if (!owner.isBlank(existingKey) && existingKey.startsWith('ERROR')) {
-			return existingKey
-		}
-
-		if (!owner.isBlank(existingKey)) {
-			KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
-			return existingKey
-		}
-
-		String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
-		if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
-			owner.saveSuiteTestPlanKey(createdKey)
-			KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
-		}
-
-		return createdKey
-	}
-}
-
-
-
-
-
-
-<?xml version="1.0" encoding="UTF-8"?>
-<WebServiceRequestEntity>
-   <description>Search existing Jira Test Plan by exact summary</description>
-   <name>Get Test Plan</name>
-   <tag></tag>
-   <elementGuidId>5e8f8a91-7f6e-4ac1-9c66-8a4fd0f87c11</elementGuidId>
-   <selectorMethod>BASIC</selectorMethod>
-   <useRalativeImagePath>false</useRalativeImagePath>
-   <httpBody></httpBody>
-   <httpBodyContent></httpBodyContent>
-   <httpBodyType></httpBodyType>
-
-   <httpHeaderProperties>
-      <isSelected>true</isSelected>
-      <matchCondition>equals</matchCondition>
-      <name>Authorization</name>
-      <type>Main</type>
-      <value>Bearer ${token}</value>
-   </httpHeaderProperties>
-
-   <httpHeaderProperties>
-      <isSelected>true</isSelected>
-      <matchCondition>equals</matchCondition>
-      <name>Accept</name>
-      <type>Main</type>
-      <value>application/json</value>
-   </httpHeaderProperties>
-
-   <migratedVersion>5.4.1</migratedVersion>
-   <restRequestMethod>GET</restRequestMethod>
-   <restUrl>${baseUrl}/rest/api/2/search?jql=${jql}&amp;maxResults=${maxResults}&amp;fields=${fields}</restUrl>
-   <serviceType>RESTful</serviceType>
-   <soapBody></soapBody>
-   <soapHeader></soapHeader>
-   <soapRequestMethod></soapRequestMethod>
-   <soapServiceFunction></soapServiceFunction>
-
-   <variables>
-      <defaultValue>'https://jira-mut.d.bbg'</defaultValue>
-      <description></description>
-      <id>7c8d93bb-1e1c-4c8a-97e9-57b17d5cf001</id>
-      <masked>false</masked>
-      <name>baseUrl</name>
-   </variables>
-
-   <variables>
-      <defaultValue>GlobalVariable.JIRA_TOKEN</defaultValue>
-      <description></description>
-      <id>7c8d93bb-1e1c-4c8a-97e9-57b17d5cf002</id>
-      <masked>true</masked>
-      <name>token</name>
-   </variables>
-
-   <variables>
-      <defaultValue>'project = "L96B2C" AND issuetype = "Test Plan" AND summary = "Correction- Add Correction Test Plan" ORDER BY created DESC'</defaultValue>
-      <description></description>
-      <id>7c8d93bb-1e1c-4c8a-97e9-57b17d5cf003</id>
-      <masked>false</masked>
-      <name>jql</name>
-   </variables>
-
-   <variables>
-      <defaultValue>'20'</defaultValue>
-      <description></description>
-      <id>7c8d93bb-1e1c-4c8a-97e9-57b17d5cf004</id>
-      <masked>false</masked>
-      <name>maxResults</name>
-   </variables>
-
-   <variables>
-      <defaultValue>'summary,created'</defaultValue>
-      <description></description>
-      <id>7c8d93bb-1e1c-4c8a-97e9-57b17d5cf005</id>
-      <masked>false</masked>
-      <name>fields</name>
-   </variables>
-
-   <verificationScript>import com.kms.katalon.core.testobject.RequestObject
-import com.kms.katalon.core.testobject.ResponseObject
-import com.kms.katalon.core.webservice.verification.WSResponseManager
-
-RequestObject request = WSResponseManager.getInstance().getCurrentRequest()
-ResponseObject response = WSResponseManager.getInstance().getCurrentResponse()
-
-println('Get Test Plan request URL: ' + request.getRestUrl())
-println('Get Test Plan response code: ' + response.getStatusCode())
-println('Get Test Plan response body: ' + response.getResponseBodyContent())
-</verificationScript>
-
-   <wsdlAddress></wsdlAddress>
-</WebServiceRequestEntity>
-
-
-
-
-
-
