@@ -1,1 +1,1007 @@
+package jiraIntegration
 
+import java.text.SimpleDateFormat
+import java.util.Locale
+
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraTestPlanManager {
+
+    JiraFlowCoordinator owner
+    JiraGateway gateway
+
+    JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
+        this.owner = owner
+        this.gateway = gateway
+    }
+
+    String findExistingTestPlanKey(String summary) {
+        if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
+            KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
+            return ''
+        }
+
+        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
+            KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
+            return owner.MANUAL_TEST_PLAN_KEY
+        }
+
+        List issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
+
+        if (!(issues instanceof List) || issues.isEmpty()) {
+            KeywordUtil.logInfo("No existing Test Plan found for summary '${summary}' in epic '${owner.EPIC_KEY}'.")
+            return ''
+        }
+
+        String expectedSummary = owner.normalizeTitle(summary)
+
+        List exactMatches = issues.findAll { def issue ->
+            String issueSummary = owner.normalizeTitle(issue?.fields?.summary)
+            return issueSummary == expectedSummary
+        }
+
+        if (exactMatches.isEmpty()) {
+            KeywordUtil.logInfo("Search returned issues, but none matched the exact summary '${summary}'.")
+            return ''
+        }
+
+        Map selected = selectNewestIssue(exactMatches)
+        String foundKey = owner.safe(selected?.key)
+
+        if (!owner.isBlank(foundKey)) {
+            owner.saveSuiteTestPlanKey(foundKey)
+            KeywordUtil.logInfo("Existing Test Plan found by exact summary and epic link: ${foundKey}")
+            return foundKey
+        }
+
+        return ''
+    }
+
+    String getOrCreateTestPlanKey() {
+        String summary = owner.getTestPlanName()
+
+        String existingKey = findExistingTestPlanKey(summary)
+        if (!owner.isBlank(existingKey)) {
+            KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
+            return existingKey
+        }
+
+        String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
+        if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+            owner.saveSuiteTestPlanKey(createdKey)
+            KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
+        }
+
+        return createdKey
+    }
+
+    private Map selectNewestIssue(List issues) {
+        List sorted = new ArrayList(issues)
+
+        sorted.sort { def issue ->
+            [
+                parseJiraCreated(owner.safe(issue?.fields?.created)),
+                safeLong(issue?.id)
+            ]
+        }
+
+        return sorted.last()
+    }
+
+    private long parseJiraCreated(String value) {
+        if (owner.isBlank(value)) {
+            return 0L
+        }
+
+        List<String> patterns = [
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            "yyyy-MM-dd'T'HH:mm:ss.SSSX",
+            "yyyy-MM-dd'T'HH:mm:ssZ",
+            "yyyy-MM-dd'T'HH:mm:ssX"
+        ]
+
+        for (String pattern : patterns) {
+            try {
+                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(value).time
+            } catch (Exception ignored) {
+            }
+        }
+
+        return 0L
+    }
+
+    private long safeLong(def value) {
+        try {
+            return Long.parseLong(owner.safe(value))
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+}
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import java.io.File
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+class JiraGateway {
+
+    JiraFlowCoordinator owner
+
+    JiraGateway(JiraFlowCoordinator owner) {
+        this.owner = owner
+    }
+
+    void validateRequiredConfiguration() {
+        if (owner.isBlank(owner.JIRA_TOKEN)) {
+            KeywordUtil.markFailed("JIRA_TOKEN is empty.")
+        }
+
+        if (owner.isBlank(owner.PROJECT_KEY)) {
+            KeywordUtil.markFailed("PROJECT_KEY is empty.")
+        }
+
+        if (owner.isBlank(owner.EPIC_KEY)) {
+            KeywordUtil.markFailed("EPIC_KEY is empty.")
+        }
+
+        if (owner.isBlank(owner.JIRA_BASE_URL)) {
+            KeywordUtil.markFailed("JIRA_BASE_URL is empty.")
+        }
+    }
+
+    String importExecutionResults(String xmlPath) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
+            ('filePath'): xmlPath,
+            ('project') : owner.PROJECT_KEY,
+            ('baseUrl') : owner.JIRA_BASE_URL,
+            ('token')   : owner.JIRA_TOKEN
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Import results status: ${status}")
+        KeywordUtil.logInfo("Import results response: ${body}")
+
+        if (!(status in [200, 201, 204])) {
+            return 'ERROR' + status
+        }
+
+        def parsed = new JsonSlurper().parseText(body)
+        String executionKey = owner.safe(parsed?.testExecIssue?.key)
+
+        if (owner.isBlank(executionKey)) {
+            return 'ERROR_NO_EXEC_KEY'
+        }
+
+        return executionKey
+    }
+
+    List searchTestPlans(String summary, String epicKey) {
+        String jql = buildTestPlanSearchJql(summary, epicKey)
+
+        KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
+
+        def response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan', [
+            ('baseUrl')   : owner.JIRA_BASE_URL,
+            ('token')     : owner.JIRA_TOKEN,
+            ('jql')       : jql,
+            ('maxResults'): '50'
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Get Test Plan status: ${status}")
+        KeywordUtil.logInfo("Get Test Plan response: ${body}")
+
+        if (status != 200) {
+            return []
+        }
+
+        def parsed = new JsonSlurper().parseText(body)
+        return parsed?.issues instanceof List ? parsed.issues : []
+    }
+
+    String createTestPlan(String summary, String epicKey) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan', [
+            ('token')  : owner.JIRA_TOKEN,
+            ('project'): owner.PROJECT_KEY,
+            ('summary'): summary,
+            ('epic')   : epicKey
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Create Test Plan status: ${status}")
+        KeywordUtil.logInfo("Create Test Plan response: ${body}")
+
+        if (!(status in [200, 201])) {
+            return 'ERROR' + status
+        }
+
+        def parsed = new JsonSlurper().parseText(body)
+        return owner.safe(parsed?.key)
+    }
+
+    int addExecutionToTestPlan(String testPlanKey, String executionKey) {
+        String jsonBody = JsonOutput.toJson([
+            addTestsToPlan: true,
+            add           : [executionKey]
+        ])
+
+        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan', [
+            ('token')      : owner.JIRA_TOKEN,
+            ('testPlanKey'): testPlanKey,
+            ('jsonBody')   : jsonBody
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
+        return status
+    }
+
+    int updateTestExecution(String executionKey, String executionSummary, String labels, String environment) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name', [
+            ('issueID'): executionKey,
+            ('token')  : owner.JIRA_TOKEN,
+            ('summary'): executionSummary,
+            ('labels') : labels,
+            ('env')    : environment
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        KeywordUtil.logInfo("Update Test Execution status: ${status}")
+        return status
+    }
+
+    int uploadAttachment(String issueKey, String filePath) {
+        if (owner.isBlank(filePath)) {
+            return 0
+        }
+
+        File file = new File(filePath)
+        if (!file.exists() || !file.isFile() || file.length() <= 0) {
+            KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
+            return 0
+        }
+
+        def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
+            ('token')    : owner.JIRA_TOKEN,
+            ('evidences'): file,
+            ('execID')   : issueKey
+        ]))
+
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
+
+        KeywordUtil.logInfo("Upload attachment status: ${status}")
+        KeywordUtil.logInfo("Upload attachment response: ${body}")
+
+        return status
+    }
+
+    private String buildTestPlanSearchJql(String summary, String epicKey) {
+        String escapedProject = escapeJqlValue(owner.PROJECT_KEY)
+        String escapedEpic = escapeJqlValue(epicKey)
+        String escapedSummary = escapeJqlValue(summary)
+
+        return 'project = "' + escapedProject + '"' +
+               ' AND issuetype = "Test Plan"' +
+               ' AND "Epic Link" = "' + escapedEpic + '"' +
+               ' AND summary ~ "\\"' + escapedSummary + '\\""' +
+               ' ORDER BY created DESC'
+    }
+
+    private String escapeJqlValue(String value) {
+        String text = owner.safe(value)
+        text = text.replace('\\', '\\\\')
+        text = text.replace('"', '\\"')
+        return text
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import java.io.File
+import java.io.FileInputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+import org.apache.poi.ss.usermodel.CellType
+import org.apache.poi.xssf.usermodel.XSSFRow
+import org.apache.poi.xssf.usermodel.XSSFSheet
+import org.apache.poi.xssf.usermodel.XSSFWorkbook
+
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraFlowCoordinator {
+
+    // ============================================================
+    // REQUIRED CONFIGURATION
+    // ============================================================
+
+    String JIRA_TOKEN    = 'aQa'
+    String PROJECT_KEY   = 'L96B2C'
+    String EPIC_KEY      = 'L96B2C-8234'
+    String JIRA_BASE_URL = 'https://jira-mut.d.bbg'
+
+    // ============================================================
+    // OPTIONAL CONFIGURATION
+    // ============================================================
+
+    String ENVIRONMENT                 = 'REC'
+    String LABELS                      = 'automate'
+    String MANUAL_TEST_PLAN_KEY        = ''
+
+    boolean FORCE_CREATE_NEW_TEST_PLAN = false
+    boolean RESET_SAVED_TEST_PLAN_KEY  = false
+
+    String TEST_PLAN_SUFFIX            = ' Test Plan'
+    String PRIMARY_XML_FILE_NAME       = 'cucumber.xml'
+    String SECONDARY_XML_FILE_NAME     = 'JUnit_Report.xml'
+    String GAIA_REPORT_FILE_NAME       = 'gaiaReport.html'
+    String RESULT_ZIP_NAME             = 'Results.zip'
+    String EVIDENCE_FOLDER_NAME        = 'Evidences'
+    String EVIDENCE_ZIP_NAME           = 'Evidences.zip'
+
+    // ============================================================
+    // BASIC HELPERS
+    // ============================================================
+
+    String safe(def value) {
+        return value == null ? '' : value.toString().trim()
+    }
+
+    boolean isBlank(def value) {
+        return safe(value).isEmpty()
+    }
+
+    boolean isTimestampFolderName(String name) {
+        String value = safe(name)
+        return value ==~ /\d{8}_\d{6}/ || value ==~ /\d{14}/
+    }
+
+    String sanitizeFileName(String value) {
+        return safe(value).replaceAll(/[\\\/:*?"<>|]/, '_').trim()
+    }
+
+    String nowExecution() {
+        return new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+    }
+
+    String formatHeaderDate(Date date) {
+        return new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy', Locale.ENGLISH).format(date)
+    }
+
+    String formatDurationMillis(long millis) {
+        long totalSeconds = (long) (millis / 1000L)
+        long minutes = (long) (totalSeconds / 60L)
+        long seconds = (long) (totalSeconds % 60L)
+        long remainingMillis = (long) (millis % 1000L)
+        return "${minutes}m ${seconds}s ${remainingMillis}ms"
+    }
+
+    String htmlEscape(def value) {
+        String text = safe(value)
+        return text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&#39;')
+    }
+
+    String relativeUri(File baseDir, File file) {
+        String basePath = baseDir.toURI().toString()
+        String filePath = file.toURI().toString()
+        return filePath.replace(basePath, '')
+    }
+
+    String normalizeTitle(String value) {
+        return safe(value)
+            .replace('\u00A0', ' ')
+            .replaceAll(/\s+/, ' ')
+            .trim()
+            .toLowerCase()
+    }
+
+    long toMillis(def secondsValue) {
+        try {
+            BigDecimal seconds = new BigDecimal(safe(secondsValue))
+            return (long) (seconds * 1000)
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    String readCellAsString(def cell) {
+        if (cell == null) {
+            return ''
+        }
+
+        try {
+            cell.setCellType(CellType.STRING)
+        } catch (Exception ignored) {
+        }
+
+        return safe(cell.toString())
+    }
+
+    // ============================================================
+    // REPORT PATH AND SUITE NAME
+    // ============================================================
+
+    String getReportPathFromLastRunFile() {
+        File file = new File(RunConfiguration.projectDir + File.separator + 'LastRun.xlsx')
+        if (!file.exists()) {
+            return ''
+        }
+
+        FileInputStream fis = null
+        XSSFWorkbook wb = null
+
+        try {
+            fis = new FileInputStream(file)
+            wb = new XSSFWorkbook(fis)
+            XSSFSheet sheet = wb.getSheetAt(0)
+            XSSFRow row = sheet.getRow(0)
+
+            if (row == null) {
+                return ''
+            }
+
+            return readCellAsString(row.getCell(0))
+        } catch (Exception e) {
+            KeywordUtil.logInfo("LastRun.xlsx read skipped: ${e.message}")
+            return ''
+        } finally {
+            try {
+                wb?.close()
+            } catch (Exception ignored) {
+            }
+            try {
+                fis?.close()
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    String getReportsRootPath() {
+        return RunConfiguration.projectDir + File.separator + 'Reports'
+    }
+
+    String getLatestLeafReportFolderFromReportsRoot() {
+        File reportsRoot = new File(getReportsRootPath())
+        if (!reportsRoot.exists() || !reportsRoot.isDirectory()) {
+            return ''
+        }
+
+        List<File> candidates = new ArrayList<File>()
+        collectLeafReportFolders(reportsRoot, candidates)
+
+        if (candidates.isEmpty()) {
+            return ''
+        }
+
+        List<File> uniqueCandidates = candidates.unique { File item -> item.absolutePath }
+        uniqueCandidates.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
+
+        return safe(uniqueCandidates[0].absolutePath)
+    }
+
+    void collectLeafReportFolders(File currentDir, List<File> candidates) {
+        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+            return
+        }
+
+        if (containsXmlReport(currentDir)) {
+            candidates.add(currentDir)
+            return
+        }
+
+        File[] children = currentDir.listFiles()
+        if (children == null || children.length == 0) {
+            return
+        }
+
+        for (File child : children) {
+            if (child != null && child.isDirectory()) {
+                collectLeafReportFolders(child, candidates)
+            }
+        }
+    }
+
+    boolean containsXmlReport(File dir) {
+        if (dir == null || !dir.exists() || !dir.isDirectory()) {
+            return false
+        }
+
+        File[] files = dir.listFiles()
+        if (files == null || files.length == 0) {
+            return false
+        }
+
+        String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
+        String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
+
+        for (File file : files) {
+            if (file == null || !file.isFile()) {
+                continue
+            }
+
+            String lowerName = safe(file.name).toLowerCase()
+
+            if (lowerName == primaryName || lowerName == secondaryName) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    String resolveExistingReportFolderCandidate(String rawPath) {
+        String value = safe(rawPath)
+        if (isBlank(value)) {
+            return ''
+        }
+
+        try {
+            File direct = new File(value)
+            if (direct.exists() && direct.isDirectory()) {
+                return direct.canonicalPath
+            }
+        } catch (Exception ignored) {
+        }
+
+        String normalized = value.replace('\\', '/')
+        List<String> parts = normalized.tokenize('/')
+
+        if (parts.isEmpty()) {
+            return ''
+        }
+
+        String leafName = safe(parts[parts.size() - 1])
+        String parentName = parts.size() > 1 ? safe(parts[parts.size() - 2]) : ''
+
+        String matched = findEquivalentLeafFolderUnderReportsRoot(parentName, leafName)
+        if (!isBlank(matched)) {
+            return matched
+        }
+
+        return ''
+    }
+
+    String findEquivalentLeafFolderUnderReportsRoot(String expectedParentName, String expectedLeafName) {
+        File reportsRoot = new File(getReportsRootPath())
+        if (!reportsRoot.exists() || !reportsRoot.isDirectory()) {
+            return ''
+        }
+
+        List<File> candidates = new ArrayList<File>()
+        collectLeafReportFolders(reportsRoot, candidates)
+
+        if (candidates.isEmpty()) {
+            return ''
+        }
+
+        for (File candidate : candidates) {
+            if (candidate == null) {
+                continue
+            }
+
+            String leafName = safe(candidate.name)
+            String parentName = candidate.parentFile != null ? safe(candidate.parentFile.name) : ''
+
+            if (!isBlank(expectedParentName) && !isBlank(expectedLeafName)) {
+                if (leafName.equalsIgnoreCase(expectedLeafName) && parentName.equalsIgnoreCase(expectedParentName)) {
+                    try {
+                        return candidate.canonicalPath
+                    } catch (Exception ignored) {
+                        return candidate.absolutePath
+                    }
+                }
+            }
+
+            if (!isBlank(expectedLeafName) && leafName.equalsIgnoreCase(expectedLeafName)) {
+                try {
+                    return candidate.canonicalPath
+                } catch (Exception ignored) {
+                    return candidate.absolutePath
+                }
+            }
+        }
+
+        return ''
+    }
+
+    String getResolvedReportFolder() {
+        List<String> candidates = new ArrayList<String>()
+
+        String current = safe(RunConfiguration.getReportFolder())
+        if (!isBlank(current)) {
+            candidates.add(current)
+        }
+
+        String fromLastRun = getReportPathFromLastRunFile()
+        if (!isBlank(fromLastRun)) {
+            candidates.add(fromLastRun)
+        }
+
+        String latest = getLatestLeafReportFolderFromReportsRoot()
+        if (!isBlank(latest)) {
+            candidates.add(latest)
+        }
+
+        for (String candidate : candidates) {
+            String resolved = resolveExistingReportFolderCandidate(candidate)
+            if (!isBlank(resolved)) {
+                return resolved
+            }
+        }
+
+        return ''
+    }
+
+    String getCurrentSuiteName() {
+        String reportFolder = getResolvedReportFolder()
+        if (isBlank(reportFolder)) {
+            return ''
+        }
+
+        File currentFolder = new File(reportFolder)
+        String currentName = safe(currentFolder.name)
+
+        if (isTimestampFolderName(currentName) && currentFolder.parentFile != null) {
+            return safe(currentFolder.parentFile.name)
+        }
+
+        return currentName
+    }
+
+    String getExecutionSummary() {
+        return getCurrentSuiteName() + ' ' + nowExecution()
+    }
+
+    String getTestPlanName() {
+        return getCurrentSuiteName() + TEST_PLAN_SUFFIX
+    }
+
+    // ============================================================
+    // SAVED TEST PLAN KEY
+    // ============================================================
+
+    String getTestPlanKeysFolderPath() {
+        File folder = new File(RunConfiguration.projectDir + File.separator + 'TestPlanKeys')
+        if (!folder.exists()) {
+            folder.mkdirs()
+        }
+        return folder.absolutePath
+    }
+
+    String getSuiteTestPlanFilePath() {
+        String suiteName = sanitizeFileName(getCurrentSuiteName())
+        return getTestPlanKeysFolderPath() + File.separator + suiteName + '.txt'
+    }
+
+    void saveSuiteTestPlanKey(String testPlanKey) {
+        if (isBlank(testPlanKey)) {
+            return
+        }
+
+        File file = new File(getSuiteTestPlanFilePath())
+        file.parentFile?.mkdirs()
+        file.setText(testPlanKey, 'UTF-8')
+    }
+
+    String readSavedSuiteTestPlanKey() {
+        if (RESET_SAVED_TEST_PLAN_KEY) {
+            return ''
+        }
+
+        File file = new File(getSuiteTestPlanFilePath())
+        if (!file.exists()) {
+            return ''
+        }
+
+        return safe(file.text)
+    }
+
+    // ============================================================
+    // XML AND SCREENSHOTS
+    // ============================================================
+
+    String findXmlFile(String reportFolder) {
+        if (isBlank(reportFolder)) {
+            return ''
+        }
+
+        File root = new File(reportFolder)
+        if (!root.exists() || !root.isDirectory()) {
+            return ''
+        }
+
+        List<File> preferred = new ArrayList<File>()
+        List<File> fallback = new ArrayList<File>()
+        collectXmlFiles(root, preferred, fallback)
+
+        if (!preferred.isEmpty()) {
+            preferred.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
+            return preferred[0].absolutePath
+        }
+
+        if (!fallback.isEmpty()) {
+            fallback.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
+            return fallback[0].absolutePath
+        }
+
+        return ''
+    }
+
+    void collectXmlFiles(File currentDir, List<File> preferred, List<File> fallback) {
+        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+            return
+        }
+
+        File[] children = currentDir.listFiles()
+        if (children == null || children.length == 0) {
+            return
+        }
+
+        String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
+        String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
+
+        for (File child : children) {
+            if (child == null) {
+                continue
+            }
+
+            if (child.isDirectory()) {
+                collectXmlFiles(child, preferred, fallback)
+                continue
+            }
+
+            String lowerName = safe(child.name).toLowerCase()
+            if (lowerName == primaryName) {
+                preferred.add(child)
+            } else if (lowerName == secondaryName) {
+                fallback.add(child)
+            }
+        }
+    }
+
+    boolean isVisualEvidence(File file) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return false
+        }
+
+        String lower = safe(file.name).toLowerCase()
+        return lower.endsWith('.png') ||
+               lower.endsWith('.jpg') ||
+               lower.endsWith('.jpeg') ||
+               lower.endsWith('.webp')
+    }
+
+    boolean shouldSkipVisualEvidence(File file) {
+        if (!isVisualEvidence(file)) {
+            return true
+        }
+
+        String path = safe(file.absolutePath).toLowerCase()
+        String separator = File.separator.toLowerCase()
+
+        if (path.contains(separator + 'requests' + separator)) {
+            return true
+        }
+        if (path.contains(separator + 'videos' + separator)) {
+            return true
+        }
+        if (path.endsWith(separator + safe(GAIA_REPORT_FILE_NAME).toLowerCase())) {
+            return true
+        }
+
+        return false
+    }
+
+    List<File> getEvidenceSearchRoots(String reportFolder) {
+        List<File> roots = new ArrayList<File>()
+
+        if (isBlank(reportFolder)) {
+            return roots
+        }
+
+        File current = new File(reportFolder)
+        if (current.exists() && current.isDirectory()) {
+            roots.add(current)
+        }
+
+        if (current.parentFile != null && current.parentFile.exists() && current.parentFile.isDirectory()) {
+            roots.add(current.parentFile)
+        }
+
+        if (current.parentFile != null &&
+            current.parentFile.parentFile != null &&
+            current.parentFile.parentFile.exists() &&
+            current.parentFile.parentFile.isDirectory()) {
+            roots.add(current.parentFile.parentFile)
+        }
+
+        File reportsRoot = new File(getReportsRootPath())
+        if (reportsRoot.exists() && reportsRoot.isDirectory()) {
+            roots.add(reportsRoot)
+        }
+
+        return roots.unique { File item -> item.absolutePath }
+    }
+
+    List<File> collectFailureImages(String reportFolder) {
+        List<File> images = new ArrayList<File>()
+        List<File> roots = getEvidenceSearchRoots(reportFolder)
+
+        if (roots.isEmpty()) {
+            return images
+        }
+
+        for (File root : roots) {
+            collectFailureImagesRecursive(root, images)
+        }
+
+        List<File> uniqueImages = images.unique { File item -> item.absolutePath }
+        uniqueImages.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+        return uniqueImages
+    }
+
+    void collectFailureImagesRecursive(File currentDir, List<File> images) {
+        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+            return
+        }
+
+        File[] children = currentDir.listFiles()
+        if (children == null || children.length == 0) {
+            return
+        }
+
+        for (File child : children) {
+            if (child == null) {
+                continue
+            }
+
+            if (child.isDirectory()) {
+                collectFailureImagesRecursive(child, images)
+                continue
+            }
+
+            if (!shouldSkipVisualEvidence(child)) {
+                images.add(child)
+            }
+        }
+    }
+
+    // ============================================================
+    // MAIN FLOW
+    // ============================================================
+
+    def jiraImport() {
+        return jiraImport('')
+    }
+
+    def jiraImport(String epicKeyOverride) {
+        if (!isBlank(epicKeyOverride)) {
+            EPIC_KEY = safe(epicKeyOverride)
+        }
+
+        JiraGateway gateway = new JiraGateway(this)
+        JiraTestPlanManager testPlanManager = new JiraTestPlanManager(this, gateway)
+        JiraGaiaReportBuilder reportBuilder = new JiraGaiaReportBuilder(this)
+        JiraExecutionPublisher executionPublisher = new JiraExecutionPublisher(this, gateway)
+
+        gateway.validateRequiredConfiguration()
+
+        KeywordUtil.logInfo("============================================================")
+        KeywordUtil.logInfo("Starting Jira import flow")
+        KeywordUtil.logInfo("============================================================")
+
+        String reportFolder = getResolvedReportFolder()
+        if (isBlank(reportFolder)) {
+            KeywordUtil.markFailed("Report folder could not be resolved.")
+            return
+        }
+
+        KeywordUtil.logInfo("Using report folder: ${reportFolder}")
+        KeywordUtil.logInfo("Epic key used: ${EPIC_KEY}")
+
+        String suiteName = getCurrentSuiteName()
+        if (isBlank(suiteName)) {
+            KeywordUtil.markFailed("Suite name could not be resolved from report path.")
+            return
+        }
+
+        KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
+
+        String executionSummary = getExecutionSummary()
+        String testPlanSummary = getTestPlanName()
+
+        KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+        KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+
+        String xmlPath = findXmlFile(reportFolder)
+        if (isBlank(xmlPath)) {
+            KeywordUtil.markFailed("JUnit or Cucumber XML file was not found in report folder.")
+            return
+        }
+
+        KeywordUtil.logInfo("XML file found: ${xmlPath}")
+
+        List<File> collectedImages = collectFailureImages(reportFolder)
+        KeywordUtil.logInfo("Failure images found: ${collectedImages.size()}")
+        for (File img : collectedImages) {
+            KeywordUtil.logInfo("Failure image candidate: ${img.absolutePath}")
+        }
+
+        String gaiaReportPath = reportBuilder.createGaiaHtmlReport(reportFolder, suiteName, xmlPath)
+        if (isBlank(gaiaReportPath)) {
+            KeywordUtil.markWarning("Gaia report could not be created.")
+        } else {
+            KeywordUtil.logInfo("Gaia report created: ${gaiaReportPath}")
+        }
+
+        String testPlanKey = testPlanManager.getOrCreateTestPlanKey()
+        if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
+            KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+            return
+        }
+
+        Map executionResult = executionPublisher.publishExecution(xmlPath, executionSummary, testPlanKey)
+
+        String executionKey = safe(executionResult.executionKey)
+        if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+            KeywordUtil.markFailed("Execution import failed: ${executionKey}")
+            return
+        }
+
+        KeywordUtil.logInfo("============================================================")
+        KeywordUtil.logInfo("Jira import finished")
+        KeywordUtil.logInfo("============================================================")
+        KeywordUtil.logInfo("Execution key: ${executionKey}")
+        KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+        KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+        KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+        KeywordUtil.logInfo("Gaia report attachment status: ${executionResult.gaiaReportStatus}")
+        KeywordUtil.logInfo("Evidences.zip attachment status: ${executionResult.evidencesStatus}")
+        KeywordUtil.logInfo("Results.zip attachment status: ${executionResult.resultsStatus}")
+        KeywordUtil.logInfo("Add execution to Test Plan status: ${executionResult.addExecutionStatus}")
+        KeywordUtil.logInfo("Update Test Execution status: ${executionResult.updateExecutionStatus}")
+
+        return executionKey
+    }
+}
