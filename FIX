@@ -7,7 +7,110 @@ pipeline {
             daysToKeepStr: '7',
             artifactNumToKeepStr: '3'
         ))
-        timestamps()
+        timestamps()package jiraIntegration
+
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraTestPlanManager {
+
+    JiraFlowCoordinator owner
+    JiraGateway gateway
+
+    JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
+        this.owner = owner
+        this.gateway = gateway
+    }
+
+    String findExistingTestPlanKey(String summary) {
+        if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
+            KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
+            return ''
+        }
+
+        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
+            KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
+            return owner.MANUAL_TEST_PLAN_KEY
+        }
+
+        String expectedSummary = owner.normalizeTitle(summary)
+        String savedKey = owner.readSavedSuiteTestPlanKey()
+
+        List issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
+
+        if (!(issues instanceof List) || issues.isEmpty()) {
+            KeywordUtil.logInfo("No Test Plan found by Jira search for summary: ${summary}")
+            return ''
+        }
+
+        if (!owner.isBlank(savedKey)) {
+            def savedMatch = issues.find { issue ->
+                owner.safe(issue?.key) == savedKey &&
+                owner.normalizeTitle(issue?.fields?.summary) == expectedSummary
+            }
+
+            if (savedMatch != null) {
+                KeywordUtil.logInfo("Using saved Test Plan key validated by Jira search: ${savedKey}")
+                owner.saveSuiteTestPlanKey(savedKey)
+                return savedKey
+            }
+
+            KeywordUtil.logInfo("Saved Test Plan key ignored because it did not match the current suite summary: ${savedKey}")
+        }
+
+        List exactMatches = issues.findAll { issue ->
+            owner.normalizeTitle(issue?.fields?.summary) == expectedSummary
+        }
+
+        if (exactMatches != null && !exactMatches.isEmpty()) {
+            exactMatches.sort { a, b ->
+                owner.safe(a?.key) <=> owner.safe(b?.key)
+            }
+
+            String foundKey = owner.safe(exactMatches[0]?.key)
+            if (!owner.isBlank(foundKey)) {
+                owner.saveSuiteTestPlanKey(foundKey)
+
+                if (exactMatches.size() > 1) {
+                    KeywordUtil.logInfo("More than one exact Test Plan match was found. Reusing the first key: ${foundKey}")
+                } else {
+                    KeywordUtil.logInfo("Existing Test Plan found by exact summary: ${foundKey}")
+                }
+
+                return foundKey
+            }
+        }
+
+        KeywordUtil.logInfo("Jira returned issues, but none matched the Test Plan summary exactly: ${summary}")
+        return ''
+    }
+
+    String getOrCreateTestPlanKey() {
+        String summary = owner.getTestPlanName()
+
+        String existingKey = findExistingTestPlanKey(summary)
+        if (!owner.isBlank(existingKey)) {
+            KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
+            return existingKey
+        }
+
+        String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
+        if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+            owner.saveSuiteTestPlanKey(createdKey)
+            KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
+            return createdKey
+        }
+
+        KeywordUtil.logInfo("Create Test Plan did not return a valid key. A second Jira search will be executed before failing.")
+
+        String searchAfterCreate = findExistingTestPlanKey(summary)
+        if (!owner.isBlank(searchAfterCreate)) {
+            KeywordUtil.logInfo("An existing Test Plan was found after create fallback: ${searchAfterCreate}")
+            return searchAfterCreate
+        }
+
+        return createdKey
+    }
+}
         disableConcurrentBuilds()
         timeout(time: 10, unit: 'HOURS')
         ansiColor('xterm')
