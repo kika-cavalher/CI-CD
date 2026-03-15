@@ -3,11 +3,8 @@ package jiraIntegration
 import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
 import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
 
-import com.kms.katalon.core.testobject.ConditionType
-import com.kms.katalon.core.testobject.RequestObject
-import com.kms.katalon.core.testobject.TestObjectProperty
 import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
 
@@ -16,224 +13,214 @@ import groovy.json.JsonSlurper
 
 class JiraGateway {
 
-	JiraFlowCoordinator owner
+    JiraFlowCoordinator owner
 
-	JiraGateway(JiraFlowCoordinator owner) {
-		this.owner = owner
-	}
+    JiraGateway(JiraFlowCoordinator owner) {
+        this.owner = owner
+    }
 
-	void validateRequiredConfiguration() {
-		if (owner.isBlank(owner.JIRA_TOKEN)) {
-			KeywordUtil.markFailed("JIRA_TOKEN is empty.")
-		}
+    void validateRequiredConfiguration() {
+        if (owner.isBlank(owner.JIRA_TOKEN)) {
+            KeywordUtil.markFailed("JIRA_TOKEN is empty.")
+        }
 
-		if (owner.isBlank(owner.PROJECT_KEY)) {
-			KeywordUtil.markFailed("PROJECT_KEY is empty.")
-		}
+        if (owner.isBlank(owner.PROJECT_KEY)) {
+            KeywordUtil.markFailed("PROJECT_KEY is empty.")
+        }
 
-		if (owner.isBlank(owner.EPIC_KEY)) {
-			KeywordUtil.markWarning("EPIC_KEY is empty. New Test Plans will be created without epic association if your Create Test Plan request object depends on it.")
-		}
+        if (owner.isBlank(owner.EPIC_KEY)) {
+            KeywordUtil.markFailed("EPIC_KEY is empty.")
+        }
 
-		if (owner.isBlank(owner.JIRA_BASE_URL)) {
-			KeywordUtil.markFailed("JIRA_BASE_URL is empty.")
-		}
-	}
+        if (owner.isBlank(owner.JIRA_BASE_URL)) {
+            KeywordUtil.markFailed("JIRA_BASE_URL is empty.")
+        }
+    }
 
-	String importExecutionResults(String xmlPath) {
-		def response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
-			('filePath'): xmlPath,
-			('project') : owner.PROJECT_KEY,
-			('baseUrl') : owner.JIRA_BASE_URL,
-			('token')   : owner.JIRA_TOKEN
-		]))
+    String importExecutionResults(String xmlPath) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
+            ('filePath'): xmlPath,
+            ('project') : owner.PROJECT_KEY,
+            ('baseUrl') : owner.JIRA_BASE_URL,
+            ('token')   : owner.JIRA_TOKEN
+        ]))
 
-		int status = WS.getResponseStatusCode(response)
-		String body = owner.safe(response.getResponseBodyContent())
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
 
-		KeywordUtil.logInfo("Import results status: ${status}")
-		KeywordUtil.logInfo("Import results response: ${body}")
+        KeywordUtil.logInfo("Import results status: ${status}")
+        KeywordUtil.logInfo("Import results response: ${body}")
 
-		if (!(status in [200, 201, 204])) {
-			return 'ERROR' + status
-		}
+        if (!(status in [200, 201, 204])) {
+            return 'ERROR' + status
+        }
 
-		def parsed = new JsonSlurper().parseText(body)
-		String executionKey = owner.safe(parsed?.testExecIssue?.key)
+        def parsed = new JsonSlurper().parseText(body)
+        String executionKey = owner.safe(parsed?.testExecIssue?.key)
 
-		if (owner.isBlank(executionKey)) {
-			return 'ERROR_NO_EXEC_KEY'
-		}
+        if (owner.isBlank(executionKey)) {
+            return 'ERROR_NO_EXEC_KEY'
+        }
 
-		return executionKey
-	}
+        return executionKey
+    }
 
-	Map searchTestPlans(String summary) {
-		String exactSummary = owner.safe(summary)
+    List searchTestPlans(String summary, String epicKey) {
+        try {
+            String cleanedSummary = owner.safe(summary)
+            String escapedSummary = escapeJqlText(cleanedSummary)
 
-		if (owner.isBlank(exactSummary)) {
-			return [
-				success: false,
-				status : 0,
-				error  : 'Summary is empty.',
-				issues  : []
-			]
-		}
+            String jql =
+                'project = "' + owner.PROJECT_KEY + '"' +
+                ' AND issuetype = "Test Plan"' +
+                ' AND summary ~ "\\\"' + escapedSummary + '\\\""' +
+                ' ORDER BY created DESC'
 
-		String escapedSummary = escapeJqlPhrase(exactSummary)
+            String fields = 'summary,created'
 
-		String jql =
-				'project = "' + owner.PROJECT_KEY + '"' +
-				' AND issuetype = "Test Plan"' +
-				' AND summary ~ "\\\"' + escapedSummary + '\\\""' +
-				' ORDER BY created DESC'
+            KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
 
-		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
+            def response = WS.sendRequest(findTestObject('Jira Integration/Get Test Plan', [
+                ('baseUrl')      : owner.JIRA_BASE_URL,
+                ('token')        : owner.JIRA_TOKEN,
+                ('jqlEncoded')   : URLEncoder.encode(jql, 'UTF-8'),
+                ('maxResults')   : '20',
+                ('fieldsEncoded'): URLEncoder.encode(fields, 'UTF-8')
+            ]))
 
-		try {
-			RequestObject request = buildSearchRequest(jql, 20, 'key,summary,created')
-			def response = WS.sendRequest(request)
+            int status = WS.getResponseStatusCode(response)
+            String body = owner.safe(response.getResponseBodyContent())
 
-			int status = WS.getResponseStatusCode(response)
-			String body = owner.safe(response.getResponseBodyContent())
+            KeywordUtil.logInfo("Get Test Plan status: ${status}")
+            KeywordUtil.logInfo("Get Test Plan response: ${body}")
 
-			KeywordUtil.logInfo("Get Test Plan status: ${status}")
-			KeywordUtil.logInfo("Get Test Plan response: ${body}")
+            if (status != 200) {
+                return []
+            }
 
-			if (status != 200) {
-				return [
-					success: false,
-					status : status,
-					error  : body,
-					issues : []
-				]
-			}
+            def parsed = new JsonSlurper().parseText(body)
+            List issues = parsed?.issues instanceof List ? parsed.issues : []
 
-			def parsed = new JsonSlurper().parseText(body)
-			List issues = parsed?.issues instanceof List ? parsed.issues : []
+            if (issues.isEmpty()) {
+                return []
+            }
 
-			return [
-				success: true,
-				status : status,
-				error  : '',
-				issues : issues
-			]
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Get Test Plan request failed: ${e.message}")
-			return [
-				success: false,
-				status : 0,
-				error  : owner.safe(e.message),
-				issues : []
-			]
-		}
-	}
+            issues = issues.sort { a, b ->
+                parseJiraDate(owner.safe(b?.fields?.created)) <=> parseJiraDate(owner.safe(a?.fields?.created))
+            }
 
-	private RequestObject buildSearchRequest(String jql, int maxResults, String fields) {
-		String encodedJql = urlEncode(jql)
-		String encodedFields = urlEncode(fields)
-		String baseUrl = owner.safe(owner.JIRA_BASE_URL)
-		String url = baseUrl + '/rest/api/2/search?jql=' + encodedJql + '&maxResults=' + maxResults + '&fields=' + encodedFields
+            return issues
+        } catch (Exception e) {
+            KeywordUtil.logInfo("Get Test Plan request failed: ${e.message}")
+            return []
+        }
+    }
 
-		RequestObject request = new RequestObject('Dynamic Get Test Plan')
-		request.setRestUrl(url)
-		request.setRestRequestMethod('GET')
-		request.setHttpHeaderProperties([
-			new TestObjectProperty('Authorization', ConditionType.EQUALS, 'Bearer ' + owner.JIRA_TOKEN),
-			new TestObjectProperty('Accept', ConditionType.EQUALS, 'application/json')
-		])
+    String createTestPlan(String summary, String epicKey) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan', [
+            ('token')  : owner.JIRA_TOKEN,
+            ('project'): owner.PROJECT_KEY,
+            ('summary'): summary,
+            ('epic')   : epicKey
+        ]))
 
-		return request
-	}
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
 
-	private String urlEncode(String value) {
-		return URLEncoder.encode(owner.safe(value), StandardCharsets.UTF_8.toString())
-	}
+        KeywordUtil.logInfo("Create Test Plan status: ${status}")
+        KeywordUtil.logInfo("Create Test Plan response: ${body}")
 
-	private String escapeJqlPhrase(String value) {
-		return owner.safe(value)
-				.replace('\\', '\\\\')
-				.replace('"', '\\"')
-	}
+        if (!(status in [200, 201])) {
+            return 'ERROR' + status
+        }
 
-	String createTestPlan(String summary, String epicKey) {
-		def response = WS.sendRequest(findTestObject('Jira Integration/Create Test Plan', [
-			('token')  : owner.JIRA_TOKEN,
-			('project'): owner.PROJECT_KEY,
-			('summary'): summary,
-			('epic')   : epicKey
-		]))
+        def parsed = new JsonSlurper().parseText(body)
+        return owner.safe(parsed?.key)
+    }
 
-		int status = WS.getResponseStatusCode(response)
-		String body = owner.safe(response.getResponseBodyContent())
+    int addExecutionToTestPlan(String testPlanKey, String executionKey) {
+        String jsonBody = JsonOutput.toJson([
+            addTestsToPlan: true,
+            add           : [executionKey]
+        ])
 
-		KeywordUtil.logInfo("Create Test Plan status: ${status}")
-		KeywordUtil.logInfo("Create Test Plan response: ${body}")
+        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan', [
+            ('token')      : owner.JIRA_TOKEN,
+            ('testPlanKey'): testPlanKey,
+            ('jsonBody')   : jsonBody
+        ]))
 
-		if (!(status in [200, 201])) {
-			return 'ERROR' + status
-		}
+        int status = WS.getResponseStatusCode(response)
+        KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
+        return status
+    }
 
-		def parsed = new JsonSlurper().parseText(body)
-		return owner.safe(parsed?.key)
-	}
+    int updateTestExecution(String executionKey, String executionSummary, String labels, String environment) {
+        def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name', [
+            ('issueID'): executionKey,
+            ('token')  : owner.JIRA_TOKEN,
+            ('summary'): executionSummary,
+            ('labels') : labels,
+            ('env')    : environment
+        ]))
 
-	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
-		String jsonBody = JsonOutput.toJson([
-			addTestsToPlan: true,
-			add           : [executionKey]
-		])
+        int status = WS.getResponseStatusCode(response)
+        KeywordUtil.logInfo("Update Test Execution status: ${status}")
+        return status
+    }
 
-		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Plan', [
-			('token')      : owner.JIRA_TOKEN,
-			('testPlanKey'): testPlanKey,
-			('jsonBody')   : jsonBody
-		]))
+    int uploadAttachment(String issueKey, String filePath) {
+        if (owner.isBlank(filePath)) {
+            return 0
+        }
 
-		int status = WS.getResponseStatusCode(response)
-		KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
-		return status
-	}
+        File file = new File(filePath)
+        if (!file.exists() || !file.isFile() || file.length() <= 0) {
+            KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
+            return 0
+        }
 
-	int updateTestExecution(String executionKey, String executionSummary, String labels, String environment) {
-		def response = WS.sendRequest(findTestObject('Jira Integration/Update Test Execution Name', [
-			('issueID'): executionKey,
-			('token')  : owner.JIRA_TOKEN,
-			('summary'): executionSummary,
-			('labels') : labels,
-			('env')    : environment
-		]))
+        def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
+            ('token')    : owner.JIRA_TOKEN,
+            ('evidences'): file,
+            ('execID')   : issueKey
+        ]))
 
-		int status = WS.getResponseStatusCode(response)
-		KeywordUtil.logInfo("Update Test Execution status: ${status}")
-		return status
-	}
+        int status = WS.getResponseStatusCode(response)
+        String body = owner.safe(response.getResponseBodyContent())
 
-	int uploadAttachment(String issueKey, String filePath) {
-		if (owner.isBlank(filePath)) {
-			return 0
-		}
+        KeywordUtil.logInfo("Upload attachment status: ${status}")
+        KeywordUtil.logInfo("Upload attachment response: ${body}")
 
-		File file = new File(filePath)
-		if (!file.exists() || !file.isFile() || file.length() <= 0) {
-			KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
-			return 0
-		}
+        return status
+    }
 
-		def response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
-			('token')    : owner.JIRA_TOKEN,
-			('evidences'): file,
-			('execID')   : issueKey
-		]))
+    private String escapeJqlText(String value) {
+        return owner.safe(value)
+            .replace('\\', '\\\\')
+            .replace('"', '\\"')
+    }
 
-		int status = WS.getResponseStatusCode(response)
-		String body = owner.safe(response.getResponseBodyContent())
+    private long parseJiraDate(String value) {
+        String text = owner.safe(value)
+        if (owner.isBlank(text)) {
+            return 0L
+        }
 
-		KeywordUtil.logInfo("Upload attachment status: ${status}")
-		KeywordUtil.logInfo("Upload attachment response: ${body}")
+        List<String> patterns = [
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            "yyyy-MM-dd'T'HH:mm:ssZ"
+        ]
 
-		return status
-	}
+        for (String pattern : patterns) {
+            try {
+                return new SimpleDateFormat(pattern).parse(text).time
+            } catch (Exception ignored) {
+            }
+        }
+
+        return 0L
+    }
 }
 
 
@@ -243,119 +230,71 @@ class JiraGateway {
 
 package jiraIntegration
 
-import java.text.SimpleDateFormat
-
 import com.kms.katalon.core.util.KeywordUtil
 
 class JiraTestPlanManager {
 
-	JiraFlowCoordinator owner
-	JiraGateway gateway
+    JiraFlowCoordinator owner
+    JiraGateway gateway
 
-	JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
-		this.owner = owner
-		this.gateway = gateway
-	}
+    JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
+        this.owner = owner
+        this.gateway = gateway
+    }
 
-	String findExistingTestPlanKey(String summary) {
-		if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
-			KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
-			return ''
-		}
+    String findExistingTestPlanKey(String summary) {
+        if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
+            KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
+            return ''
+        }
 
-		if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
-			KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
-			return owner.MANUAL_TEST_PLAN_KEY
-		}
+        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
+            KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
+            return owner.MANUAL_TEST_PLAN_KEY
+        }
 
-		Map searchResult = gateway.searchTestPlans(summary)
+        String expected = owner.normalizeTitle(summary)
+        List issues = gateway.searchTestPlans(summary, owner.EPIC_KEY)
 
-		if (!(searchResult?.success == true)) {
-			String errorMessage = owner.safe(searchResult?.error)
-			if (owner.isBlank(errorMessage)) {
-				errorMessage = 'Unknown search error.'
-			}
+        if (!(issues instanceof List) || issues.isEmpty()) {
+            KeywordUtil.logInfo("No existing Test Plan found for summary: ${summary}")
+            return ''
+        }
 
-			KeywordUtil.logInfo("Test Plan search failed. Creation will be blocked to avoid duplicates. Reason: ${errorMessage}")
-			return 'ERROR_SEARCH_FAILED: ' + errorMessage
-		}
+        List exactMatches = issues.findAll { issue ->
+            owner.normalizeTitle(issue?.fields?.summary) == expected
+        }
 
-		List issues = searchResult?.issues instanceof List ? (searchResult.issues as List) : []
+        if (exactMatches != null && !exactMatches.isEmpty()) {
+            def selected = exactMatches[0]
+            String foundKey = owner.safe(selected?.key)
 
-		if (issues.isEmpty()) {
-			KeywordUtil.logInfo("No existing Test Plan found for summary: ${summary}")
-			return ''
-		}
+            if (!owner.isBlank(foundKey)) {
+                owner.saveSuiteTestPlanKey(foundKey)
+                KeywordUtil.logInfo("Existing Test Plan found by exact summary: ${foundKey}")
+                return foundKey
+            }
+        }
 
-		String expected = owner.normalizeTitle(summary)
+        KeywordUtil.logInfo("Search returned items, but none matched exact summary: ${summary}")
+        return ''
+    }
 
-		List exactMatches = issues.findAll { issue ->
-			String foundSummary = owner.normalizeTitle(issue?.fields?.summary)
-			return foundSummary == expected
-		}
+    String getOrCreateTestPlanKey() {
+        String summary = owner.getTestPlanName()
 
-		if (exactMatches.isEmpty()) {
-			KeywordUtil.logInfo("Search returned results, but no exact summary match was found for: ${summary}")
-			return ''
-		}
+        String existingKey = findExistingTestPlanKey(summary)
+        if (!owner.isBlank(existingKey)) {
+            KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
+            return existingKey
+        }
 
-		exactMatches.sort { a, b ->
-			Long bTime = parseCreatedMillis(owner.safe(b?.fields?.created))
-			Long aTime = parseCreatedMillis(owner.safe(a?.fields?.created))
-			return bTime <=> aTime
-		}
+        String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
+        if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+            owner.saveSuiteTestPlanKey(createdKey)
+            KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
+        }
 
-		String foundKey = owner.safe(exactMatches[0]?.key)
-
-		if (!owner.isBlank(foundKey)) {
-			KeywordUtil.logInfo("Existing Test Plan found by exact summary using newest created match: ${foundKey}")
-			return foundKey
-		}
-
-		return ''
-	}
-
-	String getOrCreateTestPlanKey() {
-		String summary = owner.getTestPlanName()
-
-		String existingKey = findExistingTestPlanKey(summary)
-
-		if (owner.safe(existingKey).startsWith('ERROR_SEARCH_FAILED')) {
-			return existingKey
-		}
-
-		if (!owner.isBlank(existingKey)) {
-			KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
-			return existingKey
-		}
-
-		String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
-		if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
-			KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
-		}
-
-		return createdKey
-	}
-
-	private long parseCreatedMillis(String raw) {
-		if (owner.isBlank(raw)) {
-			return 0L
-		}
-
-		List<String> patterns = [
-			"yyyy-MM-dd'T'HH:mm:ss.SSSZ",
-			"yyyy-MM-dd'T'HH:mm:ss.SSSXX",
-			"yyyy-MM-dd'T'HH:mm:ssZ",
-			"yyyy-MM-dd'T'HH:mm:ssXX"
-		]
-
-		for (String pattern : patterns) {
-			try {
-				return new SimpleDateFormat(pattern).parse(raw).time
-			} catch (Exception ignored) {
-			}
-		}
-
-		return 0L
-	}
+        return createdKey
+    }
 }
