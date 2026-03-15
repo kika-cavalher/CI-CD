@@ -59,7 +59,7 @@ class JiraGateway {
 			return 'ERROR' + status
 		}
 
-		def parsed = new JsonSlurper().parseText(body)
+		def parsed = body ? new JsonSlurper().parseText(body) : [:]
 		String executionKey = owner.safe(parsed?.testExecIssue?.key)
 
 		if (owner.isBlank(executionKey)) {
@@ -69,33 +69,23 @@ class JiraGateway {
 		return executionKey
 	}
 
-	List searchTestPlans(String summary, String epicKey) {
-		String safeSummary = owner.safe(summary)
-
-		if (owner.isBlank(safeSummary)) {
-			KeywordUtil.logInfo("Test Plan summary is empty. Search skipped.")
-			return []
-		}
-
-		String escapedSummary = safeSummary.replace('"', '\\"')
-
+	Map searchTestPlans(String summary, String epicKey) {
 		String jql =
 			'project = "' + owner.PROJECT_KEY + '" ' +
 			'AND issuetype = "Test Plan" ' +
-			'AND summary = "' + escapedSummary + '" ' +
 			'ORDER BY created DESC'
 
 		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
 
 		try {
 			String encodedJql = URLEncoder.encode(jql, StandardCharsets.UTF_8.toString())
-			String encodedFields = URLEncoder.encode('summary,created', StandardCharsets.UTF_8.toString())
+			String encodedFields = URLEncoder.encode('summary,created,issuetype', StandardCharsets.UTF_8.toString())
 
 			String url =
 				owner.JIRA_BASE_URL +
 				'/rest/api/2/search' +
 				'?jql=' + encodedJql +
-				'&maxResults=20' +
+				'&maxResults=200' +
 				'&fields=' + encodedFields
 
 			RequestObject request = new RequestObject('Runtime Search Test Plan')
@@ -115,19 +105,93 @@ class JiraGateway {
 			KeywordUtil.logInfo("Get Test Plan response: ${body}")
 
 			if (status != 200) {
-				KeywordUtil.logInfo("Search Test Plan failed. Status: ${status}. Error: ${body}")
-				return []
+				return [
+					ok    : false,
+					status: status,
+					error : body,
+					issues: []
+				]
 			}
 
-			def parsed = new JsonSlurper().parseText(body)
+			def parsed = body ? new JsonSlurper().parseText(body) : [:]
 			List issues = parsed?.issues instanceof List ? parsed.issues : []
 
-			KeywordUtil.logInfo("Test Plans found: ${issues.size()}")
-
-			return issues
+			return [
+				ok    : true,
+				status: status,
+				error : '',
+				issues: issues
+			]
 		} catch (Exception e) {
 			KeywordUtil.logInfo("Get Test Plan request failed: ${e.message}")
-			return []
+			return [
+				ok    : false,
+				status: 0,
+				error : e.message,
+				issues: []
+			]
+		}
+	}
+
+	Map getIssueByKey(String issueKey) {
+		if (owner.isBlank(issueKey)) {
+			return [
+				ok    : false,
+				status: 0,
+				error : 'Issue key is empty.',
+				issue : null
+			]
+		}
+
+		try {
+			String encodedFields = URLEncoder.encode('summary,created,issuetype', StandardCharsets.UTF_8.toString())
+
+			String url =
+				owner.JIRA_BASE_URL +
+				'/rest/api/2/issue/' + issueKey +
+				'?fields=' + encodedFields
+
+			RequestObject request = new RequestObject('Runtime Get Issue By Key')
+			request.setRestUrl(url)
+			request.setRestRequestMethod('GET')
+			request.setHttpHeaderProperties([
+				new TestObjectProperty('Authorization', ConditionType.EQUALS, 'Bearer ' + owner.JIRA_TOKEN),
+				new TestObjectProperty('Accept', ConditionType.EQUALS, 'application/json')
+			])
+
+			def response = WS.sendRequest(request)
+
+			int status = WS.getResponseStatusCode(response)
+			String body = owner.safe(response.getResponseBodyContent())
+
+			KeywordUtil.logInfo("Get issue by key status: ${status}")
+			KeywordUtil.logInfo("Get issue by key response: ${body}")
+
+			if (status != 200) {
+				return [
+					ok    : false,
+					status: status,
+					error : body,
+					issue : null
+				]
+			}
+
+			def parsed = body ? new JsonSlurper().parseText(body) : [:]
+
+			return [
+				ok    : true,
+				status: status,
+				error : '',
+				issue : parsed
+			]
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Get issue by key request failed: ${e.message}")
+			return [
+				ok    : false,
+				status: 0,
+				error : e.message,
+				issue : null
+			]
 		}
 	}
 
@@ -149,7 +213,7 @@ class JiraGateway {
 			return 'ERROR' + status
 		}
 
-		def parsed = new JsonSlurper().parseText(body)
+		def parsed = body ? new JsonSlurper().parseText(body) : [:]
 		return owner.safe(parsed?.key)
 	}
 
@@ -208,5 +272,118 @@ class JiraGateway {
 		KeywordUtil.logInfo("Upload attachment response: ${body}")
 
 		return status
+	}
+}
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraTestPlanManager {
+
+	JiraFlowCoordinator owner
+	JiraGateway gateway
+
+	JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
+		this.owner = owner
+		this.gateway = gateway
+	}
+
+	String findExistingTestPlanKey(String summary) {
+		if (owner.FORCE_CREATE_NEW_TEST_PLAN) {
+			KeywordUtil.logInfo("FORCE_CREATE_NEW_TEST_PLAN enabled. A new Test Plan will be created.")
+			return ''
+		}
+
+		if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
+			KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
+			return owner.MANUAL_TEST_PLAN_KEY
+		}
+
+		String expectedSummary = owner.normalizeTitle(summary)
+
+		String savedKey = owner.readSavedSuiteTestPlanKey()
+		if (!owner.isBlank(savedKey)) {
+			Map savedIssueResult = gateway.getIssueByKey(savedKey)
+
+			if (savedIssueResult.ok) {
+				String savedSummary = owner.safe(savedIssueResult.issue?.fields?.summary)
+				String savedType = owner.safe(savedIssueResult.issue?.fields?.issuetype?.name)
+
+				if (owner.normalizeTitle(savedSummary) == expectedSummary &&
+					owner.normalizeTitle(savedType) == 'test plan') {
+					KeywordUtil.logInfo("Using saved Test Plan key for suite ${owner.getCurrentSuiteName()}: ${savedKey}")
+					return savedKey
+				}
+
+				KeywordUtil.logInfo("Saved Test Plan key ignored because summary/type do not match current suite.")
+			} else {
+				KeywordUtil.logInfo("Saved Test Plan key could not be validated. Search will continue. Error: ${savedIssueResult.error}")
+			}
+		}
+
+		Map searchResult = gateway.searchTestPlans(summary, owner.EPIC_KEY)
+
+		if (!searchResult.ok) {
+			KeywordUtil.logInfo("Search Test Plan failed. Status: ${searchResult.status}. Error: ${searchResult.error}")
+			return searchResult.status > 0 ? "ERROR_SEARCH_${searchResult.status}" : "ERROR_SEARCH_REQUEST"
+		}
+
+		List issues = searchResult.issues instanceof List ? searchResult.issues : []
+
+		List exactMatches = issues.findAll { issue ->
+			owner.normalizeTitle(issue?.fields?.summary) == expectedSummary
+		}
+
+		if (exactMatches.isEmpty()) {
+			KeywordUtil.logInfo("No existing Test Plan found for summary: ${summary}")
+			return ''
+		}
+
+		if (exactMatches.size() > 1) {
+			KeywordUtil.logInfo("Multiple Test Plans found with same summary. The newest one will be used. Count: ${exactMatches.size()}")
+		}
+
+		def chosen = exactMatches[0]
+		String foundKey = owner.safe(chosen?.key)
+
+		if (!owner.isBlank(foundKey)) {
+			owner.saveSuiteTestPlanKey(foundKey)
+			KeywordUtil.logInfo("Existing Test Plan found by exact summary: ${foundKey}")
+			return foundKey
+		}
+
+		return ''
+	}
+
+	String getOrCreateTestPlanKey() {
+		String summary = owner.getTestPlanName()
+
+		String existingKey = findExistingTestPlanKey(summary)
+
+		if (existingKey.startsWith('ERROR')) {
+			return existingKey
+		}
+
+		if (!owner.isBlank(existingKey)) {
+			KeywordUtil.logInfo("Resolved existing Test Plan for suite ${owner.getCurrentSuiteName()}: ${existingKey}")
+			return existingKey
+		}
+
+		String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
+		if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+			owner.saveSuiteTestPlanKey(createdKey)
+			KeywordUtil.logInfo("Created new Test Plan for suite ${owner.getCurrentSuiteName()}: ${createdKey}")
+		}
+
+		return createdKey
 	}
 }
