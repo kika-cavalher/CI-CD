@@ -2729,1862 +2729,1705 @@ A mistake here may produce a report that is generated successfully but is broken
 
 
 
+🧩 Main Classes
+6. JiraGaiaHtmlTemplateBuilder
 
+JiraGaiaHtmlTemplateBuilder is the visual rendering layer of the GAIA custom report and is responsible for transforming the normalized execution model into the final interactive HTML page attached to Jira. It builds the full report structure, including header, scenario list, scenario detail panels, steps table, failed evidence block, charts, CSS styling, and JavaScript interactions such as tabs and filtering. This is the right file to change when you need to update the report layout, labels, colors, status presentation, charts, evidence display, sidebar behavior, or any other visual and front-end aspect of gaiaReport.html. 🔗 Full page: [Add link here]
 
+📄 Page: JiraGaiaHtmlTemplateBuilder
+Overview
 
+JiraGaiaHtmlTemplateBuilder is the class responsible for generating the final HTML structure of the GAIA report. It receives a normalized model containing suite information, scenarios, steps, status, timing, and evidence, and converts that model into a complete self-contained HTML page with embedded CSS and JavaScript. In practice, this class is the presentation layer of the GAIA report, while JiraGaiaReportBuilder is the data preparation layer.
 
+Purpose in the integration
 
+The goal of this class is to transform execution data into a readable and interactive report that can be opened locally and attached to Jira. Instead of exposing raw XML, raw logs, or unstructured evidence, it organizes everything into a visual report with a sidebar, searchable scenarios, scenario detail panels, evidence previews, and execution charts. This makes failures easier to analyze and helps the team inspect the execution directly from the generated HTML artifact.
 
+Called by
 
+JiraGaiaReportBuilder.createGaiaHtmlReport()
 
-package jiraIntegration
-
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.net.URI
-
-class JiraGaiaHtmlTemplateBuilder {
-
-	private static final String APP_NAME = 'GAIA'
-	private static final String REPORT_TITLE_PREFIX = 'Test report - '
-	private static final String LOGO_SRC = 'Image/gaia-logo.png'
-
-	private static final String STATUS_PASS = '#68b84b'
-	private static final String STATUS_FAIL = '#e05b4d'
-	private static final String STATUS_SKIP = '#d7b436'
-	private static final String STATUS_INFO = '#2f86eb'
-
-	JiraGaiaHtmlTemplateBuilder() {
-	}
-
-	String build(Map model) {
-		return buildHtml(model)
-	}
-
-	String render(Map model) {
-		return buildHtml(model)
-	}
-
-	String buildHtml(Map model) {
-		Map view = normalizeModel(model)
-
-		StringBuilder html = new StringBuilder()
-
-		html.append('<!DOCTYPE html>\n')
-		html.append('<html lang="en">\n')
-		html.append('<head>\n')
-		html.append('<meta charset="UTF-8">\n')
-		html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
-		html.append('<title>')
-		html.append(htmlEscape(view.reportTitle))
-		html.append('</title>\n')
-		html.append(buildStyles())
-		html.append('</head>\n')
-		html.append('<body>\n')
-
-		html.append('<header class="top-banner">\n')
-		html.append('  <div class="top-banner-left">\n')
-		html.append('    <img class="brand-logo" src="')
-		html.append(htmlEscape(resolveLogoHref(view)))
-		html.append('" alt="GAIA logo">\n')
-		html.append('    <div class="brand-copy">\n')
-		html.append('      <div class="banner-title">')
-		html.append(htmlEscape(view.reportTitle))
-		html.append('</div>\n')
-		html.append('      <div class="banner-subtitle">GAIA execution overview</div>\n')
-		html.append('    </div>\n')
-		html.append('  </div>\n')
-		html.append('  <div class="top-banner-right">\n')
-		html.append('    <div>')
-		html.append(htmlEscape(view.generatedLabel))
-		html.append('</div>\n')
-		html.append('    <div>Project ')
-		html.append(htmlEscape(APP_NAME))
-		html.append('</div>\n')
-		html.append('  </div>\n')
-		html.append('</header>\n')
-
-		html.append('<div class="page">\n')
-
-		html.append('  <aside class="sidebar">\n')
-		html.append('    <div class="sidebar-tabs">\n')
-		html.append('      <button id="tab-tests" class="sidebar-tab active" type="button" onclick="showTab(\'tests\')">Tests</button>\n')
-		html.append('      <button id="tab-charts" class="sidebar-tab" type="button" onclick="showTab(\'charts\')">Charts</button>\n')
-		html.append('    </div>\n')
-
-		html.append('    <div id="tests-sidebar-block">\n')
-		html.append('      <div class="search-wrap">\n')
-		html.append('        <input id="scenarioSearch" class="search-input" type="text" placeholder="Search test name, path, or status." onkeyup="filterScenarios()">\n')
-		html.append('      </div>\n')
-		html.append('      <div id="scenarioList" class="scenario-list">\n')
-		view.scenarios.eachWithIndex { Map scenario, int index ->
-			html.append(buildScenarioListItem(scenario, index == 0))
-		}
-		html.append('      </div>\n')
-		html.append('    </div>\n')
-
-		html.append('    <div id="charts-sidebar-block" class="hidden">\n')
-		html.append(buildChartsSidebar(view))
-		html.append('    </div>\n')
-		html.append('  </aside>\n')
-
-		html.append('  <main class="content">\n')
-		view.scenarios.eachWithIndex { Map scenario, int index ->
-			html.append(buildScenarioPanel(scenario, view, index == 0))
-		}
-		html.append(buildChartsPanel(view))
-		html.append('  </main>\n')
-
-		html.append('</div>\n')
-		html.append(buildScripts())
-		html.append('</body>\n')
-		html.append('</html>\n')
-
-		return html.toString()
-	}
-
-	// =========================================================================
-	// NORMALIZATION
-	// =========================================================================
-
-	private Map normalizeModel(Map model) {
-		Map safeModel = model ?: [:]
-
-		String suiteName = pickFirst(
-				safeModel.suiteName,
-				safeModel.testSuiteName,
-				safeModel.suite,
-				safeModel.executionName,
-				safeModel.title,
-				'Execution'
-				)
-
-		String reportTitle = REPORT_TITLE_PREFIX + suiteName
-		List<Map> scenarios = normalizeScenarios(safeModel)
-
-		int passedCount = scenarios.count { it.status == 'passed' }
-		int failedCount = scenarios.count { it.status == 'failed' }
-		int skippedCount = scenarios.count { it.status == 'skipped' }
-		int totalCount = scenarios.size()
-
-		return [
-			reportTitle   : reportTitle,
-			suiteName     : suiteName,
-			generatedLabel: buildGeneratedLabel(safeModel),
-			reportFolder  : pickFirst(safeModel.reportFolder, safeModel.baseFolder, safeModel.executionFolder),
-			logoSrc       : pickFirst(safeModel.logoSrc, LOGO_SRC),
-			scenarios     : scenarios,
-			passedCount   : passedCount,
-			failedCount   : failedCount,
-			skippedCount  : skippedCount,
-			totalCount    : totalCount
-		]
-	}
-
-	private List<Map> normalizeScenarios(Map model) {
-		List rawList = asList(pickFirstObject(
-				model.scenarios,
-				model.tests,
-				model.cases,
-				model.executions,
-				model.items
-				))
-
-		List<Map> result = []
-
-		rawList.eachWithIndex { def rawItem, int index ->
-			Map item = rawItem instanceof Map ? rawItem : [name: safeValue(rawItem)]
-
-			String scenarioName = pickFirst(
-					item.scenarioName,
-					item.name,
-					item.title,
-					item.displayName,
-					item.shortName,
-					item.caseName,
-					item.testName,
-					"Scenario ${index + 1}"
-					)
-
-			String scenarioId = pickFirst(item.id, item.key, "scenario-${index + 1}")
-			String status = normalizeStatus(pickFirst(item.status, item.result, item.outcome, item.finalStatus))
-
-			String shortError = shorten(pickFirst(
-					item.visualError,
-					item.errorSummary,
-					item.errorShort,
-					item.failureMessage,
-					item.message
-					), 95)
-
-			String rawStart = pickFirst(
-					item.startLong,
-					item.startLabel,
-					item.startTime,
-					item.startDateTime,
-					item.startDate,
-					item.startShort,
-					item.startClock
-					)
-
-			String rawEnd = pickFirst(
-					item.endLong,
-					item.endLabel,
-					item.endTime,
-					item.endDateTime,
-					item.endDate,
-					item.endShort,
-					item.endClock
-					)
-
-			long durationMs = normalizeDurationMs(item, rawStart, rawEnd)
-			String durationLabel = formatDuration(durationMs)
-
-			List<Map> steps = normalizeSteps(item)
-			if (steps.isEmpty()) {
-				steps = parseStepsFromRawText(pickFirst(
-						item.fullError,
-						item.errorFull,
-						item.errorDetail,
-						item.stackTrace,
-						item.stacktrace,
-						item.details,
-						item.rawLog,
-						item.stepTrace
-						))
-			}
-
-			List<Map> evidence = normalizeEvidence(item, model)
-			if (status == 'failed' && evidence.size() > 1) {
-				evidence = [evidence.last()]
-			}
-
-			result << [
-				id           : scenarioId,
-				name         : scenarioName,
-				summary      : shortError,
-				status       : status,
-				startShort   : extractClockLabel(rawStart),
-				endShort     : extractClockLabel(rawEnd),
-				startLong    : formatDateTimeLabel(rawStart),
-				endLong      : formatDateTimeLabel(rawEnd),
-				durationLabel: durationLabel,
-				visualError  : pickFirst(
-				item.visualError,
-				item.errorSummary,
-				item.errorShort,
-				item.failureMessage,
-				item.message
-				),
-				fullError    : pickFirst(
-				item.errorFull,
-				item.fullError,
-				item.errorDetail,
-				item.stackTrace,
-				item.stacktrace,
-				item.details,
-				item.errorLog
-				),
-				steps        : steps,
-				evidence     : evidence
-			]
-		}
-
-		return result
-	}
-
-	private List<Map> normalizeSteps(Map item) {
-		List rawSteps = asList(pickFirstObject(
-				item.steps,
-				item.stepRows,
-				item.stepItems,
-				item.timeline,
-				item.events,
-				item.logs
-				))
-
-		List<Map> result = []
-
-		rawSteps.each { def raw ->
-			Map row = raw instanceof Map ? raw : [detail: safeValue(raw)]
-
-			String status = normalizeStatus(pickFirst(
-					row.status,
-					row.result,
-					row.outcome,
-					row.level
-					))
-
-			String detail = pickFirst(
-					row.detail,
-					row.detailText,
-					row.message,
-					row.text,
-					row.title,
-					row.name
-					)
-
-			if (detail.isEmpty()) {
-				return
-			}
-
-			String timestamp = extractClockLabel(pickFirst(
-					row.timestamp,
-					row.timeLabel,
-					row.time,
-					row.at,
-					row.label,
-					row.startLabel
-					))
-
-			result << [
-				status   : status,
-				timestamp: timestamp,
-				detail   : detail,
-				icon     : resolveStepIcon(detail, status)
-			]
-		}
-
-		return result
-	}
-
-	private List<Map> parseStepsFromRawText(String rawText) {
-		List<Map> result = []
-
-		if (rawText.isEmpty()) {
-			return result
-		}
-
-		rawText.readLines().each { String rawLine ->
-			String line = safeValue(rawLine)
-			if (line.isEmpty()) {
-				return
-			}
-
-			def matcherA = (line =~ /^(\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?)\\s+(PASSED|FAILED|ERROR|INFO|SKIPPED)\\s+(.*)$/)
-			if (matcherA.find()) {
-				String status = normalizeStatus(matcherA.group(2))
-				String detail = safeValue(matcherA.group(3))
-
-				result << [
-					status   : status,
-					timestamp: cleanClock(matcherA.group(1)),
-					detail   : detail,
-					icon     : resolveStepIcon(detail, status)
-				]
-				return
-			}
-
-			def matcherB = (line =~ /^(Given|When|Then|And)\\s+(.+?)(?:\\.{2,}|\\s+)(passed|failed|skipped)$/)
-			if (matcherB.find()) {
-				String detail = matcherB.group(1) + ' ' + matcherB.group(2)
-				String status = normalizeStatus(matcherB.group(3))
-
-				result << [
-					status   : status,
-					timestamp: '',
-					detail   : detail,
-					icon     : resolveStepIcon(detail, status)
-				]
-			}
-		}
-
-		return result
-	}
-
-	private Object firstPresent(Object... values) {
-		if (values == null) {
-			return null
-		}
-
-		for (Object value : values) {
-			if (value == null) {
-				continue
-			}
-
-			if (value instanceof CharSequence && safeValue(value).isEmpty()) {
-				continue
-			}
-
-			return value
-		}
-
-		return null
-	}
-
-	private String firstNonBlank(Object... values) {
-		if (values == null) {
-			return ''
-		}
-
-		return firstNonBlankFromCollection(values.toList())
-	}
-
-	private String firstNonBlank(Collection values) {
-		return firstNonBlankFromCollection(values)
-	}
-
-	private String firstNonBlankFromCollection(Collection values) {
-		if (values == null) {
-			return ''
-		}
-
-		for (def value : values) {
-			String text = safeValue(value)
-			if (!text.isEmpty()) {
-				return text
-			}
-		}
-
-		return ''
-	}
-
-	private List<Map> normalizeEvidence(Map item, Map model) {
-		List rawEvidence = []
-
-		if (item?.evidence instanceof Collection) {
-			rawEvidence.addAll(item.evidence as Collection)
-		}
-		if (item?.evidences instanceof Collection) {
-			rawEvidence.addAll(item.evidences as Collection)
-		}
-		if (item?.images instanceof Collection) {
-			rawEvidence.addAll(item.images as Collection)
-		}
-		if (item?.attachments instanceof Collection) {
-			rawEvidence.addAll(item.attachments as Collection)
-		}
-
-		if (rawEvidence.isEmpty()) {
-			return []
-		}
-
-		String baseFolder = firstNonBlank(
-				item?.reportFolder,
-				model?.reportFolder,
-				model?.baseFolder,
-				model?.executionFolder
-				)
-
-		List<Map> result = []
-
-		rawEvidence.each { def raw ->
-			String name = ''
-			String href = ''
-			String imgSrc = ''
-			boolean image = false
-
-			if (raw instanceof Map) {
-				name = firstNonBlank(raw.name, raw.fileName, raw.title, raw.label)
-				href = firstNonBlank(raw.href, raw.url, raw.path, raw.file, raw.absolutePath, raw.relativePath)
-				imgSrc = firstNonBlank(raw.imgSrc, raw.imageSrc, raw.imageDataUri)
-
-				def imageFlag = raw.image != null ? raw.image : raw.isImage
-				if (imageFlag != null) {
-					image = Boolean.valueOf(String.valueOf(imageFlag))
-				}
-			} else {
-				href = safeValue(raw)
-				name = new File(href).name
-			}
-
-			if (!imgSrc.isEmpty() && imgSrc.startsWith('data:image')) {
-				image = true
-			}
-
-			File resolved = null
-
-			if (imgSrc.isEmpty()) {
-				if (!href.isEmpty() &&
-						!href.startsWith('data:') &&
-						!href.startsWith('file:') &&
-						!href.startsWith('http://') &&
-						!href.startsWith('https://')) {
-					resolved = resolveFile(href, baseFolder)
-				}
-			}
-
-			if (resolved != null && resolved.exists()) {
-				if (name.isEmpty()) {
-					name = resolved.name
-				}
-				if (href.isEmpty()) {
-					href = resolved.toURI().toString()
-				}
-				if (!image) {
-					image = isImageFile(resolved.name)
-				}
-				if (imgSrc.isEmpty() && image) {
-					imgSrc = resolved.toURI().toString()
-				}
-			}
-
-			if (name.isEmpty()) {
-				name = 'Evidence'
-			}
-
-			if (!href.isEmpty() || !imgSrc.isEmpty()) {
-				result << [
-					name  : name,
-					href  : href,
-					image : image,
-					imgSrc: imgSrc
-				]
-			}
-		}
-
-		return result
-	}
-
-	// =========================================================================
-	// HTML BLOCKS
-	// =========================================================================
-
-	private String buildScenarioListItem(Map scenario, boolean selected) {
-		String borderClass = selected ? 'scenario-list-item selected' : 'scenario-list-item'
-		String shortName = shorten(scenario.name, 42)
-		String shortError = shorten(scenario.summary, 55)
-
-		StringBuilder sb = new StringBuilder()
-		sb.append('<button type="button" class="')
-		sb.append(borderClass)
-		sb.append('" data-sid="')
-		sb.append(htmlEscape(scenario.id))
-		sb.append('" onclick="showScenario(\'')
-		sb.append(jsEscape(scenario.id))
-		sb.append('\')">')
-
-		sb.append('<div class="scenario-list-main">')
-		sb.append('<div class="scenario-list-title">')
-		sb.append(htmlEscape(shortName))
-		sb.append('</div>')
-		sb.append('<div class="scenario-list-summary">')
-		sb.append(htmlEscape(shortError))
-		sb.append('</div>')
-		sb.append('<div class="scenario-list-meta">')
-		sb.append(htmlEscape(scenario.startShort))
-		sb.append('</div>')
-		sb.append('</div>')
-
-		sb.append('<div class="scenario-list-side">')
-		sb.append('<span class="status-pill ')
-		sb.append(htmlEscape(scenario.status))
-		sb.append('">')
-		sb.append(htmlEscape(statusLabel(scenario.status)))
-		sb.append('</span>')
-		sb.append('<div class="scenario-list-duration">')
-		sb.append(htmlEscape(scenario.durationLabel))
-		sb.append('</div>')
-		sb.append('</div>')
-
-		sb.append('</button>')
-		return sb.toString()
-	}
-
-	private String buildScenarioPanel(Map scenario, Map view, boolean selected) {
-		String panelClass = selected ? 'scenario-panel active' : 'scenario-panel'
-
-		String suiteLabel = safeValue(view.suiteName)
-		String scenarioName = safeValue(scenario.name)
-		String scenarioStatus = safeValue(scenario.status)
-
-		String visualError = firstNonBlank(
-				scenario.visualError,
-				scenario.errorSummary,
-				scenario.errorShort,
-				scenario.failureMessage,
-				scenario.message,
-				scenario.summary
-				)
-
-		String fullError = firstNonBlank(
-				scenario.fullError,
-				scenario.errorDetail,
-				scenario.stackTrace,
-				scenario.stacktrace,
-				scenario.details,
-				scenario.errorLog,
-				visualError
-				)
-
-		String startLabel = firstNonBlank(
-				scenario.startLong,
-				scenario.startLabel,
-				scenario.startClock,
-				scenario.startShort,
-				'--'
-				)
-
-		String endLabel = firstNonBlank(
-				scenario.endLong,
-				scenario.endLabel,
-				scenario.endClock,
-				scenario.endShort,
-				'--'
-				)
-
-		String durationLabel = firstNonBlank(
-				scenario.durationLabel,
-				'00h 00m 00s'
-				)
-
-		Map failedEvidence = null
-		List<Map> evidenceList = scenario.evidence instanceof List ? (scenario.evidence as List<Map>) : []
-
-		if (!evidenceList.isEmpty()) {
-			failedEvidence = evidenceList.find { Map ev ->
-				String name = safeValue(ev.name).toLowerCase(Locale.ENGLISH)
-				String href = safeValue(ev.href).toLowerCase(Locale.ENGLISH)
-				return name.contains('error') ||
-						name.contains('fail') ||
-						href.contains('error') ||
-						href.contains('fail')
-			}
-
-			if (failedEvidence == null) {
-				failedEvidence = evidenceList[0]
-			}
-		}
-
-		String evidenceName = failedEvidence != null ? safeValue(failedEvidence.name) : ''
-		String evidenceHref = failedEvidence != null ? safeValue(failedEvidence.href) : ''
-		String evidenceImgSrc = failedEvidence != null ? safeValue(failedEvidence.imgSrc) : ''
-		boolean evidenceIsImage = failedEvidence != null && Boolean.TRUE.equals(failedEvidence.image)
-
-		StringBuilder sb = new StringBuilder()
-
-		sb.append('<section class="')
-		sb.append(panelClass)
-		sb.append('" id="panel-')
-		sb.append(htmlEscape(safeValue(scenario.id)))
-		sb.append('">')
-
-		sb.append('<div class="scenario-header">')
-		sb.append('<div class="scenario-title">')
-		sb.append(htmlEscape(scenarioName))
-		sb.append('</div>')
-
-		sb.append('<div class="scenario-meta-row">')
-		sb.append(buildMetaChip('Suite', suiteLabel, 'plain'))
-		sb.append(buildMetaChip('Status', statusLabel(scenarioStatus), scenarioStatus))
-		sb.append(buildMetaChip('Start', startLabel, 'gradient'))
-		sb.append(buildMetaChip('End', endLabel, 'gradient'))
-		sb.append(buildMetaChip('Duration', durationLabel, 'gradient'))
-		sb.append('</div>')
-		sb.append('</div>')
-
-		sb.append('<div class="section-title">Steps</div>')
-		sb.append('<div class="steps-table">')
-		sb.append('<div class="steps-head">')
-		sb.append('<div class="col-status">STATUS</div>')
-		sb.append('<div class="col-time">TIMESTAMP</div>')
-		sb.append('<div class="col-detail">DETAILS</div>')
-		sb.append('</div>')
-
-		List<Map> steps = scenario.steps instanceof List ? (scenario.steps as List<Map>) : []
-
-		if (steps.isEmpty()) {
-			sb.append('<div class="step-row empty">')
-			sb.append('<div class="col-status"></div>')
-			sb.append('<div class="col-time"></div>')
-			sb.append('<div class="col-detail">No step details available.</div>')
-			sb.append('</div>')
-		} else {
-			steps.each { Map step ->
-				sb.append(buildStepRow(step))
-			}
-		}
-
-		sb.append('</div>')
-
-		if ('failed'.equalsIgnoreCase(scenarioStatus)) {
-			sb.append('<div class="error-block">')
-			sb.append('<div class="error-title">Visual Error Log</div>')
-			sb.append('<div class="error-summary">')
-			sb.append(htmlEscape(visualError))
-			sb.append('</div>')
-
-			if (!safeValue(fullError).isEmpty()) {
-				sb.append('<details class="details-box">')
-				sb.append('<summary>🔎 View full error</summary>')
-				sb.append('<pre>')
-				sb.append(htmlEscape(fullError))
-				sb.append('</pre>')
-				sb.append('</details>')
-			}
-
-			sb.append('</div>')
-
-			sb.append('<div class="evidence-block">')
-			sb.append('<div class="evidence-title">Evidence</div>')
-
-			if (failedEvidence != null) {
-				sb.append('<details class="evidence-item">')
-				sb.append('<summary>🖼 ')
-				sb.append(htmlEscape(evidenceName.isEmpty() ? 'Open failed evidence' : evidenceName))
-				sb.append('</summary>')
-
-				if (!evidenceHref.isEmpty()) {
-					sb.append('<div class="evidence-links">')
-					sb.append('<a href="')
-					sb.append(htmlEscape(evidenceHref))
-					sb.append('" target="_blank" rel="noopener noreferrer">🔎 Open evidence</a>')
-					sb.append('</div>')
-				}
-
-				if (evidenceIsImage && !evidenceImgSrc.isEmpty()) {
-					sb.append('<img class="evidence-image" src="')
-					sb.append(htmlEscape(evidenceImgSrc))
-					sb.append('" alt="Evidence">')
-				}
-
-				sb.append('</details>')
-			} else {
-				sb.append('<div class="evidence-empty">No failed evidence was found for this scenario.</div>')
-			}
-
-			sb.append('</div>')
-		}
-
-		sb.append('</section>')
-		return sb.toString()
-	}
-
-	private String buildStepRow(Map step) {
-		StringBuilder sb = new StringBuilder()
-
-		sb.append('<div class="step-row">')
-		sb.append('<div class="col-status">')
-		sb.append('<span class="status-pill ')
-		sb.append(htmlEscape(step.status))
-		sb.append('">')
-		sb.append(htmlEscape(statusLabel(step.status)))
-		sb.append('</span>')
-		sb.append('</div>')
-
-		sb.append('<div class="col-time">')
-		sb.append(htmlEscape(pickFirst(step.timestamp, '--')))
-		sb.append('</div>')
-
-		sb.append('<div class="col-detail">')
-		sb.append('<span class="step-icon">')
-		sb.append(htmlEscape(step.icon))
-		sb.append('</span> ')
-		sb.append(htmlEscape(step.detail))
-		sb.append('</div>')
-		sb.append('</div>')
-
-		return sb.toString()
-	}
-
-	private String buildMetaChip(String label, String value, String type) {
-		StringBuilder sb = new StringBuilder()
-		sb.append('<div class="meta-chip ')
-		sb.append(htmlEscape(type))
-		sb.append('">')
-		sb.append('<span class="meta-label">')
-		sb.append(htmlEscape(label))
-		sb.append(':</span> ')
-		sb.append('<span class="meta-value">')
-		sb.append(htmlEscape(value))
-		sb.append('</span>')
-		sb.append('</div>')
-		return sb.toString()
-	}
-
-	private String buildChartsSidebar(Map view) {
-		StringBuilder sb = new StringBuilder()
-		sb.append('<div class="chart-side-wrap">')
-		sb.append('<div class="chart-side-title">Execution Status</div>')
-		sb.append('<div class="legend-list">')
-		sb.append(buildLegendLine('Passed', STATUS_PASS, view.passedCount))
-		sb.append(buildLegendLine('Failed', STATUS_FAIL, view.failedCount))
-		sb.append(buildLegendLine('Skipped', STATUS_SKIP, view.skippedCount))
-		sb.append('</div>')
-		sb.append('</div>')
-		return sb.toString()
-	}
-
-	private String buildChartsPanel(Map view) {
-		double failPercent = percent(view.failedCount as int, view.totalCount as int)
-		double passPercent = percent(view.passedCount as int, view.totalCount as int)
-		double skipPercent = percent(view.skippedCount as int, view.totalCount as int)
-
-		String donutStyle = 'background: conic-gradient(' +
-				STATUS_FAIL + ' 0 ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '%,' +
-				STATUS_PASS + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '% ' +
-				String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '%,' +
-				STATUS_SKIP + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '% 100%);'
-
-		StringBuilder sb = new StringBuilder()
-
-		sb.append('<section id="charts-panel" class="charts-panel hidden">')
-		sb.append('<div class="chart-main-title">Global Overview</div>')
-		sb.append('<div class="charts-layout">')
-
-		sb.append('<div>')
-		sb.append('<div class="donut-card">')
-		sb.append('<div class="donut" style="')
-		sb.append(donutStyle)
-		sb.append('">')
-		sb.append('<div class="donut-center">')
-		sb.append('<div class="donut-number">')
-		sb.append(String.valueOf(view.totalCount))
-		sb.append('</div>')
-		sb.append('<div class="donut-label">Tests</div>')
-		sb.append('</div>')
-		sb.append('</div>')
-		sb.append('</div>')
-		sb.append('</div>')
-
-		sb.append('<div>')
-		sb.append('<div class="chart-bars">')
-		sb.append(buildBarRow('Passed', view.passedCount as int, view.totalCount as int, STATUS_PASS))
-		sb.append(buildBarRow('Failed', view.failedCount as int, view.totalCount as int, STATUS_FAIL))
-		sb.append(buildBarRow('Skipped', view.skippedCount as int, view.totalCount as int, STATUS_SKIP))
-		sb.append('</div>')
-		sb.append('</div>')
-
-		sb.append('</div>')
-		sb.append('</section>')
-
-		return sb.toString()
-	}
-
-	private String buildLegendLine(String label, String color, int value) {
-		StringBuilder sb = new StringBuilder()
-		sb.append('<div class="legend-line">')
-		sb.append('<span class="legend-dot" style="background:')
-		sb.append(color)
-		sb.append('"></span>')
-		sb.append('<span class="legend-text">')
-		sb.append(htmlEscape(label))
-		sb.append('</span>')
-		sb.append('<span class="legend-value">')
-		sb.append(String.valueOf(value))
-		sb.append('</span>')
-		sb.append('</div>')
-		return sb.toString()
-	}
-
-	private String buildBarRow(String label, int value, int total, String color) {
-		double width = percent(value, total)
-
-		StringBuilder sb = new StringBuilder()
-		sb.append('<div class="bar-row">')
-		sb.append('<div class="bar-row-top">')
-		sb.append('<span class="bar-label">')
-		sb.append(htmlEscape(label))
-		sb.append('</span>')
-		sb.append('<span class="bar-value">')
-		sb.append(String.valueOf(value))
-		sb.append('</span>')
-		sb.append('</div>')
-		sb.append('<div class="bar-track">')
-		sb.append('<div class="bar-fill" style="width:')
-		sb.append(String.format(Locale.ENGLISH, '%.2f', width))
-		sb.append('%; background:')
-		sb.append(color)
-		sb.append('"></div>')
-		sb.append('</div>')
-		sb.append('<div class="bar-foot">')
-		sb.append(String.valueOf(total == 0 ? 0 : Math.round(width)))
-		sb.append('% of execution')
-		sb.append('</div>')
-		sb.append('</div>')
-		return sb.toString()
-	}
-
-	// =========================================================================
-	// HELPERS
-	// =========================================================================
-
-	private String buildGeneratedLabel(Map model) {
-		String raw = pickFirst(
-				model.generatedAt,
-				model.generatedLabel,
-				model.createdAt,
-				model.executionDate
-				)
-
-		if (!raw.isEmpty()) {
-			return 'Generated ' + raw
-		}
-
-		return 'Generated ' + new SimpleDateFormat('dd.MM.yyyy HH:mm:ss').format(new Date())
-	}
-
-	private long normalizeDurationMs(Map item, String rawStart, String rawEnd) {
-		Object durationValue = pickFirstObject(
-				item.durationMs,
-				item.elapsedMs,
-				item.timeMs,
-				item.duration
-				)
-
-		long parsed = toLong(durationValue)
-		if (parsed > 0L) {
-			return parsed
-		}
-
-		long startMillis = parseDateMillis(rawStart)
-		long endMillis = parseDateMillis(rawEnd)
-
-		if (startMillis > 0L && endMillis >= startMillis) {
-			return endMillis - startMillis
-		}
-
-		return 0L
-	}
-
-	private long parseDateMillis(String raw) {
-		String text = safeValue(raw)
-		if (text.isEmpty()) {
-			return 0L
-		}
-
-		List<String> patterns = [
-			'dd.MM.yyyy HH:mm:ss',
-			'dd.MM.yyyy hh:mm:ss a',
-			'yyyy-MM-dd HH:mm:ss',
-			'yyyy-MM-dd HH:mm:ss.SSS',
-			'yyyy-MM-dd\'T\'HH:mm:ss',
-			'yyyy-MM-dd\'T\'HH:mm:ss.SSS',
-			'HH:mm:ss'
-		]
-
-		for (String pattern : patterns) {
-			try {
-				return new SimpleDateFormat(pattern).parse(text).time
-			} catch (Exception ignored) {
-			}
-		}
-
-		return 0L
-	}
-
-	private String formatDateTimeLabel(String raw) {
-		String text = safeValue(raw)
-		if (text.isEmpty()) {
-			return '--'
-		}
-		return text
-	}
-
-	private String extractClockLabel(String raw) {
-		String text = safeValue(raw)
-		if (text.isEmpty()) {
-			return ''
-		}
-
-		def matcher = (text =~ /(\\d{2}:\\d{2}:\\d{2}|\\d{1,2}:\\d{2}:\\d{2}\\s?[APMapm]{2})/)
-		if (matcher.find()) {
-			return cleanClock(matcher.group(1))
-		}
-
-		return text
-	}
-
-	private String cleanClock(String raw) {
-		String text = safeValue(raw)
-		if (text.contains('.')) {
-			return text.substring(0, text.indexOf('.'))
-		}
-		return text
-	}
-
-	private String formatDuration(long durationMs) {
-		if (durationMs < 0L) {
-			durationMs = 0L
-		}
-
-		long totalSeconds = Math.round(durationMs / 1000d)
-		long hours = (long) (totalSeconds / 3600L)
-		long minutes = (long) ((totalSeconds % 3600L) / 60L)
-		long seconds = (long) (totalSeconds % 60L)
-
-		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
-	}
-
-	private String resolveStepIcon(String detail, String status) {
-		String lower = safeValue(detail).toLowerCase(Locale.ENGLISH)
-
-		if (status == 'failed') {
-			return '❌'
-		}
-		if (status == 'skipped') {
-			return '⏭️'
-		}
-		if (lower.contains('wait')) {
-			return '🔎'
-		}
-		if (lower.contains('click') || lower.contains('select') || lower.contains('fill') || lower.contains('import')) {
-			return '🖱️'
-		}
-		if (lower.contains('open') || lower.contains('navigate')) {
-			return '🌐'
-		}
-		return 'ℹ️'
-	}
-
-	private String normalizeStatus(String raw) {
-		String text = safeValue(raw).toLowerCase(Locale.ENGLISH)
-
-		switch (text) {
-			case 'pass':
-			case 'passed':
-			case 'success':
-				return 'passed'
-			case 'fail':
-			case 'failed':
-			case 'error':
-				return 'failed'
-			case 'skip':
-			case 'skipped':
-				return 'skipped'
-			default:
-				return 'info'
-		}
-	}
-
-	private String statusLabel(String status) {
-		switch (safeValue(status)) {
-			case 'passed':
-				return 'Passed'
-			case 'failed':
-				return 'Failed'
-			case 'skipped':
-				return 'Skipped'
-			default:
-				return 'Info'
-		}
-	}
-
-	private File resolveFile(String path, String baseFolder) {
-		String raw = safeValue(path)
-		if (raw.isEmpty()) {
-			return null
-		}
-
-		try {
-			if (raw.toLowerCase(Locale.ENGLISH).startsWith('file:/')) {
-				File uriFile = new File(new URI(raw))
-				if (uriFile.exists()) {
-					return uriFile
-				}
-			}
-		} catch (Exception ignored) {
-		}
-
-		File direct = new File(raw)
-		if (direct.exists()) {
-			return direct
-		}
-
-		if (!safeValue(baseFolder).isEmpty()) {
-			File byBase = new File(baseFolder, raw)
-			if (byBase.exists()) {
-				return byBase
-			}
-		}
-
-		return direct
-	}
-
-	private String resolveLogoHref(Map view) {
-		File logoFile = resolveFile(pickFirst(view.logoSrc, LOGO_SRC), pickFirst(view.reportFolder))
-		if (logoFile != null && logoFile.exists()) {
-			return logoFile.toURI().toString()
-		}
-		return pickFirst(view.logoSrc, LOGO_SRC)
-	}
-
-	private boolean isImageFile(String fileName) {
-		String lower = safeValue(fileName).toLowerCase(Locale.ENGLISH)
-		return lower.endsWith('.png') ||
-				lower.endsWith('.jpg') ||
-				lower.endsWith('.jpeg') ||
-				lower.endsWith('.gif') ||
-				lower.endsWith('.webp') ||
-				lower.endsWith('.bmp')
-	}
-
-	private List asList(def value) {
-		if (value == null) {
-			return []
-		}
-
-		if (value instanceof Collection) {
-			return new ArrayList(value as Collection)
-		}
-
-		if (value.getClass().isArray()) {
-			return (value as Object[]).toList()
-		}
-
-		return [value]
-	}
-
-	private long toLong(def value) {
-		String raw = safeValue(value)
-		if (raw.isEmpty()) {
-			return 0L
-		}
-
-		try {
-			return Long.parseLong(raw)
-		} catch (Exception ignored) {
-		}
-
-		try {
-			String clean = raw.replace(',', '.')
-			if (clean.endsWith('s')) {
-				clean = clean.substring(0, clean.length() - 1)
-				return Math.round(Double.parseDouble(clean) * 1000d)
-			}
-		} catch (Exception ignored) {
-		}
-
-		return 0L
-	}
-
-	private double percent(int value, int total) {
-		if (total <= 0) {
-			return 0d
-		}
-		return ((double) value / (double) total) * 100d
-	}
-
-	private String shorten(String text, int max) {
-		String value = safeValue(text)
-		if (value.length() <= max) {
-			return value
-		}
-		return value.substring(0, Math.max(0, max - 3)) + '...'
-	}
-
-	private String safeValue(def value) {
-		return value == null ? '' : String.valueOf(value).trim()
-	}
-
-	private String pickFirst(Object... values) {
-		if (values == null) {
-			return ''
-		}
-
-		for (Object value : values) {
-			String text = safeValue(value)
-			if (!text.isEmpty()) {
-				return text
-			}
-		}
-
-		return ''
-	}
-
-	private Object pickFirstObject(Object... values) {
-		if (values == null) {
-			return null
-		}
-
-		for (Object value : values) {
-			if (value == null) {
-				continue
-			}
-
-			if (value instanceof CharSequence && safeValue(value).isEmpty()) {
-				continue
-			}
-
-			return value
-		}
-
-		return null
-	}
-
-	private String htmlEscape(def value) {
-		String text = safeValue(value)
-		return text
-				.replace('&', '&amp;')
-				.replace('<', '&lt;')
-				.replace('>', '&gt;')
-				.replace('"', '&quot;')
-				.replace("'", '&#39;')
-	}
-
-	private String jsEscape(def value) {
-		String text = safeValue(value)
-		return text
-				.replace('\\', '\\\\')
-				.replace("'", "\\'")
-				.replace('\r', '')
-				.replace('\n', '\\n')
-	}
-
-	// =========================================================================
-	// CSS / JS
-	// =========================================================================
-
-	private String buildStyles() {
-		return '''
-<style>
-* {
-    box-sizing: border-box;
-}
-body {
-    margin: 0;
-    font-family: Arial, Helvetica, sans-serif;
-    color: #15212b;
-    background: #ffffff;
-}
-.top-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 24px;
-    padding: 10px 18px;
-    background: linear-gradient(90deg, #0d2d57 0%, #155c78 55%, #53d17e 100%);
-    color: #ffffff;
-}
-.top-banner-left {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-}
-.brand-logo {
-    width: 92px;
-    height: 92px;
-    object-fit: contain;
-    display: block;
-}
-.brand-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-.banner-title {
-    font-size: 18px;
-    font-weight: 700;
-    line-height: 1.2;
-}
-.banner-subtitle {
-    font-size: 12px;
-    opacity: 0.92;
-}
-.top-banner-right {
-    font-size: 10px;
-    text-align: right;
-    opacity: 0.94;
-    line-height: 1.5;
-    color: #000000 !important;
-}
-.page {
-    display: grid;
-    grid-template-columns: 520px 1fr;
-    min-height: calc(100vh - 114px);
-}
-.sidebar {
-    border-right: 1px solid #dfe6ef;
-    background: #ffffff;
-}
-.content {
-    padding: 32px 38px;
-}
-.sidebar-tabs {
-    display: flex;
-    border-bottom: 1px solid #e3e8ef;
-}
-.sidebar-tab {
-    flex: 1;
-    padding: 18px 16px;
-    background: #ffffff;
-    border: 0;
-    border-bottom: 2px solid transparent;
-    font-size: 14px;
-    cursor: pointer;
-    color: #4f5d6d;
-}
-.sidebar-tab.active {
-    color: #15212b;
-    border-bottom-color: #2f86eb;
-    font-weight: 700;
-}
-.search-wrap {
-    padding: 18px 18px 12px 18px;
-}
-.search-input {
-    width: 100%;
-    padding: 12px 14px;
-    border: 1px solid #d3dce8;
-    border-radius: 8px;
-    font-size: 13px;
-    outline: none;
-}
-.search-input:focus {
-    border-color: #2f86eb;
-    box-shadow: 0 0 0 2px rgba(47,134,235,0.12);
-}
-.scenario-list {
-    padding: 0 12px 18px 12px;
-}
-.scenario-list-item {
-    width: 100%;
-    display: grid;
-    grid-template-columns: 1fr 92px;
-    gap: 6px;
-    padding: 14px 12px;
-    border: 0;
-    background: #ffffff;
-    text-align: left;
-    cursor: pointer;
-    position: relative;
-    appearance: none;
-    -webkit-appearance: none;
-    border-radius: 0;
-}
-.scenario-list-item::after {
-    content: "";
-    position: absolute;
-    left: 14px;
-    right: 14px;
-    bottom: 0;
-    height: 1px;
-    background: #dfe6ef;
-}
-.scenario-list-item:last-child::after {
-    display: none;
-}
-.scenario-list-item:hover {
-    background: #f8fbff;
-}
-.scenario-list-item.selected {
-    border-left: 4px solid #2f86eb;
-    padding-left: 10px;
-    background: #f8fbff;
-}
-.scenario-list-main {
-    min-width: 0;
-}
-.scenario-list-title {
-    font-size: 14px;
-    font-weight: 700;
-    color: #15212b;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.scenario-list-summary {
-    margin-top: 6px;
-    font-size: 12px;
-    color: #6a7786;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.scenario-list-meta {
-    margin-top: 8px;
-    font-size: 12px;
-    color: #6f7d8d;
-}
-.scenario-list-side {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 4px;
-}
-.scenario-list-duration {
-    font-size: 12px;
-    color: #6f7d8d;
-}
-.status-pill {
-    min-width: 84px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 7px 12px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 700;
-    color: #ffffff;
-}
-.status-pill.passed {
-    background: #68b84b;
-}
-.status-pill.failed {
-    background: #e05b4d;
-    color: #ffffff;
-}
-.status-pill.skipped {
-    background: #d7b436;
-    color: #ffffff;
-}
-.status-pill.info {
-    background: #2f86eb;
-}
-.scenario-panel {
-    display: none;
-}
-.scenario-panel.active {
-    display: block;
-}
-.scenario-header {
-    margin-bottom: 20px;
-}
-.scenario-title {
-    font-size: 18px;
-    font-weight: 700;
-    color: #15212b;
-    line-height: 1.3;
-    margin-bottom: 16px;
-}
-.scenario-meta-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-}
-.meta-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 36px;
-    padding: 9px 14px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 700;
-}
-.meta-chip.plain {
-    background: #eef3f8;
-    color: #1e2a35;
-}
-.meta-chip.gradient {
-    background: linear-gradient(90deg, rgba(150,180,230,0.82) 0%, rgba(150,230,190,0.82) 100%); 
-    color: #000000;
-}
-.meta-chip.passed {
-    background: #68b84b;
-    color: #ffffff;
-}
-.meta-chip.failed {
-    background: #e05b4d;
-    color: #ffffff;
-}
-.meta-chip.skipped {
-    background: #d7b436;
-    color: #ffffff;
-}
-.meta-label {
-    opacity: 0.92;
-}
-.section-title {
-    margin-top: 18px;
-    margin-bottom: 10px;
-    font-size: 15px;
-    font-weight: 700;
-    color: #15212b;
-}
-.steps-table {
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
-    overflow: hidden;
-    background: #ffffff;
-}
-.steps-head,
-.step-row {
-    display: grid;
-    grid-template-columns: 110px 92px 1fr;
-    gap: 12px;
-    align-items: center;
-    padding: 12px 16px;
-}
-.steps-head {
-    background: #f8fafc;
-    border-bottom: 1px solid #e5e7eb;
-    font-size: 12px;
-    font-weight: 700;
-    color: #5a6776;
-}
-.step-row {
-    position: relative;
-    font-size: 13px;
-    color: #15212b;
-}
-.step-row::after {
-    content: "";
-    position: absolute;
-    left: 16px;
-    right: 16px;
-    bottom: 0;
-    height: 1px;
-    background: #edf2f7;
-}
-
-.step-row:last-child::after {
-    display: none;
-}
-.step-row.empty {
-    color: #7b8896;
-}
-.col-status {
-    min-width: 0;
-}
-.col-time {
-    min-width: 0;
-    width: 92px;
-    color: #607080;
-    font-size: 12px;
-}
-.col-detail {
-    min-width: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.step-icon {
-    margin-right: 3px;
-}
-.error-block,
-.evidence-block {
-    margin-top: 20px;
-    padding: 14px 16px;
-    border-left: 3px solid #e05b4d;
-    background: #fff8f7;
-    border-radius: 10px;
-    max-width: 980px;
-}
-.evidence-empty {
-    padding: 12px 14px;
-    border: 1px dashed #d9e2ec;
-    border-radius: 10px;
-    background: #fafcff;
-    color: #6b7a89;
-    font-size: 13px;
-}
-.error-title,
-.evidence-title {
-    font-size: 14px;
-    font-weight: 700;
-    color: #7e2f29;
-    margin-bottom: 8px;
-}
-.error-summary {
-    font-size: 13px;
-    color: #253341;
-    margin-bottom: 8px;
-}
-.details-box,
-.evidence-item {
-    margin-top: 10px;
-    border: 1px solid #e3e8ef;
-    border-radius: 10px;
-    overflow: hidden;
-    background: #ffffff;
-}
-.details-box summary,
-.evidence-item summary {
-    cursor: pointer;
-    padding: 12px 14px;
-    font-size: 13px;
-    font-weight: 700;
-    color: #155c78;
-    list-style: none;
-}
-.details-box summary::-webkit-details-marker,
-.evidence-item summary::-webkit-details-marker {
-    display: none;
-}
-.details-box pre {
-    margin: 0;
-    padding: 14px;
-    background: #0f1c2b;
-    color: #ffffff;
-    font-size: 12px;
-    line-height: 1.45;
-    white-space: pre-wrap;
-    word-break: break-word;
-    overflow-x: auto;
-    max-height: 460px;
-}
-.evidence-links {
-    padding: 0 14px 12px 14px;
-    font-size: 13px;
-}
-.evidence-links a {
-    color: #155c78;
-    text-decoration: none;
-    font-weight: 700;
-}
-.evidence-image {
-    display: block;
-    width: auto;
-    max-width: calc(100% - 28px);
-    max-height: 520px;
-    margin: 0 14px 14px 14px;
-    border-radius: 10px;
-    border: 1px solid #dde5ef;
-    object-fit: contain;
-    background: #ffffff;
-}
-.chart-side-wrap {
-    padding: 18px;
-}
-.chart-side-title {
-    font-size: 14px;
-    font-weight: 700;
-    margin-bottom: 12px;
-    color: #15212b;
-}
-.donut-card {
-    display: flex;
-    justify-content: center;
-    padding: 12px 0 18px 0;
-}
-.donut {
-    width: 340px;
-    height: 340px;
-    border-radius: 50%;
-    position: relative;
-}
-.donut-center {
-    position: absolute;
-    inset: 34px;
-    border-radius: 50%;
-    background: #ffffff;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-}
-.donut-number {
-    font-size: 42px;
-    font-weight: 700;
-    color: #15212b;
-}
-.donut-label {
-    font-size: 14px;
-    color: #708091;
-}
-.legend-list {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-}
-.legend-line {
-    display: grid;
-    grid-template-columns: 12px 1fr auto;
-    gap: 10px;
-    align-items: center;
-    font-size: 13px;
-    color: #1f2b37;
-}
-.legend-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-}
-.legend-value {
-    color: #607080;
-}
-.charts-panel {
-    display: block;
-}
-.chart-main-title {
-    font-size: 18px;
-    font-weight: 700;
-    margin-bottom: 18px;
-    color: #15212b;
-}
-.charts-layout {
-    display: grid;
-    grid-template-columns: 420px 1fr;
-    gap: 40px;
-    align-items: start;
-    max-width: 1280px;
-}
-.chart-bars {
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-    max-width: 760px;
-}
-.bar-row {
-    padding: 16px 18px;
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
-    background: #ffffff;
-}
-.bar-row-top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 10px;
-}
-.bar-label {
-    font-size: 14px;
-    font-weight: 700;
-    color: #15212b;
-}
-.bar-value {
-    font-size: 24px;
-    font-weight: 700;
-    color: #15212b;
-}
-.bar-track {
-    width: 100%;
-    height: 8px;
-    border-radius: 999px;
-    background: #edf2f7;
-    overflow: hidden;
-}
-.bar-fill {
-    height: 100%;
-    border-radius: 999px;
-}
-.bar-foot {
-    margin-top: 8px;
-    font-size: 12px;
-    color: #738394;
-}
-.hidden {
-    display: none !important;
-}
-@media (max-width: 1200px) {
-    .page {
-        grid-template-columns: 1fr;
-    }
-    .sidebar {
-        border-right: 0;
-        border-bottom: 1px solid #dfe6ef;
-    }
-    .content {
-        padding: 20px;
-    }
-    .charts-layout {
-        grid-template-columns: 1fr;
-    }
-}
-</style>
-'''
-	}
-
-	private String buildScripts() {
-		return '''
-<script>
-function showTab(tabName) {
-    var tabTests = document.getElementById('tab-tests');
-    var tabCharts = document.getElementById('tab-charts');
-    var testsSidebar = document.getElementById('tests-sidebar-block');
-    var chartsSidebar = document.getElementById('charts-sidebar-block');
-    var chartsPanel = document.getElementById('charts-panel');
-    var scenarioPanels = document.querySelectorAll('.scenario-panel');
-
-    if (tabName === 'charts') {
-        tabTests.classList.remove('active');
-        tabCharts.classList.add('active');
-        testsSidebar.classList.add('hidden');
-        chartsSidebar.classList.remove('hidden');
-        chartsPanel.classList.remove('hidden');
-        scenarioPanels.forEach(function(panel) {
-            panel.classList.add('hidden');
-        });
-    } else {
-        tabCharts.classList.remove('active');
-        tabTests.classList.add('active');
-        chartsSidebar.classList.add('hidden');
-        testsSidebar.classList.remove('hidden');
-        chartsPanel.classList.add('hidden');
-        scenarioPanels.forEach(function(panel) {
-            panel.classList.remove('hidden');
-        });
-    }
-}
-
-function showScenario(id) {
-    var buttons = document.querySelectorAll('.scenario-list-item');
-    var panels = document.querySelectorAll('.scenario-panel');
-
-    buttons.forEach(function(btn) {
-        if (btn.getAttribute('data-sid') === id) {
-            btn.classList.add('selected');
-        } else {
-            btn.classList.remove('selected');
-        }
-    });
-
-    panels.forEach(function(panel) {
-        if (panel.id === 'panel-' + id) {
-            panel.classList.add('active');
-        } else {
-            panel.classList.remove('active');
-        }
-    });
-
-    showTab('tests');
-}
-
-function filterScenarios() {
-    var input = document.getElementById('scenarioSearch');
-    var filter = input.value.toLowerCase();
-    var items = document.querySelectorAll('.scenario-list-item');
-
-    items.forEach(function(item) {
-        var text = item.textContent.toLowerCase();
-        if (text.indexOf(filter) > -1) {
-            item.style.display = '';
-        } else {
-            item.style.display = 'none';
-        }
-    });
-}
-</script>
-'''
-	}
-}
+Main responsibility
+
+This class is responsible for the final rendering of the GAIA report. It does not parse Jira responses, does not call endpoints, and does not read XML directly. Its only job is to take already prepared execution data and render it into HTML, CSS, and JavaScript.
+
+What this class builds
+
+The generated report includes:
+
+• the HTML document structure
+• the report title and top banner
+• the GAIA logo reference
+• the sidebar with Tests and Charts tabs
+• the searchable scenario list
+• the scenario detail panels
+• the steps table for each scenario
+• the visual error section for failed scenarios
+• the evidence preview block
+• the global chart overview
+• all embedded CSS styling
+• all embedded JavaScript interactions
+
+Position in the architecture
+
+This class belongs to the report visualization layer.
+
+Input
+
+It receives a Map model from JiraGaiaReportBuilder.
+
+Output
+
+It returns a single HTML string.
+
+Related classes
+
+• JiraGaiaReportBuilder prepares the report model
+• JiraGaiaHtmlTemplateBuilder renders the final HTML page
+
+Constants used in the class
+APP_NAME = 'GAIA'
+
+Used in the report header to identify the project/application name.
+
+REPORT_TITLE_PREFIX = 'Test report - '
+
+Prefix used to build the page title displayed in the browser and in the report header.
+
+LOGO_SRC = 'Image/gaia-logo.png'
+
+Default logo path used when no other logo source is provided.
+
+Status colors
+
+The class defines the visual colors used to represent scenario and chart statuses:
+
+• STATUS_PASS = '#68b84b'
+• STATUS_FAIL = '#e05b4d'
+• STATUS_SKIP = '#d7b436'
+• STATUS_INFO = '#2f86eb'
+
+These constants control the visual language of the report and should be updated here if the design palette changes.
+
+Entry points
+build(Map model)
+
+This is a public wrapper method that simply delegates to buildHtml(model). It exists as an alternative semantic entry point and can be used wherever the caller wants a direct "build" action.
+
+render(Map model)
+
+This is another public wrapper method that also delegates to buildHtml(model). It provides a more presentation-oriented name for the same rendering behavior.
+
+buildHtml(Map model)
+
+This is the main rendering method of the class. It normalizes the incoming model, creates a StringBuilder, assembles the complete HTML page, injects CSS and JavaScript, and returns the final HTML string. This is the core method of the class and the most important one for visual report generation.
+
+Rendering flow inside buildHtml()
+1. Normalize the input model
+
+The method first calls normalizeModel(model) to ensure the template receives a stable structure, even if the original model contains optional fields, alternate field names, or partially missing values.
+
+2. Build the HTML skeleton
+
+It creates the root structure of the page:
+
+• <!DOCTYPE html>
+• <html>
+• <head>
+• <body>
+
+3. Inject the page title and styles
+
+The report title is inserted into <title>, and buildStyles() injects the embedded CSS.
+
+4. Build the top banner
+
+The header includes:
+
+• the GAIA logo
+• the report title
+• the subtitle GAIA execution overview
+• generated timestamp text
+• project name
+
+5. Build the page layout
+
+The page is divided into:
+
+• left sidebar
+• right content area
+
+6. Build the sidebar
+
+The sidebar includes:
+
+• Tests tab
+• Charts tab
+• search input
+• scenario list
+• chart legend block
+
+7. Build the content area
+
+The content area contains:
+
+• one panel per scenario
+• the charts panel
+
+8. Inject scripts
+
+At the bottom of the HTML, buildScripts() injects the JavaScript functions responsible for tabs, selection, and filtering.
+
+Model normalization
+normalizeModel(Map model)
+
+This method transforms the raw incoming model into a safe internal structure used by the template.
+
+What it resolves
+
+It determines:
+
+• the suite name
+• the report title
+• the generated label
+• the report folder
+• the logo source
+• the normalized scenarios list
+• the total count of passed, failed, skipped, and total scenarios
+
+Why it matters
+
+The input model may come with different field names depending on how the upstream builder assembled it. This method prevents the rendering layer from depending on only one exact key naming convention.
+
+Output structure
+
+The returned map contains at least:
+
+• reportTitle
+• suiteName
+• generatedLabel
+• reportFolder
+• logoSrc
+• scenarios
+• passedCount
+• failedCount
+• skippedCount
+• totalCount
+
+Scenario normalization
+normalizeScenarios(Map model)
+
+This method converts raw scenario-like objects into a unified list of render-ready scenario maps.
+
+Accepted scenario sources
+
+It accepts alternative input collections such as:
+
+• model.scenarios
+• model.tests
+• model.cases
+• model.executions
+• model.items
+
+What it resolves per scenario
+
+For each scenario, it prepares:
+
+• ID
+• display name
+• short summary
+• normalized status
+• start and end labels
+• duration label
+• visual error
+• full error
+• step list
+• evidence list
+
+Important behavior
+
+If a scenario is failed and has more than one evidence item, the method keeps only the last evidence item. This means the report intentionally focuses on one final evidence artifact per failed scenario in the rendering layer.
+
+Why it matters
+
+This method allows the template to render scenarios consistently even if upstream data uses different field names or different internal structures.
+
+Step normalization
+normalizeSteps(Map item)
+
+This method converts raw step collections into a standard list of step rows for display.
+
+Accepted step sources
+
+It accepts step collections from different keys such as:
+
+• steps
+• stepRows
+• stepItems
+• timeline
+• events
+• logs
+
+What it resolves per step
+
+For each step, it determines:
+
+• normalized status
+• extracted timestamp
+• detail text
+• icon based on the step content
+
+Why it matters
+
+This ensures the steps table is visually consistent regardless of how step data was originally structured.
+
+Fallback step parsing
+parseStepsFromRawText(String rawText)
+
+When structured step data is missing, the template can still derive visible steps from raw text blocks. It supports at least two line patterns:
+
+• timestamp + status + message
+• BDD-like lines such as Given, When, Then, And ending in passed, failed, or skipped
+
+Why it matters
+
+This keeps the report usable even when the upstream model only contains raw log fragments instead of structured step arrays.
+
+Evidence normalization
+normalizeEvidence(Map item, Map model)
+
+This method transforms evidence-like objects into a standard structure the HTML can render.
+
+Accepted evidence sources
+
+It collects from:
+
+• evidence
+• evidences
+• images
+• attachments
+
+What it resolves
+
+For each evidence item, it determines:
+
+• display name
+• href
+• preview source
+• image flag
+
+Supported evidence forms
+
+It can handle:
+
+• map-based evidence objects
+• plain string paths
+• relative file paths
+• absolute paths
+• file: URIs
+• data URI images
+
+Why it matters
+
+This lets the report show clickable links and image previews in a reliable way, even if evidence comes in different formats.
+
+HTML block generation
+buildScenarioListItem(Map scenario, boolean selected)
+
+Builds one clickable row in the left sidebar for a scenario.
+
+Displayed information
+
+Each sidebar item shows:
+
+• truncated scenario name
+• truncated summary or error snippet
+• start time
+• status pill
+• duration
+
+Why it matters
+
+This block gives the user a quick overview of all scenarios in the execution and acts as the main navigation entry for scenario details.
+
+buildScenarioPanel(Map scenario, Map view, boolean selected)
+
+Builds the full right-side panel for one scenario.
+
+Displayed information
+
+A scenario panel includes:
+
+• scenario title
+• suite chip
+• status chip
+• start chip
+• end chip
+• duration chip
+• steps table
+• failed error block when applicable
+• evidence block when applicable
+
+Failed scenario behavior
+
+If the scenario status is failed, the template renders:
+
+• a visual error summary
+• an expandable full error block
+• evidence details
+• image preview when the evidence is an image
+
+Why it matters
+
+This is the main analysis area of the report and the part users interact with most when investigating a failed test.
+
+buildStepRow(Map step)
+
+Builds one row in the steps table.
+
+Columns shown
+
+• status
+• timestamp
+• detail with icon
+
+Why it matters
+
+Provides step-level traceability in a readable table format.
+
+buildMetaChip(String label, String value, String type)
+
+Builds the rounded information chips shown below the scenario title.
+
+Common uses
+
+• Suite
+• Status
+• Start
+• End
+• Duration
+
+Why it matters
+
+Gives a compact visual summary of the scenario context.
+
+Charts rendering
+buildChartsSidebar(Map view)
+
+Builds the charts legend shown in the sidebar when the Charts tab is selected.
+
+Current content
+
+It displays:
+
+• Passed
+• Failed
+• Skipped
+
+with their colors and counts.
+
+buildChartsPanel(Map view)
+
+Builds the main chart panel shown on the right side.
+
+Current content
+
+It includes:
+
+• a donut chart with total test count
+• bar rows for passed, failed, and skipped counts
+
+Calculation logic
+
+The chart percentages are calculated from:
+
+• failedCount / totalCount
+• passedCount / totalCount
+• skippedCount / totalCount
+
+Why it matters
+
+This provides a fast visual overview of the execution health.
+
+buildLegendLine(String label, String color, int value)
+
+Builds one chart legend item.
+
+buildBarRow(String label, int value, int total, String color)
+
+Builds one horizontal bar visualization for a status.
+
+Helper methods
+buildGeneratedLabel(Map model)
+
+Builds the "Generated ..." text shown in the header.
+
+Input priority
+
+It tries to use:
+
+• generatedAt
+• generatedLabel
+• createdAt
+• executionDate
+
+If none is present, it generates the current date/time using dd.MM.yyyy HH:mm:ss.
+
+normalizeDurationMs(Map item, String rawStart, String rawEnd)
+
+Determines scenario duration in milliseconds using:
+
+• direct duration fields if available
+• otherwise a fallback based on parsed start and end date values
+
+parseDateMillis(String raw)
+
+Attempts to parse several date and time formats into milliseconds.
+
+Supported patterns
+
+Includes formats such as:
+
+• dd.MM.yyyy HH:mm:ss
+• yyyy-MM-dd HH:mm:ss
+• ISO-like timestamp variants
+• HH:mm:ss
+
+formatDateTimeLabel(String raw)
+
+Returns a display-friendly time label, or -- when empty.
+
+extractClockLabel(String raw)
+
+Extracts a clock value from a timestamp-like string.
+
+cleanClock(String raw)
+
+Removes milliseconds from a timestamp if present.
+
+formatDuration(long durationMs)
+
+Formats milliseconds into HHh MMm SSs.
+
+resolveStepIcon(String detail, String status)
+
+Chooses an icon for a step based on status and detail text.
+
+Current rules
+
+• failed → ❌
+• skipped → ⏭️
+• wait → 🔎
+• click/select/fill/import → 🖱️
+• open/navigate → 🌐
+• otherwise → ℹ️
+
+Status mapping
+normalizeStatus(String raw)
+
+Normalizes raw status text into:
+
+• passed
+• failed
+• skipped
+• info
+
+Accepted input variants
+
+It supports variants like:
+
+• pass
+• passed
+• success
+• fail
+• failed
+• error
+• skip
+• skipped
+
+statusLabel(String status)
+
+Converts normalized statuses into UI labels:
+
+• Passed
+• Failed
+• Skipped
+• Info
+
+File and asset resolution
+resolveFile(String path, String baseFolder)
+
+Attempts to resolve a path into a real file.
+
+Supported resolution strategies
+
+• file: URI
+• direct filesystem path
+• relative path from base folder
+
+Why it matters
+
+This helps the report open evidence and logo files correctly.
+
+resolveLogoHref(Map view)
+
+Resolves the logo source used in the report header.
+
+Behavior
+
+If the file exists, it uses the file URI. Otherwise, it falls back to the provided logo path.
+
+isImageFile(String fileName)
+
+Checks whether a file name represents an image.
+
+Supported formats
+
+• png
+• jpg
+• jpeg
+• gif
+• webp
+• bmp
+
+Generic utility methods
+
+The class includes several generic helper methods used during normalization and rendering:
+
+asList(def value)
+
+Ensures values can be safely treated as lists.
+
+toLong(def value)
+
+Converts string-like numeric values into long, including values ending in s.
+
+percent(int value, int total)
+
+Calculates percentages safely, avoiding division by zero.
+
+shorten(String text, int max)
+
+Truncates long text with ....
+
+safeValue(def value)
+
+Returns a safe trimmed string.
+
+pickFirst(Object... values)
+
+Returns the first non-empty string value.
+
+pickFirstObject(Object... values)
+
+Returns the first meaningful non-null object.
+
+htmlEscape(def value)
+
+Escapes HTML special characters to prevent broken markup.
+
+jsEscape(def value)
+
+Escapes JavaScript string content for inline handlers.
+
+CSS layer
+buildStyles()
+
+Returns the full embedded CSS used by the generated report.
+
+What it styles
+
+• page layout
+• header/banner
+• sidebar
+• tabs
+• search input
+• scenario list items
+• scenario panels
+• status pills
+• meta chips
+• steps table
+• failed error block
+• evidence block
+• donut chart
+• bar charts
+• responsive behavior
+
+Why it matters
+
+This method controls the complete look and feel of the GAIA report. Any visual redesign of the report must be done here.
+
+Change this when you need to
+
+• update colors
+• change spacing
+• change fonts or sizes
+• redesign the layout
+• improve responsive behavior
+• restyle charts or evidence blocks
+
+JavaScript layer
+buildScripts()
+
+Returns the embedded JavaScript used by the generated report.
+
+Functions included
+showTab(tabName)
+
+Switches between the Tests and Charts tabs.
+
+showScenario(id)
+
+Selects a scenario in the sidebar and shows its panel.
+
+filterScenarios()
+
+Filters visible scenario list items based on the search box value.
+
+Why it matters
+
+This method controls the interactivity of the report. If tabs, filtering, or panel switching break, this is the first place to inspect.
+
+Change this when you need to
+
+• change tab behavior
+• change scenario selection logic
+• improve search/filter logic
+• add new front-end interactions
+
+Inputs expected by this class
+
+The class expects a model that may contain values such as:
+
+• suite name
+• report title
+• generated date
+• report folder
+• logo source
+• scenarios list
+• step details
+• evidence list
+• status values
+• timing values
+
+Because normalization is flexible, the template can accept multiple alternative field names, which makes it more tolerant to upstream data changes.
+
+Outputs produced by this class
+
+This class produces a single string containing a complete HTML document. That string is then written to gaiaReport.html by JiraGaiaReportBuilder.
+
+This class does not
+
+This class does not:
+
+• call Jira endpoints
+• parse XML directly
+• parse execution logs directly
+• upload files
+• resolve Test Plans
+• create ZIP files
+
+Its responsibility is strictly visual rendering.
+
+When to change this file
+
+Update JiraGaiaHtmlTemplateBuilder when you need to:
+
+• change the GAIA report layout
+• change text labels shown in the report
+• change colors and status presentation
+• change how scenario cards are displayed
+• change how failed errors are displayed
+• change how evidence previews are shown
+• change chart rendering
+• change sidebar structure
+• change tab interaction or filtering behavior
+• support new presentation fields in the report
+
+Key methods
+
+• build()
+• render()
+• buildHtml()
+• normalizeModel()
+• normalizeScenarios()
+• normalizeSteps()
+• normalizeEvidence()
+• buildScenarioListItem()
+• buildScenarioPanel()
+• buildChartsPanel()
+• buildStyles()
+• buildScripts()
+
+Risks and attention points
+
+Be careful when changing:
+
+• HTML escaping and JS escaping
+• scenario ID handling in inline click events
+• evidence href resolution
+• CSS for responsive layout
+• chart percentage calculations
+• assumptions about normalized input keys
+
+A visual change in this class can make the report render incorrectly even when the report data itself is valid.
+
+Summary
+
+JiraGaiaHtmlTemplateBuilder is the front-end rendering class of the GAIA report. It takes the normalized execution model and transforms it into the final interactive HTML artifact with styling, charts, evidence preview, and navigation logic. If JiraGaiaReportBuilder is the class that prepares the report data, JiraGaiaHtmlTemplateBuilder is the class that turns that data into the final user-facing report.
+
+
+
+
+
+
+
 
 
 🌐 Jira Endpoints
-1. Import Results
+📄 Page: Import Results
+Overview
 
-This endpoint is used to import the XML execution results into Jira and automatically create the Test Execution issue based on the test result file generated by Katalon. It is called by JiraGateway.importExecutionResults() through the Katalon object Jira Integration/Import Results, using the endpoint POST /rest/raven/1.0/import/execution/junit?projectKey=${project}. This is the endpoint to review when execution import fails, the XML format changes, or the response no longer returns the expected execution key. 🔗 Full page: [Add link here]
+The Import Results endpoint is responsible for sending the XML test execution results generated by Katalon to Jira/Xray and creating the corresponding Test Execution issue. This is the first Jira API step in the publishing flow because it transforms the local execution result file into a Jira execution entity that can later be updated, linked to a Test Plan, and enriched with attachments.
 
-2. Create Test Plan
+Purpose in the integration
 
-This endpoint is used to create a new Jira issue of type Test Plan when no valid existing Test Plan is found for the current suite. It is called by JiraGateway.createTestPlan() through the Katalon object Jira Integration/Create Test Plan, using the endpoint POST /rest/api/2/issue, and it sends the project key, summary, issue type, and Epic relation. This is the endpoint to update when the Jira field mapping changes, the Epic field changes, or the Test Plan creation payload must include more fields. 🔗 Full page: [Add link here]
+This endpoint exists to bridge the gap between the local Katalon execution output and Jira/Xray. Without this call, the integration would not have a Jira execution key to work with, which means the rest of the publishing flow could not continue. The execution key returned by this endpoint is later used to update the execution metadata, link it to a Test Plan, and upload artifacts such as the GAIA report and ZIP files.
 
-3. Search Test Plans
+Called by
 
-This endpoint is used to search Jira for existing Test Plans so the integration can reuse the correct one instead of creating duplicates. It is called by JiraGateway.searchTestPlans() using a runtime RequestObject with the endpoint GET /rest/api/2/search, and the returned issues are later filtered by exact summary inside JiraTestPlanManager. This is the endpoint logic to review when the search is returning too many results, missing the expected Test Plan, or when the JQL needs to become more specific. 🔗 Full page: [Add link here]
+JiraGateway.importExecutionResults()
 
-4. Get Issue By Key
+Katalon request object
 
-This endpoint is used to validate whether a previously saved Test Plan key still points to the correct Jira issue before reusing it in a new execution. It is called by JiraGateway.getIssueByKey() using the endpoint GET /rest/api/2/issue/{issueKey}?fields=summary,created,issuetype, and it is mainly used by JiraTestPlanManager during saved key validation. This is the endpoint to review when saved Test Plan reuse becomes unreliable or when additional validation fields are needed. 🔗 Full page: [Add link here]
+Jira Integration/Import Results
 
-5. Update Test Plan
+HTTP method and URL
 
-This endpoint is used to link the newly created Test Execution to the resolved Jira Test Plan after the XML import is completed. It is called by JiraGateway.addExecutionToTestPlan() through the Katalon object Jira Integration/Update Test Plan, using the endpoint POST /rest/raven/2.0/api/testplan/${testPlanKey}/testexecution, and it sends the execution key in the request body. This is the endpoint to update when the Xray linking contract changes or when executions need to be added to the Test Plan in a different way. 🔗 Full page: [Add link here]
+Method: POST
+URL: https://jira-mut.d.bbg/rest/raven/1.0/import/execution/junit?projectKey=${project}
 
-6. Update Test Execution Name
+Request type
 
-This endpoint is used to update the Jira Test Execution after it is created, mainly to set the execution summary, environment, and labels according to the current run. It is called by JiraGateway.updateTestExecution() through the Katalon object Jira Integration/Update Test Execution Name, using the endpoint PUT /rest/api/2/issue/${issueID}. This is the endpoint to review when the execution metadata needs to change, more Jira fields must be updated, or labels and environment handling are modified. 🔗 Full page: [Add link here]
+multipart/form-data
 
-7. Evidence attachment
+Sent parameters
 
-This endpoint is used to upload attachments to the Jira Test Execution, including the generated gaiaReport.html, Evidences.zip, and Results.zip files. It is called by JiraGateway.uploadAttachment() through the Katalon object Jira Integration/Evidence attachment, using the endpoint POST /rest/api/2/issue/${execID}/attachments. This is the endpoint to review when attachment upload fails, file validation rules change, or new artifact types need to be uploaded. 🔗 Full page: [Add link here]
+The request uploads the XML file as a multipart file field.
 
-8. Create Test Set
+Variables used
 
-This request object exists in the project but is not used by the current integration flow. It is configured to create Jira issues of type Test Set through POST /rest/api/2/issue, but no current class calls it. This object is relevant only if the integration is extended in the future to organize or group tests using Test Sets. 🔗 Full page: [Add link here]
+• token → Jira bearer token
+• project → Jira project key
+• filePath → local path of the XML file to import
 
-9. Get Test Plan object
+Authentication
 
-This request object also exists in the project, but the active implementation does not use it directly because JiraGateway.searchTestPlans() currently builds the search request dynamically at runtime instead of calling the saved object. It is still related to the same Jira search endpoint, but today it is effectively redundant unless the code is refactored to use a saved Katalon request instead of a runtime one. 🔗 Full page: [Add link here]
+Uses Authorization: Bearer ${token}
 
-10. Transition Issue Status
+Content details
 
-This request object exists but is not currently used by the integration flow. It is intended to transition a Jira issue to another workflow status through POST /rest/api/2/issue/${issueID}/transitions, but the saved object currently contains a malformed URL and should not be considered active or production ready in its current form. This object is only relevant if the integration later needs to automate Jira workflow transitions. 🔗 Full page: [Add link here]
+The body sends a file parameter named file, using the local XML path provided by filePath.
+
+Expected input source
+
+The XML path is resolved before this endpoint is called, typically by JiraFlowCoordinator.findXmlFile(), which searches for preferred files such as cucumber.xml or JUnit_Report.xml.
+
+Expected response
+
+On success, the response body is expected to contain JSON with a structure similar to:
+
+{
+  "testExecIssue": {
+    "key": "L96B2C-1234"
+  }
+}
+
+The integration extracts:
+
+• testExecIssue.key
+
+This value becomes the Jira execution key used by the rest of the flow.
+
+Success criteria
+
+The current implementation accepts these status codes as successful:
+
+• 200
+• 201
+• 204
+
+Failure behavior
+
+If the status code is not accepted, the integration returns:
+
+ERROR<statusCode>
+
+If the response does not contain testExecIssue.key, the integration returns:
+
+ERROR_NO_EXEC_KEY
+
+In both cases, the main publishing flow stops because the execution key is mandatory for all next steps.
+
+Why this endpoint is critical
+
+This is the endpoint that actually creates the Jira execution from the automated test run. If it fails, nothing else can proceed because there is no execution issue to update or attach files to.
+
+Common maintenance scenarios
+
+Update this endpoint page when:
+
+• the Xray import route changes
+• the XML format changes from JUnit to another format
+• Jira/Xray changes the response body contract
+• authentication headers change
+• more import query parameters are needed
+
+Risks and attention points
+
+Be careful with:
+
+• XML file path correctness
+• XML format compatibility with Xray
+• response parsing for testExecIssue.key
+• accepted status codes
+• hardcoded base URL inside the saved request object
+
+Related flow
+
+This endpoint is followed by:
+
+• Update Test Plan to link execution to the Test Plan
+• Update Test Execution Name to update metadata
+• Evidence attachment to upload files
+
+📄 Page: Create Test Plan
+Overview
+
+The Create Test Plan endpoint is responsible for creating a new Jira issue of type Test Plan when the integration cannot find a valid existing Test Plan for the current suite. It is part of the Test Plan resolution strategy and is only used when reuse is not possible or not desired.
+
+Purpose in the integration
+
+The integration uses one Test Plan per suite naming convention. When the current suite does not already have a reusable Test Plan, this endpoint creates one so the imported execution can later be linked to it. This allows the Jira side to stay organized and prevents executions from remaining disconnected from their expected Test Plan structure.
+
+Called by
+
+JiraGateway.createTestPlan()
+
+Katalon request object
+
+Jira Integration/Create Test Plan
+
+HTTP method and URL
+
+Method: POST
+URL: https://jira-mut.d.bbg/rest/api/2/issue
+
+Request type
+
+application/json
+
+Variables used
+
+• token → Jira bearer token
+• project → Jira project key
+• summary → Test Plan summary/title
+• epic → Epic key to be linked through Jira custom field
+
+Authentication
+
+Uses Authorization: Bearer ${token}
+
+Payload structure
+
+The request creates a Jira issue with:
+
+• project.key
+• summary
+• issuetype.name = "Test Plan"
+• customfield_10006 = ${epic}
+
+Example structure:
+
+{
+  "fields": {
+    "project": {
+      "key": "${project}"
+    },
+    "summary": "${summary}",
+    "issuetype": {
+      "name": "Test Plan"
+    },
+    "customfield_10006": "${epic}"
+  }
+}
+Expected input source
+
+The summary is typically built by:
+
+JiraFlowCoordinator.getTestPlanName()
+
+The Epic value comes from:
+
+JiraFlowCoordinator.EPIC_KEY
+
+Expected response
+
+On success, Jira returns a JSON body containing the created issue key. The integration reads:
+
+• key
+
+That value becomes the resolved Test Plan key.
+
+Success criteria
+
+The current implementation accepts:
+
+• 200
+• 201
+
+Failure behavior
+
+If the response status is not accepted, the method returns:
+
+ERROR<statusCode>
+
+The main flow then stops because the execution cannot be published without a resolved Test Plan.
+
+Why this endpoint is important
+
+This endpoint is the fallback creation mechanism for Test Plans. It ensures the integration can still complete even when no reusable Test Plan exists yet in Jira.
+
+Common maintenance scenarios
+
+Update this endpoint page when:
+
+• the Epic custom field ID changes
+• additional Jira fields must be filled during creation
+• the issue type changes
+• project mapping changes
+• Test Plan creation needs more metadata such as labels or components
+
+Risks and attention points
+
+Be careful with:
+
+• customfield_10006 because it is environment-specific
+• Jira issue type name Test Plan
+• summary naming consistency
+• project key correctness
+• hardcoded request URL in the saved request object
+
+Related flow
+
+This endpoint is used after:
+
+• Search Test Plans
+• Get Issue By Key validation
+and before:
+• Update Test Plan to add execution into the created Test Plan
+
+📄 Page: Search Test Plans
+Overview
+
+The Search Test Plans endpoint is used to retrieve existing Jira issues of type Test Plan so the integration can decide whether a current suite should reuse an existing Test Plan instead of creating a new one. This endpoint is part of the reuse logic and supports the goal of avoiding duplicate Test Plans in Jira.
+
+Purpose in the integration
+
+The integration does not blindly create a new Test Plan every time. Instead, it first searches Jira for candidate Test Plans and then applies exact matching logic later in JiraTestPlanManager. This keeps Jira cleaner and allows repeated runs of the same suite to remain associated with the correct Test Plan.
+
+Called by
+
+JiraGateway.searchTestPlans()
+
+Current implementation type
+
+This endpoint is not called through the saved Katalon request object in the active code. Instead, the request is built dynamically using a runtime RequestObject.
+
+HTTP method and URL
+
+Method: GET
+Endpoint base: /rest/api/2/search
+
+The final URL is built dynamically with query parameters:
+
+• jql
+• maxResults=200
+• fields=summary,created,issuetype
+
+Current JQL
+
+The current implementation sends a JQL like:
+
+project = "L96B2C" AND issuetype = "Test Plan" ORDER BY created DESC
+
+Important note
+
+Although the method receives summary and epicKey as input, the current JQL does not filter directly by summary or Epic. The exact title comparison happens later in JiraTestPlanManager.
+
+Authentication
+
+Uses:
+
+• Authorization: Bearer <token>
+• Accept: application/json
+
+Expected response
+
+The method expects a Jira search response containing:
+
+• issues
+
+Each issue is later examined for fields like:
+
+• fields.summary
+• fields.issuetype.name
+
+Returned structure inside the code
+
+The gateway wraps the result into a map with:
+
+• ok
+• status
+• error
+• issues
+
+This is then consumed by JiraTestPlanManager.
+
+Success criteria
+
+HTTP status must be:
+
+• 200
+
+Failure behavior
+
+If the call fails, the gateway returns a failure map with status and error details. The Test Plan manager may then return:
+
+• ERROR_SEARCH_<status>
+• ERROR_SEARCH_REQUEST
+
+depending on the failure type.
+
+Why this endpoint is important
+
+This endpoint is the core of the reuse strategy. It allows the system to discover candidate Test Plans before deciding whether a new one is needed.
+
+Common maintenance scenarios
+
+Update this endpoint page when:
+
+• the search is returning too many irrelevant Test Plans
+• you want to filter directly by summary in the JQL
+• you want to filter by Epic
+• Jira search field selection changes
+• the integration is refactored to use the saved Get Test Plan request object
+
+Risks and attention points
+
+Be careful with:
+
+• JQL specificity
+• large result sets
+• exact summary matching being done outside the endpoint call
+• hardcoded max results
+• assumptions that newest returned item is the best candidate
+
+Related flow
+
+This endpoint works together with:
+
+• Get Issue By Key for saved key validation
+• Create Test Plan when no valid exact match is found
+
+📄 Page: Get Issue By Key
+Overview
+
+The Get Issue By Key endpoint is used to validate whether a previously saved Jira Test Plan key still points to the correct Jira issue. It is part of the optimization strategy that allows suite-to-TestPlan mappings to be stored locally and reused safely in future runs.
+
+Purpose in the integration
+
+The integration stores a local text file with the last known Test Plan key for each suite. Before reusing that key, it must confirm that the Jira issue still exists and still matches the expected suite summary and issue type. This endpoint provides that validation.
+
+Called by
+
+JiraGateway.getIssueByKey()
+
+HTTP method and URL
+
+Method: GET
+URL pattern: /rest/api/2/issue/{issueKey}?fields=summary,created,issuetype
+
+Authentication
+
+Uses:
+
+• Authorization: Bearer <token>
+• Accept: application/json
+
+Requested fields
+
+The current implementation explicitly requests:
+
+• summary
+• created
+• issuetype
+
+These are enough for the current validation logic.
+
+Input source
+
+The issueKey is usually read from a locally saved suite mapping file through:
+
+JiraFlowCoordinator.readSavedSuiteTestPlanKey()
+
+Expected response
+
+The endpoint returns a Jira issue JSON body. The integration later checks:
+
+• fields.summary
+• fields.issuetype.name
+
+Success criteria
+
+HTTP status must be:
+
+• 200
+
+Failure behavior
+
+If the status is not 200, the gateway returns a failure map and the saved key is ignored. The Test Plan manager then continues by searching Jira instead of reusing the saved key.
+
+Why this endpoint is important
+
+This endpoint protects the integration from reusing stale or incorrect saved Test Plan keys. Without this validation, a local mapping could silently point to the wrong issue and corrupt the association between suites and Test Plans.
+
+Common maintenance scenarios
+
+Update this endpoint page when:
+
+• more issue fields are needed for validation
+• saved key validation must become stricter
+• Jira issue field names change
+• local key reuse logic is extended
+
+Risks and attention points
+
+Be careful with:
+
+• validation depending only on summary and issue type
+• stale local mappings
+• issue permissions or missing issues returning non-200 responses
+• assuming the saved key is always trustworthy
+
+Related flow
+
+This endpoint is used before:
+
+• Search Test Plans
+and helps avoid unnecessary calls to:
+• Create Test Plan
+
+📄 Page: Update Test Plan
+Overview
+
+The Update Test Plan endpoint is used to link a newly created Jira Test Execution to a resolved Jira Test Plan. This step happens after the XML results have already been imported and a valid execution key has been returned.
+
+Purpose in the integration
+
+Importing the XML creates the execution, but it does not automatically attach that execution to the intended Test Plan in the current flow. This endpoint makes that relationship explicit by adding the execution key to the target Test Plan, keeping the Jira/Xray structure organized.
+
+Called by
+
+JiraGateway.addExecutionToTestPlan()
+
+Katalon request object
+
+Jira Integration/Update Test Plan
+
+HTTP method and URL
+
+Method: POST
+URL: https://jira-mut.d.bbg/rest/raven/2.0/api/testplan/${testPlanKey}/testexecution
+
+Request type
+
+application/json
+
+Variables used
+
+• token → Jira bearer token
+• testPlanKey → Jira Test Plan issue key
+• jsonBody → request body containing execution references
+
+Authentication
+
+Uses Authorization: Bearer ${token}
+
+Payload structure
+
+The body is dynamically built in code and currently looks like:
+
+{
+  "addTestsToPlan": true,
+  "add": ["<executionKey>"]
+}
+Input source
+
+The inputs come from:
+
+• JiraTestPlanManager.getOrCreateTestPlanKey() for the Test Plan key
+• Import Results response for the execution key
+
+Expected response
+
+The current implementation only checks the HTTP status code and does not parse the response body.
+
+Success criteria
+
+There is no detailed body validation in the current code. The returned status code is simply logged and stored.
+
+Failure behavior
+
+If the request fails, the status code is still returned, but the main flow currently does not parse a body-level error contract here. The execution may exist in Jira but remain disconnected from the intended Test Plan.
+
+Why this endpoint is important
+
+This endpoint creates the business association between the execution and the suite’s Test Plan. Without it, Jira would contain execution issues that are not grouped under the correct Test Plan.
+
+Common maintenance scenarios
+
+Update this endpoint page when:
+
+• Xray API version changes
+• the request body contract changes
+• linking logic becomes more complex
+• the execution needs to be added differently
+• more payload options need to be supported
+
+Risks and attention points
+
+Be careful with:
+
+• using the correct testPlanKey
+• using the correct executionKey
+• Xray API version compatibility
+• not validating the response body in depth
+
+Related flow
+
+This endpoint happens after:
+
+• Import Results
+and before:
+• Update Test Execution Name
+• Evidence attachment
+
+📄 Page: Update Test Execution Name
+Overview
+
+The Update Test Execution Name endpoint is used to update the newly created Jira Test Execution with business metadata such as summary, environment, and labels. It runs after the execution is imported and after the Test Execution key is already known.
+
+Purpose in the integration
+
+The XML import creates the Jira execution, but the execution still needs to be adjusted to match the naming and metadata conventions required by the project. This endpoint ensures the final Jira issue is readable, correctly labeled, and tagged with the right execution environment.
+
+Called by
+
+JiraGateway.updateTestExecution()
+
+Katalon request object
+
+Jira Integration/Update Test Execution Name
+
+HTTP method and URL
+
+Method: PUT
+URL: https://jira-mut.d.bbg/rest/api/2/issue/${issueID}
+
+Request type
+
+application/json
+
+Variables used
+
+• token → Jira bearer token
+• issueID → Jira execution issue key
+• summary → final execution summary
+• labels → execution label
+• env → execution environment
+
+Authentication
+
+Uses Authorization: Bearer ${token}
+
+Payload structure
+
+The current body updates:
+
+• fields.summary
+• fields.environment
+• fields.labels
+
+Example structure:
+
+{
+  "fields": {
+    "summary": "${summary}",
+    "environment": "${env}",
+    "labels": ["${labels}"]
+  }
+}
+Input source
+
+The summary usually comes from:
+
+JiraFlowCoordinator.getExecutionSummary()
+
+The labels and environment come from coordinator configuration:
+
+• LABELS
+• ENVIRONMENT
+
+Expected response
+
+The current implementation only stores and logs the HTTP status code. It does not parse the response body.
+
+Success criteria
+
+The current code treats the returned HTTP status code as the result of the update operation.
+
+Failure behavior
+
+If the update fails, the execution still exists in Jira because it was already created by the import step, but it may keep the default summary or miss expected labels and environment information.
+
+Why this endpoint is important
+
+This endpoint is what turns the imported execution into a properly named and classified Jira issue that matches the team’s conventions.
+
+Common maintenance scenarios
+
+Update this endpoint page when:
+
+• more Jira fields must be updated
+• labels should become a list instead of a single value
+• environment field mapping changes
+• execution summary format changes
+• custom fields need to be added to the update payload
+
+Risks and attention points
+
+Be careful with:
+
+• Jira field names such as environment
+• label formatting
+• summary length and formatting
+• project-specific Jira field availability
+
+Related flow
+
+This endpoint happens after:
+
+• Import Results
+• Update Test Plan
+and before:
+• Evidence attachment
+
+📄 Page: Evidence attachment
+Overview
+
+The Evidence attachment endpoint is used to upload generated files to the Jira Test Execution, including the custom GAIA report and ZIP packages containing evidences and execution results. This is the final delivery step of the publishing flow.
+
+Purpose in the integration
+
+The execution issue in Jira is much more useful when it contains the generated report and local artifacts that support troubleshooting and analysis. This endpoint is responsible for making those artifacts available directly inside Jira so users do not need to retrieve them manually from the execution machine.
+
+Called by
+
+JiraGateway.uploadAttachment()
+
+Katalon request object
+
+Jira Integration/Evidence attachment
+
+HTTP method and URL
+
+Method: POST
+URL: https://jira-mut.d.bbg/rest/api/2/issue/${execID}/attachments
+
+Request type
+
+multipart/form-data
+
+Variables used
+
+• token → Jira bearer token
+• execID → Jira Test Execution issue key
+• evidences → local file object to upload
+
+Authentication
+
+Uses:
+
+• Authorization: Bearer ${token}
+• X-Atlassian-Token: no-check
+
+Payload structure
+
+Uploads a file part named file.
+
+Input source
+
+This endpoint is called by JiraExecutionPublisher.uploadExecutionAttachments() for:
+
+• gaiaReport.html
+• Evidences.zip
+• Results.zip
+
+Pre-upload validation in code
+
+Before calling the endpoint, the integration checks that the file:
+
+• path is not blank
+• exists
+• is a regular file
+• has size greater than zero
+
+If any check fails, upload is skipped.
+
+Expected response
+
+The current implementation logs:
+
+• response status code
+• response body content
+
+It returns only the status code to the caller.
+
+Success criteria
+
+The current code uses the HTTP status code as the final upload result.
+
+Failure behavior
+
+If upload fails, the execution still exists in Jira, but one or more attachments may be missing. This reduces the usefulness of the execution for troubleshooting but does not invalidate the rest of the publishing flow.
+
+Why this endpoint is important
+
+This endpoint is what makes the execution self-contained in Jira by attaching the exact artifacts produced locally during the run.
+
+Common maintenance scenarios
+
+Update this endpoint page when:
+
+• new artifact types need to be uploaded
+• file validation rules change
+• Jira attachment policy changes
+• upload permissions or headers change
+• attachment naming conventions change
+
+Risks and attention points
+
+Be careful with:
+
+• file existence validation
+• zero-byte files
+• Jira attachment permissions
+• attachment size limitations
+• repeated uploads of the same generated files
+
+Related flow
+
+This is the final endpoint used after:
+
+• Import Results
+• Update Test Plan
+• Update Test Execution Name
+
+📄 Page: Create Test Set
+Overview
+
+The Create Test Set request object exists in the project but is not used by the current integration flow. It is configured to create a Jira issue of type Test Set and could be used in the future if the integration expands to organize tests through Test Sets.
+
+Purpose in the project
+
+At the moment, this request object is inactive from a runtime perspective, but it represents a possible extension point. If the reporting process later requires grouping tests under Test Sets, this object could become part of that future design.
+
+Called by
+
+Currently not called by any class.
+
+Katalon request object
+
+Jira Integration/Create Test Set
+
+HTTP method and URL
+
+Method: POST
+URL: https://jira-mut.d.bbg/rest/api/2/issue
+
+Request type
+
+application/json
+
+Intended variables
+
+The request body suggests use of:
+
+• project
+• summary
+• labels
+
+Payload intention
+
+Creates an issue of type Test Set and sets labels.
+
+Important note
+
+The body includes customfield_12510:[], which may be project-specific and should be validated before any future use.
+
+Current relevance
+
+This request object is only relevant if the integration later needs to create or manage Test Sets in Jira.
+
+Common maintenance scenarios
+
+Review this object when:
+
+• Test Sets are introduced into the integration
+• field mapping must be validated
+• the payload is completed and tested
+• request variables need cleanup
+
+Risks and attention points
+
+Be careful with:
+
+• unused objects becoming outdated
+• field IDs such as customfield_12510
+• assuming this request is production-ready without implementation and testing
+
+📄 Page: Get Test Plan request object
+Overview
+
+The Get Test Plan request object exists in the Katalon project, but the active implementation does not use it directly. The current search logic is implemented dynamically inside JiraGateway.searchTestPlans() using a runtime RequestObject.
+
+Purpose in the project
+
+This object appears to be an earlier or alternative version of the Jira search logic intended to search for existing Test Plans using JQL. It may still be useful if the integration is refactored to move the dynamic search logic back into a reusable saved Katalon request object.
+
+Called by
+
+Currently not called by the active code path.
+
+Katalon request object
+
+Jira Integration/Get Test Plan
+
+HTTP method and URL
+
+Method: GET
+URL pattern: ${baseUrl}/rest/api/2/search?jql=${jql}&maxResults=${maxResults}&fields=${fields}
+
+Request type
+
+GET request with query parameters.
+
+Intended variables
+
+• baseUrl
+• token
+• jql
+• maxResults
+• fields
+
+Current relation to code
+
+Although the object exists, JiraGateway.searchTestPlans() currently rebuilds the request at runtime and does not call this saved object.
+
+Current relevance
+
+This object is redundant in the current implementation unless the code is refactored.
+
+Common maintenance scenarios
+
+Review this object when:
+
+• you want to stop building the search request dynamically
+• you want search behavior centralized in repository objects
+• you want reusable testable request definitions in Katalon
+
+Risks and attention points
+
+Be careful with:
+
+• divergence between runtime logic and saved object definition
+• stale default JQL values
+• assuming edits here will impact the active integration when they currently do not
+
+📄 Page: Transition Issue Status
+Overview
+
+The Transition Issue Status request object exists in the project but is not currently used by the Jira integration flow. It appears intended to transition a Jira issue to another workflow state by sending a transition ID to Jira.
+
+Purpose in the project
+
+This object is a possible future extension point if the integration later needs to automatically move executions, Test Plans, or other Jira issues through workflow states after creation or update.
+
+Called by
+
+Currently not called by any class.
+
+Katalon request object
+
+Jira Integration/Transition Issue Status
+
+HTTP method and URL
+
+Method: POST
+Intended URL pattern: /rest/api/2/issue/${issueID}/transitions
+
+Important warning
+
+The currently saved object contains a malformed URL because the transitions URL appears duplicated and has an incorrect host suffix in one part. In its current state, it should not be considered production-ready.
+
+Request type
+
+application/json
+
+Intended variables
+
+• token
+• issueID
+• transitionID
+
+Intended payload
+{
+  "transition": {
+    "id": "${transitionID}"
+  }
+}
+Current relevance
+
+This object is inactive in the present flow and should only be considered if workflow automation becomes a future requirement.
+
+Common maintenance scenarios
+
+Review this object when:
+
+• issue transitions must be automated
+• Jira workflow states become part of the publishing process
+• the malformed URL is corrected and the object is validated
+
+Risks and attention points
+
+Be careful with:
+
+• the malformed URL in the saved object
+• Jira workflow-specific transition IDs
+• environment-specific workflow differences
+• assuming this object is active today when it is not
+
 
 
 
