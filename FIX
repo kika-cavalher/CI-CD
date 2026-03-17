@@ -1,1 +1,136 @@
+package jiraIntegration
 
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraTestPlanManager {
+
+	JiraFlowCoordinator flow
+	JiraGateway gateway
+
+	JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
+		this.flow = owner
+		this.gateway = gateway
+	}
+
+	String getOrCreateTestPlanKey() {
+		if (!flow.isBlank(flow.MANUAL_TEST_PLAN_KEY)) {
+			KeywordUtil.logInfo("Using manual Test Plan key: ${flow.MANUAL_TEST_PLAN_KEY}")
+			return flow.safe(flow.MANUAL_TEST_PLAN_KEY)
+		}
+
+		if (!flow.FORCE_CREATE_NEW_TEST_PLAN) {
+			String savedKey = getSavedValidTestPlanKey()
+			if (!flow.isBlank(savedKey)) {
+				return savedKey
+			}
+
+			String existingKey = findExistingTestPlanKey()
+			if (!flow.isBlank(existingKey)) {
+				flow.saveSuiteTestPlanKey(existingKey)
+				return existingKey
+			}
+		}
+
+		String createdKey = createTestPlan()
+		if (!flow.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+			flow.saveSuiteTestPlanKey(createdKey)
+		}
+
+		return createdKey
+	}
+
+	String getSavedValidTestPlanKey() {
+		String savedKey = flow.readSavedSuiteTestPlanKey()
+		if (flow.isBlank(savedKey)) {
+			return ''
+		}
+
+		Map savedIssueResult = gateway.getIssueByKey(savedKey)
+		int statusCode = (savedIssueResult?.statusCode ?: 0) as int
+
+		if (statusCode != 200) {
+			KeywordUtil.logInfo("Saved Test Plan key is no longer valid: ${savedKey}")
+			return ''
+		}
+
+		String expectedSummary = flow.getTestPlanName()
+		String savedSummary = flow.safe(savedIssueResult?.issue?.fields?.summary)
+		String savedType = flow.safe(savedIssueResult?.issue?.fields?.issuetype?.name)
+
+		if (flow.normalizeTitle(savedSummary) == flow.normalizeTitle(expectedSummary) &&
+			flow.normalizeTitle(savedType) == 'test plan') {
+			KeywordUtil.logInfo("Using saved Test Plan key for suite ${flow.getCurrentSuiteName()}: ${savedKey}")
+			return savedKey
+		}
+
+		KeywordUtil.logInfo("Saved Test Plan key does not match current suite/title. Ignoring key: ${savedKey}")
+		return ''
+	}
+
+	String findExistingTestPlanKey() {
+		String expectedSummary = flow.getTestPlanName()
+		Map response = gateway.searchTestPlans(expectedSummary, flow.EPIC_KEY)
+
+		int statusCode = (response?.statusCode ?: 0) as int
+		if (statusCode != 200) {
+			KeywordUtil.logInfo("Search Test Plan failed with status: ${statusCode}")
+			return ''
+		}
+
+		List issues = response?.issues instanceof List ? (response.issues as List) : []
+		if (issues.isEmpty()) {
+			KeywordUtil.logInfo("No existing Test Plan found for summary: ${expectedSummary}")
+			return ''
+		}
+
+		def matchedIssue = issues.find { issue ->
+			String issueSummary = flow.safe(issue?.fields?.summary)
+			String issueType = flow.safe(issue?.fields?.issuetype?.name)
+
+			return flow.normalizeTitle(issueSummary) == flow.normalizeTitle(expectedSummary) &&
+					flow.normalizeTitle(issueType) == 'test plan'
+		}
+
+		if (matchedIssue == null) {
+			KeywordUtil.logInfo("Search returned Test Plans, but none matched summary exactly: ${expectedSummary}")
+			return ''
+		}
+
+		String key = flow.safe(matchedIssue?.key)
+		if (!flow.isBlank(key)) {
+			KeywordUtil.logInfo("Existing Test Plan found: ${key}")
+		}
+
+		return key
+	}
+
+	String createTestPlan() {
+		String summary = flow.getTestPlanName()
+		KeywordUtil.logInfo("Creating new Test Plan with summary: ${summary}")
+
+		String createdKey = gateway.createTestPlan(summary, flow.EPIC_KEY)
+
+		if (flow.isBlank(createdKey)) {
+			return 'ERROR: empty Test Plan key returned from Jira'
+		}
+
+		if (createdKey.startsWith('ERROR')) {
+			return createdKey
+		}
+
+		KeywordUtil.logInfo("New Test Plan created successfully: ${createdKey}")
+		return createdKey
+	}
+}
+
+
+
+
+List<String> labelList = []
+if (!owner.isBlank(labels)) {
+	def flowRef = owner
+	labelList = labels
+		.split(',')
+		.collect { item -> flowRef.safe(item) }
+		.findAll { item -> !flowRef.isBlank(item) }
+}
