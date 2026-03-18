@@ -1,1 +1,427 @@
 
+/*
+ * Responsibility:
+ * Main Jenkins pipeline for Gaia Corrections.
+ * This file must remain a plain Groovy script.
+ */
+
+def safeFileName(String value) {
+    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
+}
+
+def getSuites() {
+    return [
+        [name: 'PreLoad', path: 'Test Suites/PreLoad'],
+        [name: 'Help', path: 'Test Suites/Help'],
+        [name: 'Correction- Add Correction', path: 'Test Suites/Correction- Add Correction']
+    ]
+}
+
+def bootstrapSupportFiles(script) {
+    script.deleteDir()
+
+    script.checkout([
+        $class: 'GitSCM',
+        branches: [[name: script.env.GIT_BRANCH]],
+        userRemoteConfigs: [[url: script.env.GIT_URL, credentialsId: script.env.GIT_CRED]],
+        extensions: [
+            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30],
+            [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [
+                [path: 'jenkinsPipelines'],
+                [path: 'jenkinsIntegration']
+            ]]
+        ]
+    ])
+}
+
+def fullCheckout(script) {
+    script.deleteDir()
+
+    script.checkout([
+        $class: 'GitSCM',
+        branches: [[name: script.env.GIT_BRANCH]],
+        userRemoteConfigs: [[url: script.env.GIT_URL, credentialsId: script.env.GIT_CRED]],
+        extensions: [
+            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+        ]
+    ])
+}
+
+def loadPaths(script) {
+    return script.load('jenkinsIntegration/JenkinsPaths.groovy')
+}
+
+def loadBatManager(script) {
+    return script.load('jenkinsIntegration/JenkinsBatManager.groovy')
+}
+
+def loadLiveLogger(script) {
+    return script.load('jenkinsIntegration/JenkinsLiveLogger.groovy')
+}
+
+def loadConsoleView(script) {
+    return script.load('jenkinsIntegration/JenkinsConsoleView.groovy')
+}
+
+def loadResultStore(script) {
+    return script.load('jenkinsIntegration/JenkinsResultStore.groovy')
+}
+
+def publishPrimaryArtifact(script, String reportsRoot, Map result) {
+    if (!(result?.screenshotRel ?: '').trim()) {
+        return
+    }
+
+    def parts = result.screenshotRel.tokenize('/')
+    if (!parts) {
+        return
+    }
+
+    def suiteKey = safeFileName(result.name)
+    def timestampPart = (parts.size() >= 2) ? parts[parts.size() - 2] : new Date().format('yyyyMMdd_HHmmss')
+    def fileName = parts[parts.size() - 1]
+    def srcFile = "${reportsRoot}\\${result.screenshotRel.replace('/', '\\')}"
+    def destRel = "suite-artifacts/${suiteKey}/${timestampPart}/${fileName}"
+    def destDir = "${reportsRoot}\\suite-artifacts\\${suiteKey}\\${timestampPart}"
+    def destFile = "${reportsRoot}\\${destRel.replace('/', '\\')}"
+
+    script.withEnv([
+        "SRC_FILE=${srcFile}",
+        "DEST_DIR=${destDir}",
+        "DEST_FILE=${destFile}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+if (-not [string]::IsNullOrWhiteSpace($env:SRC_FILE) -and (Test-Path -LiteralPath $env:SRC_FILE)) {
+    New-Item -ItemType Directory -Path $env:DEST_DIR -Force | Out-Null
+    Copy-Item -LiteralPath $env:SRC_FILE -Destination $env:DEST_FILE -Force
+}
+'''
+        )
+    }
+
+    result.primaryArtifactRel = destRel
+}
+
+def emergencyStopGaia(script) {
+    script.withEnv([
+        "BACK_PORT=${script.env.BACK_PORT}",
+        "FRONT_PORT=${script.env.FRONT_PORT}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+
+function Stop-ProcessListeningOnPort {
+    param([int]$Port)
+
+    try {
+        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique
+
+        foreach ($ownerPid in $owners) {
+            if ($ownerPid) {
+                Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+    }
+}
+
+Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
+Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
+
+exit 0
+'''
+        )
+    }
+}
+
+pipeline {
+    agent {
+        node {
+            label 'GI5_SWDCFRNXGI55817'
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+        }
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        timeout(time: 120, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '20'))
+    }
+
+    parameters {
+        string(name: 'STARTUP_WAIT_SECONDS', defaultValue: '40', description: 'Seconds to wait after Gaia startup')
+        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for each suite')
+        string(name: 'BROWSER', defaultValue: 'Chrome', description: 'Katalon browser type')
+    }
+
+    environment {
+        KATALON_EXE = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+        GIT_URL     = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
+        GIT_BRANCH  = '*/master'
+        GIT_CRED    = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
+        START_TASK  = 'GaiaBackFrontSetup'
+        BACK_PORT   = '8020'
+        FRONT_PORT  = '4200'
+    }
+
+    stages {
+        stage('Bootstrap Support Files') {
+            steps {
+                script {
+                    bootstrapSupportFiles(this)
+
+                    echo '------------------------------------------------------------'
+                    echo '[OK] BOOTSTRAP CHECKOUT COMPLETED'
+                    echo "Workspace: ${pwd()}"
+                    echo '------------------------------------------------------------'
+                }
+            }
+        }
+
+        stage('Validate Tools') {
+            steps {
+                script {
+                    bat """
+@echo off
+echo ------------------------------------------------------------
+echo VALIDATING TOOLS AND SUPPORT FILES
+echo ------------------------------------------------------------
+
+if not exist "${env.KATALON_EXE}" (
+    echo [ERROR] Katalon executable not found
+    echo ${env.KATALON_EXE}
+    exit /b 1
+)
+
+if not exist "${pwd()}\\jenkinsIntegration\\JenkinsBatManager.groovy" (
+    echo [ERROR] JenkinsBatManager.groovy not found
+    exit /b 1
+)
+
+if not exist "${pwd()}\\jenkinsIntegration\\JenkinsLiveLogger.groovy" (
+    echo [ERROR] JenkinsLiveLogger.groovy not found
+    exit /b 1
+)
+
+if not exist "${pwd()}\\jenkinsIntegration\\JenkinsPaths.groovy" (
+    echo [ERROR] JenkinsPaths.groovy not found
+    exit /b 1
+)
+
+if not exist "${pwd()}\\jenkinsIntegration\\JenkinsConsoleView.groovy" (
+    echo [ERROR] JenkinsConsoleView.groovy not found
+    exit /b 1
+)
+
+if not exist "${pwd()}\\jenkinsIntegration\\JenkinsResultStore.groovy" (
+    echo [ERROR] JenkinsResultStore.groovy not found
+    exit /b 1
+)
+
+echo [OK] Katalon executable found
+echo [OK] Jenkins support files found
+echo ------------------------------------------------------------
+"""
+                }
+            }
+        }
+
+        stage('Start Gaia') {
+            steps {
+                script {
+                    def batManager = loadBatManager(this)
+
+                    batManager.start(this, [
+                        taskName   : env.START_TASK,
+                        waitSeconds: params.STARTUP_WAIT_SECONDS.toInteger()
+                    ])
+                }
+            }
+        }
+
+        stage('Full Checkout Repository') {
+            steps {
+                script {
+                    fullCheckout(this)
+
+                    echo '------------------------------------------------------------'
+                    echo '[OK] FULL CHECKOUT COMPLETED'
+                    echo "Workspace: ${pwd()}"
+                    echo '------------------------------------------------------------'
+                }
+            }
+        }
+
+        stage('Prepare Useful Artifacts') {
+            steps {
+                script {
+                    def paths = loadPaths(this)
+                    def resultStore = loadResultStore(this)
+
+                    bat """
+@echo off
+if exist "${paths.reportsRoot(this)}" rmdir /s /q "${paths.reportsRoot(this)}"
+mkdir "${paths.reportsRoot(this)}"
+mkdir "${paths.logsRoot(this)}"
+mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
+"""
+
+                    resultStore.saveSuiteResults(this, paths.reportsRoot(this), [])
+                }
+            }
+        }
+
+        stage('Execute Suites') {
+            steps {
+                script {
+                    def paths = loadPaths(this)
+                    def consoleView = loadConsoleView(this)
+                    def resultStore = loadResultStore(this)
+                    def liveLogger = loadLiveLogger(this)
+
+                    def suiteResults = []
+                    def suites = getSuites()
+                    def defaultTimeout = params.SUITE_TIMEOUT_MINUTES.toInteger()
+
+                    suites.each { suite ->
+                        stage("Suite - ${suite.name}") {
+                            consoleView.printSuiteHeader(this, suite.name, suite.path, defaultTimeout.toString())
+
+                            int exitCode = liveLogger.runSuite(this, [
+                                katalonExe         : env.KATALON_EXE,
+                                projectPath        : paths.projectPath(this),
+                                reportsRoot        : paths.reportsRoot(this),
+                                browser            : params.BROWSER,
+                                suiteTimeoutMinutes: defaultTimeout
+                            ], suite)
+
+                            def meta = resultStore.readSuiteMeta(this, paths.reportsRoot(this), suite.name)
+
+                            def result = [
+                                name              : suite.name,
+                                path              : suite.path,
+                                status            : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
+                                icon              : meta['ICON'] ?: (exitCode == 0 ? '[OK]' : (exitCode == 124 ? '[TO]' : '[X]')),
+                                exitCode          : meta['EXIT_CODE'] ?: "${exitCode}",
+                                executed          : meta['EXECUTED'] ?: '0',
+                                passed            : meta['PASSED'] ?: '0',
+                                failed            : meta['FAILED'] ?: '0',
+                                skipped           : meta['SKIPPED'] ?: '0',
+                                durationSeconds   : meta['DURATION_SECONDS'] ?: '0',
+                                reason            : meta['REASON'] ?: '',
+                                screenshotRel     : meta['SCREENSHOT_REL'] ?: '',
+                                primaryArtifactRel: '',
+                                logRel            : meta['LOG_REL'] ?: '',
+                                caseSummary       : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
+                                stepSummary       : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
+                            ]
+
+                            publishPrimaryArtifact(this, paths.reportsRoot(this), result)
+
+                            suiteResults << result
+                            resultStore.saveSuiteResults(this, paths.reportsRoot(this), suiteResults)
+
+                            consoleView.printSuiteResult(this, result)
+                            consoleView.printRunningSummary(this, suiteResults)
+
+                            if (result.status != 'PASSED') {
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                    error("${result.name} finished with status ${result.status}")
+                                }
+                            }
+                        }
+                    }
+
+                    if (suiteResults.any { it.status != 'PASSED' }) {
+                        currentBuild.result = 'FAILURE'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def suiteResults = []
+                def reportsRoot = "${pwd()}\\Reports"
+
+                try {
+                    if (fileExists('jenkinsIntegration/JenkinsPaths.groovy') && fileExists('jenkinsIntegration/JenkinsResultStore.groovy')) {
+                        def paths = loadPaths(this)
+                        def resultStore = loadResultStore(this)
+                        reportsRoot = paths.reportsRoot(this)
+                        suiteResults = resultStore.loadSuiteResults(this, reportsRoot)
+                    }
+                }
+                catch (Throwable ignored) {
+                    suiteResults = []
+                }
+
+                try {
+                    if (fileExists('jenkinsIntegration/JenkinsBatManager.groovy')) {
+                        def batManager = loadBatManager(this)
+                        batManager.stop(this, [
+                            backPort : env.BACK_PORT.toInteger(),
+                            frontPort: env.FRONT_PORT.toInteger()
+                        ])
+                    }
+                    else {
+                        emergencyStopGaia(this)
+                    }
+                }
+                catch (Throwable ignored) {
+                    emergencyStopGaia(this)
+                }
+
+                try {
+                    if (fileExists('jenkinsIntegration/JenkinsConsoleView.groovy')) {
+                        def consoleView = loadConsoleView(this)
+                        consoleView.printFinalSummary(this, suiteResults, currentBuild.currentResult)
+                    }
+                }
+                catch (Throwable ignored) {
+                    echo '============================================================'
+                    echo 'PIPELINE FINISHED WITH ERRORS'
+                    echo '============================================================'
+                }
+            }
+
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                archiveArtifacts(
+                    artifacts: 'Reports/suite-artifacts/**/*.png',
+                    allowEmptyArchive: true
+                )
+            }
+
+            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml,Reports/logs/*.junit.xml'
+            }
+        }
+
+        success {
+            echo '[OK] PIPELINE FINISHED SUCCESSFULLY'
+        }
+
+        failure {
+            echo '[X] PIPELINE FINISHED WITH ERRORS'
+        }
+
+        aborted {
+            echo '[TO] PIPELINE ABORTED'
+        }
+    }
+}
