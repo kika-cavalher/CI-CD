@@ -2,20 +2,31 @@
  * Responsibility:
  * This file is responsible only for starting and stopping Gaia.
  * It preserves the scheduled task approach that already works in your machine.
+ * It is backward compatible with older Jenkinsfiles that do not pass readiness parameters.
  */
 
 def start(script, Map cfg) {
 	/*
 	 * Responsibility:
-	 * Trigger the scheduled task that starts Gaia and wait until Gaia is really ready.
+	 * Trigger the scheduled task that starts Gaia.
+	 * If readiness parameters are provided, wait until Gaia is really ready.
+	 * Otherwise, keep the legacy behavior and only wait a fixed amount of time.
 	 */
 
+	def taskName = cfg.taskName ?: ''
+	def waitSeconds = (cfg.waitSeconds ?: 40).toString()
+	def backPort = cfg.containsKey('backPort') && cfg.backPort != null ? cfg.backPort.toString() : ''
+	def frontPort = cfg.containsKey('frontPort') && cfg.frontPort != null ? cfg.frontPort.toString() : ''
+	def frontUrl = cfg.containsKey('frontUrl') && cfg.frontUrl != null ? cfg.frontUrl.toString() : ''
+	def useReadiness = (backPort?.trim() && frontPort?.trim() && frontUrl?.trim()) ? 'true' : 'false'
+
 	script.withEnv([
-		"TASK_NAME=${cfg.taskName}",
-		"WAIT_SECONDS=${cfg.waitSeconds.toString()}",
-		"BACK_PORT=${cfg.backPort.toString()}",
-		"FRONT_PORT=${cfg.frontPort.toString()}",
-		"FRONT_URL=${cfg.frontUrl}"
+		"TASK_NAME=${taskName}",
+		"WAIT_SECONDS=${waitSeconds}",
+		"BACK_PORT=${backPort}",
+		"FRONT_PORT=${frontPort}",
+		"FRONT_URL=${frontUrl}",
+		"USE_READINESS=${useReadiness}"
 	]) {
 		script.powershell '''
 $ErrorActionPreference = 'Stop'
@@ -81,12 +92,23 @@ function Wait-HttpReady {
 Write-Host '============================================================'
 Write-Host '🚀 STARTING GAIA THROUGH SCHEDULED TASK'
 Write-Host ('🕒 Max wait seconds: ' + $env:WAIT_SECONDS)
-Write-Host ('🔌 Back port: ' + $env:BACK_PORT)
-Write-Host ('🌐 Front port: ' + $env:FRONT_PORT)
-Write-Host ('🔗 Front URL : ' + $env:FRONT_URL)
+Write-Host ('🔌 Back port: ' + ($(if ([string]::IsNullOrWhiteSpace($env:BACK_PORT)) { 'N/A' } else { $env:BACK_PORT })))
+Write-Host ('🌐 Front port: ' + ($(if ([string]::IsNullOrWhiteSpace($env:FRONT_PORT)) { 'N/A' } else { $env:FRONT_PORT })))
+Write-Host ('🔗 Front URL : ' + ($(if ([string]::IsNullOrWhiteSpace($env:FRONT_URL)) { 'N/A' } else { $env:FRONT_URL })))
 Write-Host '============================================================'
 
 schtasks /run /tn $env:TASK_NAME | Out-Host
+
+if ($env:USE_READINESS -ne 'true') {
+    Write-Host 'ℹ️ Legacy mode detected'
+    Write-Host 'ℹ️ Readiness parameters were not provided by Jenkinsfile'
+    Write-Host ('ℹ️ Waiting fixed time only: ' + $env:WAIT_SECONDS + ' seconds')
+    Start-Sleep -Seconds ([int]$env:WAIT_SECONDS)
+
+    Write-Host '✅ Gaia scheduled task triggered'
+    Write-Host '============================================================'
+    return
+}
 
 $deadline = (Get-Date).AddSeconds([int]$env:WAIT_SECONDS)
 
@@ -174,429 +196,91 @@ return this
 
 
 
-
-
 /*
  * Responsibility:
- * This is the main Jenkins pipeline entry point for Gaia Corrections.
- * Jenkins must call this file directly from SCM.
- *
- * Important:
- * This file must be a plain Groovy script.
- * Do not add package declaration.
- * Do not wrap it in a class.
+ * This file prints a clean and readable view in the Jenkins console.
  */
 
-def getSuites() {
-	/*
-	 * Responsibility:
-	 * Define the suites that belong to this pipeline.
-	 * Clone this file and change only this section for another pipeline.
-	 */
-	return [
-		[name: 'PreLoad', path: 'Test Suites/PreLoad'],
-		[name: 'Help', path: 'Test Suites/Help'],
-		[name: 'Correction- Add Correction', path: 'Test Suites/Correction- Add Correction']
-	]
-}
+def fitText(String value, int width) {
+	def text = (value ?: '').replaceAll(/\\s+/, ' ').trim()
 
-def bootstrapSupportFiles(script) {
-	/*
-	 * Responsibility:
-	 * Checkout only the support folders first.
-	 * This allows Gaia start support files to be available before full checkout.
-	 */
-	script.deleteDir()
-
-	script.checkout([
-		$class: 'GitSCM',
-		branches: [[name: script.env.GIT_BRANCH]],
-		userRemoteConfigs: [[url: script.env.GIT_URL, credentialsId: script.env.GIT_CRED]],
-		extensions: [
-			[$class: 'CloneOption', shallow: false, noTags: false, timeout: 30],
-			[$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [
-				[path: 'jenkinsPipelines'],
-				[path: 'jenkinsIntegration']
-			]]
-		]
-	])
-}
-
-def fullCheckout(script) {
-	/*
-	 * Responsibility:
-	 * Replace the bootstrap checkout with the full repository checkout.
-	 */
-	script.deleteDir()
-
-	script.checkout([
-		$class: 'GitSCM',
-		branches: [[name: script.env.GIT_BRANCH]],
-		userRemoteConfigs: [[url: script.env.GIT_URL, credentialsId: script.env.GIT_CRED]],
-		extensions: [
-			[$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
-		]
-	])
-}
-
-def loadPaths(script) {
-	return script.load('jenkinsIntegration/JenkinsPaths.groovy')
-}
-
-def loadBatManager(script) {
-	return script.load('jenkinsIntegration/JenkinsBatManager.groovy')
-}
-
-def loadLiveLogger(script) {
-	return script.load('jenkinsIntegration/JenkinsLiveLogger.groovy')
-}
-
-def loadConsoleView(script) {
-	return script.load('jenkinsIntegration/JenkinsConsoleView.groovy')
-}
-
-def loadResultStore(script) {
-	return script.load('jenkinsIntegration/JenkinsResultStore.groovy')
-}
-
-def emergencyStopGaia(script) {
-	/*
-	 * Responsibility:
-	 * Fallback stop in case support files cannot be loaded in post actions.
-	 */
-	script.withEnv([
-		"BACK_PORT=${script.env.BACK_PORT}",
-		"FRONT_PORT=${script.env.FRONT_PORT}"
-	]) {
-		script.powershell(
-			returnStatus: true,
-			script: '''
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
-
-function Stop-ProcessListeningOnPort {
-    param([int]$Port)
-
-    try {
-        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty OwningProcess -Unique
-
-        foreach ($ownerPid in $owners) {
-            if ($ownerPid) {
-                Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-    catch {
-    }
-}
-
-Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
-Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
-
-$targets = Get-CimInstance Win32_Process | Where-Object {
-    $cmd = [string]$_.CommandLine
-    $name = [string]$_.Name
-
-    ($cmd -match 'gaia-start-back\\.bat') -or
-    ($cmd -match 'gaia-start-front\\.bat') -or
-    ($cmd -match 'gaia-start\\.bat') -or
-    ($cmd -match 'web_portal_back') -or
-    ($cmd -match 'web_portal') -or
-    (($name -match 'cmd\\.exe|java\\.exe|node\\.exe|notepad\\.exe') -and ($cmd -match 'gaia'))
-}
-
-foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
-    try {
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    catch {
-    }
-}
-
-exit 0
-'''
-		)
-	}
-}
-
-pipeline {
-	agent {
-		node {
-			label 'GI5_SWDCFRNXGI55817'
-			customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
-		}
+	if (text.size() > width) {
+		return text.take(width - 3) + '...'
 	}
 
-	options {
-		timestamps()
-		ansiColor('xterm')
-		disableConcurrentBuilds()
-		skipDefaultCheckout(true)
-		timeout(time: 95, unit: 'MINUTES')
-		buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '20'))
-	}
-
-	parameters {
-		string(name: 'STARTUP_WAIT_SECONDS', defaultValue: '60', description: 'Max seconds to wait until Gaia is really ready')
-		string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for each suite')
-		string(name: 'BROWSER', defaultValue: 'Chrome', description: 'Katalon browser type')
-	}
-
-	environment {
-		KATALON_EXE = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-		GIT_URL = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
-		GIT_BRANCH = '*/master'
-		GIT_CRED = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-		START_TASK = 'GaiaBackFrontSetup'
-		BACK_PORT = '8020'
-		FRONT_PORT = '4200'
-		FRONT_URL = 'http://localhost:4200/'
-	}
-
-	stages {
-		stage('Bootstrap Support Files') {
-			steps {
-				script {
-					bootstrapSupportFiles(this)
-
-					echo '============================================================'
-					echo '✅ BOOTSTRAP CHECKOUT COMPLETED'
-					echo "📁 Workspace: ${pwd()}"
-					echo '============================================================'
-				}
-			}
-		}
-
-		stage('Validate Tools') {
-			steps {
-				script {
-					bat """
-@echo off
-echo ============================================================
-echo VALIDATING TOOLS AND SUPPORT FILES
-echo ============================================================
-
-if not exist "${env.KATALON_EXE}" (
-    echo [ERROR] Katalon executable not found
-    echo ${env.KATALON_EXE}
-    exit /b 1
-)
-
-if not exist "${pwd()}\\jenkinsIntegration\\JenkinsBatManager.groovy" (
-    echo [ERROR] JenkinsBatManager.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\jenkinsIntegration\\JenkinsLiveLogger.groovy" (
-    echo [ERROR] JenkinsLiveLogger.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\jenkinsIntegration\\JenkinsPaths.groovy" (
-    echo [ERROR] JenkinsPaths.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\jenkinsIntegration\\JenkinsConsoleView.groovy" (
-    echo [ERROR] JenkinsConsoleView.groovy not found
-    exit /b 1
-)
-
-if not exist "${pwd()}\\jenkinsIntegration\\JenkinsResultStore.groovy" (
-    echo [ERROR] JenkinsResultStore.groovy not found
-    exit /b 1
-)
-
-echo [OK] Katalon executable found
-echo [OK] Jenkins support files found
-echo ============================================================
-"""
-				}
-			}
-		}
-
-		stage('Start Gaia') {
-			steps {
-				script {
-					def batManager = loadBatManager(this)
-
-					batManager.start(this, [
-						taskName   : env.START_TASK,
-						waitSeconds: params.STARTUP_WAIT_SECONDS.toInteger(),
-						backPort   : env.BACK_PORT.toInteger(),
-						frontPort  : env.FRONT_PORT.toInteger(),
-						frontUrl   : env.FRONT_URL
-					])
-				}
-			}
-		}
-
-		stage('Full Checkout Repository') {
-			steps {
-				script {
-					fullCheckout(this)
-
-					echo '============================================================'
-					echo '✅ FULL CHECKOUT COMPLETED'
-					echo "📁 Workspace: ${pwd()}"
-					echo '============================================================'
-				}
-			}
-		}
-
-		stage('Prepare Useful Artifacts') {
-			steps {
-				script {
-					def paths = loadPaths(this)
-					def resultStore = loadResultStore(this)
-
-					bat """
-@echo off
-if exist "${paths.reportsRoot(this)}" rmdir /s /q "${paths.reportsRoot(this)}"
-mkdir "${paths.reportsRoot(this)}"
-mkdir "${paths.logsRoot(this)}"
-"""
-
-					resultStore.saveSuiteResults(this, paths.reportsRoot(this), [])
-				}
-			}
-		}
-
-		stage('Execute Suites') {
-			steps {
-				script {
-					def paths = loadPaths(this)
-					def consoleView = loadConsoleView(this)
-					def resultStore = loadResultStore(this)
-					def liveLogger = loadLiveLogger(this)
-
-					def suiteResults = []
-					def suites = getSuites()
-
-					suites.each { suite ->
-						stage("Suite • ${suite.name}") {
-							consoleView.printSuiteHeader(this, suite.name, suite.path, params.SUITE_TIMEOUT_MINUTES)
-
-							int exitCode = liveLogger.runSuite(this, [
-								katalonExe         : env.KATALON_EXE,
-								projectPath        : paths.projectPath(this),
-								reportsRoot        : paths.reportsRoot(this),
-								browser            : params.BROWSER,
-								suiteTimeoutMinutes: params.SUITE_TIMEOUT_MINUTES.toInteger()
-							], suite)
-
-							def meta = resultStore.readSuiteMeta(this, paths.reportsRoot(this), suite.name)
-
-							def result = [
-								name         : suite.name,
-								path         : suite.path,
-								status       : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
-								icon         : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
-								exitCode     : meta['EXIT_CODE'] ?: "${exitCode}",
-								executed     : meta['EXECUTED'] ?: '0',
-								passed       : meta['PASSED'] ?: '0',
-								failed       : meta['FAILED'] ?: '0',
-								skipped      : meta['SKIPPED'] ?: '0',
-								reason       : meta['REASON'] ?: '',
-								screenshotRel: meta['SCREENSHOT_REL'] ?: '',
-								logRel       : meta['LOG_REL'] ?: '',
-								caseSummary  : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
-								stepSummary  : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
-							]
-
-							suiteResults << result
-							resultStore.saveSuiteResults(this, paths.reportsRoot(this), suiteResults)
-
-							consoleView.printSuiteResult(this, result)
-							consoleView.printRunningSummary(this, suiteResults)
-
-							if (result.status != 'PASSED') {
-								catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-									error("${result.name} finished with status ${result.status}")
-								}
-							}
-						}
-					}
-
-					if (suiteResults.any { it.status != 'PASSED' }) {
-						currentBuild.result = 'FAILURE'
-					}
-				}
-			}
-		}
-	}
-
-	post {
-		always {
-			script {
-				def suiteResults = []
-				def reportsRoot = "${pwd()}\\Reports"
-
-				try {
-					if (fileExists('jenkinsIntegration/JenkinsPaths.groovy') && fileExists('jenkinsIntegration/JenkinsResultStore.groovy')) {
-						def paths = loadPaths(this)
-						def resultStore = loadResultStore(this)
-						reportsRoot = paths.reportsRoot(this)
-						suiteResults = resultStore.loadSuiteResults(this, reportsRoot)
-					}
-				}
-				catch (Throwable ignored) {
-					suiteResults = []
-				}
-
-				try {
-					if (fileExists('jenkinsIntegration/JenkinsBatManager.groovy')) {
-						def batManager = loadBatManager(this)
-						batManager.stop(this, [
-							backPort : env.BACK_PORT.toInteger(),
-							frontPort: env.FRONT_PORT.toInteger()
-						])
-					}
-					else {
-						emergencyStopGaia(this)
-					}
-				}
-				catch (Throwable ignored) {
-					emergencyStopGaia(this)
-				}
-
-				try {
-					if (fileExists('jenkinsIntegration/JenkinsConsoleView.groovy')) {
-						def consoleView = loadConsoleView(this)
-						consoleView.printFinalSummary(this, suiteResults, currentBuild.currentResult)
-					}
-				}
-				catch (Throwable ignored) {
-					echo '============================================================'
-					echo '❌ PIPELINE FINISHED WITH ERRORS'
-					echo '============================================================'
-				}
-			}
-
-			catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-				archiveArtifacts(
-					artifacts: 'Reports/**/*.png,Reports/**/*.html,Reports/**/JUnit_Report.xml,Reports/**/execution0.log,Reports/**/execution.properties,Reports/logs/*.log,Reports/logs/*.err.log,Reports/logs/*.meta.properties,Reports/logs/*.junit.xml',
-					allowEmptyArchive: true
-				)
-			}
-
-			catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-				junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml,Reports/logs/*.junit.xml'
-			}
-		}
-
-		success {
-			echo '✅ PIPELINE FINISHED SUCCESSFULLY'
-		}
-
-		failure {
-			echo '❌ PIPELINE FINISHED WITH ERRORS'
-		}
-
-		aborted {
-			echo '🛑 PIPELINE ABORTED'
-		}
-	}
+	return text.padRight(width)
 }
 
+def printSuiteHeader(script, String suiteName, String suitePath, String timeoutMinutes) {
+	script.echo '╔════════════════════════════════════════════════════════════╗'
+	script.echo "║ ${fitText('🚀 STARTING SUITE', 58)} ║"
+	script.echo "║ ${fitText(suiteName, 58)} ║"
+	script.echo "║ ${fitText('📁 ' + suitePath, 58)} ║"
+	script.echo "║ ${fitText('⏱️ ' + timeoutMinutes + ' min timeout', 58)} ║"
+	script.echo '╚════════════════════════════════════════════════════════════╝'
+}
+
+def printSuiteResult(script, Map result) {
+	script.echo '╔════════════════════════════════════════════════════════════╗'
+	script.echo "║ ${fitText((result.icon ?: '') + ' ' + (result.name ?: ''), 58)} ║"
+	script.echo "║ ${fitText('Executed: ' + result.executed + ' | Passed: ' + result.passed + ' | Failed: ' + result.failed + ' | Skipped: ' + result.skipped, 58)} ║"
+
+	if (result.reason) {
+		script.echo "║ ${fitText('Reason: ' + result.reason, 58)} ║"
+	}
+
+	if (result.screenshotRel) {
+		script.echo "║ ${fitText('Screenshot: Reports/' + result.screenshotRel, 58)} ║"
+	}
+
+	if (result.logRel) {
+		script.echo "║ ${fitText('Log: Reports/' + result.logRel, 58)} ║"
+	}
+
+	(result.caseSummary ?: []).take(3).each { line ->
+		script.echo "║ ${fitText(line.toString(), 58)} ║"
+	}
+
+	script.echo '╚════════════════════════════════════════════════════════════╝'
+}
+
+def printRunningSummary(script, List results) {
+	def passed = results.count { it.status == 'PASSED' }
+	def failed = results.count { it.status == 'FAILED' }
+	def timeout = results.count { it.status == 'TIMEOUT' }
+
+	script.currentBuild.description = "✅ ${passed} | ❌ ${failed} | ⏰ ${timeout}"
+
+	script.echo '============================================================'
+	script.echo "📌 EXECUTION SUMMARY | Passed: ${passed} | Failed: ${failed} | Timeout: ${timeout}"
+	script.echo '============================================================'
+}
+
+def printFinalSummary(script, List results, String currentResult) {
+	def passed = results.count { it.status == 'PASSED' }
+	def failed = results.count { it.status == 'FAILED' }
+	def timeout = results.count { it.status == 'TIMEOUT' }
+	def total = results.size()
+
+	script.currentBuild.description = "✅ ${passed} | ❌ ${failed} | ⏰ ${timeout}"
+
+	script.echo '============================================================'
+
+	if (total == 0) {
+		script.echo '⚠️ PIPELINE STOPPED BEFORE ANY SUITE WAS EXECUTED'
+	}
+	else if (currentResult == 'ABORTED') {
+		script.echo '🛑 PIPELINE ABORTED'
+	}
+	else if (failed > 0 || timeout > 0) {
+		script.echo '❌ PIPELINE FINISHED WITH ERRORS'
+	}
+	else {
+		script.echo '✅ PIPELINE FINISHED SUCCESSFULLY'
+	}
+
+	script.echo "📌 FINAL SUMMARY | Passed: ${passed} | Failed: ${failed} | Timeout: ${timeout}"
+	script.echo '============================================================'
+}
+
+return this
