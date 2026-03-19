@@ -1,21 +1,4 @@
-1) Keywords/keywords/JiraIntegration.groovy
-package keywords
 
-import com.kms.katalon.core.annotation.Keyword
-import jiraIntegration.JiraFlowCoordinator
-
-class JiraIntegration {
-
-    @Keyword
-    def jiraImport() {
-        return new JiraFlowCoordinator().jiraImport('')
-    }
-
-    @Keyword
-    def jiraImport(String epicKeyOverride) {
-        return new JiraFlowCoordinator().jiraImport(epicKeyOverride)
-    }
-}
 2) Keywords/jiraIntegration/JiraFlowCoordinator.groovy
 package jiraIntegration
 
@@ -38,774 +21,728 @@ import com.kms.katalon.core.util.KeywordUtil
 
 class JiraFlowCoordinator {
 
-    // ============================================================
-    // REQUIRED CONFIGURATION
-    // ============================================================
-
-    String JIRA_TOKEN       = '/DuaQa'
-    String PROJECT_KEY      = 'L96B2C'
-    String DEFAULT_EPIC_KEY = 'L96B2C-8234'
-    String EPIC_KEY         = 'L96B2C-8234'
-    String JIRA_BASE_URL    = 'https://jira-mut.d.bbg'
-
-    // ============================================================
-    // OPTIONAL CONFIGURATION
-    // ============================================================
-
-    String ENVIRONMENT                  = 'REC'
-    String LABELS                       = 'automate'
-    String MANUAL_TEST_PLAN_KEY         = ''
-
-    boolean FORCE_CREATE_NEW_TEST_PLAN  = false
-    boolean RESET_SAVED_TEST_PLAN_KEY   = false
-
-    boolean AUTO_RESOLVE_EPIC_BY_NAME   = false
-    String AUTO_EPIC_PREFIX             = 'GAIA Automated Tests - '
-
-    String TEST_PLAN_SUFFIX             = ' Test Plan'
-
-    // suporta os 2 modelos
-    String PRIMARY_XML_FILE_NAME        = 'JUnit_Report.xml'
-    String SECONDARY_XML_FILE_NAME      = 'cucumber.xml'
-
-    String GAIA_REPORT_FILE_NAME        = 'gaiaReport.html'
-    String RESULT_ZIP_NAME              = 'Results.zip'
-    String EVIDENCE_FOLDER_NAME         = 'Evidences'
-    String EVIDENCE_ZIP_NAME            = 'Evidences.zip'
-
-    // ============================================================
-    // BASIC HELPERS
-    // ============================================================
-
-    String safe(def value) {
-        return value == null ? '' : value.toString().trim()
-    }
-
-    boolean isBlank(def value) {
-        return safe(value).isEmpty()
-    }
-
-    boolean isTimestampFolderName(String name) {
-        String value = safe(name)
-        return value ==~ /\d{8}_\d{6}/ || value ==~ /\d{14}/
-    }
-
-    String sanitizeFileName(String value) {
-        return safe(value).replaceAll(/[\\\/:*?"<>|]/, '_').trim()
-    }
-
-    String nowExecution() {
-        return new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
-    }
-
-    String htmlEscape(def value) {
-        String text = safe(value)
-        return text
-            .replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;')
-            .replace('"', '&quot;')
-            .replace("'", '&#39;')
-    }
-
-    String normalizeTitle(String value) {
-        return safe(value)
-            .replace('\u00A0', ' ')
-            .replaceAll(/\s+/, ' ')
-            .trim()
-            .toLowerCase()
-    }
-
-    String relativeUri(File baseDir, File file) {
-        try {
-            return baseDir.toURI().relativize(file.toURI()).toString()
-        } catch (Exception ignored) {
-            return file.name
-        }
-    }
-
-    String readCellAsString(def cell) {
-        if (cell == null) {
-            return ''
-        }
-
-        try {
-            cell.setCellType(org.apache.poi.ss.usermodel.CellType.STRING)
-        } catch (Exception ignored) {
-        }
-
-        return safe(cell.toString())
-    }
-
-    // ============================================================
-    // REPORT PATH AND SUITE NAME
-    // ============================================================
-
-    String getReportPathFromLastRunFile() {
-        File file = new File(RunConfiguration.projectDir + File.separator + 'LastRun.xlsx')
-        if (!file.exists()) {
-            return ''
-        }
-
-        FileInputStream fis = null
-        XSSFWorkbook wb = null
-
-        try {
-            fis = new FileInputStream(file)
-            wb = new XSSFWorkbook(fis)
-            XSSFSheet sheet = wb.getSheetAt(0)
-            XSSFRow row = sheet.getRow(0)
-
-            if (row == null) {
-                return ''
-            }
-
-            return readCellAsString(row.getCell(0))
-        } catch (Exception e) {
-            KeywordUtil.logInfo("LastRun.xlsx read skipped: ${e.message}")
-            return ''
-        } finally {
-            try { wb?.close() } catch (Exception ignored) {}
-            try { fis?.close() } catch (Exception ignored) {}
-        }
-    }
-
-    String getReportsRootPath() {
-        return RunConfiguration.projectDir + File.separator + 'Reports'
-    }
-
-    void collectLeafReportFolders(File currentDir, List<File> candidates) {
-        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
-            return
-        }
-
-        if (containsXmlReport(currentDir)) {
-            candidates.add(currentDir)
-            return
-        }
-
-        File[] children = currentDir.listFiles()
-        if (children == null || children.length == 0) {
-            return
-        }
-
-        for (File child : children) {
-            if (child != null && child.isDirectory()) {
-                collectLeafReportFolders(child, candidates)
-            }
-        }
-    }
-
-    boolean containsXmlReport(File dir) {
-        if (dir == null || !dir.exists() || !dir.isDirectory()) {
-            return false
-        }
-
-        File[] files = dir.listFiles()
-        if (files == null || files.length == 0) {
-            return false
-        }
-
-        String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
-        String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
-
-        for (File file : files) {
-            if (file != null && file.isFile()) {
-                String lowerName = safe(file.name).toLowerCase()
-                if (lowerName == primaryName || lowerName == secondaryName) {
-                    return true
-                }
-            }
-        }
-
-        return false
-    }
-
-    String getLatestLeafReportFolderFromReportsRoot() {
-        File reportsRoot = new File(getReportsRootPath())
-        if (!reportsRoot.exists() || !reportsRoot.isDirectory()) {
-            return ''
-        }
-
-        List<File> candidates = new ArrayList<File>()
-        collectLeafReportFolders(reportsRoot, candidates)
-
-        if (candidates.isEmpty()) {
-            return ''
-        }
-
-        candidates = candidates.unique()
-        candidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
-
-        return safe(candidates[0].absolutePath)
-    }
-
-    String resolveExistingReportFolderCandidate(String rawPath) {
-        String value = safe(rawPath)
-        if (isBlank(value)) {
-            return ''
-        }
-
-        try {
-            File direct = new File(value)
-            if (direct.exists() && direct.isDirectory()) {
-                return direct.canonicalPath
-            }
-        } catch (Exception ignored) {
-        }
-
-        String normalized = value.replace('\\', '/')
-        List<String> parts = normalized.tokenize('/')
-
-        if (parts.isEmpty()) {
-            return ''
-        }
-
-        String leafName = safe(parts[parts.size() - 1])
-        String parentName = parts.size() > 1 ? safe(parts[parts.size() - 2]) : ''
-
-        String matched = findEquivalentLeafFolderUnderReportsRoot(parentName, leafName)
-        if (!isBlank(matched)) {
-            return matched
-        }
-
-        return ''
-    }
-
-    String findEquivalentLeafFolderUnderReportsRoot(String expectedParentName, String expectedLeafName) {
-        File reportsRoot = new File(getReportsRootPath())
-        if (!reportsRoot.exists() || !reportsRoot.isDirectory()) {
-            return ''
-        }
-
-        List<File> candidates = new ArrayList<File>()
-        collectLeafReportFolders(reportsRoot, candidates)
-
-        if (candidates.isEmpty()) {
-            return ''
-        }
-
-        for (File candidate : candidates) {
-            if (candidate == null) {
-                continue
-            }
-
-            String leafName = safe(candidate.name)
-            String parentName = candidate.parentFile != null ? safe(candidate.parentFile.name) : ''
-
-            if (!isBlank(expectedParentName) && !isBlank(expectedLeafName)) {
-                if (leafName.equalsIgnoreCase(expectedLeafName) && parentName.equalsIgnoreCase(expectedParentName)) {
-                    try {
-                        return candidate.canonicalPath
-                    } catch (Exception ignored) {
-                        return candidate.absolutePath
-                    }
-                }
-            }
-
-            if (!isBlank(expectedLeafName) && leafName.equalsIgnoreCase(expectedLeafName)) {
-                try {
-                    return candidate.canonicalPath
-                } catch (Exception ignored) {
-                    return candidate.absolutePath
-                }
-            }
-        }
-
-        return ''
-    }
-
-    String getResolvedReportFolder() {
-        List<String> candidates = new ArrayList<String>()
-
-        String current = safe(RunConfiguration.getReportFolder())
-        if (!isBlank(current)) {
-            candidates.add(current)
-        }
-
-        String fromLastRun = getReportPathFromLastRunFile()
-        if (!isBlank(fromLastRun)) {
-            candidates.add(fromLastRun)
-        }
-
-        String latest = getLatestLeafReportFolderFromReportsRoot()
-        if (!isBlank(latest)) {
-            candidates.add(latest)
-        }
-
-        for (String candidate : candidates) {
-            String resolved = resolveExistingReportFolderCandidate(candidate)
-            if (!isBlank(resolved)) {
-                return resolved
-            }
-        }
-
-        return ''
-    }
-
-    String getCurrentSuiteName() {
-        String reportFolder = getResolvedReportFolder()
-        if (isBlank(reportFolder)) {
-            return ''
-        }
-
-        File currentFolder = new File(reportFolder)
-        String currentName = safe(currentFolder.name)
-
-        if (isTimestampFolderName(currentName) && currentFolder.parentFile != null) {
-            return safe(currentFolder.parentFile.name)
-        }
-
-        return currentName
-    }
-
-    String getExecutionSummary() {
-        return getCurrentSuiteName() + ' ' + nowExecution()
-    }
-
-    String getTestPlanName() {
-        return getCurrentSuiteName() + TEST_PLAN_SUFFIX
-    }
-
-    String getSuiteGroupName() {
-        String suiteName = getCurrentSuiteName()
-        if (isBlank(suiteName)) {
-            return ''
-        }
-
-        if (suiteName.contains('-')) {
-            return safe(suiteName.split('-')[0])
-        }
-
-        return suiteName
-    }
-
-    // ============================================================
-    // SAVED TEST PLAN KEY
-    // ============================================================
-
-    String getTestPlanKeysFolderPath() {
-        File folder = new File(RunConfiguration.projectDir + File.separator + 'TestPlanKeys')
-        if (!folder.exists()) {
-            folder.mkdirs()
-        }
-        return folder.absolutePath
-    }
-
-    String getSuiteTestPlanFilePath() {
-        String suiteName = sanitizeFileName(getCurrentSuiteName())
-        return getTestPlanKeysFolderPath() + File.separator + suiteName + '.txt'
-    }
-
-    void saveSuiteTestPlanKey(String testPlanKey) {
-        if (isBlank(testPlanKey)) {
-            return
-        }
-
-        File file = new File(getSuiteTestPlanFilePath())
-        file.parentFile?.mkdirs()
-        file.setText(testPlanKey, 'UTF-8')
-    }
-
-    String readSavedSuiteTestPlanKey() {
-        if (RESET_SAVED_TEST_PLAN_KEY) {
-            return ''
-        }
-
-        File file = new File(getSuiteTestPlanFilePath())
-        if (!file.exists()) {
-            return ''
-        }
-
-        return safe(file.text)
-    }
-
-    // ============================================================
-    // XML AND SCREENSHOTS
-    // ============================================================
-
-    void collectXmlFiles(File currentDir, List<File> preferred, List<File> secondary, List<File> fallback) {
-        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
-            return
-        }
-
-        File[] children = currentDir.listFiles()
-        if (children == null || children.length == 0) {
-            return
-        }
-
-        String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
-        String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
-
-        for (File child : children) {
-            if (child == null) {
-                continue
-            }
-
-            if (child.isDirectory()) {
-                collectXmlFiles(child, preferred, secondary, fallback)
-                continue
-            }
-
-            String lowerName = safe(child.name).toLowerCase()
-
-            if (lowerName == primaryName) {
-                preferred.add(child)
-            } else if (lowerName == secondaryName) {
-                secondary.add(child)
-            } else if (lowerName.endsWith('.xml')) {
-                fallback.add(child)
-            }
-        }
-    }
-
-    String findXmlFile(String reportFolder) {
-        if (isBlank(reportFolder)) {
-            return ''
-        }
-
-        File root = new File(reportFolder)
-        if (!root.exists() || !root.isDirectory()) {
-            return ''
-        }
-
-        List<File> preferred = new ArrayList<File>()
-        List<File> secondary = new ArrayList<File>()
-        List<File> fallback = new ArrayList<File>()
-
-        collectXmlFiles(root, preferred, secondary, fallback)
-
-        if (!preferred.isEmpty()) {
-            preferred.sort { a, b -> b.lastModified() <=> a.lastModified() }
-            return preferred[0].absolutePath
-        }
-
-        if (!secondary.isEmpty()) {
-            secondary.sort { a, b -> b.lastModified() <=> a.lastModified() }
-            return secondary[0].absolutePath
-        }
-
-        if (!fallback.isEmpty()) {
-            fallback = fallback.findAll { File f ->
-                String path = safe(f.absolutePath).toLowerCase()
-                return !path.contains(File.separator.toLowerCase() + 'requests' + File.separator.toLowerCase()) &&
-                       !path.contains(File.separator.toLowerCase() + 'videos' + File.separator.toLowerCase())
-            }
-
-            if (!fallback.isEmpty()) {
-                fallback.sort { a, b -> b.lastModified() <=> a.lastModified() }
-                return fallback[0].absolutePath
-            }
-        }
-
-        return ''
-    }
-
-    boolean isVisualEvidence(File file) {
-        if (file == null || !file.exists() || !file.isFile()) {
-            return false
-        }
-
-        String lower = safe(file.name).toLowerCase()
-        return lower.endsWith('.png') ||
-               lower.endsWith('.jpg') ||
-               lower.endsWith('.jpeg') ||
-               lower.endsWith('.webp') ||
-               lower.endsWith('.gif') ||
-               lower.endsWith('.bmp')
-    }
-
-    boolean shouldSkipVisualEvidence(File file) {
-        if (!isVisualEvidence(file)) {
-            return true
-        }
-
-        String path = safe(file.absolutePath).toLowerCase()
-        String separator = File.separator.toLowerCase()
-
-        if (path.contains(separator + 'requests' + separator)) return true
-        if (path.contains(separator + 'videos' + separator)) return true
-        if (path.endsWith(separator + safe(GAIA_REPORT_FILE_NAME).toLowerCase())) return true
-        if (path.endsWith(separator + safe(RESULT_ZIP_NAME).toLowerCase())) return true
-        if (path.endsWith(separator + safe(EVIDENCE_ZIP_NAME).toLowerCase())) return true
-
-        return false
-    }
-
-    List<String> getCandidateEvidenceFolderNames() {
-        LinkedHashSet<String> names = new LinkedHashSet<String>()
-        names.add(safe(EVIDENCE_FOLDER_NAME))
-        names.add('evidence')
-        names.add('Evidences')
-        return new ArrayList<String>(names.findAll { !isBlank(it) })
-    }
-
-    File getExistingEvidenceFolder(String reportFolder) {
-        if (isBlank(reportFolder)) {
-            return null
-        }
-
-        File leaf = new File(reportFolder)
-        List<File> candidates = new ArrayList<File>()
-
-        for (String name : getCandidateEvidenceFolderNames()) {
-            candidates.add(new File(leaf, name))
-            if (leaf.parentFile != null) {
-                candidates.add(new File(leaf.parentFile, name))
-            }
-        }
-
-        for (File candidate : candidates) {
-            if (candidate != null && candidate.exists() && candidate.isDirectory()) {
-                return candidate
-            }
-        }
-
-        return null
-    }
-
-    List<File> getEvidenceSearchRoots(String reportFolder) {
-        List<File> roots = new ArrayList<File>()
-
-        if (isBlank(reportFolder)) {
-            return roots
-        }
-
-        File leaf = new File(reportFolder)
-        if (leaf.exists() && leaf.isDirectory()) {
-            roots.add(leaf)
-        }
-
-        if (leaf.parentFile != null && leaf.parentFile.exists() && leaf.parentFile.isDirectory()) {
-            roots.add(leaf.parentFile)
-        }
-
-        File evidenceFolder = getExistingEvidenceFolder(reportFolder)
-        if (evidenceFolder != null) {
-            roots.add(evidenceFolder)
-        }
-
-        return roots.unique { File item -> item.absolutePath }
-    }
-
-    void collectFailureImagesRecursive(File currentDir, List<File> images) {
-        if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
-            return
-        }
-
-        File[] children = currentDir.listFiles()
-        if (children == null || children.length == 0) {
-            return
-        }
-
-        for (File child : children) {
-            if (child == null) {
-                continue
-            }
-
-            if (child.isDirectory()) {
-                collectFailureImagesRecursive(child, images)
-                continue
-            }
-
-            if (!shouldSkipVisualEvidence(child)) {
-                images.add(child)
-            }
-        }
-    }
-
-    List<File> collectFailureImages(String reportFolder) {
-        List<File> images = new ArrayList<File>()
-        List<File> roots = getEvidenceSearchRoots(reportFolder)
-
-        for (File root : roots) {
-            collectFailureImagesRecursive(root, images)
-        }
-
-        Set<String> seen = new LinkedHashSet<String>()
-        List<File> uniqueImages = new ArrayList<File>()
-
-        for (File image : images) {
-            String key = ''
-            try {
-                key = image.canonicalPath
-            } catch (Exception ignored) {
-                key = image.absolutePath
-            }
-
-            if (!seen.contains(key)) {
-                seen.add(key)
-                uniqueImages.add(image)
-            }
-        }
-
-        uniqueImages.sort { a, b -> a.lastModified() <=> b.lastModified() }
-        return uniqueImages
-    }
-
-    File findFileInReportTree(String reportFolder, String fileName) {
-        if (isBlank(reportFolder) || isBlank(fileName)) {
-            return null
-        }
-
-        File root = new File(reportFolder)
-        if (!root.exists() || !root.isDirectory()) {
-            return null
-        }
-
-        List<File> matches = new ArrayList<File>()
-        collectNamedFiles(root, fileName, matches)
-
-        if (matches.isEmpty()) {
-            return null
-        }
-
-        matches.sort { a, b -> b.lastModified() <=> a.lastModified() }
-        return matches[0]
-    }
-
-    void collectNamedFiles(File currentDir, String fileName, List<File> matches) {
-        File[] children = currentDir.listFiles()
-        if (children == null) {
-            return
-        }
-
-        for (File child : children) {
-            if (child.isDirectory()) {
-                collectNamedFiles(child, fileName, matches)
-            } else if (safe(child.name).equalsIgnoreCase(safe(fileName))) {
-                matches.add(child)
-            }
-        }
-    }
-
-    // ============================================================
-    // MAIN FLOW
-    // ============================================================
-
-    def jiraImport() {
-        return jiraImport('')
-    }
-
-    def jiraImport(String epicKeyOverride) {
-        JiraGateway gateway = new JiraGateway(this)
-        JiraTestPlanManager testPlanManager = new JiraTestPlanManager(this, gateway)
-        JiraGaiaReportBuilder reportBuilder = new JiraGaiaReportBuilder(this)
-        JiraExecutionPublisher executionPublisher = new JiraExecutionPublisher(this, gateway)
-
-        gateway.validateRequiredConfiguration()
-
-        KeywordUtil.logInfo("============================================================")
-        KeywordUtil.logInfo("Starting Jira import flow")
-        KeywordUtil.logInfo("============================================================")
-
-        String reportFolder = getResolvedReportFolder()
-        if (isBlank(reportFolder)) {
-            KeywordUtil.markFailed("Report folder could not be resolved.")
-            return
-        }
-
-        KeywordUtil.logInfo("Using report folder: ${reportFolder}")
-
-        String suiteName = getCurrentSuiteName()
-        if (isBlank(suiteName)) {
-            KeywordUtil.markFailed("Suite name could not be resolved from report path.")
-            return
-        }
-
-        KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
-
-        if (!isBlank(epicKeyOverride)) {
-            EPIC_KEY = safe(epicKeyOverride)
-        } else if (AUTO_RESOLVE_EPIC_BY_NAME) {
-            String epicSummary = AUTO_EPIC_PREFIX + getSuiteGroupName()
-            String autoEpicKey = gateway.findEpicKeyBySummary(epicSummary)
-            if (!isBlank(autoEpicKey)) {
-                EPIC_KEY = autoEpicKey
-                KeywordUtil.logInfo("Epic resolved automatically: ${EPIC_KEY} from summary ${epicSummary}")
-            } else {
-                EPIC_KEY = safe(DEFAULT_EPIC_KEY)
-                KeywordUtil.logInfo("Automatic epic not found. Using default epic key: ${EPIC_KEY}")
-            }
-        } else {
-            EPIC_KEY = safe(DEFAULT_EPIC_KEY)
-        }
-
-        String executionSummary = getExecutionSummary()
-        String testPlanSummary = getTestPlanName()
-
-        KeywordUtil.logInfo("Execution title used: ${executionSummary}")
-        KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
-
-        String xmlPath = findXmlFile(reportFolder)
-        if (isBlank(xmlPath)) {
-            KeywordUtil.markFailed("JUnit or Cucumber XML file was not found in report folder.")
-            return
-        }
-
-        KeywordUtil.logInfo("XML file found: ${xmlPath}")
-
-        List<File> collectedImages = collectFailureImages(reportFolder)
-        KeywordUtil.logInfo("Failure images found: ${collectedImages.size()}")
-        collectedImages.each { File img ->
-            KeywordUtil.logInfo("Failure image candidate: ${img.absolutePath}")
-        }
-
-        String gaiaReportPath = reportBuilder.createGaiaHtmlReport(reportFolder, suiteName, xmlPath, executionSummary)
-        if (isBlank(gaiaReportPath)) {
-            KeywordUtil.markWarning("Custom Jira HTML report could not be created.")
-        } else {
-            KeywordUtil.logInfo("Custom Jira report created: ${gaiaReportPath}")
-        }
-
-        String testPlanKey = testPlanManager.getOrCreateTestPlanKey()
-        if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
-            KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
-            return
-        }
-
-        Map executionResult = executionPublisher.publishExecution(
-            xmlPath,
-            executionSummary,
-            testPlanKey,
-            reportFolder,
-            gaiaReportPath
-        )
-
-        String executionKey = safe(executionResult.executionKey)
-        if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
-            KeywordUtil.markFailed("Execution import failed: ${executionKey}")
-            return
-        }
-
-        KeywordUtil.logInfo("============================================================")
-        KeywordUtil.logInfo("Jira import finished")
-        KeywordUtil.logInfo("============================================================")
-        KeywordUtil.logInfo("Execution key: ${executionKey}")
-        KeywordUtil.logInfo("Execution title used: ${executionSummary}")
-        KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
-        KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
-        KeywordUtil.logInfo("Custom report attachment status: ${executionResult.gaiaReportStatus}")
-        KeywordUtil.logInfo("Evidences.zip attachment status: ${executionResult.evidencesStatus}")
-        KeywordUtil.logInfo("Results.zip attachment status: ${executionResult.resultsStatus}")
-        KeywordUtil.logInfo("Add execution to Test Plan status: ${executionResult.addExecutionStatus}")
-        KeywordUtil.logInfo("Update Test Execution status: ${executionResult.updateExecutionStatus}")
-
-        return executionKey
-    }
+	// ============================================================
+	// REQUIRED CONFIGURATION
+	// ============================================================
+
+	String JIRA_TOKEN    = '/DuaQa'
+	String PROJECT_KEY   = 'L96B2C'
+	String EPIC_KEY      = 'L96B2C-8234'
+	String JIRA_BASE_URL = 'https://jira-mut.d.bbg'
+
+	// ============================================================
+	// OPTIONAL CONFIGURATION
+	// ============================================================
+
+	String ENVIRONMENT                 = 'REC'
+	String LABELS                      = 'automate'
+	String MANUAL_TEST_PLAN_KEY        = ''
+
+	boolean FORCE_CREATE_NEW_TEST_PLAN = false
+	boolean RESET_SAVED_TEST_PLAN_KEY  = false
+
+	String TEST_PLAN_SUFFIX            = ' Test Plan'
+	String PRIMARY_XML_FILE_NAME       = 'cucumber.xml'
+	String SECONDARY_XML_FILE_NAME     = 'JUnit_Report.xml'
+	String GAIA_REPORT_FILE_NAME       = 'gaiaReport.html'
+	String RESULT_ZIP_NAME             = 'Results.zip'
+	String EVIDENCE_FOLDER_NAME        = 'evidence'
+	String EVIDENCE_ZIP_NAME           = 'Evidences.zip'
+
+	// ============================================================
+	// BASIC HELPERS
+	// ============================================================
+
+	String safe(def value) {
+		return value == null ? '' : value.toString().trim()
+	}
+
+	boolean isBlank(def value) {
+		return safe(value).isEmpty()
+	}
+
+	boolean isTimestampFolderName(String name) {
+		String value = safe(name)
+		return value ==~ /\d{8}_\d{6}/ || value ==~ /\d{14}/
+	}
+
+	String sanitizeFileName(String value) {
+		return safe(value).replaceAll(/[\\\/:*?"<>|]/, '_').trim()
+	}
+
+	String nowExecution() {
+		return new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+	}
+
+	String formatHeaderDate(Date date) {
+		return new SimpleDateFormat('EEE MMM dd HH:mm:ss z yyyy', Locale.ENGLISH).format(date)
+	}
+
+	String formatDurationMillis(long millis) {
+		long totalSeconds = (long) (millis / 1000)
+		long minutes = (long) (totalSeconds / 60)
+		long seconds = (long) (totalSeconds % 60)
+		long remainingMillis = (long) (millis % 1000)
+		return "${minutes}m ${seconds}s ${remainingMillis}ms"
+	}
+
+	String htmlEscape(def value) {
+		String text = safe(value)
+		return text
+				.replace('&', '&amp;')
+				.replace('<', '&lt;')
+				.replace('>', '&gt;')
+				.replace('"', '&quot;')
+				.replace("'", '&#39;')
+	}
+
+	String relativeUri(File baseDir, File file) {
+		String basePath = baseDir.toURI().toString()
+		String filePath = file.toURI().toString()
+		return filePath.replace(basePath, '')
+	}
+
+	String normalizeTitle(String value) {
+		return safe(value)
+				.replace('\u00A0', ' ')
+				.replaceAll(/\s+/, ' ')
+				.trim()
+				.toLowerCase()
+	}
+
+	long toMillis(def secondsValue) {
+		try {
+			BigDecimal seconds = new BigDecimal(safe(secondsValue))
+			return (long) (seconds * 1000)
+		} catch (Exception ignored) {
+			return 0L
+		}
+	}
+
+	String readCellAsString(def cell) {
+		if (cell == null) {
+			return ''
+		}
+
+		try {
+			cell.setCellType(org.apache.poi.ss.usermodel.CellType.STRING)
+		} catch (Exception ignored) {
+		}
+
+		return safe(cell.toString())
+	}
+
+	// ============================================================
+	// REPORT PATH AND SUITE NAME
+	// ============================================================
+
+	String getReportPathFromLastRunFile() {
+		File file = new File(RunConfiguration.projectDir + File.separator + 'LastRun.xlsx')
+		if (!file.exists()) {
+			return ''
+		}
+
+		FileInputStream fis = null
+		XSSFWorkbook wb = null
+
+		try {
+			fis = new FileInputStream(file)
+			wb = new XSSFWorkbook(fis)
+			XSSFSheet sheet = wb.getSheetAt(0)
+			XSSFRow row = sheet.getRow(0)
+
+			if (row == null) {
+				return ''
+			}
+
+			return readCellAsString(row.getCell(0))
+		} catch (Exception e) {
+			KeywordUtil.logInfo("LastRun.xlsx read skipped: ${e.message}")
+			return ''
+		} finally {
+			try {
+				wb?.close()
+			} catch (Exception ignored) {
+			}
+			try {
+				fis?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	String getReportsRootPath() {
+		return RunConfiguration.projectDir + File.separator + 'Reports'
+	}
+
+	String getLatestLeafReportFolderFromReportsRoot() {
+		File reportsRoot = new File(getReportsRootPath())
+		if (!reportsRoot.exists() || !reportsRoot.isDirectory()) {
+			return ''
+		}
+
+		List<File> candidates = new ArrayList<File>()
+		collectLeafReportFolders(reportsRoot, candidates)
+
+		if (candidates.isEmpty()) {
+			return ''
+		}
+
+		candidates = candidates.unique()
+		candidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
+
+		return safe(candidates[0].absolutePath)
+	}
+
+	void collectLeafReportFolders(File currentDir, List<File> candidates) {
+		if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+			return
+		}
+
+		if (containsXmlReport(currentDir)) {
+			candidates.add(currentDir)
+			return
+		}
+
+		File[] children = currentDir.listFiles()
+		if (children == null || children.length == 0) {
+			return
+		}
+
+		for (File child : children) {
+			if (child != null && child.isDirectory()) {
+				collectLeafReportFolders(child, candidates)
+			}
+		}
+	}
+
+	boolean containsXmlReport(File dir) {
+		if (dir == null || !dir.exists() || !dir.isDirectory()) {
+			return false
+		}
+
+		File[] files = dir.listFiles()
+		if (files == null || files.length == 0) {
+			return false
+		}
+
+		String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
+		String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
+
+		for (File file : files) {
+			if (file != null && file.isFile()) {
+				String lowerName = safe(file.name).toLowerCase()
+
+				if (lowerName == primaryName) {
+					return true
+				}
+
+				if (lowerName == secondaryName) {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	String resolveExistingReportFolderCandidate(String rawPath) {
+		String value = safe(rawPath)
+		if (isBlank(value)) {
+			return ''
+		}
+
+		try {
+			File direct = new File(value)
+			if (direct.exists() && direct.isDirectory()) {
+				return direct.canonicalPath
+			}
+		} catch (Exception ignored) {
+		}
+
+		String normalized = value.replace('\\', '/')
+		List<String> parts = normalized.tokenize('/')
+
+		if (parts.isEmpty()) {
+			return ''
+		}
+
+		String leafName = safe(parts[parts.size() - 1])
+		String parentName = parts.size() > 1 ? safe(parts[parts.size() - 2]) : ''
+
+		String matched = findEquivalentLeafFolderUnderReportsRoot(parentName, leafName)
+		if (!isBlank(matched)) {
+			return matched
+		}
+
+		return ''
+	}
+
+	String findEquivalentLeafFolderUnderReportsRoot(String expectedParentName, String expectedLeafName) {
+		File reportsRoot = new File(getReportsRootPath())
+		if (!reportsRoot.exists() || !reportsRoot.isDirectory()) {
+			return ''
+		}
+
+		List<File> candidates = new ArrayList<File>()
+		collectLeafReportFolders(reportsRoot, candidates)
+
+		if (candidates.isEmpty()) {
+			return ''
+		}
+
+		for (File candidate : candidates) {
+			if (candidate == null) {
+				continue
+			}
+
+			String leafName = safe(candidate.name)
+			String parentName = candidate.parentFile != null ? safe(candidate.parentFile.name) : ''
+
+			if (!isBlank(expectedParentName) && !isBlank(expectedLeafName)) {
+				if (leafName.equalsIgnoreCase(expectedLeafName) && parentName.equalsIgnoreCase(expectedParentName)) {
+					try {
+						return candidate.canonicalPath
+					} catch (Exception ignored) {
+						return candidate.absolutePath
+					}
+				}
+			}
+
+			if (!isBlank(expectedLeafName) && leafName.equalsIgnoreCase(expectedLeafName)) {
+				try {
+					return candidate.canonicalPath
+				} catch (Exception ignored) {
+					return candidate.absolutePath
+				}
+			}
+		}
+
+		return ''
+	}
+
+	String getResolvedReportFolder() {
+		List<String> candidates = new ArrayList<String>()
+
+		String current = safe(RunConfiguration.getReportFolder())
+		if (!isBlank(current)) {
+			candidates.add(current)
+		}
+
+		String fromLastRun = getReportPathFromLastRunFile()
+		if (!isBlank(fromLastRun)) {
+			candidates.add(fromLastRun)
+		}
+
+		String latest = getLatestLeafReportFolderFromReportsRoot()
+		if (!isBlank(latest)) {
+			candidates.add(latest)
+		}
+
+		for (String candidate : candidates) {
+			String resolved = resolveExistingReportFolderCandidate(candidate)
+			if (!isBlank(resolved)) {
+				return resolved
+			}
+		}
+
+		return ''
+	}
+
+	String getCurrentSuiteName() {
+		String reportFolder = getResolvedReportFolder()
+		if (isBlank(reportFolder)) {
+			return ''
+		}
+
+		File currentFolder = new File(reportFolder)
+		String currentName = safe(currentFolder.name)
+
+		if (isTimestampFolderName(currentName) && currentFolder.parentFile != null) {
+			return safe(currentFolder.parentFile.name)
+		}
+
+		return currentName
+	}
+
+	String getExecutionSummary() {
+		return getCurrentSuiteName() + ' ' + nowExecution()
+	}
+
+	String getTestPlanName() {
+		return getCurrentSuiteName() + TEST_PLAN_SUFFIX
+	}
+
+	// ============================================================
+	// SAVED TEST PLAN KEY
+	// ============================================================
+
+	String getTestPlanKeysFolderPath() {
+		File folder = new File(RunConfiguration.projectDir + File.separator + 'TestPlanKeys')
+		if (!folder.exists()) {
+			folder.mkdirs()
+		}
+		return folder.absolutePath
+	}
+
+	String getSuiteTestPlanFilePath() {
+		String suiteName = sanitizeFileName(getCurrentSuiteName())
+		return getTestPlanKeysFolderPath() + File.separator + suiteName + '.txt'
+	}
+
+	void saveSuiteTestPlanKey(String testPlanKey) {
+		if (isBlank(testPlanKey)) {
+			return
+		}
+
+		File file = new File(getSuiteTestPlanFilePath())
+		file.parentFile?.mkdirs()
+		file.setText(testPlanKey, 'UTF-8')
+	}
+
+	String readSavedSuiteTestPlanKey() {
+		if (RESET_SAVED_TEST_PLAN_KEY) {
+			return ''
+		}
+
+		File file = new File(getSuiteTestPlanFilePath())
+		if (!file.exists()) {
+			return ''
+		}
+
+		return safe(file.text)
+	}
+
+	// ============================================================
+	// XML AND SCREENSHOTS
+	// ============================================================
+
+	String findXmlFile(String reportFolder) {
+		if (isBlank(reportFolder)) {
+			return ''
+		}
+
+		File root = new File(reportFolder)
+		if (!root.exists() || !root.isDirectory()) {
+			return ''
+		}
+
+		List<File> preferred = new ArrayList<File>()
+		List<File> fallback = new ArrayList<File>()
+		collectXmlFiles(root, preferred, fallback)
+
+		if (!preferred.isEmpty()) {
+			preferred.sort { a, b -> b.lastModified() <=> a.lastModified() }
+			return preferred[0].absolutePath
+		}
+
+		if (!fallback.isEmpty()) {
+			fallback.sort { a, b -> b.lastModified() <=> a.lastModified() }
+			return fallback[0].absolutePath
+		}
+
+		return ''
+	}
+
+	void collectXmlFiles(File currentDir, List<File> preferred, List<File> fallback) {
+		if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+			return
+		}
+
+		File[] children = currentDir.listFiles()
+		if (children == null || children.length == 0) {
+			return
+		}
+
+		String primaryName = safe(PRIMARY_XML_FILE_NAME).toLowerCase()
+		String secondaryName = safe(SECONDARY_XML_FILE_NAME).toLowerCase()
+
+		for (File child : children) {
+			if (child == null) {
+				continue
+			}
+
+			if (child.isDirectory()) {
+				collectXmlFiles(child, preferred, fallback)
+				continue
+			}
+
+			String lowerName = safe(child.name).toLowerCase()
+			if (lowerName == primaryName) {
+				preferred.add(child)
+			} else if (lowerName == secondaryName) {
+				fallback.add(child)
+			}
+		}
+	}
+
+	boolean isVisualEvidence(File file) {
+		if (file == null || !file.exists() || !file.isFile()) {
+			return false
+		}
+
+		String lower = safe(file.name).toLowerCase()
+		return lower.endsWith('.png') ||
+				lower.endsWith('.jpg') ||
+				lower.endsWith('.jpeg') ||
+				lower.endsWith('.webp') ||
+				lower.endsWith('.gif') ||
+				lower.endsWith('.bmp')
+	}
+
+	boolean shouldSkipVisualEvidence(File file) {
+		if (!isVisualEvidence(file)) {
+			return true
+		}
+
+		String path = safe(file.absolutePath).toLowerCase()
+		String separator = File.separator.toLowerCase()
+
+		if (path.contains(separator + 'requests' + separator)) return true
+		if (path.contains(separator + 'videos' + separator)) return true
+		if (path.contains(separator + 'image' + separator) && path.contains('gaia-logo')) return true
+		if (path.endsWith(separator + safe(GAIA_REPORT_FILE_NAME).toLowerCase())) return true
+
+		return false
+	}
+
+	List<File> getEvidenceSearchRoots(String reportFolder) {
+		List<File> roots = new ArrayList<File>()
+
+		if (isBlank(reportFolder)) {
+			return roots
+		}
+
+		File leaf = new File(reportFolder)
+		if (leaf.exists() && leaf.isDirectory()) {
+			roots.add(leaf)
+
+			File leafEvidence = new File(leaf, EVIDENCE_FOLDER_NAME)
+			if (leafEvidence.exists() && leafEvidence.isDirectory()) {
+				roots.add(leafEvidence)
+			}
+		}
+
+		File suiteFolder = leaf.parentFile
+		if (suiteFolder != null && suiteFolder.exists() && suiteFolder.isDirectory()) {
+			roots.add(suiteFolder)
+
+			File suiteEvidence = new File(suiteFolder, EVIDENCE_FOLDER_NAME)
+			if (suiteEvidence.exists() && suiteEvidence.isDirectory()) {
+				roots.add(suiteEvidence)
+			}
+		}
+
+		String mappedLeafPath = findEquivalentLeafFolderUnderReportsRoot(
+				suiteFolder != null ? safe(suiteFolder.name) : '',
+				safe(leaf.name)
+				)
+
+		if (!isBlank(mappedLeafPath)) {
+			File mappedLeaf = new File(mappedLeafPath)
+			if (mappedLeaf.exists() && mappedLeaf.isDirectory()) {
+				roots.add(mappedLeaf)
+
+				File mappedLeafEvidence = new File(mappedLeaf, EVIDENCE_FOLDER_NAME)
+				if (mappedLeafEvidence.exists() && mappedLeafEvidence.isDirectory()) {
+					roots.add(mappedLeafEvidence)
+				}
+
+				File mappedSuite = mappedLeaf.parentFile
+				if (mappedSuite != null && mappedSuite.exists() && mappedSuite.isDirectory()) {
+					roots.add(mappedSuite)
+
+					File mappedSuiteEvidence = new File(mappedSuite, EVIDENCE_FOLDER_NAME)
+					if (mappedSuiteEvidence.exists() && mappedSuiteEvidence.isDirectory()) {
+						roots.add(mappedSuiteEvidence)
+					}
+				}
+			}
+		}
+
+		return roots.unique { File item -> item.absolutePath }
+	}
+
+	List<File> collectFailureImages(String reportFolder) {
+		List<File> images = new ArrayList<File>()
+		List<File> roots = getEvidenceSearchRoots(reportFolder)
+
+		if (roots.isEmpty()) {
+			return images
+		}
+
+		for (File root : roots) {
+			collectFailureImagesRecursive(root, images)
+		}
+
+		Set<String> seen = new LinkedHashSet<String>()
+		List<File> uniqueImages = new ArrayList<File>()
+
+		for (File image : images) {
+			if (image == null) {
+				continue
+			}
+
+			String key = ''
+			try {
+				key = image.canonicalPath
+			} catch (Exception ignored) {
+				key = image.absolutePath
+			}
+
+			if (!seen.contains(key)) {
+				seen.add(key)
+				uniqueImages.add(image)
+			}
+		}
+
+		uniqueImages.sort { a, b -> a.lastModified() <=> b.lastModified() }
+		return uniqueImages
+	}
+
+	void collectFailureImagesRecursive(File currentDir, List<File> images) {
+		if (currentDir == null || !currentDir.exists() || !currentDir.isDirectory()) {
+			return
+		}
+
+		File[] children = currentDir.listFiles()
+		if (children == null || children.length == 0) {
+			return
+		}
+
+		for (File child : children) {
+			if (child == null) {
+				continue
+			}
+
+			if (child.isDirectory()) {
+				collectFailureImagesRecursive(child, images)
+				continue
+			}
+
+			if (!shouldSkipVisualEvidence(child)) {
+				images.add(child)
+			}
+		}
+	}
+
+	// ============================================================
+	// MAIN FLOW
+	// ============================================================
+
+	def jiraImport() {
+		return jiraImport('')
+	}
+
+	def jiraImport(String epicKeyOverride) {
+		if (!isBlank(epicKeyOverride)) {
+			EPIC_KEY = safe(epicKeyOverride)
+		}
+
+		JiraGateway gateway = new JiraGateway(this)
+		JiraTestPlanManager testPlanManager = new JiraTestPlanManager(this, gateway)
+		JiraGaiaReportBuilder reportBuilder = new JiraGaiaReportBuilder(this)
+		JiraExecutionPublisher executionPublisher = new JiraExecutionPublisher(this, gateway)
+
+		gateway.validateRequiredConfiguration()
+
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("Starting Jira import flow")
+		KeywordUtil.logInfo("============================================================")
+
+		String reportFolder = getResolvedReportFolder()
+		if (isBlank(reportFolder)) {
+			KeywordUtil.markFailed("Report folder could not be resolved.")
+			return
+		}
+
+		KeywordUtil.logInfo("Using report folder: ${reportFolder}")
+
+		String suiteName = getCurrentSuiteName()
+		if (isBlank(suiteName)) {
+			KeywordUtil.markFailed("Suite name could not be resolved from report path.")
+			return
+		}
+
+		KeywordUtil.logInfo("Suite name detected from report path: ${suiteName}")
+
+		String executionSummary = getExecutionSummary()
+		String testPlanSummary = getTestPlanName()
+
+		KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+		KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+
+		String xmlPath = findXmlFile(reportFolder)
+		if (isBlank(xmlPath)) {
+			KeywordUtil.markFailed("JUnit or Cucumber XML file was not found in report folder.")
+			return
+		}
+
+		KeywordUtil.logInfo("XML file found: ${xmlPath}")
+
+		List<File> collectedImages = collectFailureImages(reportFolder)
+		KeywordUtil.logInfo("Failure images found: ${collectedImages.size()}")
+		collectedImages.each { File img ->
+			KeywordUtil.logInfo("Failure image candidate: ${img.absolutePath}")
+		}
+
+		String gaiaReportPath = reportBuilder.createGaiaHtmlReport(reportFolder, suiteName, xmlPath)
+		if (isBlank(gaiaReportPath)) {
+			KeywordUtil.markWarning("Gaia report could not be created.")
+		} else {
+			KeywordUtil.logInfo("Gaia report created: ${gaiaReportPath}")
+		}
+
+		String testPlanKey = testPlanManager.getOrCreateTestPlanKey()
+		if (isBlank(testPlanKey) || testPlanKey.startsWith('ERROR')) {
+			KeywordUtil.markFailed("Test Plan could not be created or resolved: ${testPlanKey}")
+			return
+		}
+
+		Map executionResult = executionPublisher.publishExecution(xmlPath, executionSummary, testPlanKey)
+
+		String executionKey = safe(executionResult.executionKey)
+		if (isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+			KeywordUtil.markFailed("Execution import failed: ${executionKey}")
+			return
+		}
+
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("Jira import finished")
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("Execution key: ${executionKey}")
+		KeywordUtil.logInfo("Execution title used: ${executionSummary}")
+		KeywordUtil.logInfo("Test Plan key: ${testPlanKey}")
+		KeywordUtil.logInfo("Test Plan title used: ${testPlanSummary}")
+		KeywordUtil.logInfo("Gaia report attachment status: ${executionResult.gaiaReportStatus}")
+		KeywordUtil.logInfo("Evidences.zip attachment status: ${executionResult.evidencesStatus}")
+		KeywordUtil.logInfo("Results.zip attachment status: ${executionResult.resultsStatus}")
+		KeywordUtil.logInfo("Add execution to Test Plan status: ${executionResult.addExecutionStatus}")
+		KeywordUtil.logInfo("Update Test Execution status: ${executionResult.updateExecutionStatus}")
+
+		return executionKey
+	}
 }
+
+
+
+
+
+
+
 3) Keywords/jiraIntegration/JiraGateway.groovy
 package jiraIntegration
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
 
 import java.io.File
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 
-import com.kms.katalon.core.testobject.ConditionType
 import com.kms.katalon.core.testobject.RequestObject
 import com.kms.katalon.core.testobject.ResponseObject
 import com.kms.katalon.core.testobject.TestObjectProperty
-import com.kms.katalon.core.testobject.impl.HttpFileBodyContent
+import com.kms.katalon.core.testobject.ConditionType
 import com.kms.katalon.core.testobject.impl.HttpTextBodyContent
 import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
@@ -816,434 +753,354 @@ import internal.GlobalVariable
 
 class JiraGateway {
 
-    JiraFlowCoordinator owner
-    JsonSlurper jsonSlurper = new JsonSlurper()
-
-    private String cachedEpicFieldId = ''
-
-    JiraGateway(JiraFlowCoordinator owner) {
-        this.owner = owner
-    }
-
-    void validateRequiredConfiguration() {
-        List<String> missing = []
-
-        if (owner.isBlank(resolveToken())) {
-            missing << 'JIRA token'
-        }
-        if (owner.isBlank(owner.PROJECT_KEY)) {
-            missing << 'PROJECT_KEY'
-        }
-        if (owner.isBlank(owner.JIRA_BASE_URL)) {
-            missing << 'JIRA_BASE_URL'
-        }
-
-        if (!missing.isEmpty()) {
-            KeywordUtil.markFailedAndStop('Missing Jira configuration: ' + missing.join(', '))
-        }
-    }
-
-    String importExecutionResults(String xmlPath) {
-        if (owner.isBlank(xmlPath)) {
-            return 'ERROR: XML path is empty'
-        }
-
-        File xmlFile = new File(xmlPath)
-        if (!xmlFile.exists() || !xmlFile.isFile()) {
-            return 'ERROR: XML file not found'
-        }
-
-        String xmlText = xmlFile.getText('UTF-8')
-
-        RequestObject request = new RequestObject('Runtime Import Results')
-        request.setRestUrl(owner.JIRA_BASE_URL + '/rest/raven/1.0/import/execution/junit?projectKey=' + encode(owner.PROJECT_KEY))
-        request.setRestRequestMethod('POST')
-        request.setHttpHeaderProperties([
-            header('Authorization', 'Bearer ' + resolveToken()),
-            header('Accept', 'application/json'),
-            header('Content-Type', 'text/xml; charset=UTF-8')
-        ])
-        request.setBodyContent(new HttpTextBodyContent(xmlText, 'UTF-8', 'text/xml'))
-
-        ResponseObject response = WS.sendRequest(request)
-
-        int status = response.getStatusCode()
-        String body = safeBody(response)
-
-        KeywordUtil.logInfo("Import Results status: ${status}")
-        KeywordUtil.logInfo("Import Results response: ${body}")
-
-        if (status < 200 || status >= 300) {
-            return "ERROR: import execution failed with status ${status}"
-        }
-
-        def parsed = parseJson(body)
-        String key = owner.safe(parsed?.testExecIssue?.key ?: parsed?.key ?: parsed?.id)
-
-        if (owner.isBlank(key)) {
-            return 'ERROR: execution key not found in import response'
-        }
-
-        return key
-    }
-
-    int addExecutionToTestPlan(String testPlanKey, String executionKey) {
-        if (owner.isBlank(testPlanKey) || owner.isBlank(executionKey)) {
-            return 0
-        }
-
-        Map payload = [
-            add: [executionKey]
-        ]
-
-        RequestObject request = new RequestObject('Runtime Add Execution To Test Plan')
-        request.setRestUrl(owner.JIRA_BASE_URL + '/rest/raven/2.0/api/testplan/' + encode(testPlanKey) + '/testexecution')
-        request.setRestRequestMethod('POST')
-        request.setHttpHeaderProperties(jsonHeaders())
-        request.setBodyContent(jsonBody(payload))
-
-        ResponseObject response = WS.sendRequest(request)
-        int status = response.getStatusCode()
-
-        KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
-        KeywordUtil.logInfo("Add execution to Test Plan response: ${safeBody(response)}")
-
-        return status
-    }
-
-    int updateTestExecution(String issueKey, String summary, String labels, String environment) {
-        if (owner.isBlank(issueKey)) {
-            return 0
-        }
-
-        List<String> labelList = []
-        if (!owner.isBlank(labels)) {
-            labelList = labels.split(',').collect { owner.safe(it) }.findAll { !owner.isBlank(it) }
-        }
-
-        Map fields = [
-            summary: owner.safe(summary),
-            labels : labelList
-        ]
-
-        if (!owner.isBlank(environment)) {
-            fields.environment = owner.safe(environment)
-        }
-
-        RequestObject request = new RequestObject('Runtime Update Test Execution')
-        request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey))
-        request.setRestRequestMethod('PUT')
-        request.setHttpHeaderProperties(jsonHeaders())
-        request.setBodyContent(jsonBody([fields: fields]))
-
-        ResponseObject response = WS.sendRequest(request)
-        int status = response.getStatusCode()
-
-        KeywordUtil.logInfo("Update Test Execution status: ${status}")
-        KeywordUtil.logInfo("Update Test Execution response: ${safeBody(response)}")
-
-        return status
-    }
-
-    int uploadAttachment(String issueKey, String filePath) {
-        if (owner.isBlank(issueKey) || owner.isBlank(filePath)) {
-            return 0
-        }
-
-        File file = new File(filePath)
-        if (!file.exists() || !file.isFile()) {
-            return 0
-        }
-
-        RequestObject request = new RequestObject('Runtime Upload Attachment')
-        request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey) + '/attachments')
-        request.setRestRequestMethod('POST')
-        request.setHttpHeaderProperties([
-            header('Authorization', 'Bearer ' + resolveToken()),
-            header('X-Atlassian-Token', 'no-check'),
-            header('Content-Type', 'multipart/form-data')
-        ])
-        request.setBodyContent(new HttpFileBodyContent(filePath))
-
-        ResponseObject response = WS.sendRequest(request)
-        int status = response.getStatusCode()
-
-        KeywordUtil.logInfo("Upload attachment status (${filePath}): ${status}")
-        KeywordUtil.logInfo("Upload attachment response: ${safeBody(response)}")
-
-        return status
-    }
-
-    String createTestPlan(String summary, String epicKey) {
-        String epicFieldId = resolveEpicFieldId()
-
-        Map fields = [
-            project  : [key: owner.PROJECT_KEY],
-            summary  : owner.safe(summary),
-            issuetype: [name: 'Test Plan']
-        ]
-
-        if (!owner.isBlank(epicKey) && !owner.isBlank(epicFieldId)) {
-            fields[epicFieldId] = owner.safe(epicKey)
-        }
-
-        RequestObject request = new RequestObject('Runtime Create Test Plan')
-        request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue')
-        request.setRestRequestMethod('POST')
-        request.setHttpHeaderProperties(jsonHeaders())
-        request.setBodyContent(jsonBody([fields: fields]))
-
-        ResponseObject response = WS.sendRequest(request)
-
-        int status = response.getStatusCode()
-        String body = safeBody(response)
-
-        KeywordUtil.logInfo("Create Test Plan status: ${status}")
-        KeywordUtil.logInfo("Create Test Plan response: ${body}")
-
-        if (status < 200 || status >= 300) {
-            return "ERROR: create test plan failed with status ${status}"
-        }
-
-        def parsed = parseJson(body)
-        String key = owner.safe(parsed?.key)
-
-        if (owner.isBlank(key)) {
-            return 'ERROR: created Test Plan key not found in response'
-        }
-
-        return key
-    }
-
-    Map searchTestPlans(String summary, String epicKey) {
-        String jql =
-            'project = "' + owner.PROJECT_KEY + '" ' +
-            'AND issuetype = "Test Plan" ' +
-            'ORDER BY created DESC'
-
-        KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
-
-        List<String> fields = ['summary', 'created', 'issuetype']
-        String epicFieldId = resolveEpicFieldId()
-        if (!owner.isBlank(epicFieldId)) {
-            fields << epicFieldId
-        }
-
-        Map response = searchIssues('Runtime Search Test Plan', jql, fields, 200)
-        response.epicFieldId = epicFieldId
-        return response
-    }
-
-    String findEpicKeyBySummary(String epicSummary) {
-        if (owner.isBlank(epicSummary)) {
-            return ''
-        }
-
-        String jql =
-            'project = "' + owner.PROJECT_KEY + '" ' +
-            'AND issuetype = Epic ' +
-            'ORDER BY created DESC'
-
-        Map response = searchIssues('Runtime Search Epic', jql, ['summary', 'created', 'issuetype'], 200)
-
-        int statusCode = (response?.statusCode ?: 0) as int
-        if (statusCode != 200) {
-            KeywordUtil.logInfo("Search Epic failed with status: ${statusCode}")
-            return ''
-        }
-
-        List issues = response?.issues instanceof List ? (response.issues as List) : []
-        if (issues.isEmpty()) {
-            return ''
-        }
-
-        def matched = issues.find { issue ->
-            owner.normalizeTitle(owner.safe(issue?.fields?.summary)) == owner.normalizeTitle(epicSummary)
-        }
-
-        return owner.safe(matched?.key)
-    }
-
-    Map getIssueByKey(String issueKey) {
-        if (owner.isBlank(issueKey)) {
-            return [statusCode: 0, issue: null, body: '']
-        }
-
-        String epicFieldId = resolveEpicFieldId()
-        List<String> fields = ['summary', 'created', 'issuetype']
-        if (!owner.isBlank(epicFieldId)) {
-            fields << epicFieldId
-        }
-
-        String url =
-            owner.JIRA_BASE_URL +
-            '/rest/api/2/issue/' + encode(issueKey) +
-            '?fields=' + encode(fields.join(','))
-
-        RequestObject request = new RequestObject('Runtime Get Issue By Key')
-        request.setRestUrl(url)
-        request.setRestRequestMethod('GET')
-        request.setHttpHeaderProperties(defaultGetHeaders())
-
-        ResponseObject response = WS.sendRequest(request)
-
-        int status = response.getStatusCode()
-        String body = safeBody(response)
-
-        KeywordUtil.logInfo("Get Issue By Key status: ${status}")
-        KeywordUtil.logInfo("Get Issue By Key response: ${body}")
-
-        def parsed = parseJson(body)
-
-        return [
-            statusCode : status,
-            body       : body,
-            issue      : parsed,
-            epicFieldId: epicFieldId
-        ]
-    }
-
-    Map searchIssues(String requestName, String jql, List<String> fields, int maxResults) {
-        String url =
-            owner.JIRA_BASE_URL +
-            '/rest/api/2/search' +
-            '?jql=' + encode(jql) +
-            '&maxResults=' + maxResults +
-            '&fields=' + encode(fields.join(','))
-
-        RequestObject request = new RequestObject(requestName)
-        request.setRestUrl(url)
-        request.setRestRequestMethod('GET')
-        request.setHttpHeaderProperties(defaultGetHeaders())
-
-        ResponseObject response = WS.sendRequest(request)
-
-        int status = response.getStatusCode()
-        String body = safeBody(response)
-
-        KeywordUtil.logInfo("${requestName} status: ${status}")
-        KeywordUtil.logInfo("${requestName} response: ${body}")
-
-        def parsed = parseJson(body)
-
-        return [
-            statusCode: status,
-            body      : body,
-            issues    : parsed?.issues instanceof List ? parsed.issues : []
-        ]
-    }
-
-    String resolveEpicFieldId() {
-        if (!owner.isBlank(cachedEpicFieldId)) {
-            return cachedEpicFieldId
-        }
-
-        try {
-            RequestObject request = new RequestObject('Runtime Get Jira Fields')
-            request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/field')
-            request.setRestRequestMethod('GET')
-            request.setHttpHeaderProperties(defaultGetHeaders())
-
-            ResponseObject response = WS.sendRequest(request)
-            int status = response.getStatusCode()
-            String body = safeBody(response)
-
-            if (status != 200) {
-                KeywordUtil.logInfo("Get fields failed with status: ${status}")
-                return ''
-            }
-
-            def parsed = parseJson(body)
-            if (!(parsed instanceof List)) {
-                return ''
-            }
-
-            def epicField = parsed.find { field ->
-                String name = owner.safe(field?.name)
-                String custom = owner.safe(field?.schema?.custom)
-
-                return owner.normalizeTitle(name) == 'epic link' ||
-                       custom == 'com.pyxis.greenhopper.jira:gh-epic-link'
-            }
-
-            cachedEpicFieldId = owner.safe(epicField?.id)
-            KeywordUtil.logInfo("Resolved Epic Link field id: ${cachedEpicFieldId}")
-
-            return cachedEpicFieldId
-        } catch (Exception e) {
-            KeywordUtil.logInfo("Epic field resolution skipped: ${e.message}")
-            return ''
-        }
-    }
-
-    private String resolveToken() {
-        try {
-            def direct = GlobalVariable.JIRA_TOKEN
-            if (!owner.isBlank(direct)) {
-                return owner.safe(direct)
-            }
-        } catch (Exception ignored) {
-        }
-
-        try {
-            def fallback = GlobalVariable.token
-            if (!owner.isBlank(fallback)) {
-                return owner.safe(fallback)
-            }
-        } catch (Exception ignored) {
-        }
-
-        return owner.safe(owner.JIRA_TOKEN)
-    }
-
-    private List<TestObjectProperty> defaultGetHeaders() {
-        return [
-            header('Authorization', 'Bearer ' + resolveToken()),
-            header('Accept', 'application/json')
-        ]
-    }
-
-    private List<TestObjectProperty> jsonHeaders() {
-        return [
-            header('Authorization', 'Bearer ' + resolveToken()),
-            header('Accept', 'application/json'),
-            header('Content-Type', 'application/json')
-        ]
-    }
-
-    private TestObjectProperty header(String name, String value) {
-        return new TestObjectProperty(name, ConditionType.EQUALS, value)
-    }
-
-    private HttpTextBodyContent jsonBody(Object payload) {
-        String text = new JsonBuilder(payload).toString()
-        return new HttpTextBodyContent(text, 'UTF-8', 'application/json')
-    }
-
-    private Object parseJson(String body) {
-        if (owner.isBlank(body)) {
-            return [:]
-        }
-
-        try {
-            return jsonSlurper.parseText(body)
-        } catch (Exception ignored) {
-            return [:]
-        }
-    }
-
-    private String safeBody(ResponseObject response) {
-        try {
-            return owner.safe(response?.getResponseBodyContent())
-        } catch (Exception ignored) {
-            return ''
-        }
-    }
-
-    private String encode(String value) {
-        return URLEncoder.encode(owner.safe(value), StandardCharsets.UTF_8.toString())
-    }
+	JiraFlowCoordinator owner
+	JsonSlurper jsonSlurper = new JsonSlurper()
+
+	JiraGateway(JiraFlowCoordinator owner) {
+		this.owner = owner
+	}
+
+	void validateRequiredConfiguration() {
+		List<String> missing = []
+
+		if (owner.isBlank(resolveToken())) {
+			missing << 'JIRA token'
+		}
+		if (owner.isBlank(owner.PROJECT_KEY)) {
+			missing << 'PROJECT_KEY'
+		}
+		if (owner.isBlank(owner.JIRA_BASE_URL)) {
+			missing << 'JIRA_BASE_URL'
+		}
+
+		if (!missing.isEmpty()) {
+			KeywordUtil.markFailedAndStop('Missing Jira configuration: ' + missing.join(', '))
+		}
+	}
+
+	String importExecutionResults(String xmlPath) {
+		if (owner.isBlank(xmlPath)) {
+			return 'ERROR: XML path is empty'
+		}
+
+		File xmlFile = new File(xmlPath)
+		if (!xmlFile.exists() || !xmlFile.isFile() || xmlFile.length() <= 0) {
+			return 'ERROR: XML file not found or empty'
+		}
+
+		try {
+			ResponseObject response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
+				('filePath') : xmlPath,
+				('project')  : owner.PROJECT_KEY,
+				('baseUrl')  : owner.JIRA_BASE_URL,
+				('token')    : resolveToken()
+			]))
+
+			int status = response.getStatusCode()
+			String body = safeBody(response)
+
+			KeywordUtil.logInfo("Import Results status: ${status}")
+			KeywordUtil.logInfo("Import Results response: ${body}")
+
+			if (status < 200 || status >= 300) {
+				return "ERROR: import execution failed with status ${status}"
+			}
+
+			def parsed = parseJson(body)
+			String key = owner.safe(parsed?.testExecIssue?.key)
+
+			if (owner.isBlank(key)) {
+				return 'ERROR: execution key not found in import response'
+			}
+
+			return key
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Import Results request failed: ${e.message}")
+			return "ERROR: import execution request failed - ${e.message}"
+		}
+	}
+
+	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
+		if (owner.isBlank(testPlanKey) || owner.isBlank(executionKey)) {
+			return 0
+		}
+
+		Map payload = [
+			add: [executionKey]
+		]
+
+		RequestObject request = new RequestObject('Runtime Add Execution To Test Plan')
+		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/raven/2.0/api/testplan/' + encode(testPlanKey) + '/testexecution')
+		request.setRestRequestMethod('POST')
+		request.setHttpHeaderProperties(jsonHeaders())
+		request.setBodyContent(jsonBody(payload))
+
+		ResponseObject response = WS.sendRequest(request)
+		int status = response.getStatusCode()
+
+		KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
+		KeywordUtil.logInfo("Add execution to Test Plan response: ${safeBody(response)}")
+
+		return status
+	}
+
+	int updateTestExecution(String issueKey, String summary, String labels, String environment) {
+		if (owner.isBlank(issueKey)) {
+			return 0
+		}
+
+		List<String> labelList = []
+		if (!owner.isBlank(labels)) {
+			def flowRef = owner
+			labelList = labels
+					.split(',')
+					.collect { item -> flowRef.safe(item) }
+					.findAll { item -> !flowRef.isBlank(item) }
+		}
+
+		Map fields = [
+			summary: owner.safe(summary),
+			labels : labelList
+		]
+
+		if (!owner.isBlank(environment)) {
+			fields.environment = owner.safe(environment)
+		}
+
+		RequestObject request = new RequestObject('Runtime Update Test Execution')
+		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey))
+		request.setRestRequestMethod('PUT')
+		request.setHttpHeaderProperties(jsonHeaders())
+		request.setBodyContent(jsonBody([fields: fields]))
+
+		ResponseObject response = WS.sendRequest(request)
+		int status = response.getStatusCode()
+
+		KeywordUtil.logInfo("Update Test Execution status: ${status}")
+		KeywordUtil.logInfo("Update Test Execution response: ${safeBody(response)}")
+
+		return status
+	}
+
+	int uploadAttachment(String issueKey, String filePath) {
+		if (owner.isBlank(issueKey) || owner.isBlank(filePath)) {
+			return 0
+		}
+
+		File file = new File(filePath)
+		if (!file.exists() || !file.isFile() || file.length() <= 0) {
+			KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
+			return 0
+		}
+
+		try {
+			ResponseObject response = WS.sendRequest(findTestObject('Jira Integration/Evidence attachment', [
+				('token')    : resolveToken(),
+				('evidences'): file,
+				('execID')   : issueKey
+			]))
+
+			int status = response.getStatusCode()
+			String body = safeBody(response)
+
+			KeywordUtil.logInfo("Upload attachment status (${filePath}): ${status}")
+			KeywordUtil.logInfo("Upload attachment response: ${body}")
+
+			return status
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Upload attachment request failed: ${e.message}")
+			return 0
+		}
+	}
+
+	String createTestPlan(String summary, String epicKey) {
+		String epicFieldId = resolveEpicFieldId()
+
+		Map fields = [
+			project  : [key: owner.PROJECT_KEY],
+			summary  : owner.safe(summary),
+			issuetype: [name: 'Test Plan']
+		]
+
+		if (!owner.isBlank(epicKey) && !owner.isBlank(epicFieldId)) {
+			fields[epicFieldId] = owner.safe(epicKey)
+		}
+
+		RequestObject request = new RequestObject('Runtime Create Test Plan')
+		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue')
+		request.setRestRequestMethod('POST')
+		request.setHttpHeaderProperties(jsonHeaders())
+		request.setBodyContent(jsonBody([fields: fields]))
+
+		ResponseObject response = WS.sendRequest(request)
+
+		int status = response.getStatusCode()
+		String body = safeBody(response)
+
+		KeywordUtil.logInfo("Create Test Plan status: ${status}")
+		KeywordUtil.logInfo("Create Test Plan response: ${body}")
+
+		if (status < 200 || status >= 300) {
+			return "ERROR: create test plan failed with status ${status}"
+		}
+
+		def parsed = parseJson(body)
+		String key = owner.safe(parsed?.key)
+
+		if (owner.isBlank(key)) {
+			return 'ERROR: created Test Plan key not found in response'
+		}
+
+		return key
+	}
+
+	Map searchTestPlans(String summary, String epicKey) {
+		String jql =
+				'project = "' + owner.PROJECT_KEY + '" ' +
+				'AND issuetype = "Test Plan" ' +
+				'ORDER BY created DESC'
+
+		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
+
+		String url =
+				owner.JIRA_BASE_URL +
+				'/rest/api/2/search' +
+				'?jql=' + encode(jql) +
+				'&maxResults=200' +
+				'&fields=' + encode('summary,created,issuetype')
+
+		RequestObject request = new RequestObject('Runtime Search Test Plan')
+		request.setRestUrl(url)
+		request.setRestRequestMethod('GET')
+		request.setHttpHeaderProperties(defaultGetHeaders())
+
+		ResponseObject response = WS.sendRequest(request)
+
+		int status = response.getStatusCode()
+		String body = safeBody(response)
+
+		KeywordUtil.logInfo("Get Test Plan status: ${status}")
+		KeywordUtil.logInfo("Get Test Plan response: ${body}")
+
+		def parsed = parseJson(body)
+
+		return [
+			statusCode: status,
+			body      : body,
+			issues    : parsed?.issues instanceof List ? parsed.issues : []
+		]
+	}
+
+	Map getIssueByKey(String issueKey) {
+		if (owner.isBlank(issueKey)) {
+			return [statusCode: 0, issue: null, body: '']
+		}
+
+		String url =
+				owner.JIRA_BASE_URL +
+				'/rest/api/2/issue/' + encode(issueKey) +
+				'?fields=' + encode('summary,created,issuetype')
+
+		RequestObject request = new RequestObject('Runtime Get Issue By Key')
+		request.setRestUrl(url)
+		request.setRestRequestMethod('GET')
+		request.setHttpHeaderProperties(defaultGetHeaders())
+
+		ResponseObject response = WS.sendRequest(request)
+
+		int status = response.getStatusCode()
+		String body = safeBody(response)
+
+		KeywordUtil.logInfo("Get Issue By Key status: ${status}")
+		KeywordUtil.logInfo("Get Issue By Key response: ${body}")
+
+		def parsed = parseJson(body)
+
+		return [
+			statusCode: status,
+			body      : body,
+			issue     : parsed
+		]
+	}
+
+	private String resolveToken() {
+		try {
+			def direct = GlobalVariable.JIRA_TOKEN
+			if (!owner.isBlank(direct)) {
+				return owner.safe(direct)
+			}
+		} catch (Exception ignored) {
+		}
+
+		try {
+			def fallback = GlobalVariable.token
+			if (!owner.isBlank(fallback)) {
+				return owner.safe(fallback)
+			}
+		} catch (Exception ignored) {
+		}
+
+		return owner.safe(owner.JIRA_TOKEN)
+	}
+
+	private String resolveEpicFieldId() {
+		return 'customfield_10006'
+	}
+
+	private List<TestObjectProperty> defaultGetHeaders() {
+		return [
+			header('Authorization', 'Bearer ' + resolveToken()),
+			header('Accept', 'application/json')
+		]
+	}
+
+	private List<TestObjectProperty> jsonHeaders() {
+		return [
+			header('Authorization', 'Bearer ' + resolveToken()),
+			header('Accept', 'application/json'),
+			header('Content-Type', 'application/json')
+		]
+	}
+
+	private TestObjectProperty header(String name, String value) {
+		return new TestObjectProperty(name, ConditionType.EQUALS, value)
+	}
+
+	private HttpTextBodyContent jsonBody(Object payload) {
+		String text = new JsonBuilder(payload).toString()
+		return new HttpTextBodyContent(text, 'UTF-8', 'application/json')
+	}
+
+	private Object parseJson(String body) {
+		if (owner.isBlank(body)) {
+			return [:]
+		}
+
+		try {
+			return jsonSlurper.parseText(body)
+		} catch (Exception ignored) {
+			return [:]
+		}
+	}
+
+	private String safeBody(ResponseObject response) {
+		try {
+			return owner.safe(response?.getResponseBodyContent())
+		} catch (Exception ignored) {
+			return ''
+		}
+	}
+
+	private String encode(String value) {
+		return URLEncoder.encode(owner.safe(value), StandardCharsets.UTF_8.toString())
+	}
 }
+
+
+
+
+
+
 4) Keywords/jiraIntegration/JiraTestPlanManager.groovy
 package jiraIntegration
 
@@ -1251,144 +1108,136 @@ import com.kms.katalon.core.util.KeywordUtil
 
 class JiraTestPlanManager {
 
-    JiraFlowCoordinator owner
-    JiraGateway gateway
+	JiraFlowCoordinator flow
+	JiraGateway gateway
 
-    JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
-        this.owner = owner
-        this.gateway = gateway
-    }
+	JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
+		this.flow = owner
+		this.gateway = gateway
+	}
 
-    String getOrCreateTestPlanKey() {
-        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
-            KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
-            return owner.safe(owner.MANUAL_TEST_PLAN_KEY)
-        }
+	String getOrCreateTestPlanKey() {
+		if (!flow.isBlank(flow.MANUAL_TEST_PLAN_KEY)) {
+			KeywordUtil.logInfo("Using manual Test Plan key: ${flow.MANUAL_TEST_PLAN_KEY}")
+			return flow.safe(flow.MANUAL_TEST_PLAN_KEY)
+		}
 
-        if (!owner.FORCE_CREATE_NEW_TEST_PLAN) {
-            String savedKey = getSavedValidTestPlanKey()
-            if (!owner.isBlank(savedKey)) {
-                return savedKey
-            }
+		if (!flow.FORCE_CREATE_NEW_TEST_PLAN) {
+			String savedKey = getSavedValidTestPlanKey()
+			if (!flow.isBlank(savedKey)) {
+				return savedKey
+			}
 
-            String existingKey = findExistingTestPlanKey()
-            if (!owner.isBlank(existingKey)) {
-                owner.saveSuiteTestPlanKey(existingKey)
-                return existingKey
-            }
-        }
+			String existingKey = findExistingTestPlanKey()
+			if (!flow.isBlank(existingKey)) {
+				flow.saveSuiteTestPlanKey(existingKey)
+				return existingKey
+			}
+		}
 
-        String createdKey = createTestPlan()
-        if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
-            owner.saveSuiteTestPlanKey(createdKey)
-        }
+		String createdKey = createTestPlan()
+		if (!flow.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
+			flow.saveSuiteTestPlanKey(createdKey)
+		}
 
-        return createdKey
-    }
+		return createdKey
+	}
 
-    String getSavedValidTestPlanKey() {
-        String savedKey = owner.readSavedSuiteTestPlanKey()
-        if (owner.isBlank(savedKey)) {
-            return ''
-        }
+	String getSavedValidTestPlanKey() {
+		String savedKey = flow.readSavedSuiteTestPlanKey()
+		if (flow.isBlank(savedKey)) {
+			return ''
+		}
 
-        Map savedIssueResult = gateway.getIssueByKey(savedKey)
-        int statusCode = (savedIssueResult?.statusCode ?: 0) as int
+		Map savedIssueResult = gateway.getIssueByKey(savedKey)
+		int statusCode = (savedIssueResult?.statusCode ?: 0) as int
 
-        if (statusCode != 200) {
-            KeywordUtil.logInfo("Saved Test Plan key is no longer valid: ${savedKey}")
-            return ''
-        }
+		if (statusCode != 200) {
+			KeywordUtil.logInfo("Saved Test Plan key is no longer valid: ${savedKey}")
+			return ''
+		}
 
-        String expectedSummary = owner.getTestPlanName()
-        String savedSummary = owner.safe(savedIssueResult?.issue?.fields?.summary)
-        String savedType = owner.safe(savedIssueResult?.issue?.fields?.issuetype?.name)
+		String expectedSummary = flow.getTestPlanName()
+		String savedSummary = flow.safe(savedIssueResult?.issue?.fields?.summary)
+		String savedType = flow.safe(savedIssueResult?.issue?.fields?.issuetype?.name)
 
-        String epicFieldId = owner.safe(savedIssueResult?.epicFieldId)
-        String savedEpic = owner.safe(epicFieldId ? savedIssueResult?.issue?.fields?."${epicFieldId}" : '')
+		if (flow.normalizeTitle(savedSummary) == flow.normalizeTitle(expectedSummary) &&
+				flow.normalizeTitle(savedType) == 'test plan') {
+			KeywordUtil.logInfo("Using saved Test Plan key for suite ${flow.getCurrentSuiteName()}: ${savedKey}")
+			return savedKey
+		}
 
-        boolean sameSummary = owner.normalizeTitle(savedSummary) == owner.normalizeTitle(expectedSummary)
-        boolean sameType = owner.normalizeTitle(savedType) == 'test plan'
-        boolean sameEpic = owner.isBlank(owner.EPIC_KEY) || owner.safe(savedEpic) == owner.safe(owner.EPIC_KEY)
+		KeywordUtil.logInfo("Saved Test Plan key does not match current suite/title. Ignoring key: ${savedKey}")
+		return ''
+	}
 
-        if (sameSummary && sameType && sameEpic) {
-            KeywordUtil.logInfo("Using saved Test Plan key for suite ${owner.getCurrentSuiteName()}: ${savedKey}")
-            return savedKey
-        }
+	String findExistingTestPlanKey() {
+		String expectedSummary = flow.getTestPlanName()
+		Map response = gateway.searchTestPlans(expectedSummary, flow.EPIC_KEY)
 
-        KeywordUtil.logInfo("Saved Test Plan key does not match current suite/title/epic. Ignoring key: ${savedKey}")
-        return ''
-    }
+		int statusCode = (response?.statusCode ?: 0) as int
+		if (statusCode != 200) {
+			KeywordUtil.logInfo("Search Test Plan failed with status: ${statusCode}")
+			return ''
+		}
 
-    String findExistingTestPlanKey() {
-        String expectedSummary = owner.getTestPlanName()
-        Map response = gateway.searchTestPlans(expectedSummary, owner.EPIC_KEY)
+		List issues = response?.issues instanceof List ? (response.issues as List) : []
+		if (issues.isEmpty()) {
+			KeywordUtil.logInfo("No existing Test Plan found for summary: ${expectedSummary}")
+			return ''
+		}
 
-        int statusCode = (response?.statusCode ?: 0) as int
-        if (statusCode != 200) {
-            KeywordUtil.logInfo("Search Test Plan failed with status: ${statusCode}")
-            return ''
-        }
+		def matchedIssue = issues.find { issue ->
+			String issueSummary = flow.safe(issue?.fields?.summary)
+			String issueType = flow.safe(issue?.fields?.issuetype?.name)
 
-        List issues = response?.issues instanceof List ? (response.issues as List) : []
-        if (issues.isEmpty()) {
-            KeywordUtil.logInfo("No existing Test Plan found for summary: ${expectedSummary}")
-            return ''
-        }
+			return flow.normalizeTitle(issueSummary) == flow.normalizeTitle(expectedSummary) &&
+					flow.normalizeTitle(issueType) == 'test plan'
+		}
 
-        String epicFieldId = owner.safe(response?.epicFieldId)
+		if (matchedIssue == null) {
+			KeywordUtil.logInfo("Search returned Test Plans, but none matched summary exactly: ${expectedSummary}")
+			return ''
+		}
 
-        def matchedIssue = issues.find { issue ->
-            String issueSummary = owner.safe(issue?.fields?.summary)
-            String issueType = owner.safe(issue?.fields?.issuetype?.name)
-            String issueEpic = owner.safe(epicFieldId ? issue?.fields?."${epicFieldId}" : '')
+		String key = flow.safe(matchedIssue?.key)
+		if (!flow.isBlank(key)) {
+			KeywordUtil.logInfo("Existing Test Plan found: ${key}")
+		}
 
-            boolean sameSummary = owner.normalizeTitle(issueSummary) == owner.normalizeTitle(expectedSummary)
-            boolean sameType = owner.normalizeTitle(issueType) == 'test plan'
-            boolean sameEpic = owner.isBlank(owner.EPIC_KEY) || owner.safe(issueEpic) == owner.safe(owner.EPIC_KEY)
+		return key
+	}
 
-            return sameSummary && sameType && sameEpic
-        }
+	String createTestPlan() {
+		String summary = flow.getTestPlanName()
+		KeywordUtil.logInfo("Creating new Test Plan with summary: ${summary}")
 
-        if (matchedIssue == null) {
-            KeywordUtil.logInfo("Search returned Test Plans, but none matched summary exactly inside the expected epic: ${expectedSummary}")
-            return ''
-        }
+		String createdKey = gateway.createTestPlan(summary, flow.EPIC_KEY)
 
-        String key = owner.safe(matchedIssue?.key)
-        if (!owner.isBlank(key)) {
-            KeywordUtil.logInfo("Existing Test Plan found: ${key}")
-        }
+		if (flow.isBlank(createdKey)) {
+			return 'ERROR: empty Test Plan key returned from Jira'
+		}
 
-        return key
-    }
+		if (createdKey.startsWith('ERROR')) {
+			return createdKey
+		}
 
-    String createTestPlan() {
-        String summary = owner.getTestPlanName()
-        KeywordUtil.logInfo("Creating new Test Plan with summary: ${summary}")
-
-        String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
-
-        if (owner.isBlank(createdKey)) {
-            return 'ERROR: empty Test Plan key returned from Jira'
-        }
-
-        if (createdKey.startsWith('ERROR')) {
-            return createdKey
-        }
-
-        KeywordUtil.logInfo("New Test Plan created successfully: ${createdKey}")
-        return createdKey
-    }
+		KeywordUtil.logInfo("New Test Plan created successfully: ${createdKey}")
+		return createdKey
+	}
 }
+
+
+
+
+
 5) Keywords/jiraIntegration/JiraExecutionPublisher.groovy
 package jiraIntegration
 
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.util.ArrayList
-import java.util.List
+import java.io.RandomAccessFile
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -1396,742 +1245,3561 @@ import com.kms.katalon.core.util.KeywordUtil
 
 class JiraExecutionPublisher {
 
-    JiraFlowCoordinator owner
-    JiraGateway gateway
+	JiraFlowCoordinator owner
+	JiraGateway gateway
 
-    JiraExecutionPublisher(JiraFlowCoordinator owner, JiraGateway gateway) {
-        this.owner = owner
-        this.gateway = gateway
-    }
+	JiraExecutionPublisher(JiraFlowCoordinator owner, JiraGateway gateway) {
+		this.owner = owner
+		this.gateway = gateway
+	}
 
-    Map publishExecution(String xmlPath, String executionSummary, String testPlanKey, String reportFolder, String customReportPath) {
-        Map result = [
-            executionKey        : '',
-            gaiaReportStatus    : 0,
-            evidencesStatus     : 0,
-            resultsStatus       : 0,
-            addExecutionStatus  : 0,
-            updateExecutionStatus: 0
-        ]
+	String getGaiaReportFilePath() {
+		return owner.getResolvedReportFolder() + File.separator + owner.GAIA_REPORT_FILE_NAME
+	}
 
-        String executionKey = gateway.importExecutionResults(xmlPath)
-        result.executionKey = executionKey
+	boolean isLockedOrUnreadable(File file) {
+		if (file == null || !file.exists() || !file.isFile()) {
+			return true
+		}
 
-        if (owner.isBlank(executionKey) || executionKey.startsWith('ERROR')) {
-            return result
-        }
+		RandomAccessFile raf = null
+		try {
+			raf = new RandomAccessFile(file, 'r')
+			return false
+		} catch (Exception ignored) {
+			return true
+		} finally {
+			try {
+				raf?.close()
+			} catch (Exception ignored) {}
+		}
+	}
 
-        result.addExecutionStatus = gateway.addExecutionToTestPlan(testPlanKey, executionKey)
-        result.updateExecutionStatus = gateway.updateTestExecution(executionKey, executionSummary, owner.LABELS, owner.ENVIRONMENT)
+	boolean shouldSkipReportEntry(File file) {
+		String name = owner.safe(file?.name).toLowerCase()
 
-        String evidencesZipPath = createEvidenceZip(reportFolder)
-        String resultsZipPath = createResultsZip(reportFolder)
+		if (owner.isBlank(name)) return true
+		if (name == owner.safe(owner.RESULT_ZIP_NAME).toLowerCase()) return true
+		if (name == owner.safe(owner.EVIDENCE_ZIP_NAME).toLowerCase()) return true
+		if (name == owner.safe(owner.GAIA_REPORT_FILE_NAME).toLowerCase()) return true
+		if (name == owner.safe(owner.EVIDENCE_FOLDER_NAME).toLowerCase()) return true
+		if (name == 'videos') return true
+		if (name == 'requests') return true
+		if (name.endsWith('.lck')) return true
+		if (name.endsWith('.lock')) return true
 
-        if (!owner.isBlank(customReportPath)) {
-            result.gaiaReportStatus = gateway.uploadAttachment(executionKey, customReportPath)
-        }
+		return false
+	}
 
-        if (!owner.isBlank(evidencesZipPath)) {
-            result.evidencesStatus = gateway.uploadAttachment(executionKey, evidencesZipPath)
-        }
+	boolean shouldSkipEvidenceEntry(File file) {
+		String name = owner.safe(file?.name).toLowerCase()
 
-        if (!owner.isBlank(resultsZipPath)) {
-            result.resultsStatus = gateway.uploadAttachment(executionKey, resultsZipPath)
-        }
+		if (owner.isBlank(name)) return true
+		if (name == owner.safe(owner.EVIDENCE_ZIP_NAME).toLowerCase()) return true
+		if (name.endsWith('.lck')) return true
+		if (name.endsWith('.lock')) return true
 
-        return result
-    }
+		return false
+	}
 
-    String createEvidenceZip(String reportFolder) {
-        File evidenceFolder = owner.getExistingEvidenceFolder(reportFolder)
-        if (evidenceFolder == null || !evidenceFolder.exists() || !evidenceFolder.isDirectory()) {
-            KeywordUtil.logInfo("Evidence ZIP skipped. Folder not found.")
-            return ''
-        }
+	void addFileToZip(ZipOutputStream output, File rootFolder, File currentFile) {
+		if (currentFile == null || !currentFile.exists()) {
+			return
+		}
 
-        List<File> evidenceFiles = new ArrayList<File>()
-        collectFilesRecursively(evidenceFolder, evidenceFiles)
+		if (currentFile.isDirectory()) {
+			File[] children = currentFile.listFiles()
+			if (children != null) {
+				children.each { child ->
+					addFileToZip(output, rootFolder, child)
+				}
+			}
+			return
+		}
 
-        evidenceFiles = evidenceFiles.findAll { File file ->
-            file.isFile() &&
-            !owner.safe(file.name).equalsIgnoreCase(owner.EVIDENCE_ZIP_NAME)
-        }
+		if (isLockedOrUnreadable(currentFile)) {
+			KeywordUtil.logInfo("Skipping locked file from ZIP: ${currentFile.absolutePath}")
+			return
+		}
 
-        if (evidenceFiles.isEmpty()) {
-            KeywordUtil.logInfo("Evidence ZIP skipped. No files found inside evidence folder.")
-            return ''
-        }
+		String relativePath = rootFolder.toURI().relativize(currentFile.toURI()).getPath()
+		if (owner.isBlank(relativePath)) {
+			return
+		}
 
-        File zipFile = new File(evidenceFolder, owner.EVIDENCE_ZIP_NAME)
-        zipFiles(evidenceFolder, evidenceFiles, zipFile)
+		FileInputStream input = null
+		try {
+			output.putNextEntry(new ZipEntry(relativePath))
+			input = new FileInputStream(currentFile)
 
-        KeywordUtil.logInfo("Evidence ZIP created successfully: ${zipFile.absolutePath}")
-        return zipFile.absolutePath
-    }
+			byte[] buffer = new byte[8192]
+			int readBytes = 0
 
-    String createResultsZip(String reportFolder) {
-        if (owner.isBlank(reportFolder)) {
-            return ''
-        }
+			while ((readBytes = input.read(buffer)) != -1) {
+				output.write(buffer, 0, readBytes)
+			}
 
-        File root = new File(reportFolder)
-        if (!root.exists() || !root.isDirectory()) {
-            return ''
-        }
+			output.closeEntry()
+			KeywordUtil.logInfo("Adding file to ZIP: ${relativePath}")
+		} catch (Exception e) {
+			try {
+				output.closeEntry()
+			} catch (Exception ignored) {}
+			KeywordUtil.logInfo("Skipping file from ZIP due to error: ${currentFile.absolutePath} | ${e.message}")
+		} finally {
+			try {
+				input?.close()
+			} catch (Exception ignored) {}
+		}
+	}
 
-        List<File> files = new ArrayList<File>()
-        collectFilesRecursively(root, files)
+	String zipReports() {
+		String reportFolder = owner.getResolvedReportFolder()
+		File sourceFolder = new File(reportFolder)
 
-        files = files.findAll { File file ->
-            if (!file.isFile()) {
-                return false
-            }
+		if (!sourceFolder.exists() || !sourceFolder.isDirectory()) {
+			KeywordUtil.logInfo("Report ZIP skipped. Folder not found: ${reportFolder}")
+			return ''
+		}
 
-            String lowerPath = owner.safe(file.absolutePath).toLowerCase()
-            String lowerName = owner.safe(file.name).toLowerCase()
+		String zipPath = reportFolder + File.separator + owner.RESULT_ZIP_NAME
+		File zipFile = new File(zipPath)
+		if (zipFile.exists()) {
+			zipFile.delete()
+		}
 
-            if (lowerPath.contains(File.separator.toLowerCase() + 'requests' + File.separator.toLowerCase())) return false
-            if (lowerPath.contains(File.separator.toLowerCase() + 'videos' + File.separator.toLowerCase())) return false
-            if (lowerName == owner.safe(owner.RESULT_ZIP_NAME).toLowerCase()) return false
-            if (lowerName == owner.safe(owner.EVIDENCE_ZIP_NAME).toLowerCase()) return false
+		ZipOutputStream output = null
+		try {
+			output = new ZipOutputStream(new FileOutputStream(zipFile))
 
-            return true
-        }
+			File[] children = sourceFolder.listFiles()
+			if (children != null) {
+				children.each { file ->
+					if (!shouldSkipReportEntry(file)) {
+						addFileToZip(output, sourceFolder, file)
+					}
+				}
+			}
 
-        if (files.isEmpty()) {
-            return ''
-        }
+			KeywordUtil.logInfo("Report ZIP created successfully: ${zipPath}")
+			return zipPath
+		} finally {
+			try {
+				output?.close()
+			} catch (Exception ignored) {}
+		}
+	}
 
-        File zipFile = new File(root, owner.RESULT_ZIP_NAME)
-        zipFiles(root, files, zipFile)
+	String zipEvidences() {
+		String evidenceFolderPath = owner.getResolvedReportFolder() + File.separator + owner.EVIDENCE_FOLDER_NAME
+		File sourceFolder = new File(evidenceFolderPath)
 
-        KeywordUtil.logInfo("Report ZIP created successfully: ${zipFile.absolutePath}")
-        return zipFile.absolutePath
-    }
+		if (!sourceFolder.exists() || !sourceFolder.isDirectory()) {
+			KeywordUtil.logInfo("Evidence ZIP skipped. Folder not found: ${evidenceFolderPath}")
+			return ''
+		}
 
-    void collectFilesRecursively(File current, List<File> files) {
-        if (current == null || !current.exists()) {
-            return
-        }
+		File[] evidenceChildren = sourceFolder.listFiles()
+		if (evidenceChildren == null || evidenceChildren.length == 0) {
+			KeywordUtil.logInfo("Evidence ZIP skipped. Evidence folder is empty.")
+			return ''
+		}
 
-        if (current.isFile()) {
-            files.add(current)
-            return
-        }
+		String zipPath = evidenceFolderPath + File.separator + owner.EVIDENCE_ZIP_NAME
+		File zipFile = new File(zipPath)
+		if (zipFile.exists()) {
+			zipFile.delete()
+		}
 
-        File[] children = current.listFiles()
-        if (children == null) {
-            return
-        }
+		ZipOutputStream output = null
+		try {
+			output = new ZipOutputStream(new FileOutputStream(zipFile))
 
-        for (File child : children) {
-            collectFilesRecursively(child, files)
-        }
-    }
+			evidenceChildren.each { file ->
+				if (!shouldSkipEvidenceEntry(file)) {
+					addFileToZip(output, sourceFolder, file)
+				}
+			}
 
-    void zipFiles(File baseDir, List<File> files, File zipFile) {
-        FileOutputStream fos = null
-        ZipOutputStream zos = null
+			KeywordUtil.logInfo("Evidence ZIP created successfully: ${zipPath}")
+			return zipPath
+		} finally {
+			try {
+				output?.close()
+			} catch (Exception ignored) {}
+		}
+	}
 
-        try {
-            fos = new FileOutputStream(zipFile)
-            zos = new ZipOutputStream(fos)
+	Map uploadExecutionAttachments(String executionKey) {
+		Map result = [
+			gaiaReportStatus: 0,
+			evidencesStatus : 0,
+			resultsStatus   : 0
+		]
 
-            for (File file : files) {
-                String relativePath = owner.relativeUri(baseDir, file)
-                if (owner.isBlank(relativePath)) {
-                    relativePath = file.name
-                }
+		String gaiaReportPath = getGaiaReportFilePath()
+		String evidencesZipPath = zipEvidences()
+		String resultsZipPath = zipReports()
 
-                KeywordUtil.logInfo("Adding file to ZIP: ${relativePath}")
+		if (!owner.isBlank(gaiaReportPath) && new File(gaiaReportPath).exists()) {
+			KeywordUtil.logInfo("Uploading Gaia report attachment: ${gaiaReportPath}")
+			result.gaiaReportStatus = gateway.uploadAttachment(executionKey, gaiaReportPath)
+		} else {
+			KeywordUtil.logInfo("Gaia report attachment skipped. File not found.")
+		}
 
-                ZipEntry entry = new ZipEntry(relativePath)
-                zos.putNextEntry(entry)
+		if (!owner.isBlank(evidencesZipPath) && new File(evidencesZipPath).exists()) {
+			KeywordUtil.logInfo("Uploading Evidences ZIP attachment: ${evidencesZipPath}")
+			result.evidencesStatus = gateway.uploadAttachment(executionKey, evidencesZipPath)
+		} else {
+			KeywordUtil.logInfo("Evidences ZIP attachment skipped.")
+		}
 
-                FileInputStream fis = new FileInputStream(file)
-                try {
-                    byte[] buffer = new byte[4096]
-                    int len = 0
-                    while ((len = fis.read(buffer)) > 0) {
-                        zos.write(buffer, 0, len)
-                    }
-                } finally {
-                    fis.close()
-                }
+		if (!owner.isBlank(resultsZipPath) && new File(resultsZipPath).exists()) {
+			KeywordUtil.logInfo("Uploading Results ZIP attachment: ${resultsZipPath}")
+			result.resultsStatus = gateway.uploadAttachment(executionKey, resultsZipPath)
+		} else {
+			KeywordUtil.logInfo("Results ZIP attachment skipped.")
+		}
 
-                zos.closeEntry()
-            }
-        } finally {
-            try { zos?.close() } catch (Exception ignored) {}
-            try { fos?.close() } catch (Exception ignored) {}
-        }
-    }
+		return result
+	}
+
+	Map publishExecution(String xmlPath, String executionSummary, String testPlanKey) {
+		Map result = [
+			executionKey         : '',
+			addExecutionStatus   : 0,
+			updateExecutionStatus: 0,
+			gaiaReportStatus     : 0,
+			evidencesStatus      : 0,
+			resultsStatus        : 0
+		]
+
+		String executionKey = gateway.importExecutionResults(xmlPath)
+		result.executionKey = executionKey
+
+		if (owner.isBlank(executionKey) || executionKey.startsWith('ERROR')) {
+			return result
+		}
+
+		result.addExecutionStatus = gateway.addExecutionToTestPlan(testPlanKey, executionKey)
+		result.updateExecutionStatus = gateway.updateTestExecution(
+				executionKey,
+				executionSummary,
+				owner.LABELS,
+				owner.ENVIRONMENT
+				)
+
+		Map attachmentResult = uploadExecutionAttachments(executionKey)
+		result.putAll(attachmentResult)
+
+		return result
+	}
 }
+
+
+
+
+
+
 6) Keywords/jiraIntegration/JiraGaiaReportBuilder.groovy
 package jiraIntegration
 
 import java.io.File
-import java.text.DecimalFormat
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-import groovy.util.XmlSlurper
+import javax.xml.parsers.DocumentBuilderFactory
+
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+import java.util.Base64
+import java.nio.file.StandardCopyOption
 
 class JiraGaiaReportBuilder {
 
-    JiraFlowCoordinator owner
-    JiraGaiaHtmlTemplateBuilder templateBuilder
+	private static final String DEFAULT_REPORT_FILE_NAME = 'gaiaReport.html'
+	private static final String DEFAULT_LOGO_RELATIVE_PATH = 'Image/gaia-logo.png'
 
-    JiraGaiaReportBuilder(JiraFlowCoordinator owner) {
-        this.owner = owner
-        this.templateBuilder = new JiraGaiaHtmlTemplateBuilder(owner)
-    }
+	JiraFlowCoordinator flow
 
-    String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath, String executionSummary) {
-        if (owner.isBlank(reportFolder) || owner.isBlank(xmlPath)) {
-            return ''
-        }
+	JiraGaiaReportBuilder(JiraFlowCoordinator flow) {
+		this.flow = flow
+	}
 
-        File reportDir = new File(reportFolder)
-        if (!reportDir.exists() || !reportDir.isDirectory()) {
-            return ''
-        }
+	String createGaiaHtmlReport(String reportFolder, String suiteName, String xmlPath) {
+		if (isBlank(reportFolder) || isBlank(xmlPath)) {
+			return ''
+		}
 
-        Map parsedXml = parseXmlResults(xmlPath)
-        List<Map> executionEntries = parseExecutionLog(reportFolder)
-        List<File> screenshots = owner.collectFailureImages(reportFolder)
+		File reportDir = new File(reportFolder)
+		if (!reportDir.exists()) {
+			return ''
+		}
 
-        List<Map> screenshotModels = screenshots.collect { File file ->
-            [
-                name: file.name,
-                relativePath: owner.relativeUri(reportDir, file)
-            ]
-        }
+		String resolvedSuiteName = resolveSuiteName(reportDir)
+		List<Map> xmlCases = parseXmlCases(xmlPath)
+		List<Map> scenarios = parseExecutionScenarios(reportDir)
 
-        Map model = [
-            suiteName        : suiteName,
-            executionSummary : executionSummary,
-            environment      : owner.ENVIRONMENT,
-            projectKey       : owner.PROJECT_KEY,
-            generatedAt      : new Date(),
-            xmlPath          : xmlPath,
-            totals           : parsedXml.totals,
-            testCases        : parsedXml.testCases,
-            executionEntries : executionEntries,
-            screenshots      : screenshotModels
-        ]
+		if (scenarios.isEmpty()) {
+			scenarios = buildFallbackScenarios(xmlCases)
+		} else {
+			enrichScenariosWithFallbackData(scenarios, xmlCases)
+		}
 
-        String html = templateBuilder.build(model)
+		normalizeScenarioSteps(scenarios)
+		applySequentialTimingFallback(reportDir, scenarios)
+		attachEvidenceToFailedScenarios(reportDir, scenarios)
 
-        File output = new File(reportDir, owner.GAIA_REPORT_FILE_NAME)
-        output.setText(html, 'UTF-8')
+		Map summary = buildSummary(reportDir, scenarios)
+		String logoSrc = resolveAssetUrl(reportDir, DEFAULT_LOGO_RELATIVE_PATH)
 
-        return output.absolutePath
-    }
+		Map model = [
+			suiteName   : resolvedSuiteName,
+			reportTitle : 'Test report - ' + resolvedSuiteName,
+			subtitle    : 'GAIA execution overview',
+			generatedAt : formatDisplayDate(new Date()),
+			logoSrc     : logoSrc,
+			reportFolder: reportDir.absolutePath,
+			summary     : summary,
+			scenarios   : scenarios
+		]
 
-    Map parseXmlResults(String xmlPath) {
-        List<Map> testCases = []
-        int totalTests = 0
-        int totalFailures = 0
-        int totalSkipped = 0
-        BigDecimal totalTime = 0
+		String html = new JiraGaiaHtmlTemplateBuilder().build(model)
 
-        def root = new XmlSlurper(false, false).parse(new File(xmlPath))
-        String rootName = owner.safe(root.name())
+		File htmlFile = new File(reportDir, resolveReportFileName())
+		htmlFile.setText(html, 'UTF-8')
+		return htmlFile.absolutePath
+	}
 
-        List suiteNodes = []
-        if (rootName.equalsIgnoreCase('testsuites')) {
-            suiteNodes.addAll(root.testsuite)
-        } else if (rootName.equalsIgnoreCase('testsuite')) {
-            suiteNodes << root
-        } else {
-            suiteNodes << root
-        }
+	// =========================================================================
+	// BASIC HELPERS
+	// =========================================================================
 
-        suiteNodes.each { suiteNode ->
-            String suiteNodeName = owner.safe(suiteNode.@name?.text())
+	private String resolveReportFileName() {
+		try {
+			String value = safeValue(flow?.GAIA_REPORT_FILE_NAME)
+			if (!isBlank(value)) {
+				return value
+			}
+		} catch (Exception ignored) {
+		}
+		return DEFAULT_REPORT_FILE_NAME
+	}
 
-            suiteNode.testcase.each { testCaseNode ->
-                String name = owner.safe(testCaseNode.@name?.text())
-                String className = owner.safe(testCaseNode.@classname?.text())
-                String timeValue = owner.safe(testCaseNode.@time?.text())
+	private String safeValue(def value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
 
-                boolean failed = testCaseNode.failure?.size() > 0 || testCaseNode.error?.size() > 0
-                boolean skipped = testCaseNode.skipped?.size() > 0
+	private boolean isBlank(def value) {
+		return safeValue(value).isEmpty()
+	}
 
-                String failureMessage = ''
-                if (failed) {
-                    def failureNode = testCaseNode.failure?.size() > 0 ? testCaseNode.failure[0] : testCaseNode.error[0]
-                    failureMessage = owner.safe(failureNode.@message?.text())
-                    if (owner.isBlank(failureMessage)) {
-                        failureMessage = owner.safe(failureNode.text())
-                    }
-                }
+	private long toLong(def value) {
+		try {
+			return Long.parseLong(safeValue(value))
+		} catch (Exception ignored) {
+			return 0L
+		}
+	}
 
-                BigDecimal caseTime = 0
-                try {
-                    caseTime = new BigDecimal(owner.safe(timeValue == '' ? '0' : timeValue))
-                } catch (Exception ignored) {
-                    caseTime = 0
-                }
+	private String normalizeText(List<String> lines) {
+		if (lines == null || lines.isEmpty()) {
+			return ''
+		}
+		return lines.findAll { String item -> !isBlank(item) }.join('\n').trim()
+	}
 
-                totalTests++
-                if (failed) totalFailures++
-                if (skipped) totalSkipped++
-                totalTime += caseTime
+	// =========================================================================
+	// SUITE / SUMMARY
+	// =========================================================================
 
-                testCases << [
-                    suite         : suiteNodeName,
-                    name          : name,
-                    className     : className,
-                    status        : skipped ? 'SKIPPED' : (failed ? 'FAILED' : 'PASSED'),
-                    duration      : formatSeconds(caseTime),
-                    durationRaw   : caseTime,
-                    failureMessage: failureMessage
-                ]
-            }
-        }
+	private String resolveSuiteName(File reportDir) {
+		File parent = reportDir.parentFile
+		if (parent != null && !isBlank(parent.name)) {
+			return safeValue(parent.name)
+		}
+		return 'GAIA Execution'
+	}
 
-        return [
-            totals: [
-                tests   : totalTests,
-                failures: totalFailures,
-                passed  : Math.max(totalTests - totalFailures - totalSkipped, 0),
-                skipped : totalSkipped,
-                duration: formatSeconds(totalTime)
-            ],
-            testCases: testCases
-        ]
-    }
+	private Map buildSummary(File reportDir, List<Map> scenarios) {
+		int passed = scenarios.count { Map item -> safeValue(item.status) == 'passed' }
+		int failed = scenarios.count { Map item -> safeValue(item.status) == 'failed' }
+		int skipped = scenarios.count { Map item -> safeValue(item.status) == 'skipped' }
+		int info = scenarios.count { Map item -> safeValue(item.status) == 'info' }
 
-    List<Map> parseExecutionLog(String reportFolder) {
-        List<Map> entries = []
+		long totalDurationMs = 0L
+		scenarios.each { Map item ->
+			totalDurationMs += toLong(item.durationMs)
+		}
 
-        File logFile = owner.findFileInReportTree(reportFolder, 'execution0.log')
-        if (logFile == null || !logFile.exists() || !logFile.isFile()) {
-            return entries
-        }
+		String startLabel = ''
+		String endLabel = ''
 
-        List<String> lines = []
-        try {
-            lines = logFile.readLines('UTF-8')
-        } catch (Exception ignored) {
-            lines = logFile.readLines()
-        }
+		List<String> starts = scenarios.collect { safeValue(it.startLabel) }.findAll { !isBlank(it) }
+		List<String> ends = scenarios.collect { safeValue(it.endLabel) }.findAll { !isBlank(it) }
 
-        lines.each { String line ->
-            String safeLine = owner.safe(line)
+		if (!starts.isEmpty()) {
+			startLabel = starts.first()
+		}
+		if (!ends.isEmpty()) {
+			endLabel = ends.last()
+		}
 
-            if (safeLine.contains('TEST CASE:')) {
-                entries << [
-                    type  : 'CASE',
-                    status: safeLine.toUpperCase().contains('FAILED') ? 'FAILED' : 'INFO',
-                    text  : extractAfter(safeLine, 'TEST CASE:')
-                ]
-                return
-            }
+		if (isBlank(startLabel) || isBlank(endLabel)) {
+			Date endDate = new Date(reportDir.lastModified())
+			Date startDate = new Date(endDate.time - totalDurationMs)
 
-            if (safeLine.contains('TEST STEP:')) {
-                entries << [
-                    type  : 'STEP',
-                    status: safeLine.toUpperCase().contains('FAILED') || safeLine.toUpperCase().contains('STOP_ON_FAILURE') ? 'FAILED' : 'INFO',
-                    text  : extractAfter(safeLine, 'TEST STEP:')
-                ]
-                return
-            }
+			if (isBlank(startLabel)) {
+				startLabel = formatTimeOnly(endDate.time - totalDurationMs)
+			}
+			if (isBlank(endLabel)) {
+				endLabel = formatTimeOnly(endDate)
+			}
+		}
 
-            if (safeLine.startsWith('Caused by:') || safeLine.startsWith('Reason:')) {
-                entries << [
-                    type  : 'ERROR',
-                    status: 'FAILED',
-                    text  : safeLine
-                ]
-            }
-        }
+		return [
+			total         : scenarios.size(),
+			passed        : passed,
+			failed        : failed,
+			skipped       : skipped,
+			info          : info,
+			totalDuration : totalDurationMs,
+			durationLabel : formatDurationFull(totalDurationMs),
+			startLabel    : startLabel,
+			endLabel      : endLabel
+		]
+	}
 
-        return entries
-    }
+	// =========================================================================
+	// XML FALLBACK
+	// =========================================================================
 
-    String extractAfter(String line, String token) {
-        int index = line.indexOf(token)
-        if (index < 0) {
-            return owner.safe(line)
-        }
-        return owner.safe(line.substring(index + token.length()))
-    }
+	private List<Map> parseXmlCases(String xmlPath) {
+		List<Map> result = []
 
-    String formatSeconds(def seconds) {
-        BigDecimal value = 0
-        try {
-            value = new BigDecimal(owner.safe(seconds == null ? '0' : seconds.toString()))
-        } catch (Exception ignored) {
-            value = 0
-        }
+		File xmlFile = new File(xmlPath)
+		if (!xmlFile.exists()) {
+			return result
+		}
 
-        DecimalFormat df = new DecimalFormat('0.###')
-        return df.format(value) + 's'
-    }
+		Document document = parseXmlDocument(xmlFile)
+		if (document == null) {
+			return result
+		}
+
+		def testcases = document.getElementsByTagName('testcase')
+		for (int index = 0; index < testcases.length; index++) {
+			Element testcase = (Element) testcases.item(index)
+
+			String className = safeValue(testcase.getAttribute('classname'))
+			String testName = safeValue(testcase.getAttribute('name'))
+			long durationMs = toMillisFromSeconds(testcase.getAttribute('time'))
+
+			Element failureNode = firstChildElement(testcase, 'failure')
+			Element errorNode = firstChildElement(testcase, 'error')
+			Element skippedNode = firstChildElement(testcase, 'skipped')
+
+			boolean failed = failureNode != null || errorNode != null
+			boolean skipped = skippedNode != null
+
+			String message = ''
+			String details = ''
+
+			if (failureNode != null) {
+				message = safeValue(failureNode.getAttribute('message'))
+				details = safeValue(failureNode.getTextContent())
+			} else if (errorNode != null) {
+				message = safeValue(errorNode.getAttribute('message'))
+				details = safeValue(errorNode.getTextContent())
+			} else if (skippedNode != null) {
+				message = safeValue(skippedNode.getAttribute('message'))
+				details = safeValue(skippedNode.getTextContent())
+			}
+
+			result << [
+				index      : index + 1,
+				name       : buildDisplayName(className, testName),
+				shortName  : isBlank(testName) ? buildDisplayName(className, testName) : testName,
+				durationMs : durationMs,
+				status     : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
+				message    : message,
+				details    : details
+			]
+		}
+
+		return result
+	}
+
+	private Document parseXmlDocument(File xmlFile) {
+		try {
+			def factory = DocumentBuilderFactory.newInstance()
+			factory.setNamespaceAware(false)
+			factory.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
+			factory.setFeature('http://xml.org/sax/features/external-general-entities', false)
+			factory.setFeature('http://xml.org/sax/features/external-parameter-entities', false)
+			factory.setFeature('http://apache.org/xml/features/nonvalidating/load-external-dtd', false)
+			factory.setExpandEntityReferences(false)
+
+			def builder = factory.newDocumentBuilder()
+			return builder.parse(xmlFile)
+		} catch (Exception ignored) {
+			return null
+		}
+	}
+
+	private Element firstChildElement(Element parent, String tagName) {
+		def nodes = parent.getElementsByTagName(tagName)
+		if (nodes == null || nodes.length == 0) {
+			return null
+		}
+		return (Element) nodes.item(0)
+	}
+
+	private String buildDisplayName(String className, String testName) {
+		if (!isBlank(className) && !isBlank(testName)) {
+			return className + '/' + testName
+		}
+		if (!isBlank(testName)) {
+			return testName
+		}
+		return className
+	}
+
+	private List<Map> buildFallbackScenarios(List<Map> xmlCases) {
+		List<Map> scenarios = []
+
+		xmlCases.eachWithIndex { Map xmlCase, int index ->
+			String title = safeValue(xmlCase.shortName)
+
+			Map failedStep = [
+				id           : 'step-' + (index + 1) + '-1',
+				title        : title,
+				status       : safeValue(xmlCase.status),
+				timeLabel    : '',
+				startLabel   : '',
+				endLabel     : '',
+				durationMs   : toLong(xmlCase.durationMs),
+				durationLabel: formatDurationFull(toLong(xmlCase.durationMs)),
+				detailText   : safeValue(xmlCase.details),
+				shortError   : extractShortError(xmlCase.message ?: xmlCase.details),
+				errorFull    : safeValue(xmlCase.details),
+				emoji        : resolveStepEmoji(title)
+			]
+
+			scenarios << [
+				id             : 'scenario-' + (index + 1),
+				title          : title,
+				status         : safeValue(xmlCase.status),
+				startLabel     : '',
+				endLabel       : '',
+				durationMs     : toLong(xmlCase.durationMs),
+				durationLabel  : formatDurationFull(toLong(xmlCase.durationMs)),
+				steps          : [failedStep],
+				errorShort     : extractShortError(xmlCase.message ?: xmlCase.details),
+				errorFull      : safeValue(xmlCase.details),
+				sidebarSubtitle: extractShortError(xmlCase.message ?: xmlCase.details),
+				evidences      : []
+			]
+		}
+
+		return scenarios
+	}
+
+	private void enrichScenariosWithFallbackData(List<Map> scenarios, List<Map> xmlCases) {
+		scenarios.eachWithIndex { Map scenario, int index ->
+			if (index >= xmlCases.size()) {
+				return
+			}
+
+			Map xmlCase = xmlCases[index]
+
+			if (toLong(scenario.durationMs) <= 0L) {
+				scenario.durationMs = toLong(xmlCase.durationMs)
+			}
+
+			if (isBlank(scenario.errorShort)) {
+				scenario.errorShort = extractShortError(xmlCase.message ?: xmlCase.details)
+			}
+
+			if (isBlank(scenario.errorFull)) {
+				scenario.errorFull = safeValue(xmlCase.details)
+			}
+
+			if (isBlank(scenario.sidebarSubtitle)) {
+				scenario.sidebarSubtitle = scenario.errorShort
+			}
+
+			scenario.durationLabel = formatDurationFull(toLong(scenario.durationMs))
+		}
+	}
+
+	// =========================================================================
+	// EXECUTION LOG PARSING
+	// =========================================================================
+
+	private List<Map> parseExecutionScenarios(File reportDir) {
+		File logFile = findExecutionLog(reportDir)
+		if (logFile == null || !logFile.exists()) {
+			return []
+		}
+
+		List<String> lines = readFileLines(logFile)
+		if (lines.isEmpty()) {
+			return []
+		}
+
+		List<Map> scenarios = []
+		Map currentScenario = null
+		Map currentStep = null
+
+		Closure finalizeStep = {
+			if (currentScenario == null || currentStep == null) {
+				return
+			}
+
+			if (safeValue(currentStep.status) == 'pending') {
+				currentStep.status = 'skipped'
+			}
+
+			currentStep.detailText = normalizeText(currentStep.detailLines as List<String>)
+			currentStep.errorFull = normalizeText(currentStep.errorLines as List<String>)
+
+			if (isBlank(currentStep.shortError)) {
+				currentStep.shortError = extractShortError(currentStep.errorFull ?: currentStep.detailText)
+			}
+
+			currentStep.durationLabel = formatDurationFull(toLong(currentStep.durationMs))
+			currentStep = null
+		}
+
+		Closure finalizeScenario = {
+			if (currentScenario == null) {
+				return
+			}
+
+			List<Map> steps = (currentScenario.steps ?: []) as List<Map>
+			if (steps.isEmpty()) {
+				currentScenario = null
+				return
+			}
+
+			long stepTotal = sumStepDurations(steps)
+			if (stepTotal > toLong(currentScenario.durationMs)) {
+				currentScenario.durationMs = stepTotal
+			}
+
+			currentScenario.status = resolveScenarioStatus(steps)
+			currentScenario.errorShort = resolveScenarioErrorShort(steps)
+			currentScenario.errorFull = resolveScenarioErrorFull(steps)
+			currentScenario.sidebarSubtitle = isBlank(currentScenario.errorShort)
+					? safeValue(currentScenario.title)
+					: currentScenario.errorShort
+			currentScenario.durationLabel = formatDurationFull(toLong(currentScenario.durationMs))
+			scenarios << currentScenario
+			currentScenario = null
+		}
+
+		for (String rawLine : lines) {
+			String line = sanitizeLogLine(rawLine)
+			if (isBlank(line)) {
+				continue
+			}
+
+			String scenarioTitleVerbose = extractScenarioTitleFromVerboseLine(line)
+			if (!isBlank(scenarioTitleVerbose)) {
+				finalizeStep.call()
+				finalizeScenario.call()
+				currentScenario = newScenarioMap('scenario-' + (scenarios.size() + 1), scenarioTitleVerbose)
+				continue
+			}
+
+			Map scenarioCompact = parseCompactScenarioLine(line, scenarios.size() + 1)
+			if (scenarioCompact != null) {
+				finalizeStep.call()
+				finalizeScenario.call()
+				currentScenario = scenarioCompact
+				continue
+			}
+
+			if (currentScenario == null) {
+				continue
+			}
+
+			if (line.startsWith('Start / End / Elapsed:')) {
+				if (currentStep == null) {
+					applyTimingInfo(currentScenario, line)
+				} else {
+					applyTimingInfo(currentStep, line)
+				}
+				continue
+			}
+
+			String verboseStep = extractStepTitleFromVerboseLine(line)
+			if (!isBlank(verboseStep)) {
+				if (!shouldIgnoreStep(verboseStep)) {
+					finalizeStep.call()
+					currentStep = [
+						id           : currentScenario.id + '-step-' + (((currentScenario.steps ?: []).size()) + 1),
+						title        : cleanupStepTitle(verboseStep),
+						status       : 'pending',
+						timeLabel    : '',
+						startLabel   : '',
+						endLabel     : '',
+						durationMs   : 0L,
+						durationLabel: formatDurationFull(0L),
+						detailLines  : [],
+						errorLines   : [],
+						detailText   : '',
+						errorFull    : '',
+						shortError   : '',
+						emoji        : resolveStepEmoji(verboseStep)
+					]
+					currentScenario.steps << currentStep
+				}
+				continue
+			}
+
+			Map compactStep = parseCompactStepLine(line, ((currentScenario.steps ?: []).size()) + 1)
+			if (compactStep != null) {
+				finalizeStep.call()
+				currentStep = compactStep
+				currentStep.id = currentScenario.id + '-step-' + (((currentScenario.steps ?: []).size()) + 1)
+				currentScenario.steps << currentStep
+				continue
+			}
+
+			if (currentStep == null) {
+				continue
+			}
+
+			Map event = parseEventLine(line)
+			if (event != null) {
+				if (isBlank(currentStep.timeLabel)) {
+					currentStep.timeLabel = safeValue(event.timeLabel)
+				}
+
+				currentStep.detailLines << safeValue(event.message)
+
+				if (safeValue(event.status) == 'failed') {
+					currentStep.status = 'failed'
+					currentStep.errorLines << safeValue(event.message)
+					currentStep.shortError = extractShortError(event.message)
+				} else if (safeValue(event.status) == 'passed') {
+					if (safeValue(currentStep.status) != 'failed') {
+						currentStep.status = 'passed'
+					}
+				} else if (safeValue(event.status) == 'skipped') {
+					if (safeValue(currentStep.status) != 'failed' && safeValue(currentStep.status) != 'passed') {
+						currentStep.status = 'skipped'
+					}
+				} else {
+					if (safeValue(currentStep.status) == 'pending') {
+						currentStep.status = 'info'
+					}
+				}
+
+				continue
+			}
+
+			currentStep.detailLines << line
+
+			if (looksLikeErrorLine(line)) {
+				currentStep.errorLines << line
+				currentStep.status = 'failed'
+				if (isBlank(currentStep.shortError)) {
+					currentStep.shortError = extractShortError(line)
+				}
+			}
+		}
+
+		finalizeStep.call()
+		finalizeScenario.call()
+
+		return scenarios
+	}
+
+	private Map newScenarioMap(String id, String title) {
+		return [
+			id             : id,
+			title          : title,
+			status         : 'skipped',
+			startLabel     : '',
+			endLabel       : '',
+			durationMs     : 0L,
+			durationLabel  : formatDurationFull(0L),
+			steps          : [],
+			errorShort     : '',
+			errorFull      : '',
+			sidebarSubtitle: '',
+			evidences      : []
+		]
+	}
+
+	private File findExecutionLog(File reportDir) {
+		List<File> candidates = []
+
+		File[] files = reportDir.listFiles()
+		if (files != null) {
+			files.each { File file ->
+				if (file.isFile()
+						&& file.name.toLowerCase(Locale.ENGLISH).startsWith('execution')
+						&& file.name.toLowerCase(Locale.ENGLISH).endsWith('.log')) {
+					candidates << file
+				}
+			}
+		}
+
+		if (candidates.isEmpty()) {
+			return null
+		}
+
+		candidates.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+		return candidates.last()
+	}
+
+	private List<String> readFileLines(File file) {
+		try {
+			return Files.readAllLines(file.toPath(), StandardCharsets.UTF_8)
+		} catch (Exception ignored) {
+			try {
+				return file.readLines()
+			} catch (Exception ignoredAgain) {
+				return []
+			}
+		}
+	}
+
+	private String sanitizeLogLine(String rawLine) {
+		String line = safeValue(rawLine)
+		if (isBlank(line)) {
+			return ''
+		}
+
+		line = line.replaceAll(/\u001B\[[;\d]*m/, '')
+		line = line.replace('\t', ' ')
+		line = line.replaceAll(/\s+/, ' ').trim()
+
+		def prefixed = (line =~ /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\s+[A-Z]+\s+.+?\s+-\s+(.*)$/)
+		if (prefixed.find()) {
+			line = safeValue(prefixed.group(1))
+		}
+
+		return line
+	}
+
+	private String extractScenarioTitleFromVerboseLine(String line) {
+		String marker = 'TEST STEP: Start Test Case : SCENARIO '
+		if (!line.contains(marker)) {
+			return ''
+		}
+
+		String title = line.substring(line.indexOf(marker) + marker.length()).trim()
+		return cleanupScenarioTitle(title)
+	}
+
+	private Map parseCompactScenarioLine(String line, int scenarioIndex) {
+		def matcher = (line =~ /.*SCENARIO\s+(.+?)\s*\(([\d.,]+s)\)\s*$/)
+		if (!matcher.find()) {
+			return null
+		}
+
+		String title = cleanupScenarioTitle(safeValue(matcher.group(1)))
+		long durationMs = toMillisFromCompactSeconds(matcher.group(2))
+
+		return [
+			id             : 'scenario-' + scenarioIndex,
+			title          : title,
+			status         : 'skipped',
+			startLabel     : '',
+			endLabel       : '',
+			durationMs     : durationMs,
+			durationLabel  : formatDurationFull(durationMs),
+			steps          : [],
+			errorShort     : '',
+			errorFull      : '',
+			sidebarSubtitle: '',
+			evidences      : []
+		]
+	}
+
+	private String extractStepTitleFromVerboseLine(String line) {
+		String marker = 'TEST STEP: '
+		if (!line.contains(marker)) {
+			return ''
+		}
+
+		String text = line.substring(line.indexOf(marker) + marker.length()).trim()
+		return safeValue(text)
+	}
+
+	private Map parseCompactStepLine(String line, int stepIndex) {
+		def matcher = (line =~ /.*?(\\d+)\\s*-\\s*(.+?)\\s*\\(([\\d.,]+s)\\)\\s*$/)
+		if (!matcher.find()) {
+			return null
+		}
+
+		String stepTitle = cleanupStepTitle(safeValue(matcher.group(2)))
+		long durationMs = toMillisFromCompactSeconds(matcher.group(3))
+
+		return [
+			id           : 'step-' + stepIndex,
+			title        : stepTitle,
+			status       : inferStatusFromCompactStepTitle(stepTitle),
+			timeLabel    : '',
+			startLabel   : '',
+			endLabel     : '',
+			durationMs   : durationMs,
+			durationLabel: formatDurationFull(durationMs),
+			detailLines  : [],
+			errorLines   : [],
+			detailText   : '',
+			errorFull    : '',
+			shortError   : '',
+			emoji        : resolveStepEmoji(stepTitle)
+		]
+	}
+
+	private String inferStatusFromCompactStepTitle(String title) {
+		String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
+		if (lower.contains('failed')) {
+			return 'failed'
+		}
+		if (lower.contains('passed')) {
+			return 'passed'
+		}
+		if (lower.contains('skipped')) {
+			return 'skipped'
+		}
+		return 'info'
+	}
+
+	private void applyTimingInfo(Map target, String timingLine) {
+		def matcher = (timingLine =~ /^Start \\/ End \\/ Elapsed:\\s*(.*?)\\s*\\/\\s*(.*?)\\s*\\/\\s*(.*)$/)
+		if (!matcher.find()) {
+			return
+		}
+
+		String rawStart = safeValue(matcher.group(1))
+		String rawEnd = safeValue(matcher.group(2))
+		String rawElapsed = safeValue(matcher.group(3))
+
+		if (!isBlank(rawStart)) {
+			target.startLabel = formatTimeFromAny(rawStart)
+		}
+		if (!isBlank(rawEnd)) {
+			target.endLabel = formatTimeFromAny(rawEnd)
+		}
+
+		long durationMs = toMillisFromElapsed(rawElapsed)
+		if (durationMs > 0L) {
+			target.durationMs = durationMs
+			target.durationLabel = formatDurationFull(durationMs)
+		}
+	}
+
+	private Map parseEventLine(String line) {
+		def matcher = (line =~ /^(\\d{2}:\\d{2}:\\d{2}\\.\\d{3})\\s+([A-Z]+)\\s+(.*)$/)
+		if (!matcher.find()) {
+			return null
+		}
+
+		String rawStatus = safeValue(matcher.group(2)).toUpperCase(Locale.ENGLISH)
+		String message = safeValue(matcher.group(3))
+
+		return [
+			timeLabel: formatTimeFromClock(safeValue(matcher.group(1))),
+			status   : normalizeEventStatus(rawStatus),
+			message  : message
+		]
+	}
+
+	private String normalizeEventStatus(String rawStatus) {
+		if (rawStatus == 'PASSED') {
+			return 'passed'
+		}
+		if (rawStatus == 'FAILED' || rawStatus == 'ERROR') {
+			return 'failed'
+		}
+		if (rawStatus == 'SKIPPED') {
+			return 'skipped'
+		}
+		return 'info'
+	}
+
+	private boolean shouldIgnoreStep(String title) {
+		String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
+
+		boolean ignored = false
+		ignored = ignored || lower.startsWith('start listener action')
+		ignored = ignored || lower.startsWith('glue')
+		ignored = ignored || lower.startsWith('runfeaturefile')
+		ignored = ignored || lower.startsWith('exportkatalonreports')
+		ignored = ignored || lower.startsWith('sampleaftertestcase')
+		ignored = ignored || lower.startsWith('video')
+		ignored = ignored || lower.startsWith('beforetestcase')
+		ignored = ignored || lower.startsWith('start test case : scenario')
+
+		return ignored
+	}
+
+	// =========================================================================
+	// STEP NORMALIZATION
+	// =========================================================================
+
+	private void normalizeScenarioSteps(List<Map> scenarios) {
+		scenarios.each { Map scenario ->
+			List<Map> currentSteps = (scenario.steps ?: []) as List<Map>
+			List<Map> narrativeSteps = extractNarrativeSteps(safeValue(scenario.errorFull))
+
+			if (!narrativeSteps.isEmpty()) {
+				Map<String, Map> existingByKey = [:]
+				currentSteps.each { Map step ->
+					existingByKey[stepKey(step.title)] = step
+				}
+
+				List<Map> merged = []
+				narrativeSteps.eachWithIndex { Map narrative, int idx ->
+					String key = stepKey(narrative.title)
+					Map existing = existingByKey[key]
+
+					Map step = [
+						id           : scenario.id + '-step-' + (idx + 1),
+						title        : cleanupStepTitle(narrative.title),
+						status       : safeValue(narrative.status),
+						timeLabel    : existing != null ? safeValue(existing.timeLabel) : '',
+						startLabel   : existing != null ? safeValue(existing.startLabel) : '',
+						endLabel     : existing != null ? safeValue(existing.endLabel) : '',
+						durationMs   : existing != null ? toLong(existing.durationMs) : 0L,
+						durationLabel: formatDurationFull(existing != null ? toLong(existing.durationMs) : 0L),
+						detailText   : existing != null ? safeValue(existing.detailText) : safeValue(narrative.title),
+						shortError   : existing != null ? safeValue(existing.shortError) : '',
+						errorFull    : existing != null ? safeValue(existing.errorFull) : '',
+						emoji        : resolveStepEmoji(narrative.title)
+					]
+
+					if (safeValue(step.status) == 'failed' && isBlank(step.shortError)) {
+						step.shortError = extractShortError(step.errorFull ?: scenario.errorShort ?: scenario.errorFull)
+					}
+					if (safeValue(step.status) == 'failed' && isBlank(step.errorFull)) {
+						step.errorFull = safeValue(scenario.errorFull)
+					}
+
+					merged << step
+				}
+
+				scenario.steps = merged
+			} else {
+				currentSteps.eachWithIndex { Map step, int idx ->
+					step.id = isBlank(step.id) ? (scenario.id + '-step-' + (idx + 1)) : step.id
+					step.title = cleanupStepTitle(step.title)
+					step.emoji = resolveStepEmoji(step.title)
+					step.durationMs = toLong(step.durationMs)
+					step.durationLabel = formatDurationFull(toLong(step.durationMs))
+					step.timeLabel = safeValue(step.timeLabel)
+					step.shortError = safeValue(step.shortError)
+					step.errorFull = safeValue(step.errorFull)
+					step.detailText = safeValue(step.detailText)
+				}
+			}
+
+			List<Map> steps = (scenario.steps ?: []) as List<Map>
+			scenario.status = resolveScenarioStatus(steps)
+			scenario.errorShort = resolveScenarioErrorShort(steps)
+			scenario.errorFull = resolveScenarioErrorFull(steps)
+			scenario.sidebarSubtitle = isBlank(scenario.errorShort) ? safeValue(scenario.title) : scenario.errorShort
+			scenario.durationLabel = formatDurationFull(toLong(scenario.durationMs))
+		}
+	}
+
+	private List<Map> extractNarrativeSteps(String source) {
+		List<Map> steps = []
+		if (isBlank(source)) {
+			return steps
+		}
+
+		source.readLines().each { String raw ->
+			String line = safeValue(raw)
+			if (isBlank(line)) {
+				return
+			}
+
+			String lower = line.toLowerCase(Locale.ENGLISH)
+			if (!(lower.endsWith('passed') || lower.endsWith('failed') || lower.endsWith('skipped'))) {
+				return
+			}
+
+			String status = ''
+			if (lower.endsWith('passed')) {
+				status = 'passed'
+			} else if (lower.endsWith('failed')) {
+				status = 'failed'
+			} else if (lower.endsWith('skipped')) {
+				status = 'skipped'
+			}
+
+			String base = line.substring(0, line.length() - status.length()).trim()
+			base = base.replaceAll(/[.]+$/, '').trim()
+			if (isBlank(base)) {
+				return
+			}
+
+			String baseLower = base.toLowerCase(Locale.ENGLISH)
+			boolean looksLikeStep = false
+			looksLikeStep = looksLikeStep || baseLower.startsWith('given ')
+			looksLikeStep = looksLikeStep || baseLower.startsWith('when ')
+			looksLikeStep = looksLikeStep || baseLower.startsWith('then ')
+			looksLikeStep = looksLikeStep || baseLower.startsWith('and ')
+
+			if (!looksLikeStep) {
+				return
+			}
+
+			steps << [
+				title : cleanupStepTitle(base),
+				status: status
+			]
+		}
+
+		return steps
+	}
+
+	private String stepKey(String value) {
+		String text = safeValue(value).toLowerCase(Locale.ENGLISH)
+		text = text.replaceAll(/^(given|when|then|and)\\s+/, '')
+		text = text.replaceAll(/[^a-z0-9]+/, '')
+		return text
+	}
+
+	private String cleanupScenarioTitle(String value) {
+		String text = safeValue(value)
+		text = text.replaceAll(/\\s+\\(\\d+[.,]\\d+s\\)$/, '').trim()
+		text = text.replaceAll(/^Start Test Case : SCENARIO /, '').trim()
+		return text
+	}
+
+	private String cleanupStepTitle(String value) {
+		String text = safeValue(value)
+		text = text.replaceAll(/\\s+\\(\\d+[.,]\\d+s\\)$/, '').trim()
+		text = text.replaceAll(/[.]{2,}$/, '').trim()
+		return text
+	}
+
+	private String resolveScenarioStatus(List<Map> steps) {
+		boolean hasFailed = steps.any { Map item -> safeValue(item.status) == 'failed' }
+		if (hasFailed) {
+			return 'failed'
+		}
+
+		boolean hasPassed = steps.any { Map item -> safeValue(item.status) == 'passed' }
+		if (hasPassed) {
+			return 'passed'
+		}
+
+		boolean hasInfo = steps.any { Map item -> safeValue(item.status) == 'info' }
+		if (hasInfo) {
+			return 'info'
+		}
+
+		return 'skipped'
+	}
+
+	private String resolveScenarioErrorShort(List<Map> steps) {
+		Map failedStep = steps.find { Map item -> safeValue(item.status) == 'failed' }
+		if (failedStep == null) {
+			return ''
+		}
+		return extractShortError(failedStep.shortError ?: failedStep.errorFull ?: failedStep.detailText)
+	}
+
+	private String resolveScenarioErrorFull(List<Map> steps) {
+		Map failedStep = steps.find { Map item -> safeValue(item.status) == 'failed' }
+		if (failedStep == null) {
+			return ''
+		}
+		return safeValue(failedStep.errorFull ?: failedStep.detailText)
+	}
+
+	// =========================================================================
+	// TIMING / DURATION
+	// =========================================================================
+
+	private void applySequentialTimingFallback(File reportDir, List<Map> scenarios) {
+		if (scenarios.isEmpty()) {
+			return
+		}
+
+		scenarios.each { Map scenario ->
+			long stepTotal = sumStepDurations((scenario.steps ?: []) as List<Map>)
+			if (stepTotal > toLong(scenario.durationMs)) {
+				scenario.durationMs = stepTotal
+			}
+			scenario.durationLabel = formatDurationFull(toLong(scenario.durationMs))
+		}
+
+		long totalDurationMs = 0L
+		scenarios.each { Map item ->
+			totalDurationMs += toLong(item.durationMs)
+		}
+
+		Date suiteEnd = new Date(reportDir.lastModified())
+		Date suiteStart = new Date(suiteEnd.time - totalDurationMs)
+
+		long cursor = suiteStart.time
+
+		scenarios.each { Map scenario ->
+			long scenarioDuration = toLong(scenario.durationMs)
+			if (scenarioDuration <= 0L) {
+				scenarioDuration = Math.max(1000L, sumStepDurations((scenario.steps ?: []) as List<Map>))
+			}
+
+			if (isBlank(scenario.startLabel)) {
+				scenario.startLabel = formatTimeOnly(new Date(cursor))
+			}
+
+			if (isBlank(scenario.endLabel)) {
+				scenario.endLabel = formatTimeOnly(new Date(cursor + scenarioDuration))
+			}
+
+			fillStepTimeLabels(scenario)
+			scenario.durationMs = scenarioDuration
+			scenario.durationLabel = formatDurationFull(scenarioDuration)
+
+			cursor += scenarioDuration
+		}
+	}
+
+	private void fillStepTimeLabels(Map scenario) {
+		List<Map> steps = (scenario.steps ?: []) as List<Map>
+		if (steps.isEmpty()) {
+			return
+		}
+
+		Date scenarioStart = parseTimeOnly(safeValue(scenario.startLabel))
+		if (scenarioStart == null) {
+			return
+		}
+
+		long cursor = scenarioStart.time
+
+		steps.each { Map step ->
+			if (isBlank(step.timeLabel)) {
+				step.timeLabel = formatTimeOnly(new Date(cursor))
+			} else {
+				Date parsed = parseTimeOnly(safeValue(step.timeLabel))
+				if (parsed != null) {
+					cursor = parsed.time
+				}
+			}
+
+			long stepDuration = toLong(step.durationMs)
+			if (stepDuration <= 0L) {
+				stepDuration = 1000L
+			}
+
+			cursor += stepDuration
+		}
+	}
+
+	private Date parseTimeOnly(String raw) {
+		if (isBlank(raw)) {
+			return null
+		}
+
+		try {
+			return new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH).parse(raw)
+		} catch (Exception ignored) {
+			return null
+		}
+	}
+
+	private long sumStepDurations(List<Map> steps) {
+		long value = 0L
+		steps.each { Map item ->
+			value += toLong(item.durationMs)
+		}
+		return value
+	}
+
+	private long toMillisFromElapsed(String rawValue) {
+		String raw = safeValue(rawValue)
+		if (isBlank(raw)) {
+			return 0L
+		}
+
+		def matcher = (raw =~ /^(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})$/)
+		if (matcher.find()) {
+			long hours = matcher.group(1) as long
+			long minutes = matcher.group(2) as long
+			long seconds = matcher.group(3) as long
+			long millis = matcher.group(4) as long
+			return (((hours * 60L + minutes) * 60L) + seconds) * 1000L + millis
+		}
+
+		return toMillisFromCompactSeconds(raw)
+	}
+
+	private long toMillisFromCompactSeconds(String rawValue) {
+		String raw = safeValue(rawValue).replace(',', '.').replace('s', '').trim()
+		if (isBlank(raw)) {
+			return 0L
+		}
+
+		try {
+			double seconds = Double.parseDouble(raw)
+			return Math.round(seconds * 1000d)
+		} catch (Exception ignored) {
+			return 0L
+		}
+	}
+
+	private long toMillisFromSeconds(String rawValue) {
+		return toMillisFromCompactSeconds(rawValue)
+	}
+
+	private String formatDurationFull(long durationMs) {
+		long totalSeconds = durationMs > 0L ? Math.round(durationMs / 1000d) : 0L
+		long hours = (long) Math.floor(totalSeconds / 3600L)
+		long minutes = (long) Math.floor((totalSeconds % 3600L) / 60L)
+		long seconds = totalSeconds % 60L
+		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+	}
+
+	private String formatDisplayDate(Date value) {
+		return new SimpleDateFormat('MM.dd.yyyy hh:mm:ss a', Locale.ENGLISH).format(value)
+	}
+
+	private String formatTimeOnly(Date value) {
+		return new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH).format(value)
+	}
+
+	private String formatTimeOnly(long timeMillis) {
+		return formatTimeOnly(new Date(timeMillis))
+	}
+
+	private String formatTimeFromAny(String raw) {
+		String text = safeValue(raw)
+
+		List<String> formats = [
+			'yyyy-MM-dd HH:mm:ss.SSS',
+			'yyyy-MM-dd HH:mm:ss',
+			'dd-MM-yyyy HH:mm:ss',
+			'MM.dd.yyyy hh:mm:ss a',
+			'HH:mm:ss'
+		]
+
+		for (String pattern : formats) {
+			try {
+				Date value = new SimpleDateFormat(pattern, Locale.ENGLISH).parse(text)
+				return formatTimeOnly(value)
+			} catch (Exception ignored) {
+			}
+		}
+
+		return text
+	}
+
+	private String formatTimeFromClock(String raw) {
+		try {
+			Date value = new SimpleDateFormat('HH:mm:ss.SSS', Locale.ENGLISH).parse(safeValue(raw))
+			return formatTimeOnly(value)
+		} catch (Exception ignored) {
+			return safeValue(raw)
+		}
+	}
+
+	// =========================================================================
+	// ERROR / EVIDENCE
+	// =========================================================================
+
+	private boolean looksLikeErrorLine(String line) {
+		String lower = safeValue(line).toLowerCase(Locale.ENGLISH)
+
+		boolean error = false
+		error = error || lower.contains('exception')
+		error = error || lower.contains('root cause')
+		error = error || lower.contains('caused by:')
+		error = error || lower.contains('unable to ')
+		error = error || lower.contains('stacktrace')
+		error = error || lower.startsWith('at ')
+		return error
+	}
+
+	private String extractShortError(def source) {
+		String text = safeValue(source)
+		if (isBlank(text)) {
+			return ''
+		}
+
+		List<String> lines = text.readLines().collect { safeValue(it) }.findAll { !isBlank(it) }
+		if (lines.isEmpty()) {
+			return ''
+		}
+
+		String preferred = lines.find { String line ->
+			String lower = line.toLowerCase(Locale.ENGLISH)
+			boolean match = false
+			match = match || lower.contains('unable to ')
+			match = match || lower.contains('element click intercepted')
+			match = match || lower.contains('object repository')
+			match = match || lower.contains('no such element')
+			match = match || lower.contains('timeout')
+			return match
+		}
+
+		String value = safeValue(preferred ?: lines.first())
+		value = value.replace('com.kms.katalon.core.exception.StepFailedException:', '').trim()
+		value = value.replace('(Root cause:', '').trim()
+
+		int atIndex = value.indexOf(' at ')
+		if (atIndex > 0) {
+			value = value.substring(0, atIndex).trim()
+		}
+
+		if (value.length() > 180) {
+			value = value.substring(0, 177) + '...'
+		}
+
+		return value
+	}
+
+	private void attachEvidenceToFailedScenarios(File reportDir, List<Map> scenarios) {
+		scenarios.each { Map scenario ->
+			scenario.evidences = []
+		}
+
+		List<File> candidates = findEvidenceImages(reportDir)
+		if (candidates.isEmpty()) {
+			return
+		}
+
+		candidates.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+
+		List<Map> failedScenarios = scenarios.findAll { Map item ->
+			safeValue(item.status) == 'failed'
+		}
+
+		failedScenarios.each { Map scenario ->
+			File selected = pickEvidenceForScenario(reportDir, candidates, scenario)
+			if (selected == null || !selected.exists()) {
+				return
+			}
+
+			File bundled = ensureEvidenceInReportFolder(reportDir, selected)
+			String href = buildEvidenceHref(bundled, reportDir)
+			String previewSrc = buildEvidencePreviewSrc(bundled)
+
+			scenario.evidences = [
+				[
+					name         : bundled.name,
+					fileName     : bundled.name,
+					href         : href,
+					imgSrc       : previewSrc,
+					imageSrc     : previewSrc,
+					imageDataUri : previewSrc,
+					image        : true
+				]
+			]
+		}
+	}
+
+	private List<File> findEvidenceImages(File reportDir) {
+		List<File> roots = []
+		Set<String> seen = [] as Set
+		List<File> images = []
+
+		if (reportDir != null && reportDir.exists()) {
+			roots << reportDir
+		}
+
+		if (reportDir?.parentFile != null && reportDir.parentFile.exists()) {
+			roots << reportDir.parentFile
+		}
+
+		if (reportDir?.parentFile?.parentFile != null && reportDir.parentFile.parentFile.exists()) {
+			roots << reportDir.parentFile.parentFile
+		}
+
+		roots.unique { File item -> item.absolutePath }.each { File root ->
+			root.eachFileRecurse { File file ->
+				if (!file.isFile()) {
+					return
+				}
+
+				if (!isImageFile(file.name)) {
+					return
+				}
+
+				try {
+					String key = file.canonicalPath
+					if (seen.add(key)) {
+						images << file
+					}
+				} catch (Exception ignored) {
+					if (seen.add(file.absolutePath)) {
+						images << file
+					}
+				}
+			}
+		}
+
+		images.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+		return images
+	}
+
+	private File pickEvidenceForScenario(File reportDir, List<File> candidates, Map scenario) {
+		if (candidates == null || candidates.isEmpty()) {
+			return null
+		}
+
+		long startMillis = resolveScenarioAbsoluteTime(reportDir, safeValue(scenario.startLabel))
+		long endMillis = resolveScenarioAbsoluteTime(reportDir, safeValue(scenario.endLabel))
+
+		if (startMillis > 0L && endMillis >= startMillis) {
+			List<File> insideWindow = candidates.findAll { File file ->
+				long modified = file.lastModified()
+				return modified >= (startMillis - 5000L) && modified <= (endMillis + 15000L)
+			}
+
+			if (!insideWindow.isEmpty()) {
+				insideWindow.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+				return insideWindow.last()
+			}
+
+			List<File> sortedByDistance = candidates.sort { File a, File b ->
+				long da = Math.abs(a.lastModified() - endMillis)
+				long db = Math.abs(b.lastModified() - endMillis)
+				return da <=> db
+			}
+
+			return sortedByDistance.first()
+		}
+
+		return candidates.last()
+	}
+
+	private long resolveScenarioAbsoluteTime(File reportDir, String timeLabel) {
+		if (isBlank(timeLabel)) {
+			return 0L
+		}
+
+		String raw = safeValue(timeLabel)
+
+		try {
+			List<String> patterns = [
+				'yyyy-MM-dd HH:mm:ss',
+				'yyyy-MM-dd HH:mm:ss.SSS',
+				'MM.dd.yyyy hh:mm:ss a',
+				'dd.MM.yyyy HH:mm:ss'
+			]
+
+			for (String pattern : patterns) {
+				try {
+					Date parsed = new SimpleDateFormat(pattern, Locale.ENGLISH).parse(raw)
+					return parsed.time
+				} catch (Exception ignored) {
+				}
+			}
+
+			String baseDate = new SimpleDateFormat('yyyy-MM-dd', Locale.ENGLISH).format(new Date(reportDir.lastModified()))
+			Date clockDate = new SimpleDateFormat('yyyy-MM-dd HH:mm:ss', Locale.ENGLISH).parse(baseDate + ' ' + raw)
+			return clockDate.time
+		} catch (Exception ignored) {
+			return 0L
+		}
+	}
+
+	private File ensureEvidenceInReportFolder(File reportDir, File source) {
+		if (source == null || !source.exists()) {
+			return source
+		}
+
+		File evidenceDir = new File(reportDir, 'evidence')
+		if (!evidenceDir.exists()) {
+			evidenceDir.mkdirs()
+		}
+
+		File target = new File(evidenceDir, source.name)
+
+		try {
+			if (!target.exists() || target.length() != source.length()) {
+				Files.copy(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+				target.setLastModified(source.lastModified())
+			}
+		} catch (Exception ignored) {
+			return source
+		}
+
+		return target
+	}
+
+	private String buildEvidenceHref(File file, File reportDir) {
+		if (file == null || !file.exists()) {
+			return ''
+		}
+
+		try {
+			String reportBase = reportDir.canonicalPath.replace('\\', '/') + '/'
+			String filePath = file.canonicalPath.replace('\\', '/')
+
+			if (filePath.startsWith(reportBase)) {
+				return filePath.substring(reportBase.length())
+			}
+		} catch (Exception ignored) {
+		}
+
+		return file.toURI().toString()
+	}
+
+	private String buildEvidencePreviewSrc(File file) {
+		if (file == null || !file.exists()) {
+			return ''
+		}
+
+		if (!isImageFile(file.name)) {
+			return ''
+		}
+
+		try {
+			byte[] content = Files.readAllBytes(file.toPath())
+			String mime = resolveImageMime(file.name)
+			return 'data:' + mime + ';base64,' + Base64.encoder.encodeToString(content)
+		} catch (Exception ignored) {
+			return file.toURI().toString()
+		}
+	}
+
+	private String resolveImageMime(String fileName) {
+		String lower = safeValue(fileName).toLowerCase(Locale.ENGLISH)
+
+		if (lower.endsWith('.png')) {
+			return 'image/png'
+		}
+		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
+			return 'image/jpeg'
+		}
+		if (lower.endsWith('.webp')) {
+			return 'image/webp'
+		}
+		if (lower.endsWith('.gif')) {
+			return 'image/gif'
+		}
+		if (lower.endsWith('.bmp')) {
+			return 'image/bmp'
+		}
+
+		return 'image/png'
+	}
+
+	private boolean isImageFile(String fileName) {
+		String lower = safeValue(fileName).toLowerCase(Locale.ENGLISH)
+		return lower.endsWith('.png') ||
+				lower.endsWith('.jpg') ||
+				lower.endsWith('.jpeg') ||
+				lower.endsWith('.webp') ||
+				lower.endsWith('.gif') ||
+				lower.endsWith('.bmp')
+	}
+
+	private void collectEvidenceImages(File folder, List<File> images) {
+		if (folder == null || !folder.exists()) {
+			return
+		}
+
+		File[] files = folder.listFiles()
+		if (files == null) {
+			return
+		}
+
+		files.each { File file ->
+			if (file.isDirectory()) {
+				collectEvidenceImages(file, images)
+				return
+			}
+
+			String lower = file.name.toLowerCase(Locale.ENGLISH)
+
+			boolean isImage = false
+			isImage = isImage || lower.endsWith('.png')
+			isImage = isImage || lower.endsWith('.jpg')
+			isImage = isImage || lower.endsWith('.jpeg')
+			isImage = isImage || lower.endsWith('.webp')
+
+			boolean isLogo = lower.contains('gaia-logo')
+
+			if (isImage && !isLogo) {
+				images << file
+			}
+		}
+	}
+	private String resolveAssetUrl(File reportDir, String relativePath) {
+		File projectRoot = findProjectRoot(reportDir)
+		File asset = new File(projectRoot, relativePath)
+		if (asset.exists()) {
+			return asset.toURI().toString()
+		}
+		return ''
+	}
+
+	private File findProjectRoot(File reportDir) {
+		File current = reportDir
+		while (current != null) {
+			if ('Reports'.equalsIgnoreCase(current.name)) {
+				return current.parentFile != null ? current.parentFile : current
+			}
+			current = current.parentFile
+		}
+		return reportDir
+	}
+
+	// =========================================================================
+	// STEP DECORATION
+	// =========================================================================
+
+	private String resolveStepEmoji(String title) {
+		String lower = safeValue(title).toLowerCase(Locale.ENGLISH)
+
+		boolean isSearch = lower.contains('search') || lower.contains('find') || lower.contains('wait')
+		if (isSearch) {
+			return '🔎'
+		}
+
+		boolean isClick = lower.contains('click') || lower.contains('select') || lower.contains('open') || lower.contains('navigate')
+		if (isClick) {
+			return '🖱️'
+		}
+
+		boolean isFill = lower.contains('fill') || lower.contains('input') || lower.contains('type') || lower.contains('write')
+		if (isFill) {
+			return '⌨️'
+		}
+
+		boolean isUpload = lower.contains('import') || lower.contains('upload') || lower.contains('file')
+		if (isUpload) {
+			return '📄'
+		}
+
+		boolean isValidation = lower.contains('verify') || lower.contains('assert') || lower.contains('match') || lower.contains('contain')
+		if (isValidation) {
+			return '✅'
+		}
+
+		return '🔹'
+	}
 }
+
+
+
+
+
 7) Keywords/jiraIntegration/JiraGaiaHtmlTemplateBuilder.groovy
 package jiraIntegration
 
+import java.io.File
 import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.net.URI
 
 class JiraGaiaHtmlTemplateBuilder {
 
-    JiraFlowCoordinator owner
+	private static final String APP_NAME = 'GAIA'
+	private static final String REPORT_TITLE_PREFIX = 'Test report - '
+	private static final String LOGO_SRC = 'Image/gaia-logo.png'
 
-    JiraGaiaHtmlTemplateBuilder(JiraFlowCoordinator owner) {
-        this.owner = owner
+	private static final String STATUS_PASS = '#68b84b'
+	private static final String STATUS_FAIL = '#e05b4d'
+	private static final String STATUS_SKIP = '#d7b436'
+	private static final String STATUS_INFO = '#2f86eb'
+
+	JiraGaiaHtmlTemplateBuilder() {
+	}
+
+	String build(Map model) {
+		return buildHtml(model)
+	}
+
+	String render(Map model) {
+		return buildHtml(model)
+	}
+
+	String buildHtml(Map model) {
+		Map view = normalizeModel(model)
+
+		StringBuilder html = new StringBuilder()
+
+		html.append('<!DOCTYPE html>\n')
+		html.append('<html lang="en">\n')
+		html.append('<head>\n')
+		html.append('<meta charset="UTF-8">\n')
+		html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
+		html.append('<title>')
+		html.append(htmlEscape(view.reportTitle))
+		html.append('</title>\n')
+		html.append(buildStyles())
+		html.append('</head>\n')
+		html.append('<body>\n')
+
+		html.append('<header class="top-banner">\n')
+		html.append('  <div class="top-banner-left">\n')
+		html.append('    <img class="brand-logo" src="')
+		html.append(htmlEscape(resolveLogoHref(view)))
+		html.append('" alt="GAIA logo">\n')
+		html.append('    <div class="brand-copy">\n')
+		html.append('      <div class="banner-title">')
+		html.append(htmlEscape(view.reportTitle))
+		html.append('</div>\n')
+		html.append('      <div class="banner-subtitle">GAIA execution overview</div>\n')
+		html.append('    </div>\n')
+		html.append('  </div>\n')
+		html.append('  <div class="top-banner-right">\n')
+		html.append('    <div>')
+		html.append(htmlEscape(view.generatedLabel))
+		html.append('</div>\n')
+		html.append('    <div>Project ')
+		html.append(htmlEscape(APP_NAME))
+		html.append('</div>\n')
+		html.append('  </div>\n')
+		html.append('</header>\n')
+
+		html.append('<div class="page">\n')
+
+		html.append('  <aside class="sidebar">\n')
+		html.append('    <div class="sidebar-tabs">\n')
+		html.append('      <button id="tab-tests" class="sidebar-tab active" type="button" onclick="showTab(\'tests\')">Tests</button>\n')
+		html.append('      <button id="tab-charts" class="sidebar-tab" type="button" onclick="showTab(\'charts\')">Charts</button>\n')
+		html.append('    </div>\n')
+
+		html.append('    <div id="tests-sidebar-block">\n')
+		html.append('      <div class="search-wrap">\n')
+		html.append('        <input id="scenarioSearch" class="search-input" type="text" placeholder="Search test name, path, or status." onkeyup="filterScenarios()">\n')
+		html.append('      </div>\n')
+		html.append('      <div id="scenarioList" class="scenario-list">\n')
+		view.scenarios.eachWithIndex { Map scenario, int index ->
+			html.append(buildScenarioListItem(scenario, index == 0))
+		}
+		html.append('      </div>\n')
+		html.append('    </div>\n')
+
+		html.append('    <div id="charts-sidebar-block" class="hidden">\n')
+		html.append(buildChartsSidebar(view))
+		html.append('    </div>\n')
+		html.append('  </aside>\n')
+
+		html.append('  <main class="content">\n')
+		view.scenarios.eachWithIndex { Map scenario, int index ->
+			html.append(buildScenarioPanel(scenario, view, index == 0))
+		}
+		html.append(buildChartsPanel(view))
+		html.append('  </main>\n')
+
+		html.append('</div>\n')
+		html.append(buildScripts())
+		html.append('</body>\n')
+		html.append('</html>\n')
+
+		return html.toString()
+	}
+
+	// =========================================================================
+	// NORMALIZATION
+	// =========================================================================
+
+	private Map normalizeModel(Map model) {
+		Map safeModel = model ?: [:]
+
+		String suiteName = pickFirst(
+				safeModel.suiteName,
+				safeModel.testSuiteName,
+				safeModel.suite,
+				safeModel.executionName,
+				safeModel.title,
+				'Execution'
+				)
+
+		String reportTitle = REPORT_TITLE_PREFIX + suiteName
+		List<Map> scenarios = normalizeScenarios(safeModel)
+
+		int passedCount = scenarios.count { it.status == 'passed' }
+		int failedCount = scenarios.count { it.status == 'failed' }
+		int skippedCount = scenarios.count { it.status == 'skipped' }
+		int totalCount = scenarios.size()
+
+		return [
+			reportTitle   : reportTitle,
+			suiteName     : suiteName,
+			generatedLabel: buildGeneratedLabel(safeModel),
+			reportFolder  : pickFirst(safeModel.reportFolder, safeModel.baseFolder, safeModel.executionFolder),
+			logoSrc       : pickFirst(safeModel.logoSrc, LOGO_SRC),
+			scenarios     : scenarios,
+			passedCount   : passedCount,
+			failedCount   : failedCount,
+			skippedCount  : skippedCount,
+			totalCount    : totalCount
+		]
+	}
+
+	private List<Map> normalizeScenarios(Map model) {
+		List rawList = asList(pickFirstObject(
+				model.scenarios,
+				model.tests,
+				model.cases,
+				model.executions,
+				model.items
+				))
+
+		List<Map> result = []
+
+		rawList.eachWithIndex { def rawItem, int index ->
+			Map item = rawItem instanceof Map ? rawItem : [name: safeValue(rawItem)]
+
+			String scenarioName = pickFirst(
+					item.scenarioName,
+					item.name,
+					item.title,
+					item.displayName,
+					item.shortName,
+					item.caseName,
+					item.testName,
+					"Scenario ${index + 1}"
+					)
+
+			String scenarioId = pickFirst(item.id, item.key, "scenario-${index + 1}")
+			String status = normalizeStatus(pickFirst(item.status, item.result, item.outcome, item.finalStatus))
+
+			String shortError = shorten(pickFirst(
+					item.visualError,
+					item.errorSummary,
+					item.errorShort,
+					item.failureMessage,
+					item.message
+					), 95)
+
+			String rawStart = pickFirst(
+					item.startLong,
+					item.startLabel,
+					item.startTime,
+					item.startDateTime,
+					item.startDate,
+					item.startShort,
+					item.startClock
+					)
+
+			String rawEnd = pickFirst(
+					item.endLong,
+					item.endLabel,
+					item.endTime,
+					item.endDateTime,
+					item.endDate,
+					item.endShort,
+					item.endClock
+					)
+
+			long durationMs = normalizeDurationMs(item, rawStart, rawEnd)
+			String durationLabel = formatDuration(durationMs)
+
+			List<Map> steps = normalizeSteps(item)
+			if (steps.isEmpty()) {
+				steps = parseStepsFromRawText(pickFirst(
+						item.fullError,
+						item.errorFull,
+						item.errorDetail,
+						item.stackTrace,
+						item.stacktrace,
+						item.details,
+						item.rawLog,
+						item.stepTrace
+						))
+			}
+
+			List<Map> evidence = normalizeEvidence(item, model)
+			if (status == 'failed' && evidence.size() > 1) {
+				evidence = [evidence.last()]
+			}
+
+			result << [
+				id           : scenarioId,
+				name         : scenarioName,
+				summary      : shortError,
+				status       : status,
+				startShort   : extractClockLabel(rawStart),
+				endShort     : extractClockLabel(rawEnd),
+				startLong    : formatDateTimeLabel(rawStart),
+				endLong      : formatDateTimeLabel(rawEnd),
+				durationLabel: durationLabel,
+				visualError  : pickFirst(
+				item.visualError,
+				item.errorSummary,
+				item.errorShort,
+				item.failureMessage,
+				item.message
+				),
+				fullError    : pickFirst(
+				item.errorFull,
+				item.fullError,
+				item.errorDetail,
+				item.stackTrace,
+				item.stacktrace,
+				item.details,
+				item.errorLog
+				),
+				steps        : steps,
+				evidence     : evidence
+			]
+		}
+
+		return result
+	}
+
+	private List<Map> normalizeSteps(Map item) {
+		List rawSteps = asList(pickFirstObject(
+				item.steps,
+				item.stepRows,
+				item.stepItems,
+				item.timeline,
+				item.events,
+				item.logs
+				))
+
+		List<Map> result = []
+
+		rawSteps.each { def raw ->
+			Map row = raw instanceof Map ? raw : [detail: safeValue(raw)]
+
+			String status = normalizeStatus(pickFirst(
+					row.status,
+					row.result,
+					row.outcome,
+					row.level
+					))
+
+			String detail = pickFirst(
+					row.detail,
+					row.detailText,
+					row.message,
+					row.text,
+					row.title,
+					row.name
+					)
+
+			if (detail.isEmpty()) {
+				return
+			}
+
+			String timestamp = extractClockLabel(pickFirst(
+					row.timestamp,
+					row.timeLabel,
+					row.time,
+					row.at,
+					row.label,
+					row.startLabel
+					))
+
+			result << [
+				status   : status,
+				timestamp: timestamp,
+				detail   : detail,
+				icon     : resolveStepIcon(detail, status)
+			]
+		}
+
+		return result
+	}
+
+	private List<Map> parseStepsFromRawText(String rawText) {
+		List<Map> result = []
+
+		if (rawText.isEmpty()) {
+			return result
+		}
+
+		rawText.readLines().each { String rawLine ->
+			String line = safeValue(rawLine)
+			if (line.isEmpty()) {
+				return
+			}
+
+			def matcherA = (line =~ /^(\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?)\\s+(PASSED|FAILED|ERROR|INFO|SKIPPED)\\s+(.*)$/)
+			if (matcherA.find()) {
+				String status = normalizeStatus(matcherA.group(2))
+				String detail = safeValue(matcherA.group(3))
+
+				result << [
+					status   : status,
+					timestamp: cleanClock(matcherA.group(1)),
+					detail   : detail,
+					icon     : resolveStepIcon(detail, status)
+				]
+				return
+			}
+
+			def matcherB = (line =~ /^(Given|When|Then|And)\\s+(.+?)(?:\\.{2,}|\\s+)(passed|failed|skipped)$/)
+			if (matcherB.find()) {
+				String detail = matcherB.group(1) + ' ' + matcherB.group(2)
+				String status = normalizeStatus(matcherB.group(3))
+
+				result << [
+					status   : status,
+					timestamp: '',
+					detail   : detail,
+					icon     : resolveStepIcon(detail, status)
+				]
+			}
+		}
+
+		return result
+	}
+
+	private Object firstPresent(Object... values) {
+		if (values == null) {
+			return null
+		}
+
+		for (Object value : values) {
+			if (value == null) {
+				continue
+			}
+
+			if (value instanceof CharSequence && safeValue(value).isEmpty()) {
+				continue
+			}
+
+			return value
+		}
+
+		return null
+	}
+
+	private String firstNonBlank(Object... values) {
+		if (values == null) {
+			return ''
+		}
+
+		return firstNonBlankFromCollection(values.toList())
+	}
+
+	private String firstNonBlank(Collection values) {
+		return firstNonBlankFromCollection(values)
+	}
+
+	private String firstNonBlankFromCollection(Collection values) {
+		if (values == null) {
+			return ''
+		}
+
+		for (def value : values) {
+			String text = safeValue(value)
+			if (!text.isEmpty()) {
+				return text
+			}
+		}
+
+		return ''
+	}
+
+	private List<Map> normalizeEvidence(Map item, Map model) {
+		List rawEvidence = []
+
+		if (item?.evidence instanceof Collection) {
+			rawEvidence.addAll(item.evidence as Collection)
+		}
+		if (item?.evidences instanceof Collection) {
+			rawEvidence.addAll(item.evidences as Collection)
+		}
+		if (item?.images instanceof Collection) {
+			rawEvidence.addAll(item.images as Collection)
+		}
+		if (item?.attachments instanceof Collection) {
+			rawEvidence.addAll(item.attachments as Collection)
+		}
+
+		if (rawEvidence.isEmpty()) {
+			return []
+		}
+
+		String baseFolder = firstNonBlank(
+				item?.reportFolder,
+				model?.reportFolder,
+				model?.baseFolder,
+				model?.executionFolder
+				)
+
+		List<Map> result = []
+
+		rawEvidence.each { def raw ->
+			String name = ''
+			String href = ''
+			String imgSrc = ''
+			boolean image = false
+
+			if (raw instanceof Map) {
+				name = firstNonBlank(raw.name, raw.fileName, raw.title, raw.label)
+				href = firstNonBlank(raw.href, raw.url, raw.path, raw.file, raw.absolutePath, raw.relativePath)
+				imgSrc = firstNonBlank(raw.imgSrc, raw.imageSrc, raw.imageDataUri)
+
+				def imageFlag = raw.image != null ? raw.image : raw.isImage
+				if (imageFlag != null) {
+					image = Boolean.valueOf(String.valueOf(imageFlag))
+				}
+			} else {
+				href = safeValue(raw)
+				name = new File(href).name
+			}
+
+			if (!imgSrc.isEmpty() && imgSrc.startsWith('data:image')) {
+				image = true
+			}
+
+			File resolved = null
+
+			if (imgSrc.isEmpty()) {
+				if (!href.isEmpty() &&
+						!href.startsWith('data:') &&
+						!href.startsWith('file:') &&
+						!href.startsWith('http://') &&
+						!href.startsWith('https://')) {
+					resolved = resolveFile(href, baseFolder)
+				}
+			}
+
+			if (resolved != null && resolved.exists()) {
+				if (name.isEmpty()) {
+					name = resolved.name
+				}
+				if (href.isEmpty()) {
+					href = resolved.toURI().toString()
+				}
+				if (!image) {
+					image = isImageFile(resolved.name)
+				}
+				if (imgSrc.isEmpty() && image) {
+					imgSrc = resolved.toURI().toString()
+				}
+			}
+
+			if (name.isEmpty()) {
+				name = 'Evidence'
+			}
+
+			if (!href.isEmpty() || !imgSrc.isEmpty()) {
+				result << [
+					name  : name,
+					href  : href,
+					image : image,
+					imgSrc: imgSrc
+				]
+			}
+		}
+
+		return result
+	}
+
+	// =========================================================================
+	// HTML BLOCKS
+	// =========================================================================
+
+	private String buildScenarioListItem(Map scenario, boolean selected) {
+		String borderClass = selected ? 'scenario-list-item selected' : 'scenario-list-item'
+		String shortName = shorten(scenario.name, 42)
+		String shortError = shorten(scenario.summary, 55)
+
+		StringBuilder sb = new StringBuilder()
+		sb.append('<button type="button" class="')
+		sb.append(borderClass)
+		sb.append('" data-sid="')
+		sb.append(htmlEscape(scenario.id))
+		sb.append('" onclick="showScenario(\'')
+		sb.append(jsEscape(scenario.id))
+		sb.append('\')">')
+
+		sb.append('<div class="scenario-list-main">')
+		sb.append('<div class="scenario-list-title">')
+		sb.append(htmlEscape(shortName))
+		sb.append('</div>')
+		sb.append('<div class="scenario-list-summary">')
+		sb.append(htmlEscape(shortError))
+		sb.append('</div>')
+		sb.append('<div class="scenario-list-meta">')
+		sb.append(htmlEscape(scenario.startShort))
+		sb.append('</div>')
+		sb.append('</div>')
+
+		sb.append('<div class="scenario-list-side">')
+		sb.append('<span class="status-pill ')
+		sb.append(htmlEscape(scenario.status))
+		sb.append('">')
+		sb.append(htmlEscape(statusLabel(scenario.status)))
+		sb.append('</span>')
+		sb.append('<div class="scenario-list-duration">')
+		sb.append(htmlEscape(scenario.durationLabel))
+		sb.append('</div>')
+		sb.append('</div>')
+
+		sb.append('</button>')
+		return sb.toString()
+	}
+
+	private String buildScenarioPanel(Map scenario, Map view, boolean selected) {
+		String panelClass = selected ? 'scenario-panel active' : 'scenario-panel'
+
+		String suiteLabel = safeValue(view.suiteName)
+		String scenarioName = safeValue(scenario.name)
+		String scenarioStatus = safeValue(scenario.status)
+
+		String visualError = firstNonBlank(
+				scenario.visualError,
+				scenario.errorSummary,
+				scenario.errorShort,
+				scenario.failureMessage,
+				scenario.message,
+				scenario.summary
+				)
+
+		String fullError = firstNonBlank(
+				scenario.fullError,
+				scenario.errorDetail,
+				scenario.stackTrace,
+				scenario.stacktrace,
+				scenario.details,
+				scenario.errorLog,
+				visualError
+				)
+
+		String startLabel = firstNonBlank(
+				scenario.startLong,
+				scenario.startLabel,
+				scenario.startClock,
+				scenario.startShort,
+				'--'
+				)
+
+		String endLabel = firstNonBlank(
+				scenario.endLong,
+				scenario.endLabel,
+				scenario.endClock,
+				scenario.endShort,
+				'--'
+				)
+
+		String durationLabel = firstNonBlank(
+				scenario.durationLabel,
+				'00h 00m 00s'
+				)
+
+		Map failedEvidence = null
+		List<Map> evidenceList = scenario.evidence instanceof List ? (scenario.evidence as List<Map>) : []
+
+		if (!evidenceList.isEmpty()) {
+			failedEvidence = evidenceList.find { Map ev ->
+				String name = safeValue(ev.name).toLowerCase(Locale.ENGLISH)
+				String href = safeValue(ev.href).toLowerCase(Locale.ENGLISH)
+				return name.contains('error') ||
+						name.contains('fail') ||
+						href.contains('error') ||
+						href.contains('fail')
+			}
+
+			if (failedEvidence == null) {
+				failedEvidence = evidenceList[0]
+			}
+		}
+
+		String evidenceName = failedEvidence != null ? safeValue(failedEvidence.name) : ''
+		String evidenceHref = failedEvidence != null ? safeValue(failedEvidence.href) : ''
+		String evidenceImgSrc = failedEvidence != null ? safeValue(failedEvidence.imgSrc) : ''
+		boolean evidenceIsImage = failedEvidence != null && Boolean.TRUE.equals(failedEvidence.image)
+
+		StringBuilder sb = new StringBuilder()
+
+		sb.append('<section class="')
+		sb.append(panelClass)
+		sb.append('" id="panel-')
+		sb.append(htmlEscape(safeValue(scenario.id)))
+		sb.append('">')
+
+		sb.append('<div class="scenario-header">')
+		sb.append('<div class="scenario-title">')
+		sb.append(htmlEscape(scenarioName))
+		sb.append('</div>')
+
+		sb.append('<div class="scenario-meta-row">')
+		sb.append(buildMetaChip('Suite', suiteLabel, 'plain'))
+		sb.append(buildMetaChip('Status', statusLabel(scenarioStatus), scenarioStatus))
+		sb.append(buildMetaChip('Start', startLabel, 'gradient'))
+		sb.append(buildMetaChip('End', endLabel, 'gradient'))
+		sb.append(buildMetaChip('Duration', durationLabel, 'gradient'))
+		sb.append('</div>')
+		sb.append('</div>')
+
+		sb.append('<div class="section-title">Steps</div>')
+		sb.append('<div class="steps-table">')
+		sb.append('<div class="steps-head">')
+		sb.append('<div class="col-status">STATUS</div>')
+		sb.append('<div class="col-time">TIMESTAMP</div>')
+		sb.append('<div class="col-detail">DETAILS</div>')
+		sb.append('</div>')
+
+		List<Map> steps = scenario.steps instanceof List ? (scenario.steps as List<Map>) : []
+
+		if (steps.isEmpty()) {
+			sb.append('<div class="step-row empty">')
+			sb.append('<div class="col-status"></div>')
+			sb.append('<div class="col-time"></div>')
+			sb.append('<div class="col-detail">No step details available.</div>')
+			sb.append('</div>')
+		} else {
+			steps.each { Map step ->
+				sb.append(buildStepRow(step))
+			}
+		}
+
+		sb.append('</div>')
+
+		if ('failed'.equalsIgnoreCase(scenarioStatus)) {
+			sb.append('<div class="error-block">')
+			sb.append('<div class="error-title">Visual Error Log</div>')
+			sb.append('<div class="error-summary">')
+			sb.append(htmlEscape(visualError))
+			sb.append('</div>')
+
+			if (!safeValue(fullError).isEmpty()) {
+				sb.append('<details class="details-box">')
+				sb.append('<summary>🔎 View full error</summary>')
+				sb.append('<pre>')
+				sb.append(htmlEscape(fullError))
+				sb.append('</pre>')
+				sb.append('</details>')
+			}
+
+			sb.append('</div>')
+
+			sb.append('<div class="evidence-block">')
+			sb.append('<div class="evidence-title">Evidence</div>')
+
+			if (failedEvidence != null) {
+				sb.append('<details class="evidence-item">')
+				sb.append('<summary>🖼 ')
+				sb.append(htmlEscape(evidenceName.isEmpty() ? 'Open failed evidence' : evidenceName))
+				sb.append('</summary>')
+
+				if (!evidenceHref.isEmpty()) {
+					sb.append('<div class="evidence-links">')
+					sb.append('<a href="')
+					sb.append(htmlEscape(evidenceHref))
+					sb.append('" target="_blank" rel="noopener noreferrer">🔎 Open evidence</a>')
+					sb.append('</div>')
+				}
+
+				if (evidenceIsImage && !evidenceImgSrc.isEmpty()) {
+					sb.append('<img class="evidence-image" src="')
+					sb.append(htmlEscape(evidenceImgSrc))
+					sb.append('" alt="Evidence">')
+				}
+
+				sb.append('</details>')
+			} else {
+				sb.append('<div class="evidence-empty">No failed evidence was found for this scenario.</div>')
+			}
+
+			sb.append('</div>')
+		}
+
+		sb.append('</section>')
+		return sb.toString()
+	}
+
+	private String buildStepRow(Map step) {
+		StringBuilder sb = new StringBuilder()
+
+		sb.append('<div class="step-row">')
+		sb.append('<div class="col-status">')
+		sb.append('<span class="status-pill ')
+		sb.append(htmlEscape(step.status))
+		sb.append('">')
+		sb.append(htmlEscape(statusLabel(step.status)))
+		sb.append('</span>')
+		sb.append('</div>')
+
+		sb.append('<div class="col-time">')
+		sb.append(htmlEscape(pickFirst(step.timestamp, '--')))
+		sb.append('</div>')
+
+		sb.append('<div class="col-detail">')
+		sb.append('<span class="step-icon">')
+		sb.append(htmlEscape(step.icon))
+		sb.append('</span> ')
+		sb.append(htmlEscape(step.detail))
+		sb.append('</div>')
+		sb.append('</div>')
+
+		return sb.toString()
+	}
+
+	private String buildMetaChip(String label, String value, String type) {
+		StringBuilder sb = new StringBuilder()
+		sb.append('<div class="meta-chip ')
+		sb.append(htmlEscape(type))
+		sb.append('">')
+		sb.append('<span class="meta-label">')
+		sb.append(htmlEscape(label))
+		sb.append(':</span> ')
+		sb.append('<span class="meta-value">')
+		sb.append(htmlEscape(value))
+		sb.append('</span>')
+		sb.append('</div>')
+		return sb.toString()
+	}
+
+	private String buildChartsSidebar(Map view) {
+		StringBuilder sb = new StringBuilder()
+		sb.append('<div class="chart-side-wrap">')
+		sb.append('<div class="chart-side-title">Execution Status</div>')
+		sb.append('<div class="legend-list">')
+		sb.append(buildLegendLine('Passed', STATUS_PASS, view.passedCount))
+		sb.append(buildLegendLine('Failed', STATUS_FAIL, view.failedCount))
+		sb.append(buildLegendLine('Skipped', STATUS_SKIP, view.skippedCount))
+		sb.append('</div>')
+		sb.append('</div>')
+		return sb.toString()
+	}
+
+	private String buildChartsPanel(Map view) {
+		double failPercent = percent(view.failedCount as int, view.totalCount as int)
+		double passPercent = percent(view.passedCount as int, view.totalCount as int)
+		double skipPercent = percent(view.skippedCount as int, view.totalCount as int)
+
+		String donutStyle = 'background: conic-gradient(' +
+				STATUS_FAIL + ' 0 ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '%,' +
+				STATUS_PASS + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '% ' +
+				String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '%,' +
+				STATUS_SKIP + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '% 100%);'
+
+		StringBuilder sb = new StringBuilder()
+
+		sb.append('<section id="charts-panel" class="charts-panel hidden">')
+		sb.append('<div class="chart-main-title">Global Overview</div>')
+		sb.append('<div class="charts-layout">')
+
+		sb.append('<div>')
+		sb.append('<div class="donut-card">')
+		sb.append('<div class="donut" style="')
+		sb.append(donutStyle)
+		sb.append('">')
+		sb.append('<div class="donut-center">')
+		sb.append('<div class="donut-number">')
+		sb.append(String.valueOf(view.totalCount))
+		sb.append('</div>')
+		sb.append('<div class="donut-label">Tests</div>')
+		sb.append('</div>')
+		sb.append('</div>')
+		sb.append('</div>')
+		sb.append('</div>')
+
+		sb.append('<div>')
+		sb.append('<div class="chart-bars">')
+		sb.append(buildBarRow('Passed', view.passedCount as int, view.totalCount as int, STATUS_PASS))
+		sb.append(buildBarRow('Failed', view.failedCount as int, view.totalCount as int, STATUS_FAIL))
+		sb.append(buildBarRow('Skipped', view.skippedCount as int, view.totalCount as int, STATUS_SKIP))
+		sb.append('</div>')
+		sb.append('</div>')
+
+		sb.append('</div>')
+		sb.append('</section>')
+
+		return sb.toString()
+	}
+
+	private String buildLegendLine(String label, String color, int value) {
+		StringBuilder sb = new StringBuilder()
+		sb.append('<div class="legend-line">')
+		sb.append('<span class="legend-dot" style="background:')
+		sb.append(color)
+		sb.append('"></span>')
+		sb.append('<span class="legend-text">')
+		sb.append(htmlEscape(label))
+		sb.append('</span>')
+		sb.append('<span class="legend-value">')
+		sb.append(String.valueOf(value))
+		sb.append('</span>')
+		sb.append('</div>')
+		return sb.toString()
+	}
+
+	private String buildBarRow(String label, int value, int total, String color) {
+		double width = percent(value, total)
+
+		StringBuilder sb = new StringBuilder()
+		sb.append('<div class="bar-row">')
+		sb.append('<div class="bar-row-top">')
+		sb.append('<span class="bar-label">')
+		sb.append(htmlEscape(label))
+		sb.append('</span>')
+		sb.append('<span class="bar-value">')
+		sb.append(String.valueOf(value))
+		sb.append('</span>')
+		sb.append('</div>')
+		sb.append('<div class="bar-track">')
+		sb.append('<div class="bar-fill" style="width:')
+		sb.append(String.format(Locale.ENGLISH, '%.2f', width))
+		sb.append('%; background:')
+		sb.append(color)
+		sb.append('"></div>')
+		sb.append('</div>')
+		sb.append('<div class="bar-foot">')
+		sb.append(String.valueOf(total == 0 ? 0 : Math.round(width)))
+		sb.append('% of execution')
+		sb.append('</div>')
+		sb.append('</div>')
+		return sb.toString()
+	}
+
+	// =========================================================================
+	// HELPERS
+	// =========================================================================
+
+	private String buildGeneratedLabel(Map model) {
+		String raw = pickFirst(
+				model.generatedAt,
+				model.generatedLabel,
+				model.createdAt,
+				model.executionDate
+				)
+
+		if (!raw.isEmpty()) {
+			return 'Generated ' + raw
+		}
+
+		return 'Generated ' + new SimpleDateFormat('dd.MM.yyyy HH:mm:ss').format(new Date())
+	}
+
+	private long normalizeDurationMs(Map item, String rawStart, String rawEnd) {
+		Object durationValue = pickFirstObject(
+				item.durationMs,
+				item.elapsedMs,
+				item.timeMs,
+				item.duration
+				)
+
+		long parsed = toLong(durationValue)
+		if (parsed > 0L) {
+			return parsed
+		}
+
+		long startMillis = parseDateMillis(rawStart)
+		long endMillis = parseDateMillis(rawEnd)
+
+		if (startMillis > 0L && endMillis >= startMillis) {
+			return endMillis - startMillis
+		}
+
+		return 0L
+	}
+
+	private long parseDateMillis(String raw) {
+		String text = safeValue(raw)
+		if (text.isEmpty()) {
+			return 0L
+		}
+
+		List<String> patterns = [
+			'dd.MM.yyyy HH:mm:ss',
+			'dd.MM.yyyy hh:mm:ss a',
+			'yyyy-MM-dd HH:mm:ss',
+			'yyyy-MM-dd HH:mm:ss.SSS',
+			'yyyy-MM-dd\'T\'HH:mm:ss',
+			'yyyy-MM-dd\'T\'HH:mm:ss.SSS',
+			'HH:mm:ss'
+		]
+
+		for (String pattern : patterns) {
+			try {
+				return new SimpleDateFormat(pattern).parse(text).time
+			} catch (Exception ignored) {
+			}
+		}
+
+		return 0L
+	}
+
+	private String formatDateTimeLabel(String raw) {
+		String text = safeValue(raw)
+		if (text.isEmpty()) {
+			return '--'
+		}
+		return text
+	}
+
+	private String extractClockLabel(String raw) {
+		String text = safeValue(raw)
+		if (text.isEmpty()) {
+			return ''
+		}
+
+		def matcher = (text =~ /(\\d{2}:\\d{2}:\\d{2}|\\d{1,2}:\\d{2}:\\d{2}\\s?[APMapm]{2})/)
+		if (matcher.find()) {
+			return cleanClock(matcher.group(1))
+		}
+
+		return text
+	}
+
+	private String cleanClock(String raw) {
+		String text = safeValue(raw)
+		if (text.contains('.')) {
+			return text.substring(0, text.indexOf('.'))
+		}
+		return text
+	}
+
+	private String formatDuration(long durationMs) {
+		if (durationMs < 0L) {
+			durationMs = 0L
+		}
+
+		long totalSeconds = Math.round(durationMs / 1000d)
+		long hours = (long) (totalSeconds / 3600L)
+		long minutes = (long) ((totalSeconds % 3600L) / 60L)
+		long seconds = (long) (totalSeconds % 60L)
+
+		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+	}
+
+	private String resolveStepIcon(String detail, String status) {
+		String lower = safeValue(detail).toLowerCase(Locale.ENGLISH)
+
+		if (status == 'failed') {
+			return '❌'
+		}
+		if (status == 'skipped') {
+			return '⏭️'
+		}
+		if (lower.contains('wait')) {
+			return '🔎'
+		}
+		if (lower.contains('click') || lower.contains('select') || lower.contains('fill') || lower.contains('import')) {
+			return '🖱️'
+		}
+		if (lower.contains('open') || lower.contains('navigate')) {
+			return '🌐'
+		}
+		return 'ℹ️'
+	}
+
+	private String normalizeStatus(String raw) {
+		String text = safeValue(raw).toLowerCase(Locale.ENGLISH)
+
+		switch (text) {
+			case 'pass':
+			case 'passed':
+			case 'success':
+				return 'passed'
+			case 'fail':
+			case 'failed':
+			case 'error':
+				return 'failed'
+			case 'skip':
+			case 'skipped':
+				return 'skipped'
+			default:
+				return 'info'
+		}
+	}
+
+	private String statusLabel(String status) {
+		switch (safeValue(status)) {
+			case 'passed':
+				return 'Passed'
+			case 'failed':
+				return 'Failed'
+			case 'skipped':
+				return 'Skipped'
+			default:
+				return 'Info'
+		}
+	}
+
+	private File resolveFile(String path, String baseFolder) {
+		String raw = safeValue(path)
+		if (raw.isEmpty()) {
+			return null
+		}
+
+		try {
+			if (raw.toLowerCase(Locale.ENGLISH).startsWith('file:/')) {
+				File uriFile = new File(new URI(raw))
+				if (uriFile.exists()) {
+					return uriFile
+				}
+			}
+		} catch (Exception ignored) {
+		}
+
+		File direct = new File(raw)
+		if (direct.exists()) {
+			return direct
+		}
+
+		if (!safeValue(baseFolder).isEmpty()) {
+			File byBase = new File(baseFolder, raw)
+			if (byBase.exists()) {
+				return byBase
+			}
+		}
+
+		return direct
+	}
+
+	private String resolveLogoHref(Map view) {
+		File logoFile = resolveFile(pickFirst(view.logoSrc, LOGO_SRC), pickFirst(view.reportFolder))
+		if (logoFile != null && logoFile.exists()) {
+			return logoFile.toURI().toString()
+		}
+		return pickFirst(view.logoSrc, LOGO_SRC)
+	}
+
+	private boolean isImageFile(String fileName) {
+		String lower = safeValue(fileName).toLowerCase(Locale.ENGLISH)
+		return lower.endsWith('.png') ||
+				lower.endsWith('.jpg') ||
+				lower.endsWith('.jpeg') ||
+				lower.endsWith('.gif') ||
+				lower.endsWith('.webp') ||
+				lower.endsWith('.bmp')
+	}
+
+	private List asList(def value) {
+		if (value == null) {
+			return []
+		}
+
+		if (value instanceof Collection) {
+			return new ArrayList(value as Collection)
+		}
+
+		if (value.getClass().isArray()) {
+			return (value as Object[]).toList()
+		}
+
+		return [value]
+	}
+
+	private long toLong(def value) {
+		String raw = safeValue(value)
+		if (raw.isEmpty()) {
+			return 0L
+		}
+
+		try {
+			return Long.parseLong(raw)
+		} catch (Exception ignored) {
+		}
+
+		try {
+			String clean = raw.replace(',', '.')
+			if (clean.endsWith('s')) {
+				clean = clean.substring(0, clean.length() - 1)
+				return Math.round(Double.parseDouble(clean) * 1000d)
+			}
+		} catch (Exception ignored) {
+		}
+
+		return 0L
+	}
+
+	private double percent(int value, int total) {
+		if (total <= 0) {
+			return 0d
+		}
+		return ((double) value / (double) total) * 100d
+	}
+
+	private String shorten(String text, int max) {
+		String value = safeValue(text)
+		if (value.length() <= max) {
+			return value
+		}
+		return value.substring(0, Math.max(0, max - 3)) + '...'
+	}
+
+	private String safeValue(def value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+
+	private String pickFirst(Object... values) {
+		if (values == null) {
+			return ''
+		}
+
+		for (Object value : values) {
+			String text = safeValue(value)
+			if (!text.isEmpty()) {
+				return text
+			}
+		}
+
+		return ''
+	}
+
+	private Object pickFirstObject(Object... values) {
+		if (values == null) {
+			return null
+		}
+
+		for (Object value : values) {
+			if (value == null) {
+				continue
+			}
+
+			if (value instanceof CharSequence && safeValue(value).isEmpty()) {
+				continue
+			}
+
+			return value
+		}
+
+		return null
+	}
+
+	private String htmlEscape(def value) {
+		String text = safeValue(value)
+		return text
+				.replace('&', '&amp;')
+				.replace('<', '&lt;')
+				.replace('>', '&gt;')
+				.replace('"', '&quot;')
+				.replace("'", '&#39;')
+	}
+
+	private String jsEscape(def value) {
+		String text = safeValue(value)
+		return text
+				.replace('\\', '\\\\')
+				.replace("'", "\\'")
+				.replace('\r', '')
+				.replace('\n', '\\n')
+	}
+
+	// =========================================================================
+	// CSS / JS
+	// =========================================================================
+
+	private String buildStyles() {
+		return '''
+<style>
+* {
+    box-sizing: border-box;
+}
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    color: #15212b;
+    background: #ffffff;
+}
+.top-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 10px 18px;
+    background: linear-gradient(90deg, #3f00ff 0%, #6f1dff 50%, #c92aa0 100%);
+    color: #ffffff;
+}
+.top-banner-left {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+}
+.brand-logo {
+    width: 92px;
+    height: 92px;
+    object-fit: contain;
+    display: block;
+}
+.brand-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.banner-title {
+    font-size: 18px;
+    font-weight: 700;
+    line-height: 1.2;
+}
+.banner-subtitle {
+    font-size: 12px;
+    opacity: 0.92;
+}
+.top-banner-right {
+    font-size: 10px;
+    text-align: right;
+    opacity: 0.94;
+    line-height: 1.5;
+    color: #ffffff !important;
+}
+.page {
+    display: grid;
+    grid-template-columns: 520px 1fr;
+    min-height: calc(100vh - 114px);
+}
+.sidebar {
+    border-right: 1px solid #dfe6ef;
+    background: #ffffff;
+}
+.content {
+    padding: 32px 38px;
+}
+.sidebar-tabs {
+    display: flex;
+    border-bottom: 1px solid #e3e8ef;
+}
+.sidebar-tab {
+    flex: 1;
+    padding: 18px 16px;
+    background: #ffffff;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    font-size: 14px;
+    cursor: pointer;
+    color: #4f5d6d;
+}
+.sidebar-tab.active {
+    color: #5a00d6;
+    border-bottom-color: #7b1fff;
+    font-weight: 700;
+}
+.search-wrap {
+    padding: 18px 18px 12px 18px;
+}
+.search-input {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid #d3dce8;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+}
+.search-input:focus {
+    border-color: #7b1fff;
+    box-shadow: 0 0 0 2px rgba(123,31,255,0.14);
+}
+.scenario-list {
+    padding: 0 12px 18px 12px;
+}
+.scenario-list-item {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 92px;
+    gap: 6px;
+    padding: 14px 12px;
+    border: 0;
+    background: #ffffff;
+    text-align: left;
+    cursor: pointer;
+    position: relative;
+    appearance: none;
+    -webkit-appearance: none;
+    border-radius: 0;
+}
+.scenario-list-item::after {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 0;
+    height: 1px;
+    background: #dfe6ef;
+}
+.scenario-list-item:last-child::after {
+    display: none;
+}
+.scenario-list-item:hover {
+    background: #faf2ff;
+}
+.scenario-list-item.selected {
+    border-left: 4px solid #7b1fff;
+    padding-left: 10px;
+    background: #f7edff;
+}
+.scenario-list-main {
+    min-width: 0;
+}
+.scenario-list-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #15212b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.scenario-list-summary {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #6a7786;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.scenario-list-meta {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #6f7d8d;
+}
+.scenario-list-side {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 4px;
+}
+.scenario-list-duration {
+    font-size: 12px;
+    color: #6f7d8d;
+}
+.status-pill {
+    min-width: 84px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 7px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #ffffff;
+}
+.status-pill.passed {
+    background: #68b84b;
+}
+.status-pill.failed {
+    background: #e05b4d;
+    color: #ffffff;
+}
+.status-pill.skipped {
+    background: #d7b436;
+    color: #ffffff;
+}
+.status-pill.info {
+    background: #c92aa0;
+}
+.scenario-panel {
+    display: none;
+}
+.scenario-panel.active {
+    display: block;
+}
+.scenario-header {
+    margin-bottom: 20px;
+}
+.scenario-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: #15212b;
+    line-height: 1.3;
+    margin-bottom: 16px;
+}
+.scenario-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+.meta-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 36px;
+    padding: 9px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+}
+.meta-chip.plain {
+    background: #eef3f8;
+    color: #1e2a35;
+}
+.meta-chip.gradient {
+    background: linear-gradient(90deg, rgba(90,0,255,0.88) 0%, rgba(201,42,160,0.88) 100%); 
+    color: #ffffff;
+}
+.meta-chip.passed {
+    background: #7b1fff;
+    color: #ffffff;
+}
+.meta-chip.failed {
+    background: #e05b4d;
+    color: #ffffff;
+}
+.meta-chip.skipped {
+    background: #d7b436;
+    color: #ffffff;
+}
+.meta-label {
+    opacity: 0.92;
+}
+.section-title {
+    margin-top: 18px;
+    margin-bottom: 10px;
+    font-size: 15px;
+    font-weight: 700;
+    color: #15212b;
+}
+.steps-table {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #ffffff;
+}
+.steps-head,
+.step-row {
+    display: grid;
+    grid-template-columns: 110px 92px 1fr;
+    gap: 12px;
+    align-items: center;
+    padding: 12px 16px;
+}
+.steps-head {
+    background: #f8fafc;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 12px;
+    font-weight: 700;
+    color: #5a6776;
+}
+.step-row {
+    position: relative;
+    font-size: 13px;
+    color: #15212b;
+}
+.step-row::after {
+    content: "";
+    position: absolute;
+    left: 16px;
+    right: 16px;
+    bottom: 0;
+    height: 1px;
+    background: #edf2f7;
+}
+
+.step-row:last-child::after {
+    display: none;
+}
+.step-row.empty {
+    color: #7b8896;
+}
+.col-status {
+    min-width: 0;
+}
+.col-time {
+    min-width: 0;
+    width: 92px;
+    color: #607080;
+    font-size: 12px;
+}
+.col-detail {
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.step-icon {
+    margin-right: 3px;
+}
+.error-block,
+.evidence-block {
+    margin-top: 20px;
+    padding: 14px 16px;
+    border-left: 3px solid #e05b4d;
+    background: #fff8f7;
+    border-radius: 10px;
+    max-width: 980px;
+}
+.evidence-empty {
+    padding: 12px 14px;
+    border: 1px dashed #d9e2ec;
+    border-radius: 10px;
+    background: #fafcff;
+    color: #6b7a89;
+    font-size: 13px;
+}
+.error-title,
+.evidence-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #7e2f29;
+    margin-bottom: 8px;
+}
+.error-summary {
+    font-size: 13px;
+    color: #253341;
+    margin-bottom: 8px;
+}
+.details-box,
+.evidence-item {
+    margin-top: 10px;
+    border: 1px solid #e3e8ef;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #ffffff;
+}
+.details-box summary,
+.evidence-item summary {
+    cursor: pointer;
+    padding: 12px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #7b1fff;
+    list-style: none;
+}
+.details-box summary::-webkit-details-marker,
+.evidence-item summary::-webkit-details-marker {
+    display: none;
+}
+.details-box pre {
+    margin: 0;
+    padding: 14px;
+    background: #0f1c2b;
+    color: #ffffff;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+    max-height: 460px;
+}
+.evidence-links {
+    padding: 0 14px 12px 14px;
+    font-size: 13px;
+}
+.evidence-links a {
+    color: #7b1fff;
+    text-decoration: none;
+    font-weight: 700;
+}
+.evidence-image {
+    display: block;
+    width: auto;
+    max-width: calc(100% - 28px);
+    max-height: 520px;
+    margin: 0 14px 14px 14px;
+    border-radius: 10px;
+    border: 1px solid #dde5ef;
+    object-fit: contain;
+    background: #ffffff;
+}
+.chart-side-wrap {
+    padding: 18px;
+}
+.chart-side-title {
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 12px;
+    color: #15212b;
+}
+.donut-card {
+    display: flex;
+    justify-content: center;
+    padding: 12px 0 18px 0;
+}
+.donut {
+    width: 340px;
+    height: 340px;
+    border-radius: 50%;
+    position: relative;
+}
+.donut-center {
+    position: absolute;
+    inset: 34px;
+    border-radius: 50%;
+    background: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+}
+.donut-number {
+    font-size: 42px;
+    font-weight: 700;
+    color: #15212b;
+}
+.donut-label {
+    font-size: 14px;
+    color: #708091;
+}
+.legend-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.legend-line {
+    display: grid;
+    grid-template-columns: 12px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    font-size: 13px;
+    color: #1f2b37;
+}
+.legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+}
+.legend-value {
+    color: #607080;
+}
+.charts-panel {
+    display: block;
+}
+.chart-main-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 18px;
+    color: #15212b;
+}
+.charts-layout {
+    display: grid;
+    grid-template-columns: 420px 1fr;
+    gap: 40px;
+    align-items: start;
+    max-width: 1280px;
+}
+.chart-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    max-width: 760px;
+}
+.bar-row {
+    padding: 16px 18px;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    background: #ffffff;
+}
+.bar-row-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+.bar-label {
+    font-size: 14px;
+    font-weight: 700;
+    color: #15212b;
+}
+.bar-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: #15212b;
+}
+.bar-track {
+    width: 100%;
+    height: 8px;
+    border-radius: 999px;
+    background: #edf2f7;
+    overflow: hidden;
+}
+.bar-fill {
+    height: 100%;
+    border-radius: 999px;
+}
+.bar-foot {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #738394;
+}
+.hidden {
+    display: none !important;
+}
+@media (max-width: 1200px) {
+    .page {
+        grid-template-columns: 1fr;
     }
-
-    String build(Map model) {
-        List<Map> testCases = model.testCases instanceof List ? model.testCases : []
-        List<Map> executionEntries = model.executionEntries instanceof List ? model.executionEntries : []
-        List<Map> screenshots = model.screenshots instanceof List ? model.screenshots : []
-
-        Map totals = model.totals instanceof Map ? model.totals : [:]
-
-        String generatedAt = new SimpleDateFormat('yyyy-MM-dd HH:mm:ss').format(model.generatedAt ?: new Date())
-
-        String caseRows = testCases.collect { Map tc ->
-            String status = owner.safe(tc.status)
-            String statusClass = status.toLowerCase()
-
-            return """
-                <tr>
-                    <td>${esc(tc.suite)}</td>
-                    <td>${esc(tc.className)}</td>
-                    <td>${esc(tc.name)}</td>
-                    <td><span class="badge ${statusClass}">${esc(status)}</span></td>
-                    <td>${esc(tc.duration)}</td>
-                    <td>${esc(tc.failureMessage)}</td>
-                </tr>
-            """
-        }.join('\n')
-
-        String executionRows = executionEntries.collect { Map entry ->
-            String type = owner.safe(entry.type)
-            String status = owner.safe(entry.status).toLowerCase()
-
-            return """
-                <tr class="line-${status}">
-                    <td class="mono type-col">${esc(type)}</td>
-                    <td class="mono">${esc(entry.text)}</td>
-                </tr>
-            """
-        }.join('\n')
-
-        String screenshotsHtml = screenshots.collect { Map shot ->
-            return """
-                <div class="shot-card">
-                    <div class="shot-title">${esc(shot.name)}</div>
-                    <img src="${esc(shot.relativePath)}" alt="${esc(shot.name)}" />
-                </div>
-            """
-        }.join('\n')
-
-        return """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>${esc(model.executionSummary)}</title>
-    <style>
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            margin: 0;
-            font-family: Arial, Helvetica, sans-serif;
-            background: #f5f4fa;
-            color: #1f2430;
-        }
-
-        .header {
-            background: #4c2a85;
-            color: #ffffff;
-            padding: 28px 32px;
-            border-bottom: 4px solid #6b46c1;
-        }
-
-        .header h1 {
-            margin: 0 0 8px 0;
-            font-size: 28px;
-        }
-
-        .header .meta {
-            font-size: 14px;
-            opacity: 0.95;
-            line-height: 1.7;
-        }
-
-        .container {
-            padding: 24px;
-        }
-
-        .cards {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 16px;
-            margin-bottom: 24px;
-        }
-
-        .card {
-            background: #ffffff;
-            border-radius: 12px;
-            padding: 18px 20px;
-            min-width: 180px;
-            box-shadow: 0 2px 10px rgba(35, 24, 64, 0.08);
-            border: 1px solid #ece8f8;
-        }
-
-        .card .label {
-            font-size: 12px;
-            color: #6b7280;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            margin-bottom: 8px;
-        }
-
-        .card .value {
-            font-size: 28px;
-            font-weight: bold;
-            color: #2d1c4d;
-        }
-
-        .section {
-            background: #ffffff;
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 24px;
-            box-shadow: 0 2px 10px rgba(35, 24, 64, 0.08);
-            border: 1px solid #ece8f8;
-        }
-
-        .section h2 {
-            margin: 0 0 16px 0;
-            font-size: 20px;
-            color: #2d1c4d;
-        }
-
-        .summary-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 12px;
-        }
-
-        .summary-item {
-            background: #faf8ff;
-            border: 1px solid #ece8f8;
-            border-radius: 10px;
-            padding: 12px 14px;
-        }
-
-        .summary-item strong {
-            display: block;
-            color: #4c2a85;
-            margin-bottom: 6px;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        th {
-            background: #f3effb;
-            color: #2d1c4d;
-            text-align: left;
-            padding: 12px;
-            border-bottom: 1px solid #e5def7;
-            font-size: 13px;
-        }
-
-        td {
-            padding: 12px;
-            border-bottom: 1px solid #f0ebfa;
-            vertical-align: top;
-            font-size: 13px;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 999px;
-            font-size: 12px;
-            font-weight: bold;
-        }
-
-        .badge.passed {
-            background: #e9f8ef;
-            color: #1c7c45;
-        }
-
-        .badge.failed {
-            background: #fdecec;
-            color: #b42318;
-        }
-
-        .badge.skipped {
-            background: #f3f4f6;
-            color: #4b5563;
-        }
-
-        .mono {
-            font-family: Consolas, "Courier New", monospace;
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-
-        .type-col {
-            width: 110px;
-            font-weight: bold;
-        }
-
-        .line-info td {
-            background: #fcfbff;
-        }
-
-        .line-failed td {
-            background: #fff2f2;
-            color: #8f1d1d;
-        }
-
-        .shots {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 16px;
-        }
-
-        .shot-card {
-            border: 1px solid #ece8f8;
-            border-radius: 12px;
-            padding: 12px;
-            background: #faf8ff;
-        }
-
-        .shot-title {
-            font-size: 13px;
-            font-weight: bold;
-            margin-bottom: 10px;
-            color: #2d1c4d;
-            word-break: break-word;
-        }
-
-        .shot-card img {
-            width: 100%;
-            border-radius: 8px;
-            border: 1px solid #ddd6f5;
-            display: block;
-        }
-
-        .empty {
-            color: #6b7280;
-            font-style: italic;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>${esc(model.suiteName)}</h1>
-        <div class="meta">
-            <div><strong>Execution:</strong> ${esc(model.executionSummary)}</div>
-            <div><strong>Project:</strong> ${esc(model.projectKey)} | <strong>Environment:</strong> ${esc(model.environment)}</div>
-            <div><strong>Generated at:</strong> ${esc(generatedAt)}</div>
-            <div><strong>XML source:</strong> ${esc(model.xmlPath)}</div>
-        </div>
-    </div>
-
-    <div class="container">
-        <div class="cards">
-            <div class="card">
-                <div class="label">Tests</div>
-                <div class="value">${esc(totals.tests)}</div>
-            </div>
-            <div class="card">
-                <div class="label">Passed</div>
-                <div class="value">${esc(totals.passed)}</div>
-            </div>
-            <div class="card">
-                <div class="label">Failures</div>
-                <div class="value">${esc(totals.failures)}</div>
-            </div>
-            <div class="card">
-                <div class="label">Skipped</div>
-                <div class="value">${esc(totals.skipped)}</div>
-            </div>
-            <div class="card">
-                <div class="label">Duration</div>
-                <div class="value">${esc(totals.duration)}</div>
-            </div>
-        </div>
-
-        <div class="section">
-            <h2>Execution Summary</h2>
-            <div class="summary-grid">
-                <div class="summary-item">
-                    <strong>Suite</strong>
-                    <span>${esc(model.suiteName)}</span>
-                </div>
-                <div class="summary-item">
-                    <strong>Execution title</strong>
-                    <span>${esc(model.executionSummary)}</span>
-                </div>
-                <div class="summary-item">
-                    <strong>Project key</strong>
-                    <span>${esc(model.projectKey)}</span>
-                </div>
-                <div class="summary-item">
-                    <strong>Environment</strong>
-                    <span>${esc(model.environment)}</span>
-                </div>
-            </div>
-        </div>
-
-        <div class="section">
-            <h2>Test Cases</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Suite</th>
-                        <th>Class</th>
-                        <th>Test</th>
-                        <th>Status</th>
-                        <th>Duration</th>
-                        <th>Failure message</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${caseRows ?: '<tr><td colspan="6" class="empty">No test cases were parsed from the XML file.</td></tr>'}
-                </tbody>
-            </table>
-        </div>
-
-        <div class="section">
-            <h2>Execution Steps</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width: 110px;">Type</th>
-                        <th>Content</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${executionRows ?: '<tr><td colspan="2" class="empty">No TEST STEP lines were found in execution0.log.</td></tr>'}
-                </tbody>
-            </table>
-        </div>
-
-        <div class="section">
-            <h2>Failure Screenshots</h2>
-            ${screenshotsHtml ? '<div class="shots">' + screenshotsHtml + '</div>' : '<div class="empty">No screenshots found.</div>'}
-        </div>
-    </div>
-</body>
-</html>
-"""
+    .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid #dfe6ef;
     }
-
-    String esc(def value) {
-        return owner.htmlEscape(value)
+    .content {
+        padding: 20px;
+    }
+    .charts-layout {
+        grid-template-columns: 1fr;
     }
 }
+</style>
+'''
+	}
+
+	private String buildScripts() {
+		return '''
+<script>
+function showTab(tabName) {
+    var tabTests = document.getElementById('tab-tests');
+    var tabCharts = document.getElementById('tab-charts');
+    var testsSidebar = document.getElementById('tests-sidebar-block');
+    var chartsSidebar = document.getElementById('charts-sidebar-block');
+    var chartsPanel = document.getElementById('charts-panel');
+    var scenarioPanels = document.querySelectorAll('.scenario-panel');
+
+    if (tabName === 'charts') {
+        tabTests.classList.remove('active');
+        tabCharts.classList.add('active');
+        testsSidebar.classList.add('hidden');
+        chartsSidebar.classList.remove('hidden');
+        chartsPanel.classList.remove('hidden');
+        scenarioPanels.forEach(function(panel) {
+            panel.classList.add('hidden');
+        });
+    } else {
+        tabCharts.classList.remove('active');
+        tabTests.classList.add('active');
+        chartsSidebar.classList.add('hidden');
+        testsSidebar.classList.remove('hidden');
+        chartsPanel.classList.add('hidden');
+        scenarioPanels.forEach(function(panel) {
+            panel.classList.remove('hidden');
+        });
+    }
+}
+
+function showScenario(id) {
+    var buttons = document.querySelectorAll('.scenario-list-item');
+    var panels = document.querySelectorAll('.scenario-panel');
+
+    buttons.forEach(function(btn) {
+        if (btn.getAttribute('data-sid') === id) {
+            btn.classList.add('selected');
+        } else {
+            btn.classList.remove('selected');
+        }
+    });
+
+    panels.forEach(function(panel) {
+        if (panel.id === 'panel-' + id) {
+            panel.classList.add('active');
+        } else {
+            panel.classList.remove('active');
+        }
+    });
+
+    showTab('tests');
+}
+
+function filterScenarios() {
+    var input = document.getElementById('scenarioSearch');
+    var filter = input.value.toLowerCase();
+    var items = document.querySelectorAll('.scenario-list-item');
+
+    items.forEach(function(item) {
+        var text = item.textContent.toLowerCase();
+        if (text.indexOf(filter) > -1) {
+            item.style.display = '';
+        } else {
+            item.style.display = 'none';
+        }
+    });
+}
+</script>
+'''
+	}
+}
+
