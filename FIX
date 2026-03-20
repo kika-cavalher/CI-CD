@@ -1,359 +1,101 @@
-package jiraIntegration
+// =========================================================================
+// TEST EXECUTION UPDATE
+// =========================================================================
 
-import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+Map updateTestExecution(String testExecutionKey, String executionTitle, String executionDescription = '') {
+	String issueKey = textOrEmpty(testExecutionKey)
+	String summary = textOrEmpty(executionTitle)
+	String description = textOrEmpty(executionDescription)
 
-import java.io.File
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-
-import com.kms.katalon.core.testobject.ConditionType
-import com.kms.katalon.core.testobject.RequestObject
-import com.kms.katalon.core.testobject.ResponseObject
-import com.kms.katalon.core.testobject.TestObjectProperty
-import com.kms.katalon.core.testobject.impl.HttpTextBodyContent
-import com.kms.katalon.core.util.KeywordUtil
-import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
-
-import groovy.json.JsonBuilder
-import groovy.json.JsonSlurper
-import internal.GlobalVariable
-
-class JiraGateway {
-
-	JiraFlowCoordinator owner
-	JsonSlurper jsonSlurper = new JsonSlurper()
-
-	JiraGateway(JiraFlowCoordinator owner) {
-		this.owner = owner
-	}
-
-	void validateRequiredConfiguration() {
-		List<String> missing = []
-
-		if (owner.isBlank(resolveToken())) {
-			missing << 'JIRA token'
-		}
-		if (owner.isBlank(owner.PROJECT_KEY)) {
-			missing << 'PROJECT_KEY'
-		}
-		if (owner.isBlank(owner.JIRA_BASE_URL)) {
-			missing << 'JIRA_BASE_URL'
-		}
-
-		if (!missing.isEmpty()) {
-			KeywordUtil.markFailedAndStop('Missing Jira configuration: ' + missing.join(', '))
-		}
-	}
-
-	String importExecutionResults(String xmlPath) {
-		if (owner.isBlank(xmlPath)) {
-			return 'ERROR: XML path is empty'
-		}
-
-		File xmlFile = new File(xmlPath)
-		if (!xmlFile.exists() || !xmlFile.isFile() || xmlFile.length() <= 0) {
-			return 'ERROR: XML file not found or empty'
-		}
-
-		try {
-			ResponseObject response = WS.sendRequest(
-				findTestObject('Jira Integration/Import Results', [
-					('filePath') : xmlPath,
-					('project')  : owner.PROJECT_KEY,
-					('baseUrl')  : owner.JIRA_BASE_URL,
-					('token')    : resolveToken()
-				])
-			)
-
-			int status = response.getStatusCode()
-			String body = safeBody(response)
-
-			KeywordUtil.logInfo("Import Results status: ${status}")
-			KeywordUtil.logInfo("Import Results response: ${body}")
-
-			if (status < 200 || status >= 300) {
-				return "ERROR: import execution failed with status ${status}"
-			}
-
-			def parsed = parseJson(body)
-			String key = owner.safe(parsed?.testExecIssue?.key ?: parsed?.key)
-
-			if (owner.isBlank(key)) {
-				return 'ERROR: execution key not found in import response'
-			}
-
-			return key
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Import Results request failed: ${e.message}")
-			return "ERROR: import execution request failed - ${e.message}"
-		}
-	}
-
-	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
-		if (owner.isBlank(testPlanKey) || owner.isBlank(executionKey)) {
-			return 0
-		}
-
-		Map payload = [
-			add: [executionKey]
+	if (blankText(issueKey)) {
+		return [
+			status : 0,
+			body   : 'Skipped update because testExecutionKey is empty'
 		]
-
-		RequestObject request = new RequestObject('Runtime Add Execution To Test Plan')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/raven/2.0/api/testplan/' + encode(testPlanKey) + '/testexecution')
-		request.setRestRequestMethod('POST')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody(payload))
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-
-		KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
-		KeywordUtil.logInfo("Add execution to Test Plan response: ${safeBody(response)}")
-
-		return status
 	}
 
-	int updateTestExecution(String issueKey, String summary, String labels, String environment) {
-		if (owner.isBlank(issueKey)) {
-			return 0
-		}
+	Map fields = [:]
 
-		List<String> labelList = []
-		if (!owner.isBlank(labels)) {
-			labelList = labels
-				.split(',')
-				collect { owner.safe(it) }
-				.findAll { !owner.isBlank(it) }
-		}
+	if (!blankText(summary)) {
+		fields.summary = summary
+	}
 
-		Map fields = [
-			summary: owner.safe(summary),
-			labels : labelList
+	if (!blankText(description)) {
+		fields.description = description
+	}
+
+	if (fields.isEmpty()) {
+		return [
+			status : 0,
+			body   : 'Skipped update because there are no fields to update'
 		]
-
-		if (!owner.isBlank(environment)) {
-			fields.environment = owner.safe(environment)
-		}
-
-		RequestObject request = new RequestObject('Runtime Update Test Execution')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey))
-		request.setRestRequestMethod('PUT')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody([fields: fields]))
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-
-		KeywordUtil.logInfo("Update Test Execution status: ${status}")
-		KeywordUtil.logInfo("Update Test Execution response: ${safeBody(response)}")
-
-		return status
 	}
 
-	int uploadAttachment(String issueKey, String filePath) {
-		if (owner.isBlank(issueKey) || owner.isBlank(filePath)) {
-			return 0
+	String endpoint = JIRA_BASE_URL + '/rest/api/2/issue/' + encodePath(issueKey)
+	String payload = groovy.json.JsonOutput.toJson([fields: fields])
+
+	HttpURLConnection connection = null
+
+	try {
+		connection = openConnection(endpoint, 'PUT')
+		connection.setDoOutput(true)
+		connection.setRequestProperty('Content-Type', 'application/json')
+		connection.setRequestProperty('Accept', 'application/json')
+
+		connection.outputStream.withWriter('UTF-8') { writer ->
+			writer.write(payload)
 		}
 
-		File file = new File(filePath)
-		if (!file.exists() || !file.isFile() || file.length() <= 0) {
-			KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
-			return 0
-		}
-
-		try {
-			ResponseObject response = WS.sendRequest(
-				findTestObject('Jira Integration/Evidence attachment', [
-					('token')    : resolveToken(),
-					('evidences'): file,
-					('execID')   : issueKey
-				])
-			)
-
-			int status = response.getStatusCode()
-			String body = safeBody(response)
-
-			KeywordUtil.logInfo("Upload attachment status (${filePath}): ${status}")
-			KeywordUtil.logInfo("Upload attachment response: ${body}")
-
-			return status
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Upload attachment request failed: ${e.message}")
-			return 0
-		}
-	}
-
-	String createTestPlan(String summary, String epicKey) {
-		Map fields = [
-			project  : [key: owner.PROJECT_KEY],
-			summary  : owner.safe(summary),
-			issuetype: [name: 'Test Plan']
-		]
-
-		if (!owner.isBlank(epicKey) && !owner.SKIP_EPIC_LINK_IF_FIELD_NOT_AVAILABLE && !owner.isBlank(owner.EPIC_FIELD_ID)) {
-			fields[owner.EPIC_FIELD_ID] = owner.safe(epicKey)
-		}
-
-		RequestObject request = new RequestObject('Runtime Create Test Plan')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue')
-		request.setRestRequestMethod('POST')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody([fields: fields]))
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Create Test Plan status: ${status}")
-		KeywordUtil.logInfo("Create Test Plan response: ${body}")
-
-		if (status < 200 || status >= 300) {
-			return "ERROR: create test plan failed with status ${status}"
-		}
-
-		def parsed = parseJson(body)
-		String key = owner.safe(parsed?.key)
-
-		if (owner.isBlank(key)) {
-			return 'ERROR: created Test Plan key not found in response'
-		}
-
-		return key
-	}
-
-	Map searchTestPlans(String summary, String epicKey) {
-		String jql =
-			'project = "' + owner.PROJECT_KEY + '" ' +
-			'AND issuetype = "Test Plan" ' +
-			'ORDER BY created DESC'
-
-		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
-
-		String url =
-			owner.JIRA_BASE_URL +
-			'/rest/api/2/search' +
-			'?jql=' + encode(jql) +
-			'&maxResults=200' +
-			'&fields=' + encode('summary,created,issuetype')
-
-		RequestObject request = new RequestObject('Runtime Search Test Plan')
-		request.setRestUrl(url)
-		request.setRestRequestMethod('GET')
-		request.setHttpHeaderProperties(defaultGetHeaders())
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Runtime Search Test Plan status: ${status}")
-		KeywordUtil.logInfo("Runtime Search Test Plan response: ${body}")
-
-		def parsed = parseJson(body)
+		int status = connection.responseCode
+		String body = readResponseBody(connection)
 
 		return [
-			statusCode: status,
-			body      : body,
-			issues    : parsed?.issues instanceof List ? parsed.issues : []
+			status : status,
+			body   : body
 		]
+	} finally {
+		connection?.disconnect()
+	}
+}
+
+// =========================================================================
+// INTERNAL HELPERS FOR UPDATE
+// =========================================================================
+
+private String textOrEmpty(Object value) {
+	return value == null ? '' : String.valueOf(value).trim()
+}
+
+private boolean blankText(Object value) {
+	return textOrEmpty(value).isEmpty()
+}
+
+private String encodePath(String value) {
+	return java.net.URLEncoder.encode(textOrEmpty(value), 'UTF-8').replace('+', '%20')
+}
+
+private String readResponseBody(HttpURLConnection connection) {
+	if (connection == null) {
+		return ''
 	}
 
-	Map getIssueByKey(String issueKey) {
-		if (owner.isBlank(issueKey)) {
-			return [statusCode: 0, issue: null, body: '']
-		}
+	InputStream stream = null
 
-		String url =
-			owner.JIRA_BASE_URL +
-			'/rest/api/2/issue/' + encode(issueKey) +
-			'?fields=' + encode('summary,created,issuetype')
+	try {
+		stream = connection.responseCode >= 400 ? connection.getErrorStream() : connection.getInputStream()
 
-		RequestObject request = new RequestObject('Runtime Get Issue By Key')
-		request.setRestUrl(url)
-		request.setRestRequestMethod('GET')
-		request.setHttpHeaderProperties(defaultGetHeaders())
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Get Issue By Key status: ${status}")
-		KeywordUtil.logInfo("Get Issue By Key response: ${body}")
-
-		def parsed = parseJson(body)
-
-		return [
-			statusCode: status,
-			body      : body,
-			issue     : parsed
-		]
-	}
-
-	private String resolveToken() {
-		try {
-			def direct = GlobalVariable.JIRA_TOKEN
-			if (!owner.isBlank(direct)) {
-				return owner.safe(direct)
-			}
-		} catch (Exception ignored) {
-		}
-
-		try {
-			def fallback = GlobalVariable.token
-			if (!owner.isBlank(fallback)) {
-				return owner.safe(fallback)
-			}
-		} catch (Exception ignored) {
-		}
-
-		return owner.safe(owner.JIRA_TOKEN)
-	}
-
-	private List<TestObjectProperty> defaultGetHeaders() {
-		return [
-			header('Authorization', 'Bearer ' + resolveToken()),
-			header('Accept', 'application/json')
-		]
-	}
-
-	private List<TestObjectProperty> jsonHeaders() {
-		return [
-			header('Authorization', 'Bearer ' + resolveToken()),
-			header('Accept', 'application/json'),
-			header('Content-Type', 'application/json')
-		]
-	}
-
-	private TestObjectProperty header(String name, String value) {
-		return new TestObjectProperty(name, ConditionType.EQUALS, value)
-	}
-
-	private HttpTextBodyContent jsonBody(Object payload) {
-		String text = new JsonBuilder(payload).toString()
-		return new HttpTextBodyContent(text, 'UTF-8', 'application/json')
-	}
-
-	private Object parseJson(String body) {
-		if (owner.isBlank(body)) {
-			return [:]
-		}
-
-		try {
-			return jsonSlurper.parseText(body)
-		} catch (Exception ignored) {
-			return [:]
-		}
-	}
-
-	private String safeBody(ResponseObject response) {
-		try {
-			return owner.safe(response?.getResponseBodyContent())
-		} catch (Exception ignored) {
+		if (stream == null) {
 			return ''
 		}
-	}
 
-	private String encode(String value) {
-		return URLEncoder.encode(owner.safe(value), StandardCharsets.UTF_8.toString())
+		return stream.getText('UTF-8')
+	} catch (Exception ignored) {
+		return ''
+	} finally {
+		try {
+			stream?.close()
+		} catch (Exception ignored) {
+		}
 	}
 }
 
@@ -361,200 +103,9 @@ class JiraGateway {
 
 
 
-package jiraIntegration
 
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.util.ArrayList
-import java.util.List
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
-
-import com.kms.katalon.core.util.KeywordUtil
-
-class JiraExecutionPublisher {
-
-	JiraFlowCoordinator owner
-	JiraGateway gateway
-
-	JiraExecutionPublisher(JiraFlowCoordinator owner, JiraGateway gateway) {
-		this.owner = owner
-		this.gateway = gateway
-	}
-
-	Map publishExecution(String xmlPath, String executionSummary, String testPlanKey, String reportFolder, String customReportPath) {
-		Map result = [
-			executionKey         : '',
-			addExecutionStatus   : 0,
-			updateExecutionStatus: 0,
-			gaiaReportStatus     : 0,
-			evidencesStatus      : 0,
-			resultsStatus        : 0
-		]
-
-		String executionKey = gateway.importExecutionResults(xmlPath)
-		result.executionKey = executionKey
-
-		if (owner.isBlank(executionKey) || executionKey.startsWith('ERROR')) {
-			return result
-		}
-
-		result.addExecutionStatus = gateway.addExecutionToTestPlan(testPlanKey, executionKey)
-		result.updateExecutionStatus = gateway.updateTestExecution(
-			executionKey,
-			executionSummary,
-			owner.LABELS,
-			owner.ENVIRONMENT
-		)
-
-		String evidencesZipPath = createEvidenceZip(reportFolder)
-		String resultsZipPath = createResultsZip(reportFolder)
-
-		if (!owner.isBlank(customReportPath) && new File(customReportPath).exists()) {
-			result.gaiaReportStatus = gateway.uploadAttachment(executionKey, customReportPath)
-		} else {
-			KeywordUtil.logInfo("Custom Jira report attachment skipped.")
-		}
-
-		if (!owner.isBlank(evidencesZipPath) && new File(evidencesZipPath).exists()) {
-			result.evidencesStatus = gateway.uploadAttachment(executionKey, evidencesZipPath)
-		} else {
-			KeywordUtil.logInfo("Evidences ZIP attachment skipped.")
-		}
-
-		if (!owner.isBlank(resultsZipPath) && new File(resultsZipPath).exists()) {
-			result.resultsStatus = gateway.uploadAttachment(executionKey, resultsZipPath)
-		} else {
-			KeywordUtil.logInfo("Results ZIP attachment skipped.")
-		}
-
-		return result
-	}
-
-	String createEvidenceZip(String reportFolder) {
-		File evidenceFolder = owner.getExistingEvidenceFolder(reportFolder)
-
-		if (evidenceFolder == null || !evidenceFolder.exists() || !evidenceFolder.isDirectory()) {
-			KeywordUtil.logInfo("Evidence ZIP skipped. Folder not found.")
-			return ''
-		}
-
-		List<File> evidenceFiles = new ArrayList<File>()
-		collectFilesRecursively(evidenceFolder, evidenceFiles)
-
-		evidenceFiles = evidenceFiles.findAll { File file ->
-			file.isFile() &&
-			!owner.safe(file.name).equalsIgnoreCase(owner.safe(owner.EVIDENCE_ZIP_NAME))
-		}
-
-		if (evidenceFiles.isEmpty()) {
-			KeywordUtil.logInfo("Evidence ZIP skipped. No files found inside evidence folder.")
-			return ''
-		}
-
-		File zipFile = new File(evidenceFolder, owner.EVIDENCE_ZIP_NAME)
-		zipFiles(evidenceFolder, evidenceFiles, zipFile)
-
-		KeywordUtil.logInfo("Evidence ZIP created successfully: ${zipFile.absolutePath}")
-		return zipFile.absolutePath
-	}
-
-	String createResultsZip(String reportFolder) {
-		if (owner.isBlank(reportFolder)) {
-			return ''
-		}
-
-		File root = new File(reportFolder)
-		if (!root.exists() || !root.isDirectory()) {
-			return ''
-		}
-
-		List<File> files = new ArrayList<File>()
-		collectFilesRecursively(root, files)
-
-		files = files.findAll { File file ->
-			if (!file.isFile()) {
-				return false
-			}
-
-			String lowerPath = owner.safe(file.absolutePath).toLowerCase()
-			String lowerName = owner.safe(file.name).toLowerCase()
-
-			if (lowerPath.contains(File.separator.toLowerCase() + 'requests' + File.separator.toLowerCase())) return false
-			if (lowerPath.contains(File.separator.toLowerCase() + 'videos' + File.separator.toLowerCase())) return false
-			if (lowerName == owner.safe(owner.RESULT_ZIP_NAME).toLowerCase()) return false
-			if (lowerName == owner.safe(owner.EVIDENCE_ZIP_NAME).toLowerCase()) return false
-
-			return true
-		}
-
-		if (files.isEmpty()) {
-			return ''
-		}
-
-		File zipFile = new File(root, owner.RESULT_ZIP_NAME)
-		zipFiles(root, files, zipFile)
-
-		KeywordUtil.logInfo("Report ZIP created successfully: ${zipFile.absolutePath}")
-		return zipFile.absolutePath
-	}
-
-	void collectFilesRecursively(File current, List<File> files) {
-		if (current == null || !current.exists()) {
-			return
-		}
-
-		if (current.isFile()) {
-			files.add(current)
-			return
-		}
-
-		File[] children = current.listFiles()
-		if (children == null) {
-			return
-		}
-
-		for (File child : children) {
-			collectFilesRecursively(child, files)
-		}
-	}
-
-	void zipFiles(File baseDir, List<File> files, File zipFile) {
-		FileOutputStream fos = null
-		ZipOutputStream zos = null
-
-		try {
-			fos = new FileOutputStream(zipFile)
-			zos = new ZipOutputStream(fos)
-
-			for (File file : files) {
-				String relativePath = owner.relativeUri(baseDir, file)
-				if (owner.isBlank(relativePath)) {
-					relativePath = file.name
-				}
-
-				KeywordUtil.logInfo("Adding file to ZIP: ${relativePath}")
-
-				ZipEntry entry = new ZipEntry(relativePath)
-				zos.putNextEntry(entry)
-
-				FileInputStream fis = new FileInputStream(file)
-				try {
-					byte[] buffer = new byte[4096]
-					int len = 0
-					while ((len = fis.read(buffer)) > 0) {
-						zos.write(buffer, 0, len)
-					}
-				} finally {
-					fis.close()
-				}
-
-				zos.closeEntry()
-			}
-		} finally {
-			try { zos?.close() } catch (Exception ignored) {}
-			try { fos?.close() } catch (Exception ignored) {}
-		}
-	}
-}
+gateway.updateTestExecution(
+	testExecutionKey,
+	executionTitle,
+	'Execution imported automatically from Katalon'
+)
