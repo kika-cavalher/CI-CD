@@ -1,384 +1,5 @@
 package jiraIntegration
 
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurper
-
-import java.nio.charset.StandardCharsets
-import java.nio.file.Files
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-
-class JiraGateway {
-
-	private final Object owner
-	private final JsonSlurper jsonSlurper = new JsonSlurper()
-
-	JiraGateway() {
-		this(null)
-	}
-
-	JiraGateway(Object owner) {
-		this.owner = owner
-	}
-
-	// =========================================================================
-	// PUBLIC API
-	// =========================================================================
-
-	Map getIssueByKey(String issueKey) {
-		if (blank(issueKey)) {
-			return [status: 0, body: '', json: null]
-		}
-
-		String url = buildUrl("/rest/api/2/issue/${encodePath(issueKey)}", [
-			expand: 'renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations'
-		])
-
-		return doJsonRequest('GET', url, null)
-	}
-
-	Map searchIssues(String jql, int maxResults = 200) {
-		String url = buildUrl('/rest/api/2/search')
-
-		Map payload = [
-			jql       : safe(jql),
-			startAt   : 0,
-			maxResults: maxResults,
-			fields    : ['summary', 'issuetype', 'created']
-		]
-
-		return doJsonRequest('POST', url, payload)
-	}
-
-	Map searchTestPlans(String projectKey, String summary) {
-		String jql = buildTestPlanJql(projectKey, summary)
-		return searchIssues(jql, 200)
-	}
-
-	Map createTestPlan(String summary, String description = '') {
-		String projectKey = firstNonBlank(readOwnerText('PROJECT_KEY'), readOwnerText('PROJECT'), readOwnerText('JIRA_PROJECT_KEY'))
-		String issueTypeName = firstNonBlank(readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'), 'Test Plan')
-
-		Map payload = [
-			fields: [
-				project    : [key: projectKey],
-				summary    : safe(summary),
-				description: safe(description),
-				issuetype  : [name: issueTypeName]
-			]
-		]
-
-		String url = buildUrl('/rest/api/2/issue')
-		return doJsonRequest('POST', url, payload)
-	}
-
-	Map updateTestExecution(String testExecutionKey, String executionTitle, String executionDescription = '') {
-		String issueKey = safe(testExecutionKey)
-
-		if (blank(issueKey)) {
-			return [status: 0, body: 'Skipped update because testExecutionKey is empty', json: null]
-		}
-
-		Map fields = [:]
-
-		if (!blank(executionTitle)) {
-			fields.summary = safe(executionTitle)
-		}
-
-		if (!blank(executionDescription)) {
-			fields.description = safe(executionDescription)
-		}
-
-		if (fields.isEmpty()) {
-			return [status: 0, body: 'Skipped update because there are no fields to update', json: null]
-		}
-
-		String url = buildUrl("/rest/api/2/issue/${encodePath(issueKey)}")
-		return doJsonRequest('PUT', url, [fields: fields])
-	}
-
-	Map addExecutionToTestPlan(String testPlanKey, String testExecutionKey) {
-		if (blank(testPlanKey) || blank(testExecutionKey)) {
-			return [status: 0, body: 'Skipped link because testPlanKey or testExecutionKey is empty', json: null]
-		}
-
-		String url = buildUrl("/rest/raven/2.0/api/testplan/${encodePath(testPlanKey)}/testexecution")
-		List payload = [safe(testExecutionKey)]
-
-		return doJsonRequest('POST', url, payload)
-	}
-
-	Map importExecutionResults(File xmlFile) {
-		String projectKey = firstNonBlank(readOwnerText('PROJECT_KEY'), readOwnerText('PROJECT'), readOwnerText('JIRA_PROJECT_KEY'))
-		return importJunitExecution(xmlFile, projectKey, '')
-	}
-
-	Map importJunitExecution(File xmlFile, String projectKey = '', String testPlanKey = '') {
-		if (xmlFile == null || !xmlFile.exists()) {
-			return [status: 0, body: 'JUnit XML file was not found', json: null]
-		}
-
-		Map query = [:]
-
-		if (!blank(projectKey)) {
-			query.projectKey = safe(projectKey)
-		}
-
-		if (!blank(testPlanKey)) {
-			query.testPlanKey = safe(testPlanKey)
-		}
-
-		String url = buildUrl('/rest/raven/1.0/import/execution/junit', query)
-
-		return doMultipartFileRequest(
-			url,
-			xmlFile,
-			'file',
-			'text/xml',
-			[
-				'Accept': 'application/json'
-			]
-		)
-	}
-
-	Map addAttachmentToIssue(String issueKey, File file) {
-		if (blank(issueKey) || file == null || !file.exists()) {
-			return [status: 0, body: 'Skipped attachment because issueKey or file is invalid', json: null]
-		}
-
-		String url = buildUrl("/rest/api/2/issue/${encodePath(issueKey)}/attachments")
-
-		return doMultipartFileRequest(
-			url,
-			file,
-			'file',
-			'application/octet-stream',
-			[
-				'X-Atlassian-Token': 'no-check',
-				'Accept'           : 'application/json'
-			]
-		)
-	}
-
-	// =========================================================================
-	// HTTP
-	// =========================================================================
-
-	private Map doJsonRequest(String method, String url, Object payload) {
-		HttpURLConnection connection = null
-
-		try {
-			connection = openConnection(url, method)
-			connection.setRequestProperty('Accept', 'application/json')
-
-			if (payload != null) {
-				connection.setDoOutput(true)
-				connection.setRequestProperty('Content-Type', 'application/json')
-
-				String json = JsonOutput.toJson(payload)
-				connection.outputStream.withWriter('UTF-8') { writer ->
-					writer.write(json)
-				}
-			}
-
-			int status = connection.responseCode
-			String body = readBody(connection)
-
-			return [
-				status: status,
-				body  : body,
-				json  : parseJson(body)
-			]
-		} finally {
-			connection?.disconnect()
-		}
-	}
-
-	private Map doMultipartFileRequest(String url, File file, String fieldName, String contentType, Map extraHeaders = [:]) {
-		HttpURLConnection connection = null
-		String boundary = '----OpenAIBoundary' + System.currentTimeMillis()
-
-		try {
-			connection = openConnection(url, 'POST')
-			connection.setDoOutput(true)
-			connection.setRequestProperty('Content-Type', "multipart/form-data; boundary=${boundary}")
-
-			extraHeaders.each { String headerName, Object headerValue ->
-				connection.setRequestProperty(headerName, safe(headerValue))
-			}
-
-			byte[] fileBytes = Files.readAllBytes(file.toPath())
-
-			connection.outputStream.withCloseable { output ->
-				output.write(("--${boundary}\r\n").getBytes(StandardCharsets.UTF_8))
-				output.write(("Content-Disposition: form-data; name=\"${safe(fieldName)}\"; filename=\"${safe(file.name)}\"\r\n").getBytes(StandardCharsets.UTF_8))
-				output.write(("Content-Type: ${safe(contentType)}\r\n\r\n").getBytes(StandardCharsets.UTF_8))
-				output.write(fileBytes)
-				output.write("\r\n".getBytes(StandardCharsets.UTF_8))
-				output.write(("--${boundary}--\r\n").getBytes(StandardCharsets.UTF_8))
-				output.flush()
-			}
-
-			int status = connection.responseCode
-			String body = readBody(connection)
-
-			return [
-				status: status,
-				body  : body,
-				json  : parseJson(body)
-			]
-		} finally {
-			connection?.disconnect()
-		}
-	}
-
-	private HttpURLConnection openConnection(String url, String method) {
-		HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection()
-		connection.setRequestMethod(method)
-		connection.setConnectTimeout(60000)
-		connection.setReadTimeout(60000)
-		connection.setUseCaches(false)
-		connection.setDoInput(true)
-
-		String authHeader = resolveAuthorizationHeader()
-		if (!blank(authHeader)) {
-			connection.setRequestProperty('Authorization', authHeader)
-		}
-
-		return connection
-	}
-
-	private String readBody(HttpURLConnection connection) {
-		InputStream stream = null
-
-		try {
-			stream = connection.responseCode >= 400 ? connection.errorStream : connection.inputStream
-			if (stream == null) {
-				return ''
-			}
-			return stream.getText('UTF-8')
-		} catch (Exception ignored) {
-			return ''
-		} finally {
-			try {
-				stream?.close()
-			} catch (Exception ignored) {
-			}
-		}
-	}
-
-	// =========================================================================
-	// HELPERS
-	// =========================================================================
-
-	private String buildTestPlanJql(String projectKey, String summary) {
-		String project = safe(projectKey)
-		String testPlanIssueType = firstNonBlank(readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'), 'Test Plan')
-		String escapedSummary = safe(summary).replace('\\', '\\\\').replace('"', '\\"')
-
-		return "project = \"${project}\" AND issuetype = \"${testPlanIssueType}\" AND summary ~ \"\\\"${escapedSummary}\\\"\" ORDER BY created DESC"
-	}
-
-	private String buildUrl(String path, Map query = [:]) {
-		String baseUrl = firstNonBlank(
-			readOwnerText('JIRA_BASE_URL'),
-			readOwnerText('BASE_URL'),
-			readOwnerText('JIRA_URL')
-		)
-
-		String normalizedPath = safe(path)
-		StringBuilder builder = new StringBuilder()
-		builder.append(baseUrl)
-		builder.append(normalizedPath)
-
-		Map cleanQuery = query.findAll { key, value -> !blank(value) }
-		if (!cleanQuery.isEmpty()) {
-			builder.append('?')
-			builder.append(cleanQuery.collect { key, value ->
-				encodeQueryParam(key) + '=' + encodeQueryParam(value)
-			}.join('&'))
-		}
-
-		return builder.toString()
-	}
-
-	private String resolveAuthorizationHeader() {
-		String rawToken = firstNonBlank(
-			readOwnerText('AUTHORIZATION_HEADER'),
-			readOwnerText('JIRA_AUTHORIZATION_HEADER'),
-			readOwnerText('JIRA_TOKEN'),
-			readOwnerText('TOKEN')
-		)
-
-		if (blank(rawToken)) {
-			return ''
-		}
-
-		if (rawToken.startsWith('Basic ') || rawToken.startsWith('Bearer ')) {
-			return rawToken
-		}
-
-		return 'Basic ' + rawToken
-	}
-
-	private Object parseJson(String body) {
-		if (blank(body)) {
-			return null
-		}
-
-		try {
-			return jsonSlurper.parseText(body)
-		} catch (Exception ignored) {
-			return null
-		}
-	}
-
-	private String readOwnerText(String propertyName) {
-		if (owner == null || blank(propertyName)) {
-			return ''
-		}
-
-		try {
-			def value = owner."${propertyName}"
-			return safe(value)
-		} catch (MissingPropertyException ignored) {
-			return ''
-		} catch (Exception ignored) {
-			return ''
-		}
-	}
-
-	private String encodePath(Object value) {
-		return URLEncoder.encode(safe(value), 'UTF-8').replace('+', '%20')
-	}
-
-	private String encodeQueryParam(Object value) {
-		return URLEncoder.encode(safe(value), 'UTF-8')
-	}
-
-	String safe(Object value) {
-		return value == null ? '' : String.valueOf(value).trim()
-	}
-
-	boolean blank(Object value) {
-		return safe(value).isEmpty()
-	}
-
-	private String firstNonBlank(Object... values) {
-		if (values == null) {
-			return ''
-		}
-
-		for (Object value : values) {
-			String text = safe(value)
-			if (!text.isEmpty()) {
-				return text
-			}
-		}
-
-		package jiraIntegration
-
 import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.exception.StepErrorException
 
@@ -876,3 +497,394 @@ class JiraExecutionPublisher {
 		return ''
 	}
 }
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+
+class JiraGateway {
+
+	private final Object owner
+	private final JsonSlurper jsonSlurper = new JsonSlurper()
+
+	JiraGateway() {
+		this(null)
+	}
+
+	JiraGateway(Object owner) {
+		this.owner = owner
+	}
+
+	// =========================================================================
+	// PUBLIC API
+	// =========================================================================
+
+	Map getIssueByKey(String issueKey) {
+		if (blank(issueKey)) {
+			return [status: 0, body: '', json: null]
+		}
+
+		String url = buildUrl("/rest/api/2/issue/${encodePath(issueKey)}", [
+			expand: 'renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations'
+		])
+
+		return doJsonRequest('GET', url, null)
+	}
+
+	Map searchIssues(String jql, int maxResults = 200) {
+		String url = buildUrl('/rest/api/2/search')
+
+		Map payload = [
+			jql       : safe(jql),
+			startAt   : 0,
+			maxResults: maxResults,
+			fields    : ['summary', 'issuetype', 'created']
+		]
+
+		return doJsonRequest('POST', url, payload)
+	}
+
+	Map searchTestPlans(String projectKey, String summary) {
+		String jql = buildTestPlanJql(projectKey, summary)
+		return searchIssues(jql, 200)
+	}
+
+	Map createTestPlan(String summary, String description = '') {
+		String projectKey = firstNonBlank(readOwnerText('PROJECT_KEY'), readOwnerText('PROJECT'), readOwnerText('JIRA_PROJECT_KEY'))
+		String issueTypeName = firstNonBlank(readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'), 'Test Plan')
+
+		Map payload = [
+			fields: [
+				project    : [key: projectKey],
+				summary    : safe(summary),
+				description: safe(description),
+				issuetype  : [name: issueTypeName]
+			]
+		]
+
+		String url = buildUrl('/rest/api/2/issue')
+		return doJsonRequest('POST', url, payload)
+	}
+
+	Map updateTestExecution(String testExecutionKey, String executionTitle, String executionDescription = '') {
+		String issueKey = safe(testExecutionKey)
+
+		if (blank(issueKey)) {
+			return [status: 0, body: 'Skipped update because testExecutionKey is empty', json: null]
+		}
+
+		Map fields = [:]
+
+		if (!blank(executionTitle)) {
+			fields.summary = safe(executionTitle)
+		}
+
+		if (!blank(executionDescription)) {
+			fields.description = safe(executionDescription)
+		}
+
+		if (fields.isEmpty()) {
+			return [status: 0, body: 'Skipped update because there are no fields to update', json: null]
+		}
+
+		String url = buildUrl("/rest/api/2/issue/${encodePath(issueKey)}")
+		return doJsonRequest('PUT', url, [fields: fields])
+	}
+
+	Map addExecutionToTestPlan(String testPlanKey, String testExecutionKey) {
+		if (blank(testPlanKey) || blank(testExecutionKey)) {
+			return [status: 0, body: 'Skipped link because testPlanKey or testExecutionKey is empty', json: null]
+		}
+
+		String url = buildUrl("/rest/raven/2.0/api/testplan/${encodePath(testPlanKey)}/testexecution")
+		List payload = [safe(testExecutionKey)]
+
+		return doJsonRequest('POST', url, payload)
+	}
+
+	Map importExecutionResults(File xmlFile) {
+		String projectKey = firstNonBlank(readOwnerText('PROJECT_KEY'), readOwnerText('PROJECT'), readOwnerText('JIRA_PROJECT_KEY'))
+		return importJunitExecution(xmlFile, projectKey, '')
+	}
+
+	Map importJunitExecution(File xmlFile, String projectKey = '', String testPlanKey = '') {
+		if (xmlFile == null || !xmlFile.exists()) {
+			return [status: 0, body: 'JUnit XML file was not found', json: null]
+		}
+
+		Map query = [:]
+
+		if (!blank(projectKey)) {
+			query.projectKey = safe(projectKey)
+		}
+
+		if (!blank(testPlanKey)) {
+			query.testPlanKey = safe(testPlanKey)
+		}
+
+		String url = buildUrl('/rest/raven/1.0/import/execution/junit', query)
+
+		return doMultipartFileRequest(
+			url,
+			xmlFile,
+			'file',
+			'text/xml',
+			[
+				'Accept': 'application/json'
+			]
+		)
+	}
+
+	Map addAttachmentToIssue(String issueKey, File file) {
+		if (blank(issueKey) || file == null || !file.exists()) {
+			return [status: 0, body: 'Skipped attachment because issueKey or file is invalid', json: null]
+		}
+
+		String url = buildUrl("/rest/api/2/issue/${encodePath(issueKey)}/attachments")
+
+		return doMultipartFileRequest(
+			url,
+			file,
+			'file',
+			'application/octet-stream',
+			[
+				'X-Atlassian-Token': 'no-check',
+				'Accept'           : 'application/json'
+			]
+		)
+	}
+
+	// =========================================================================
+	// HTTP
+	// =========================================================================
+
+	private Map doJsonRequest(String method, String url, Object payload) {
+		HttpURLConnection connection = null
+
+		try {
+			connection = openConnection(url, method)
+			connection.setRequestProperty('Accept', 'application/json')
+
+			if (payload != null) {
+				connection.setDoOutput(true)
+				connection.setRequestProperty('Content-Type', 'application/json')
+
+				String json = JsonOutput.toJson(payload)
+				connection.outputStream.withWriter('UTF-8') { writer ->
+					writer.write(json)
+				}
+			}
+
+			int status = connection.responseCode
+			String body = readBody(connection)
+
+			return [
+				status: status,
+				body  : body,
+				json  : parseJson(body)
+			]
+		} finally {
+			connection?.disconnect()
+		}
+	}
+
+	private Map doMultipartFileRequest(String url, File file, String fieldName, String contentType, Map extraHeaders = [:]) {
+		HttpURLConnection connection = null
+		String boundary = '----OpenAIBoundary' + System.currentTimeMillis()
+
+		try {
+			connection = openConnection(url, 'POST')
+			connection.setDoOutput(true)
+			connection.setRequestProperty('Content-Type', "multipart/form-data; boundary=${boundary}")
+
+			extraHeaders.each { String headerName, Object headerValue ->
+				connection.setRequestProperty(headerName, safe(headerValue))
+			}
+
+			byte[] fileBytes = Files.readAllBytes(file.toPath())
+
+			connection.outputStream.withCloseable { output ->
+				output.write(("--${boundary}\r\n").getBytes(StandardCharsets.UTF_8))
+				output.write(("Content-Disposition: form-data; name=\"${safe(fieldName)}\"; filename=\"${safe(file.name)}\"\r\n").getBytes(StandardCharsets.UTF_8))
+				output.write(("Content-Type: ${safe(contentType)}\r\n\r\n").getBytes(StandardCharsets.UTF_8))
+				output.write(fileBytes)
+				output.write("\r\n".getBytes(StandardCharsets.UTF_8))
+				output.write(("--${boundary}--\r\n").getBytes(StandardCharsets.UTF_8))
+				output.flush()
+			}
+
+			int status = connection.responseCode
+			String body = readBody(connection)
+
+			return [
+				status: status,
+				body  : body,
+				json  : parseJson(body)
+			]
+		} finally {
+			connection?.disconnect()
+		}
+	}
+
+	private HttpURLConnection openConnection(String url, String method) {
+		HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection()
+		connection.setRequestMethod(method)
+		connection.setConnectTimeout(60000)
+		connection.setReadTimeout(60000)
+		connection.setUseCaches(false)
+		connection.setDoInput(true)
+
+		String authHeader = resolveAuthorizationHeader()
+		if (!blank(authHeader)) {
+			connection.setRequestProperty('Authorization', authHeader)
+		}
+
+		return connection
+	}
+
+	private String readBody(HttpURLConnection connection) {
+		InputStream stream = null
+
+		try {
+			stream = connection.responseCode >= 400 ? connection.errorStream : connection.inputStream
+			if (stream == null) {
+				return ''
+			}
+			return stream.getText('UTF-8')
+		} catch (Exception ignored) {
+			return ''
+		} finally {
+			try {
+				stream?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	// =========================================================================
+	// HELPERS
+	// =========================================================================
+
+	private String buildTestPlanJql(String projectKey, String summary) {
+		String project = safe(projectKey)
+		String testPlanIssueType = firstNonBlank(readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'), 'Test Plan')
+		String escapedSummary = safe(summary).replace('\\', '\\\\').replace('"', '\\"')
+
+		return "project = \"${project}\" AND issuetype = \"${testPlanIssueType}\" AND summary ~ \"\\\"${escapedSummary}\\\"\" ORDER BY created DESC"
+	}
+
+	private String buildUrl(String path, Map query = [:]) {
+		String baseUrl = firstNonBlank(
+			readOwnerText('JIRA_BASE_URL'),
+			readOwnerText('BASE_URL'),
+			readOwnerText('JIRA_URL')
+		)
+
+		String normalizedPath = safe(path)
+		StringBuilder builder = new StringBuilder()
+		builder.append(baseUrl)
+		builder.append(normalizedPath)
+
+		Map cleanQuery = query.findAll { key, value -> !blank(value) }
+		if (!cleanQuery.isEmpty()) {
+			builder.append('?')
+			builder.append(cleanQuery.collect { key, value ->
+				encodeQueryParam(key) + '=' + encodeQueryParam(value)
+			}.join('&'))
+		}
+
+		return builder.toString()
+	}
+
+	private String resolveAuthorizationHeader() {
+		String rawToken = firstNonBlank(
+			readOwnerText('AUTHORIZATION_HEADER'),
+			readOwnerText('JIRA_AUTHORIZATION_HEADER'),
+			readOwnerText('JIRA_TOKEN'),
+			readOwnerText('TOKEN')
+		)
+
+		if (blank(rawToken)) {
+			return ''
+		}
+
+		if (rawToken.startsWith('Basic ') || rawToken.startsWith('Bearer ')) {
+			return rawToken
+		}
+
+		return 'Basic ' + rawToken
+	}
+
+	private Object parseJson(String body) {
+		if (blank(body)) {
+			return null
+		}
+
+		try {
+			return jsonSlurper.parseText(body)
+		} catch (Exception ignored) {
+			return null
+		}
+	}
+
+	private String readOwnerText(String propertyName) {
+		if (owner == null || blank(propertyName)) {
+			return ''
+		}
+
+		try {
+			def value = owner."${propertyName}"
+			return safe(value)
+		} catch (MissingPropertyException ignored) {
+			return ''
+		} catch (Exception ignored) {
+			return ''
+		}
+	}
+
+	private String encodePath(Object value) {
+		return URLEncoder.encode(safe(value), 'UTF-8').replace('+', '%20')
+	}
+
+	private String encodeQueryParam(Object value) {
+		return URLEncoder.encode(safe(value), 'UTF-8')
+	}
+
+	String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+
+	boolean blank(Object value) {
+		return safe(value).isEmpty()
+	}
+
+	private String firstNonBlank(Object... values) {
+		if (values == null) {
+			return ''
+		}
+
+		for (Object value : values) {
+			String text = safe(value)
+			if (!text.isEmpty()) {
+				return text
+			}
+		}
+
+		return ''
+	}
+}
+
