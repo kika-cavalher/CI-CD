@@ -1,3 +1,5 @@
+
+
 package jiraIntegration
 
 import groovy.json.JsonOutput
@@ -44,7 +46,7 @@ class JiraGateway {
 		}
 
 		if (blank(authHeader)) {
-			throw new IllegalStateException('Jira authentication is required. Configure token or username/password.')
+			throw new IllegalStateException('Jira authentication is required.')
 		}
 	}
 
@@ -68,34 +70,59 @@ class JiraGateway {
 		return searchIssues(jql)
 	}
 
-	Map createTestPlan(String projectKey,
-					   String summary,
-					   String epicFieldId,
-					   String epicKey,
-					   List labels,
-					   String description) {
+	/*
+	 * This method was intentionally made flexible because different project files
+	 * may call createTestPlan with different signatures.
+	 *
+	 * Supported signatures:
+	 * 1) createTestPlan(summary, epicKey)
+	 * 2) createTestPlan(projectKey, summary, epicKey)
+	 * 3) createTestPlan(projectKey, summary, epicFieldId, epicKey)
+	 * 4) createTestPlan(projectKey, summary, epicFieldId, epicKey, labels)
+	 * 5) createTestPlan(projectKey, summary, epicFieldId, epicKey, labels, description)
+	 */
+	Map createTestPlan(Object... args) {
 		validateRequiredConfiguration()
 
-		Map fields = [
-			project  : [key: safe(projectKey)],
-			summary  : safe(summary),
-			issuetype: [name: 'Test Plan']
-		]
+		List values = args == null ? [] : args.toList()
 
-		List safeLabels = (labels ?: []).findAll { !blank(it) }.collect { safe(it) }
-		if (!safeLabels.isEmpty()) {
-			fields.labels = safeLabels
+		String projectKey = defaultProjectKey()
+		String summary = ''
+		String epicFieldId = defaultEpicFieldId()
+		String epicKey = ''
+		List labels = defaultLabels()
+		String description = ''
+
+		if (values.size() == 2) {
+			summary = safe(values[0])
+			epicKey = safe(values[1])
+		} else if (values.size() == 3) {
+			projectKey = safe(values[0])
+			summary = safe(values[1])
+			epicKey = safe(values[2])
+		} else if (values.size() == 4) {
+			projectKey = safe(values[0])
+			summary = safe(values[1])
+			epicFieldId = safe(values[2])
+			epicKey = safe(values[3])
+		} else if (values.size() == 5) {
+			projectKey = safe(values[0])
+			summary = safe(values[1])
+			epicFieldId = safe(values[2])
+			epicKey = safe(values[3])
+			labels = normalizeLabels(values[4])
+		} else if (values.size() >= 6) {
+			projectKey = safe(values[0])
+			summary = safe(values[1])
+			epicFieldId = safe(values[2])
+			epicKey = safe(values[3])
+			labels = normalizeLabels(values[4])
+			description = safe(values[5])
+		} else {
+			throw new IllegalArgumentException('Unsupported createTestPlan signature. Received args size = ' + values.size())
 		}
 
-		if (!blank(description)) {
-			fields.description = safe(description)
-		}
-
-		if (!blank(epicFieldId) && !blank(epicKey)) {
-			fields[epicFieldId] = safe(epicKey)
-		}
-
-		return doPostJson('/rest/api/2/issue', [fields: fields])
+		return createTestPlanInternal(projectKey, summary, epicFieldId, epicKey, labels, description)
 	}
 
 	Map importExecutionResults(File junitXmlFile, String projectKey, String testPlanKey) {
@@ -107,18 +134,6 @@ class JiraGateway {
 
 		String path = buildJUnitImportPath(projectKey, testPlanKey)
 		return doMultipartFile(path, 'file', junitXmlFile, 'application/json')
-	}
-
-	Map importExecutionResults(File junitXmlFile, String projectKey, String testPlanKey, String ignoredExecutionSummary) {
-		return importExecutionResults(junitXmlFile, projectKey, testPlanKey)
-	}
-
-	Map importJunitExecution(File junitXmlFile, String projectKey, String testPlanKey) {
-		return importExecutionResults(junitXmlFile, projectKey, testPlanKey)
-	}
-
-	Map importJunitExecution(File junitXmlFile, String projectKey, String testPlanKey, String ignoredExecutionSummary) {
-		return importExecutionResults(junitXmlFile, projectKey, testPlanKey)
 	}
 
 	Map addExecutionToTestPlan(String testPlanKey, String testExecutionKey) {
@@ -136,11 +151,45 @@ class JiraGateway {
 		}
 
 		String path = '/rest/api/2/issue/' + encoded(issueKey) + '/attachments'
-		return doMultipartFile(path, 'file', attachmentFile, 'application/json', ['X-Atlassian-Token': 'no-check'])
+		return doMultipartFile(
+			path,
+			'file',
+			attachmentFile,
+			'application/json',
+			['X-Atlassian-Token': 'no-check']
+		)
 	}
 
-	Map addAttachment(String issueKey, File attachmentFile) {
-		return uploadAttachment(issueKey, attachmentFile)
+	// =========================================================================
+	// TEST PLAN CREATION
+	// =========================================================================
+
+	private Map createTestPlanInternal(String projectKey,
+									   String summary,
+									   String epicFieldId,
+									   String epicKey,
+									   List labels,
+									   String description) {
+		Map fields = [
+			project  : [key: safe(projectKey)],
+			summary  : safe(summary),
+			issuetype: [name: 'Test Plan']
+		]
+
+		List safeLabels = normalizeLabels(labels)
+		if (!safeLabels.isEmpty()) {
+			fields.labels = safeLabels
+		}
+
+		if (!blank(description)) {
+			fields.description = safe(description)
+		}
+
+		if (!blank(epicFieldId) && !blank(epicKey)) {
+			fields[epicFieldId] = safe(epicKey)
+		}
+
+		return doPostJson('/rest/api/2/issue', [fields: fields])
 	}
 
 	// =========================================================================
@@ -232,24 +281,18 @@ class JiraGateway {
 				responseBody = responseStream.getText('UTF-8')
 			}
 
-			return buildResponse(status, responseBody, connection)
+			return [
+				status     : status,
+				body       : safeRaw(responseBody),
+				json       : parseJsonSilently(responseBody),
+				contentType: safe(connection?.getHeaderField('Content-Type'))
+			]
 		} finally {
 			try {
 				connection?.disconnect()
 			} catch (Exception ignored) {
 			}
 		}
-	}
-
-	private Map buildResponse(int status, String responseBody, HttpURLConnection connection) {
-		Object parsedJson = parseJsonSilently(responseBody)
-
-		return [
-			status     : status,
-			body       : safeRaw(responseBody),
-			json       : parsedJson,
-			contentType: safe(connection?.getHeaderField('Content-Type'))
-		]
 	}
 
 	// =========================================================================
@@ -324,6 +367,10 @@ class JiraGateway {
 		HttpsURLConnection.setDefaultHostnameVerifier({ String hostname, SSLSession session -> true } as HostnameVerifier)
 	}
 
+	// =========================================================================
+	// VALUE HELPERS
+	// =========================================================================
+
 	private String buildJUnitImportPath(String projectKey, String testPlanKey) {
 		List<String> params = []
 
@@ -337,10 +384,6 @@ class JiraGateway {
 
 		return '/rest/raven/1.0/import/execution/junit' + (params.isEmpty() ? '' : '?' + params.join('&'))
 	}
-
-	// =========================================================================
-	// SMALL HELPERS
-	// =========================================================================
 
 	private Object parseJsonSilently(String body) {
 		String text = safeRaw(body)
@@ -358,6 +401,45 @@ class JiraGateway {
 		} catch (Exception ignored) {
 			return null
 		}
+	}
+
+	private String defaultProjectKey() {
+		return firstNonBlank(
+			readOwnerText('PROJECT_KEY'),
+			readOwnerText('DEFAULT_PROJECT_KEY'),
+			readOwnerText('JIRA_PROJECT_KEY')
+		)
+	}
+
+	private String defaultEpicFieldId() {
+		return firstNonBlank(
+			readOwnerText('EPIC_FIELD_ID'),
+			'customfield_10008'
+		)
+	}
+
+	private List defaultLabels() {
+		return normalizeLabels(readOwnerText('LABELS'))
+	}
+
+	private List normalizeLabels(def raw) {
+		if (raw == null) {
+			return []
+		}
+
+		if (raw instanceof Collection) {
+			return raw.findAll { !blank(it) }.collect { safe(it) }
+		}
+
+		String value = safe(raw)
+		if (value.isEmpty()) {
+			return []
+		}
+
+		return value
+			.split(',')
+			collect { safe(it) }
+			.findAll { !it.isEmpty() }
 	}
 
 	private String readOwnerText(String propertyName) {
@@ -419,380 +501,6 @@ class JiraGateway {
 
 	private String safeRaw(def value) {
 		return value == null ? '' : String.valueOf(value)
-	}
-
-	private String firstNonBlank(Object... values) {
-		if (values == null) {
-			return ''
-		}
-
-		for (Object value : values) {
-			String text = safe(value)
-			if (!text.isEmpty()) {
-				return text
-			}
-		}
-
-		return ''
-	}
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-package jiraIntegration
-
-import com.kms.katalon.core.util.KeywordUtil
-
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.util.LinkedHashSet
-import java.util.Set
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
-
-class JiraExecutionPublisher {
-
-	private final def owner
-	private final JiraGateway gateway
-
-	JiraExecutionPublisher(def owner, JiraGateway gateway) {
-		this.owner = owner
-		this.gateway = gateway
-	}
-
-	Map publishExecution(Map request) {
-		String issueKey = firstNonBlank(
-			request?.issueKey,
-			request?.executionKey,
-			request?.testExecutionKey,
-			request?.jiraExecutionKey
-		)
-
-		File reportFolder = resolveFolder(firstNonBlank(
-			request?.reportFolder,
-			request?.reportFolderPath,
-			request?.folder
-		))
-
-		File explicitHtml = resolveFile(firstNonBlank(
-			request?.htmlReport,
-			request?.htmlReportPath,
-			request?.htmlFile
-		), reportFolder)
-
-		return publishExecutionInternal(issueKey, reportFolder, explicitHtml)
-	}
-
-	Map publishExecution(String issueKey, String reportFolderPath, String htmlReportPath) {
-		return publishExecutionInternal(
-			issueKey,
-			resolveFolder(reportFolderPath),
-			resolveFile(htmlReportPath, resolveFolder(reportFolderPath))
-		)
-	}
-
-	Map publishExecution(String issueKey, String reportFolderPath) {
-		return publishExecutionInternal(
-			issueKey,
-			resolveFolder(reportFolderPath),
-			null
-		)
-	}
-
-	Map publishExecution(String issueKey, File reportFolder, File htmlReportFile) {
-		return publishExecutionInternal(issueKey, reportFolder, htmlReportFile)
-	}
-
-	// =========================================================================
-	// CORE
-	// =========================================================================
-
-	private Map publishExecutionInternal(String issueKey, File reportFolder, File explicitHtmlFile) {
-		if (blank(issueKey)) {
-			KeywordUtil.logInfo('Skipping attachment publish because execution key is empty.')
-			return [uploaded: [], failed: []]
-		}
-
-		if (reportFolder == null || !reportFolder.exists()) {
-			KeywordUtil.logInfo('Skipping attachment publish because report folder was not found.')
-			return [uploaded: [], failed: []]
-		}
-
-		File htmlReport = explicitHtmlFile
-		if (htmlReport == null || !htmlReport.exists()) {
-			htmlReport = findFirstExisting(reportFolder, [
-				readOwnerText('HTML_REPORT_FILE_NAME'),
-				readOwnerText('RESULT_REPORT_NAME'),
-				'JiraReport.html'
-			])
-		}
-
-		File xmlReport = findFirstExisting(reportFolder, [
-			readOwnerText('PRIMARY_XML_FILE_NAME'),
-			readOwnerText('SECONDARY_XML_FILE_NAME'),
-			'JUnit_Report.xml',
-			'cucumber.json'
-		])
-
-		File evidenceZip = findFirstExisting(reportFolder, [
-			readOwnerText('EVIDENCE_ZIP_NAME'),
-			'Evidences.zip'
-		])
-
-		File resultsZip = findFirstExisting(reportFolder, [
-			readOwnerText('RESULT_ZIP_NAME'),
-			'Results.zip'
-		])
-
-		if (evidenceZip == null || !evidenceZip.exists()) {
-			File evidenceFolder = resolveFile(firstNonBlank(
-				readOwnerText('EVIDENCE_FOLDER_NAME'),
-				'evidence'
-			), reportFolder)
-
-			if (evidenceFolder != null && evidenceFolder.exists() && evidenceFolder.isDirectory()) {
-				evidenceZip = new File(reportFolder, firstNonBlank(readOwnerText('EVIDENCE_ZIP_NAME'), 'Evidences.zip'))
-				createZipFromFolder(evidenceFolder, evidenceZip)
-			}
-		}
-
-		if (resultsZip == null || !resultsZip.exists()) {
-			resultsZip = new File(reportFolder, firstNonBlank(readOwnerText('RESULT_ZIP_NAME'), 'Results.zip'))
-			createZipFromFolder(reportFolder, resultsZip, ['.zip'])
-		}
-
-		Set<File> attachments = new LinkedHashSet<>()
-
-		addIfExists(attachments, htmlReport)
-		addIfExists(attachments, xmlReport)
-		addIfExists(attachments, resultsZip)
-		addIfExists(attachments, evidenceZip)
-
-		List<String> uploaded = []
-		List<String> failed = []
-
-		attachments.each { File file ->
-			try {
-				KeywordUtil.logInfo('Uploading attachment: ' + file.absolutePath)
-				Map response = gateway.uploadAttachment(issueKey, file)
-				int status = asInt(response?.status)
-
-				if (status >= 200 && status < 300) {
-					uploaded << file.name
-					KeywordUtil.logInfo('Attachment uploaded successfully: ' + file.name)
-				} else {
-					failed << file.name
-					KeywordUtil.logInfo('Attachment upload failed: ' + file.name + ' | status=' + status + ' | body=' + safe(response?.body))
-				}
-			} catch (Exception ex) {
-				failed << file.name
-				KeywordUtil.logInfo('Attachment upload exception: ' + file.name + ' | ' + ex.message)
-			}
-		}
-
-		return [
-			uploaded: uploaded,
-			failed  : failed
-		]
-	}
-
-	// =========================================================================
-	// FILE HELPERS
-	// =========================================================================
-
-	private void addIfExists(Set<File> files, File candidate) {
-		if (candidate != null && candidate.exists() && candidate.isFile()) {
-			files << candidate
-		}
-	}
-
-	private File findFirstExisting(File baseFolder, List<String> candidateNames) {
-		List<String> names = (candidateNames ?: []).findAll { !blank(it) }.collect { safe(it) }
-
-		for (String name : names) {
-			File direct = resolveFile(name, baseFolder)
-			if (direct != null && direct.exists() && direct.isFile()) {
-				return direct
-			}
-		}
-
-		for (String name : names) {
-			File recursive = findFileRecursively(baseFolder, name)
-			if (recursive != null && recursive.exists() && recursive.isFile()) {
-				return recursive
-			}
-		}
-
-		return null
-	}
-
-	private File findFileRecursively(File folder, String expectedName) {
-		if (folder == null || !folder.exists() || !folder.isDirectory() || blank(expectedName)) {
-			return null
-		}
-
-		File[] children = folder.listFiles()
-		if (children == null) {
-			return null
-		}
-
-		for (File child : children) {
-			if (child.isFile() && child.name.equalsIgnoreCase(expectedName)) {
-				return child
-			}
-		}
-
-		for (File child : children) {
-			if (child.isDirectory()) {
-				File nested = findFileRecursively(child, expectedName)
-				if (nested != null) {
-					return nested
-				}
-			}
-		}
-
-		return null
-	}
-
-	private void createZipFromFolder(File sourceFolder, File zipFile) {
-		createZipFromFolder(sourceFolder, zipFile, [])
-	}
-
-	private void createZipFromFolder(File sourceFolder, File zipFile, List<String> ignoredExtensions) {
-		if (sourceFolder == null || !sourceFolder.exists() || !sourceFolder.isDirectory()) {
-			return
-		}
-
-		if (zipFile == null) {
-			return
-		}
-
-		if (zipFile.exists()) {
-			return
-		}
-
-		ZipOutputStream zos = null
-
-		try {
-			zos = new ZipOutputStream(new FileOutputStream(zipFile))
-			String rootPath = sourceFolder.absolutePath
-
-			sourceFolder.eachFileRecurse { File file ->
-				if (!file.isFile()) {
-					return
-				}
-
-				if (file.absolutePath.equalsIgnoreCase(zipFile.absolutePath)) {
-					return
-				}
-
-				String lowerName = file.name.toLowerCase()
-				for (String ext : (ignoredExtensions ?: [])) {
-					if (!blank(ext) && lowerName.endsWith(ext.toLowerCase())) {
-						return
-					}
-				}
-
-				String relativePath = file.absolutePath.substring(rootPath.length() + 1).replace('\\', '/')
-				zos.putNextEntry(new ZipEntry(relativePath))
-
-				FileInputStream fis = new FileInputStream(file)
-				try {
-					byte[] buffer = new byte[4096]
-					int len
-					while ((len = fis.read(buffer)) > 0) {
-						zos.write(buffer, 0, len)
-					}
-				} finally {
-					fis.close()
-				}
-
-				zos.closeEntry()
-			}
-		} catch (Exception ex) {
-			KeywordUtil.logInfo('Could not create zip file: ' + safe(zipFile?.absolutePath) + ' | ' + ex.message)
-		} finally {
-			try {
-				zos?.close()
-			} catch (Exception ignored) {
-			}
-		}
-	}
-
-	private File resolveFolder(String path) {
-		if (blank(path)) {
-			return null
-		}
-
-		File folder = new File(path)
-		return folder
-	}
-
-	private File resolveFile(String path, File baseFolder) {
-		if (blank(path)) {
-			return null
-		}
-
-		File direct = new File(path)
-		if (direct.exists()) {
-			return direct
-		}
-
-		if (baseFolder != null) {
-			File nested = new File(baseFolder, path)
-			if (nested.exists()) {
-				return nested
-			}
-		}
-
-		return direct
-	}
-
-	// =========================================================================
-	// SMALL HELPERS
-	// =========================================================================
-
-	private String readOwnerText(String propertyName) {
-		if (owner == null || blank(propertyName)) {
-			return ''
-		}
-
-		try {
-			def property = owner.metaClass?.hasProperty(owner, propertyName)
-			if (property == null) {
-				return ''
-			}
-			return safe(owner."${propertyName}")
-		} catch (Exception ignored) {
-			return ''
-		}
-	}
-
-	private int asInt(def value) {
-		try {
-			return Integer.parseInt(safe(value))
-		} catch (Exception ignored) {
-			return -1
-		}
-	}
-
-	private boolean blank(def value) {
-		return safe(value).isEmpty()
-	}
-
-	private String safe(def value) {
-		return value == null ? '' : String.valueOf(value).trim()
 	}
 
 	private String firstNonBlank(Object... values) {
