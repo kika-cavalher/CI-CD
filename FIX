@@ -1,5 +1,209 @@
+	package jiraIntegration
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSession
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+
+class JiraGateway {
+
+	private final Object owner
+	private static boolean SSL_READY = false
+
+	JiraGateway() {
+		this(null)
+	}
+
+	JiraGateway(Object owner) {
+		this.owner = owner
+		configureUnsafeSslIfNeeded()
+	}
+
 	// =========================================================================
-	// EXECUTION IMPORT
+	// VALIDATION
+	// =========================================================================
+
+	void validateRequiredConfiguration() {
+		String baseUrl = getBaseUrl()
+		String authHeader = buildAuthorizationHeader()
+
+		if (blank(baseUrl)) {
+			throw new IllegalStateException('JIRA_BASE_URL is required')
+		}
+
+		if (blank(authHeader)) {
+			throw new IllegalStateException('JIRA authentication is required. Set JIRA_TOKEN or JIRA_USER/JIRA_PASSWORD')
+		}
+	}
+
+	// =========================================================================
+	// ISSUE METHODS
+	// =========================================================================
+
+	Map getIssue(String issueKey) {
+		return getIssueByKey(issueKey)
+	}
+
+	Map getIssueByKey(String issueKey) {
+		return getIssueByKey(issueKey, '')
+	}
+
+	Map getIssueByKey(String issueKey, String fieldsCsv) {
+		validateRequiredConfiguration()
+
+		if (blank(issueKey)) {
+			throw new IllegalArgumentException('Issue key is required')
+		}
+
+		Map query = [:]
+		if (notBlank(fieldsCsv)) {
+			query.fields = fieldsCsv
+		}
+
+		String path = '/rest/api/2/issue/' + encodePath(issueKey) + buildQueryString(query)
+		return doJsonRequest('GET', path, null, [:])
+	}
+
+	Map searchIssues(String jql) {
+		return searchIssues(jql, 200, 0)
+	}
+
+	Map searchIssues(String jql, int maxResults) {
+		return searchIssues(jql, maxResults, 0)
+	}
+
+	Map searchIssues(String jql, int maxResults, int startAt) {
+		validateRequiredConfiguration()
+
+		if (blank(jql)) {
+			throw new IllegalArgumentException('JQL is required')
+		}
+
+		Map query = [
+			jql       : jql,
+			maxResults: maxResults,
+			startAt   : startAt
+		]
+
+		return doJsonRequest('GET', '/rest/api/2/search' + buildQueryString(query), null, [:])
+	}
+
+	Map createIssue(Map issueFields) {
+		validateRequiredConfiguration()
+
+		Map payload = [:]
+
+		if (issueFields instanceof Map && issueFields.containsKey('fields')) {
+			payload = issueFields
+		} else {
+			payload = [fields: issueFields ?: [:]]
+		}
+
+		return doJsonRequest('POST', '/rest/api/2/issue', payload, [:])
+	}
+
+	Map updateIssue(String issueKey, Map payload) {
+		validateRequiredConfiguration()
+
+		if (blank(issueKey)) {
+			throw new IllegalArgumentException('Issue key is required')
+		}
+
+		return doJsonRequest('PUT', '/rest/api/2/issue/' + encodePath(issueKey), payload ?: [:], [:])
+	}
+
+	// =========================================================================
+	// TEST PLAN METHODS
+	// =========================================================================
+
+	Map findTestPlans(String projectKey, String summary) {
+		String escapedProject = escapeJql(projectKey)
+		String escapedSummary = escapeJql(summary)
+
+		String jql = 'project = "' + escapedProject + '" AND issuetype = "Test Plan"'
+		if (notBlank(summary)) {
+			jql += ' AND summary ~ "\\"' + escapedSummary + '\\""'
+		}
+		jql += ' ORDER BY created DESC'
+
+		return searchIssues(jql, 200, 0)
+	}
+
+	Map searchTestPlans(String projectKey, String summary) {
+		return findTestPlans(projectKey, summary)
+	}
+
+	Map createTestPlan(String projectKey, String summary) {
+		return createTestPlan(projectKey, summary, '')
+	}
+
+	Map createTestPlan(String projectKey, String summary, String description) {
+		Map fields = [
+			project    : [key: projectKey],
+			summary    : summary,
+			issuetype  : [name: 'Test Plan']
+		]
+
+		if (notBlank(description)) {
+			fields.description = description
+		}
+
+		return createIssue(fields)
+	}
+
+	Map createTestPlanIssue(String projectKey, String summary, String description) {
+		return createTestPlan(projectKey, summary, description)
+	}
+
+	Map addExecutionToTestPlan(String testPlanKey, String testExecKey) {
+		List<String> executionKeys = []
+		if (notBlank(testExecKey)) {
+			executionKeys << testExecKey
+		}
+		return addExecutionToTestPlan(testPlanKey, executionKeys)
+	}
+
+	Map addExecutionToTestPlan(String testPlanKey, List<String> testExecKeys) {
+		validateRequiredConfiguration()
+
+		if (blank(testPlanKey)) {
+			throw new IllegalArgumentException('Test Plan key is required')
+		}
+
+		List<String> cleanKeys = (testExecKeys ?: []).findAll { String key ->
+			notBlank(key)
+		}
+
+		if (cleanKeys.isEmpty()) {
+			return [status: 200, ok: true, data: []]
+		}
+
+		String path = '/rest/raven/1.0/api/testplan/' + encodePath(testPlanKey) + '/testexecution'
+		return doJsonRequest('POST', path, cleanKeys, [:])
+	}
+
+	Map addTestExecutionToTestPlan(String testPlanKey, String testExecKey) {
+		return addExecutionToTestPlan(testPlanKey, testExecKey)
+	}
+
+	Map linkExecutionToTestPlan(String testPlanKey, String testExecKey) {
+		return addExecutionToTestPlan(testPlanKey, testExecKey)
+	}
+
+	// =========================================================================
+	// EXECUTION IMPORT METHODS
 	// =========================================================================
 
 	Map importJunitExecution(File junitXmlFile, String projectKey, String testPlanKey) {
@@ -54,3 +258,443 @@
 			]
 		)
 	}
+
+	Map importXmlExecution(File junitXmlFile, String projectKey, String testPlanKey) {
+		return importExecutionResults(junitXmlFile, projectKey, testPlanKey, '')
+	}
+
+	// =========================================================================
+	// ATTACHMENTS
+	// =========================================================================
+
+	Map attachFile(String issueKey, File file) {
+		validateRequiredConfiguration()
+
+		if (blank(issueKey)) {
+			throw new IllegalArgumentException('Issue key is required')
+		}
+
+		if (file == null || !file.exists() || !file.isFile()) {
+			throw new IllegalArgumentException('Attachment file was not found: ' + safePath(file))
+		}
+
+		String path = '/rest/api/2/issue/' + encodePath(issueKey) + '/attachments'
+
+		return doMultipartFileRequest(
+			'POST',
+			path,
+			file,
+			'file',
+			detectMimeType(file),
+			[
+				'X-Atlassian-Token': 'no-check'
+			]
+		)
+	}
+
+	Map addAttachment(String issueKey, File file) {
+		return attachFile(issueKey, file)
+	}
+
+	Map attachEvidence(String issueKey, File file) {
+		return attachFile(issueKey, file)
+	}
+
+	// =========================================================================
+	// LOW LEVEL HTTP
+	// =========================================================================
+
+	private Map doJsonRequest(String method, String path, Object payload, Map extraHeaders) {
+		HttpURLConnection connection = openConnection(method, path)
+
+		Map<String, String> headers = defaultHeaders(payload != null ? 'application/json' : null)
+		headers.putAll(normalizeHeaderMap(extraHeaders))
+		applyHeaders(connection, headers)
+
+		if (payload != null) {
+			connection.doOutput = true
+			byte[] bodyBytes = JsonOutput.toJson(payload).getBytes(StandardCharsets.UTF_8)
+
+			connection.outputStream.withCloseable { output ->
+				output.write(bodyBytes)
+				output.flush()
+			}
+		}
+
+		return readResponse(connection)
+	}
+
+	private Map doMultipartFileRequest(String method, String path, File file, String fieldName, String contentType, Map extraHeaders) {
+		HttpURLConnection connection = openConnection(method, path)
+		String boundary = '----ChatGPTBoundary' + System.currentTimeMillis()
+
+		Map<String, String> headers = defaultHeaders('multipart/form-data; boundary=' + boundary)
+		headers.putAll(normalizeHeaderMap(extraHeaders))
+		applyHeaders(connection, headers)
+
+		connection.doOutput = true
+
+		OutputStream output = connection.outputStream
+		OutputStreamWriter writer = new OutputStreamWriter(output, StandardCharsets.UTF_8)
+
+		try {
+			writer.write('--' + boundary + '\r\n')
+			writer.write('Content-Disposition: form-data; name="' + safe(fieldName) + '"; filename="' + escapeHeaderValue(file.name) + '"\r\n')
+			writer.write('Content-Type: ' + safe(contentType) + '\r\n\r\n')
+			writer.flush()
+
+			file.withInputStream { input ->
+				byte[] buffer = new byte[8192]
+				int read = 0
+				while ((read = input.read(buffer)) != -1) {
+					output.write(buffer, 0, read)
+				}
+				output.flush()
+			}
+
+			writer.write('\r\n')
+			writer.write('--' + boundary + '--\r\n')
+			writer.flush()
+		} finally {
+			try {
+				writer.close()
+			} catch (Exception ignored) {
+			}
+			try {
+				output.close()
+			} catch (Exception ignored) {
+			}
+		}
+
+		return readResponse(connection)
+	}
+
+	private HttpURLConnection openConnection(String method, String path) {
+		validateRequiredConfiguration()
+
+		String fullUrl = getBaseUrl() + safe(path)
+		HttpURLConnection connection = (HttpURLConnection) new URL(fullUrl).openConnection()
+
+		connection.requestMethod = safe(method).toUpperCase(Locale.ENGLISH)
+		connection.connectTimeout = 120000
+		connection.readTimeout = 120000
+		connection.useCaches = false
+		connection.instanceFollowRedirects = true
+		connection.doInput = true
+
+		return connection
+	}
+
+	private Map readResponse(HttpURLConnection connection) {
+		int status = connection.responseCode
+		String text = readResponseText(connection)
+
+		def parsed = parseJson(text)
+
+		Map result
+		if (parsed instanceof Map) {
+			result = parsed as Map
+		} else if (parsed != null) {
+			result = [data: parsed]
+		} else {
+			result = [raw: text]
+		}
+
+		result.status = status
+		result.ok = (status >= 200 && status < 300)
+		result.body = text
+
+		return result
+	}
+
+	private String readResponseText(HttpURLConnection connection) {
+		InputStream stream = null
+
+		try {
+			stream = connection.responseCode >= 400 ? connection.errorStream : connection.inputStream
+		} catch (Exception ignored) {
+		}
+
+		if (stream == null) {
+			return ''
+		}
+
+		try {
+			return stream.getText('UTF-8')
+		} finally {
+			try {
+				stream.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private Object parseJson(String body) {
+		if (blank(body)) {
+			return null
+		}
+
+		try {
+			return new JsonSlurper().parseText(body)
+		} catch (Exception ignored) {
+			return null
+		}
+	}
+
+	private void applyHeaders(HttpURLConnection connection, Map<String, String> headers) {
+		headers.each { String key, String value ->
+			if (notBlank(key) && notBlank(value)) {
+				connection.setRequestProperty(key, value)
+			}
+		}
+	}
+
+	private Map<String, String> defaultHeaders(String contentType) {
+		Map<String, String> headers = [:]
+
+		String authorization = buildAuthorizationHeader()
+		if (notBlank(authorization)) {
+			headers['Authorization'] = authorization
+		}
+
+		headers['Accept'] = 'application/json'
+
+		if (notBlank(contentType)) {
+			headers['Content-Type'] = contentType
+		}
+
+		return headers
+	}
+
+	private Map<String, String> normalizeHeaderMap(Map rawHeaders) {
+		Map<String, String> result = [:]
+
+		(rawHeaders ?: [:]).each { key, value ->
+			String headerName = safe(key)
+			String headerValue = safe(value)
+
+			if (notBlank(headerName) && notBlank(headerValue)) {
+				result[headerName] = headerValue
+			}
+		}
+
+		return result
+	}
+
+	// =========================================================================
+	// CONFIG
+	// =========================================================================
+
+	private String getBaseUrl() {
+		String raw = readConfigValue('JIRA_BASE_URL', ['JIRA_URL'])
+		if (blank(raw)) {
+			return ''
+		}
+		return raw.endsWith('/') ? raw.substring(0, raw.length() - 1) : raw
+	}
+
+	private String buildAuthorizationHeader() {
+		String token = readConfigValue('JIRA_TOKEN', ['JIRA_API_TOKEN', 'JIRA_AUTH_TOKEN'])
+		if (notBlank(token)) {
+			String cleanToken = token.trim()
+			if (cleanToken.startsWith('Basic ') || cleanToken.startsWith('Bearer ')) {
+				return cleanToken
+			}
+			return 'Basic ' + cleanToken
+		}
+
+		String user = readConfigValue('JIRA_USER', ['JIRA_USERNAME', 'JIRA_EMAIL'])
+		String password = readConfigValue('JIRA_PASSWORD', ['JIRA_PASS'])
+
+		if (notBlank(user) && notBlank(password)) {
+			String base64 = (user + ':' + password).getBytes(StandardCharsets.UTF_8).encodeBase64().toString()
+			return 'Basic ' + base64
+		}
+
+		return ''
+	}
+
+	private String readConfigValue(String primaryName, List<String> aliases) {
+		List<String> names = []
+		names << primaryName
+		names.addAll(aliases ?: [])
+
+		for (String name : names) {
+			String ownerValue = readOwnerText(name)
+			if (notBlank(ownerValue)) {
+				return ownerValue
+			}
+
+			try {
+				String propertyValue = safe(System.getProperty(name))
+				if (notBlank(propertyValue)) {
+					return propertyValue
+				}
+			} catch (Exception ignored) {
+			}
+
+			try {
+				String envValue = safe(System.getenv(name))
+				if (notBlank(envValue)) {
+					return envValue
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		return ''
+	}
+
+	private String readOwnerText(String propertyName) {
+		if (owner == null || blank(propertyName)) {
+			return ''
+		}
+
+		try {
+			if (owner instanceof Map && owner.containsKey(propertyName)) {
+				return safe(owner[propertyName])
+			}
+		} catch (Exception ignored) {
+		}
+
+		try {
+			def metaProperty = owner.metaClass?.hasProperty(owner, propertyName)
+			if (metaProperty != null) {
+				return safe(metaProperty.getProperty(owner))
+			}
+		} catch (Exception ignored) {
+		}
+
+		try {
+			return safe(owner."${propertyName}")
+		} catch (Exception ignored) {
+		}
+
+		return ''
+	}
+
+	// =========================================================================
+	// SSL
+	// =========================================================================
+
+	private static synchronized void configureUnsafeSslIfNeeded() {
+		if (SSL_READY) {
+			return
+		}
+
+		try {
+			TrustManager[] trustAllManagers = [
+				new X509TrustManager() {
+					@Override
+					X509Certificate[] getAcceptedIssuers() {
+						return new X509Certificate[0]
+					}
+
+					@Override
+					void checkClientTrusted(X509Certificate[] chain, String authType) {
+					}
+
+					@Override
+					void checkServerTrusted(X509Certificate[] chain, String authType) {
+					}
+				}
+			] as TrustManager[]
+
+			SSLContext sslContext = SSLContext.getInstance('TLS')
+			sslContext.init(null, trustAllManagers, new SecureRandom())
+
+			HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.socketFactory)
+			HttpsURLConnection.setDefaultHostnameVerifier([
+				verify: { String hostName, SSLSession session -> true }
+			] as HostnameVerifier)
+		} catch (Exception ignored) {
+		}
+
+		SSL_READY = true
+	}
+
+	// =========================================================================
+	// HELPERS
+	// =========================================================================
+
+	private static String buildQueryString(Map query) {
+		Map clean = [:]
+
+		(query ?: [:]).each { key, value ->
+			if (value == null) {
+				return
+			}
+
+			if (value instanceof CharSequence && blank(String.valueOf(value))) {
+				return
+			}
+
+			clean[String.valueOf(key)] = String.valueOf(value)
+		}
+
+		if (clean.isEmpty()) {
+			return ''
+		}
+
+		List<String> pairs = clean.collect { String key, String value ->
+			return urlEncode(key) + '=' + urlEncode(value)
+		}
+
+		return '?' + pairs.join('&')
+	}
+
+	private static String encodePath(String value) {
+		return urlEncode(value).replace('+', '%20')
+	}
+
+	private static String urlEncode(String value) {
+		return URLEncoder.encode(safe(value), 'UTF-8')
+	}
+
+	private static String escapeJql(String value) {
+		return safe(value).replace('\\', '\\\\').replace('"', '\\"')
+	}
+
+	private static String escapeHeaderValue(String value) {
+		return safe(value).replace('"', '')
+	}
+
+	private static String detectMimeType(File file) {
+		String lower = safe(file?.name).toLowerCase(Locale.ENGLISH)
+
+		if (lower.endsWith('.xml')) return 'application/xml'
+		if (lower.endsWith('.html')) return 'text/html'
+		if (lower.endsWith('.zip')) return 'application/zip'
+		if (lower.endsWith('.png')) return 'image/png'
+		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+		if (lower.endsWith('.gif')) return 'image/gif'
+		if (lower.endsWith('.json')) return 'application/json'
+		if (lower.endsWith('.txt') || lower.endsWith('.log')) return 'text/plain'
+
+		return 'application/octet-stream'
+	}
+
+	private static String safePath(File file) {
+		if (file == null) {
+			return ''
+		}
+
+		try {
+			return safe(file.absolutePath)
+		} catch (Exception ignored) {
+			return safe(file?.path)
+		}
+	}
+
+	private static boolean blank(String value) {
+		return value == null || value.trim().isEmpty()
+	}
+
+	private static boolean notBlank(String value) {
+		return !blank(value)
+	}
+
+	private static String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
