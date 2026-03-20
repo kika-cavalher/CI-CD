@@ -1,268 +1,718 @@
-String createRuntimeJunitXmlFromKatalonLog(String reportFolder, String suiteName) {
-    return createRuntimeJunitXmlFromKatalonLog(reportFolder, suiteName, 'JUnit_Report.xml')
-}
+package jiraIntegration
 
-String createRuntimeJunitXmlFromKatalonLog(String reportFolder, String suiteName, String targetFileName) {
-    File reportDir = new File(safeLocal(reportFolder))
-    if (!reportDir.exists() || !reportDir.isDirectory()) {
-        return ''
+import java.io.File
+import java.text.DecimalFormat
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.regex.Pattern
+
+import groovy.util.XmlSlurper
+
+class JiraReportBuilder {
+
+    JiraFlowCoordinator owner
+    JiraHtmlTemplateBuilder templateBuilder
+
+    JiraReportBuilder(JiraFlowCoordinator owner) {
+        this.owner = owner
+        this.templateBuilder = new JiraHtmlTemplateBuilder()
     }
 
-    File logFile = findExecutionLogFile(reportDir)
-    if (logFile == null || !logFile.exists() || !logFile.isFile()) {
-        return ''
+    String createHtmlReport(String reportFolder, String suiteName, String xmlPath) {
+        return createHtmlReport(reportFolder, suiteName, xmlPath, '')
     }
 
-    List<Map> testCases = parseRuntimeCasesFromKatalonLog(logFile)
-
-    testCases = testCases.findAll { Map item ->
-        String name = safeLocal(item.name).toLowerCase(Locale.ENGLISH)
-        return !name.contains('/jira_import') &&
-               !name.contains('\\jira_import') &&
-               !name.contains('jiraintegration.jiraimport')
-    }
-
-    if (testCases.isEmpty()) {
-        return ''
-    }
-
-    File xmlFile = new File(reportDir, safeLocal(targetFileName).isEmpty() ? 'JUnit_Report.xml' : safeLocal(targetFileName))
-    writeRuntimeJunitXml(xmlFile, suiteName, testCases)
-    return xmlFile.absolutePath
-}
-
-private File findExecutionLogFile(File reportDir) {
-    if (reportDir == null || !reportDir.exists() || !reportDir.isDirectory()) {
-        return null
-    }
-
-    List<File> matches = []
-    collectFilesByName(reportDir, 'execution0.log', matches)
-
-    if (matches.isEmpty()) {
-        collectFilesEndingWith(reportDir, '.log', matches)
-    }
-
-    if (matches.isEmpty()) {
-        return null
-    }
-
-    matches.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
-    return matches[0]
-}
-
-private void collectFilesByName(File folder, String fileName, List<File> matches) {
-    File[] children = folder.listFiles()
-    if (children == null) {
-        return
-    }
-
-    for (File child : children) {
-        if (child.isDirectory()) {
-            collectFilesByName(child, fileName, matches)
-        } else if (safeLocal(child.name).equalsIgnoreCase(safeLocal(fileName))) {
-            matches.add(child)
-        }
-    }
-}
-
-private void collectFilesEndingWith(File folder, String suffix, List<File> matches) {
-    File[] children = folder.listFiles()
-    if (children == null) {
-        return
-    }
-
-    for (File child : children) {
-        if (child.isDirectory()) {
-            collectFilesEndingWith(child, suffix, matches)
-        } else if (safeLocal(child.name).toLowerCase(Locale.ENGLISH).endsWith(safeLocal(suffix).toLowerCase(Locale.ENGLISH))) {
-            matches.add(child)
-        }
-    }
-}
-
-private List<Map> parseRuntimeCasesFromKatalonLog(File logFile) {
-    List<String> lines = []
-    try {
-        lines = logFile.readLines('UTF-8')
-    } catch (Exception ignored) {
-        lines = logFile.readLines()
-    }
-
-    Map<String, Map> casesByName = new LinkedHashMap<String, Map>()
-
-    for (String rawLine : lines) {
-        String line = safeLocal(rawLine)
-        if (blankLocal(line)) {
-            continue
+    String createHtmlReport(String reportFolder, String suiteName, String xmlPath, String executionSummary) {
+        if (blank(reportFolder)) {
+            return ''
         }
 
-        Map parsed = parseSingleRuntimeCaseLine(line)
-        if (parsed == null) {
-            continue
+        File reportDir = new File(reportFolder)
+        if (!reportDir.exists() || !reportDir.isDirectory()) {
+            return ''
         }
 
-        String name = safeLocal(parsed.name)
-        if (blankLocal(name)) {
-            continue
-        }
+        Map parsedXml = parseXmlResults(xmlPath)
+        List<Map> logScenarios = parseExecutionLog(reportDir)
+        List<Map> scenarios = mergeScenarios(parsedXml.testCases as List<Map>, logScenarios, reportDir)
 
-        if (!casesByName.containsKey(name)) {
-            casesByName.put(name, [
-                name    : name,
-                status  : safeLocal(parsed.status),
-                duration: ((parsed.duration ?: 0L) as long),
-                message : safeLocal(parsed.message)
-            ])
-        } else {
-            Map existing = casesByName.get(name)
+        Map model = [
+            appName         : 'Execution',
+            suiteName       : safe(suiteName),
+            executionSummary: blank(executionSummary) ? safe(suiteName) : safe(executionSummary),
+            subtitle        : 'Execution overview',
+            generatedAt     : new Date(),
+            reportFolder    : reportDir.absolutePath,
+            logoSrc         : '',
+            headerBackground: '#4C1D95',
+            accentColor     : '#6D28D9',
+            accentSoftColor : '#F3E8FF',
+            infoColor       : '#7C3AED',
+            scenarios       : scenarios
+        ]
 
-            String newStatus = safeLocal(parsed.status)
-            if (!blankLocal(newStatus)) {
-                existing.status = newStatus
-            }
+        String html = templateBuilder.build(model)
 
-            long newDuration = ((parsed.duration ?: 0L) as long)
-            if (newDuration > 0L) {
-                existing.duration = newDuration
-            }
-
-            String newMessage = safeLocal(parsed.message)
-            if (!blankLocal(newMessage)) {
-                existing.message = newMessage
-            }
-        }
-    }
-
-    return new ArrayList<Map>(casesByName.values())
-}
-
-private Map parseSingleRuntimeCaseLine(String line) {
-    int index = line.indexOf('Test Cases/')
-    if (index < 0) {
-        return null
-    }
-
-    String tail = line.substring(index).trim()
-    if (blankLocal(tail)) {
-        return null
-    }
-
-    String detectedStatus = ''
-    String upper = tail.toUpperCase(Locale.ENGLISH)
-
-    if (upper.contains(' FAILED')) {
-        detectedStatus = 'failed'
-    } else if (upper.contains(' ERROR')) {
-        detectedStatus = 'failed'
-    } else if (upper.contains(' SKIPPED')) {
-        detectedStatus = 'skipped'
-    } else if (upper.contains(' PASSED')) {
-        detectedStatus = 'passed'
-    }
-
-    long durationMs = 0L
-    def durationMatcher = (tail =~ /\(([\d.,]+)s\)/)
-    if (durationMatcher.find()) {
+        String outputName = 'jiraReport.html'
         try {
-            String rawDuration = safeLocal(durationMatcher.group(1)).replace(',', '.')
-            durationMs = Math.round(Double.parseDouble(rawDuration) * 1000d)
+            if (!blank(owner?.safe(owner?.GAIA_REPORT_FILE_NAME))) {
+                outputName = owner.safe(owner.GAIA_REPORT_FILE_NAME)
+            }
         } catch (Exception ignored) {
-            durationMs = 0L
+        }
+
+        File output = new File(reportDir, outputName)
+        output.setText(html, 'UTF-8')
+        return output.absolutePath
+    }
+
+    String createRuntimeJunitXmlFromKatalonLog(String reportFolder, String suiteName) {
+        return createRuntimeJunitXmlFromKatalonLog(reportFolder, suiteName, null, '', '')
+    }
+
+    String createRuntimeJunitXmlFromKatalonLog(String reportFolder, String suiteName, Long totalDurationMs, String startTime, String endTime) {
+        if (blank(reportFolder)) {
+            return ''
+        }
+
+        File reportDir = new File(reportFolder)
+        if (!reportDir.exists() || !reportDir.isDirectory()) {
+            return ''
+        }
+
+        List<Map> scenarios = parseExecutionLog(reportDir)
+        if (scenarios.isEmpty()) {
+            return ''
+        }
+
+        long computedDuration = 0L
+        int failures = 0
+        int skipped = 0
+
+        StringBuilder xml = new StringBuilder()
+        xml.append('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n')
+        xml.append('<testsuite')
+
+        scenarios.each { Map scenario ->
+            computedDuration += toLong(scenario.durationMs)
+            String status = safe(scenario.status).toLowerCase(Locale.ENGLISH)
+            if (status == 'failed') {
+                failures++
+            } else if (status == 'skipped') {
+                skipped++
+            }
+        }
+
+        long suiteDuration = totalDurationMs != null && totalDurationMs.longValue() > 0L ? totalDurationMs.longValue() : computedDuration
+
+        xml.append(' name="').append(xmlEscape(blank(suiteName) ? 'Execution' : suiteName)).append('"')
+        xml.append(' tests="').append(scenarios.size()).append('"')
+        xml.append(' failures="').append(failures).append('"')
+        xml.append(' errors="0"')
+        xml.append(' skipped="').append(skipped).append('"')
+        xml.append(' time="').append(formatSeconds(suiteDuration)).append('"')
+        xml.append('>\n')
+
+        scenarios.eachWithIndex { Map scenario, int index ->
+            String caseName = blank(safe(scenario.name)) ? "Scenario ${index + 1}" : safe(scenario.name)
+            String className = blank(suiteName) ? 'Execution' : safe(suiteName)
+            long caseDuration = toLong(scenario.durationMs)
+            String status = safe(scenario.status).toLowerCase(Locale.ENGLISH)
+            String fullError = safe(scenario.fullError)
+            String visualError = safe(scenario.visualError)
+
+            xml.append('  <testcase')
+            xml.append(' classname="').append(xmlEscape(className)).append('"')
+            xml.append(' name="').append(xmlEscape(caseName)).append('"')
+            xml.append(' time="').append(formatSeconds(caseDuration)).append('"')
+            xml.append('>\n')
+
+            if (status == 'failed') {
+                xml.append('    <failure')
+                xml.append(' message="').append(xmlEscape(blank(visualError) ? 'Execution failed' : visualError)).append('">')
+                xml.append(xmlEscape(blank(fullError) ? visualError : fullError))
+                xml.append('</failure>\n')
+            } else if (status == 'skipped') {
+                xml.append('    <skipped message="Skipped"/>').append('\n')
+            }
+
+            xml.append('  </testcase>\n')
+        }
+
+        xml.append('</testsuite>\n')
+
+        File output = new File(reportDir, 'JUnit_Report.xml')
+        output.setText(xml.toString(), 'UTF-8')
+        return output.absolutePath
+    }
+
+    private Map parseXmlResults(String xmlPath) {
+        List<Map> testCases = []
+
+        if (blank(xmlPath)) {
+            return [testCases: testCases]
+        }
+
+        File xmlFile = new File(xmlPath)
+        if (!xmlFile.exists() || !xmlFile.isFile()) {
+            return [testCases: testCases]
+        }
+
+        try {
+            def root = new XmlSlurper(false, false).parse(xmlFile)
+            String rootName = safe(root.name())
+
+            List suiteNodes = []
+            if ('testsuites'.equalsIgnoreCase(rootName)) {
+                suiteNodes.addAll(root.testsuite)
+            } else if ('testsuite'.equalsIgnoreCase(rootName)) {
+                suiteNodes << root
+            } else {
+                suiteNodes << root
+            }
+
+            suiteNodes.each { suiteNode ->
+                suiteNode.testcase.each { tc ->
+                    boolean failed = tc.failure?.size() > 0 || tc.error?.size() > 0
+                    boolean skipped = tc.skipped?.size() > 0
+
+                    String failureMessage = ''
+                    String fullError = ''
+
+                    if (failed) {
+                        def failureNode = tc.failure?.size() > 0 ? tc.failure[0] : tc.error[0]
+                        failureMessage = safe(failureNode.@message?.text())
+                        fullError = safe(failureNode.text())
+                        if (blank(failureMessage)) {
+                            failureMessage = firstLine(fullError)
+                        }
+                    }
+
+                    testCases << [
+                        name       : safe(tc.@name?.text()),
+                        className  : safe(tc.@classname?.text()),
+                        durationMs : parseSecondsToMillis(safe(tc.@time?.text())),
+                        status     : skipped ? 'skipped' : (failed ? 'failed' : 'passed'),
+                        visualError: failureMessage,
+                        fullError  : fullError,
+                        steps      : []
+                    ]
+                }
+            }
+        } catch (Exception ignored) {
+            return [testCases: []]
+        }
+
+        return [testCases: testCases]
+    }
+
+    private List<Map> parseExecutionLog(File reportDir) {
+        List<Map> scenarios = []
+        File logFile = findExecutionLog(reportDir)
+
+        if (logFile == null || !logFile.exists() || !logFile.isFile()) {
+            return scenarios
+        }
+
+        List<String> lines = readLinesSafe(logFile)
+        if (lines.isEmpty()) {
+            return scenarios
+        }
+
+        Map currentScenario = null
+
+        lines.each { String rawLine ->
+            String line = safe(rawLine)
+            if (blank(line)) {
+                return
+            }
+
+            String cleaned = removeAnsi(line)
+
+            String scenarioFromTree = extractScenarioFromTree(cleaned)
+            if (!blank(scenarioFromTree)) {
+                if (currentScenario != null) {
+                    finalizeScenario(currentScenario)
+                    scenarios << currentScenario
+                }
+                currentScenario = newScenarioMap(scenarioFromTree)
+                return
+            }
+
+            String scenarioFromKeyword = extractAfterToken(cleaned, 'TEST CASE:')
+            if (!blank(scenarioFromKeyword)) {
+                if (currentScenario != null) {
+                    finalizeScenario(currentScenario)
+                    scenarios << currentScenario
+                }
+                currentScenario = newScenarioMap(scenarioFromKeyword)
+                return
+            }
+
+            if (currentScenario == null) {
+                return
+            }
+
+            String stepFromKeyword = extractAfterToken(cleaned, 'TEST STEP:')
+            if (!blank(stepFromKeyword)) {
+                currentScenario.steps << [
+                    status   : inferStepStatus(stepFromKeyword),
+                    timestamp: extractTimeLabel(cleaned),
+                    detail   : stepFromKeyword,
+                    icon     : resolveStepIcon(stepFromKeyword, inferStepStatus(stepFromKeyword))
+                ]
+                return
+            }
+
+            if (looksLikeFailure(cleaned)) {
+                currentScenario.status = 'failed'
+                currentScenario.errorLines << cleaned
+                if (blank(currentScenario.visualError)) {
+                    currentScenario.visualError = firstLine(cleaned)
+                }
+                return
+            }
+
+            if (looksLikeSkip(cleaned) && currentScenario.status != 'failed') {
+                currentScenario.status = 'skipped'
+                return
+            }
+
+            if (looksLikePass(cleaned) && currentScenario.status == 'info') {
+                currentScenario.status = 'passed'
+                return
+            }
+
+            if (looksLikeDuration(cleaned)) {
+                long duration = parseDurationToMillis(cleaned)
+                if (duration > 0L) {
+                    currentScenario.durationMs = duration
+                }
+            }
+        }
+
+        if (currentScenario != null) {
+            finalizeScenario(currentScenario)
+            scenarios << currentScenario
+        }
+
+        return scenarios
+    }
+
+    private List<Map> mergeScenarios(List<Map> xmlCases, List<Map> logScenarios, File reportDir) {
+        List<Map> result = []
+
+        if (logScenarios != null && !logScenarios.isEmpty()) {
+            result.addAll(logScenarios)
+
+            if (xmlCases != null && !xmlCases.isEmpty()) {
+                int max = Math.min(result.size(), xmlCases.size())
+                for (int i = 0; i < max; i++) {
+                    Map logItem = result[i]
+                    Map xmlItem = xmlCases[i]
+
+                    if (blank(logItem.name)) {
+                        logItem.name = safe(xmlItem.name)
+                    }
+
+                    if (toLong(logItem.durationMs) <= 0L) {
+                        logItem.durationMs = toLong(xmlItem.durationMs)
+                    }
+
+                    if ('info'.equalsIgnoreCase(safe(logItem.status))) {
+                        logItem.status = safe(xmlItem.status)
+                    }
+
+                    if (blank(logItem.visualError)) {
+                        logItem.visualError = safe(xmlItem.visualError)
+                    }
+
+                    if (blank(logItem.fullError)) {
+                        logItem.fullError = safe(xmlItem.fullError)
+                    }
+                }
+            }
+        } else if (xmlCases != null) {
+            xmlCases.each { Map xmlItem ->
+                result << [
+                    id          : buildIdFromName(safe(xmlItem.name)),
+                    name        : safe(xmlItem.name),
+                    status      : safe(xmlItem.status),
+                    durationMs  : toLong(xmlItem.durationMs),
+                    visualError : safe(xmlItem.visualError),
+                    fullError   : safe(xmlItem.fullError),
+                    startShort  : '',
+                    endShort    : '',
+                    startLong   : '',
+                    endLong     : '',
+                    steps       : [],
+                    errorLines  : []
+                ]
+            }
+        }
+
+        attachScreenshots(result, reportDir)
+
+        result.each { Map item ->
+            item.durationLabel = formatDuration(toLong(item.durationMs))
+            item.startShort = safe(item.startShort)
+            item.endShort = safe(item.endShort)
+            item.startLong = safe(item.startLong)
+            item.endLong = safe(item.endLong)
+            item.summary = safe(item.visualError)
+            item.evidence = item.evidence instanceof List ? item.evidence : []
+            item.steps = item.steps instanceof List ? item.steps : []
+        }
+
+        return result
+    }
+
+    private void attachScreenshots(List<Map> scenarios, File reportDir) {
+        if (scenarios == null || scenarios.isEmpty()) {
+            return
+        }
+
+        List<File> images = collectImages(reportDir)
+        if (images.isEmpty()) {
+            scenarios.each { Map item -> item.evidence = [] }
+            return
+        }
+
+        List<Map> failedScenarios = scenarios.findAll { Map item ->
+            'failed'.equalsIgnoreCase(safe(item.status))
+        }
+
+        scenarios.each { Map item -> item.evidence = [] }
+
+        int count = Math.min(failedScenarios.size(), images.size())
+        for (int i = 0; i < count; i++) {
+            Map scenario = failedScenarios[i]
+            File image = images[i]
+            scenario.evidence = [[
+                name  : image.name,
+                href  : image.toURI().toString(),
+                imgSrc: image.toURI().toString(),
+                image : true
+            ]]
         }
     }
 
-    String name = tail
-    name = name.replaceAll(/\s+\([\d.,]+s\).*$/, '')
-    name = name.replaceAll(/\s+(PASSED|FAILED|ERROR|SKIPPED)\.?$/, '')
-    name = name.trim()
+    private List<File> collectImages(File reportDir) {
+        List<File> images = []
 
-    if (blankLocal(name)) {
-        return null
-    }
+        List<File> roots = []
+        roots << reportDir
+        if (reportDir.parentFile != null) {
+            roots << reportDir.parentFile
+        }
 
-    return [
-        name    : name,
-        status  : blankLocal(detectedStatus) ? 'passed' : detectedStatus,
-        duration: durationMs,
-        message : ''
-    ]
-}
-
-private void writeRuntimeJunitXml(File xmlFile, String suiteName, List<Map> testCases) {
-    int failures = testCases.count { Map item -> safeLocal(item.status) == 'failed' }
-    int skipped = testCases.count { Map item -> safeLocal(item.status) == 'skipped' }
-
-    long totalDurationMs = 0L
-    testCases.each { Map item ->
-        totalDurationMs += ((item.duration ?: 0L) as long)
-    }
-
-    xmlFile.parentFile?.mkdirs()
-
-    OutputStreamWriter writer = null
-    try {
-        writer = new OutputStreamWriter(new FileOutputStream(xmlFile), 'UTF-8')
-        MarkupBuilder xml = new MarkupBuilder(writer)
-        xml.setDoubleQuotes(true)
-
-        xml.mkp.xmlDeclaration(version: '1.0', encoding: 'UTF-8')
-
-        xml.testsuite(
-            name: safeLocal(suiteName),
-            tests: String.valueOf(testCases.size()),
-            failures: String.valueOf(failures),
-            errors: '0',
-            skipped: String.valueOf(skipped),
-            time: toJUnitSeconds(totalDurationMs)
-        ) {
-            for (Map item : testCases) {
-                String caseName = safeLocal(item.name)
-                String status = safeLocal(item.status)
-                long durationMs = ((item.duration ?: 0L) as long)
-                String message = safeLocal(item.message)
-
-                testcase(
-                    classname: safeLocal(suiteName),
-                    name: caseName,
-                    time: toJUnitSeconds(durationMs)
-                ) {
-                    if (status == 'failed') {
-                        failure(message: blankLocal(message) ? 'Failed' : message, 'Failed')
-                    } else if (status == 'skipped') {
-                        skipped(message: 'Skipped')
+        roots.unique { File f -> f.absolutePath }.each { File root ->
+            if (root != null && root.exists()) {
+                root.eachFileRecurse { File item ->
+                    if (item.isFile() && isImage(item.name) && !item.name.toLowerCase(Locale.ENGLISH).contains('logo')) {
+                        images << item
                     }
                 }
             }
         }
-    } finally {
+
+        images.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+        return images
+    }
+
+    private File findExecutionLog(File reportDir) {
+        List<File> candidates = []
+
+        reportDir.eachFileRecurse { File file ->
+            if (file.isFile()) {
+                String name = safe(file.name).toLowerCase(Locale.ENGLISH)
+                if (name.startsWith('execution') && name.endsWith('.log')) {
+                    candidates << file
+                }
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        candidates.sort { File a, File b -> a.lastModified() <=> b.lastModified() }
+        return candidates.last()
+    }
+
+    private List<String> readLinesSafe(File file) {
         try {
-            writer?.close()
+            return file.readLines('UTF-8')
         } catch (Exception ignored) {
+            try {
+                return file.readLines()
+            } catch (Exception ignoredAgain) {
+                return []
+            }
         }
     }
-}
 
-private String toJUnitSeconds(long durationMs) {
-    if (durationMs <= 0L) {
-        return '0'
+    private Map newScenarioMap(String name) {
+        return [
+            id         : buildIdFromName(name),
+            name       : name,
+            status     : 'info',
+            durationMs : 0L,
+            visualError: '',
+            fullError  : '',
+            startShort : '',
+            endShort   : '',
+            startLong  : '',
+            endLong    : '',
+            steps      : [],
+            errorLines : [],
+            evidence   : []
+        ]
     }
-    BigDecimal seconds = new BigDecimal(durationMs).divide(new BigDecimal(1000))
-    return seconds.stripTrailingZeros().toPlainString()
+
+    private void finalizeScenario(Map scenario) {
+        if (scenario == null) {
+            return
+        }
+
+        if ((scenario.steps as List).isEmpty() && blank(scenario.fullError) && !blank(scenario.visualError)) {
+            scenario.fullError = scenario.visualError
+        }
+
+        if (blank(scenario.fullError) && scenario.errorLines instanceof List && !scenario.errorLines.isEmpty()) {
+            scenario.fullError = (scenario.errorLines as List<String>).join('\n')
+        }
+
+        if (blank(scenario.visualError) && !blank(scenario.fullError)) {
+            scenario.visualError = firstLine(scenario.fullError)
+        }
+
+        if ('info'.equalsIgnoreCase(safe(scenario.status))) {
+            boolean hasFailedStep = (scenario.steps as List<Map>).any { Map step ->
+                'failed'.equalsIgnoreCase(safe(step.status))
+            }
+            boolean hasSkippedStep = (scenario.steps as List<Map>).any { Map step ->
+                'skipped'.equalsIgnoreCase(safe(step.status))
+            }
+
+            if (hasFailedStep) {
+                scenario.status = 'failed'
+            } else if (hasSkippedStep) {
+                scenario.status = 'skipped'
+            } else {
+                scenario.status = 'passed'
+            }
+        }
+    }
+
+    private String extractScenarioFromTree(String rawLine) {
+        String line = safe(rawLine)
+
+        def matcher = (line =~ /Test Cases\/(.+?)(?:\s*\([\d.,]+s\))?$/)
+        if (matcher.find()) {
+            return safe(matcher.group(1))
+        }
+
+        return ''
+    }
+
+    private String extractAfterToken(String rawLine, String token) {
+        String line = safe(rawLine)
+        int idx = line.indexOf(token)
+        if (idx < 0) {
+            return ''
+        }
+
+        String value = line.substring(idx + token.length()).trim()
+        if (value.startsWith(':')) {
+            value = value.substring(1).trim()
+        }
+        return safe(value)
+    }
+
+    private boolean looksLikeFailure(String rawLine) {
+        String line = safe(rawLine).toLowerCase(Locale.ENGLISH)
+        return line.contains('stepfailedexception') ||
+               line.contains('caused by:') ||
+               line.contains('reason:') ||
+               line.contains(' error ') ||
+               line.startsWith('error ') ||
+               line.contains(' failed') ||
+               line.contains('unable to')
+    }
+
+    private boolean looksLikeSkip(String rawLine) {
+        String line = safe(rawLine).toLowerCase(Locale.ENGLISH)
+        return line.contains(' skipped')
+    }
+
+    private boolean looksLikePass(String rawLine) {
+        String line = safe(rawLine).toLowerCase(Locale.ENGLISH)
+        return line.contains(' passed')
+    }
+
+    private boolean looksLikeDuration(String rawLine) {
+        String line = safe(rawLine).toLowerCase(Locale.ENGLISH)
+        return line.contains('elapsed time:') || line ==~ /.*\([\d.,]+s\).*/
+    }
+
+    private String inferStepStatus(String detail) {
+        String lower = safe(detail).toLowerCase(Locale.ENGLISH)
+        if (lower.contains('fail')) {
+            return 'failed'
+        }
+        if (lower.contains('skip')) {
+            return 'skipped'
+        }
+        if (lower.contains('pass')) {
+            return 'passed'
+        }
+        return 'info'
+    }
+
+    private String extractTimeLabel(String rawLine) {
+        def matcher = (safe(rawLine) =~ /\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2})/)
+        return matcher.find() ? safe(matcher.group(1)) : ''
+    }
+
+    private long parseDurationToMillis(String raw) {
+        String value = safe(raw).replace(',', '.')
+        if (blank(value)) {
+            return 0L
+        }
+
+        def matcherSeconds = (value =~ /([\d.]+)\s*s/)
+        if (matcherSeconds.find()) {
+            try {
+                return Math.round(Double.parseDouble(safe(matcherSeconds.group(1))) * 1000d)
+            } catch (Exception ignored) {
+                return 0L
+            }
+        }
+
+        def matcherElapsed = (value =~ /Elapsed time:\s*([\d.,]+)s/i)
+        if (matcherElapsed.find()) {
+            try {
+                return Math.round(Double.parseDouble(safe(matcherElapsed.group(1)).replace(',', '.')) * 1000d)
+            } catch (Exception ignored) {
+                return 0L
+            }
+        }
+
+        return 0L
+    }
+
+    private long parseSecondsToMillis(String raw) {
+        String value = safe(raw).replace(',', '.')
+        if (blank(value)) {
+            return 0L
+        }
+
+        try {
+            return Math.round(Double.parseDouble(value) * 1000d)
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    private String formatSeconds(long millis) {
+        BigDecimal seconds = new BigDecimal(millis).divide(new BigDecimal(1000), 3, BigDecimal.ROUND_HALF_UP)
+        return new DecimalFormat('0.###').format(seconds)
+    }
+
+    private String formatDuration(long durationMs) {
+        if (durationMs < 0L) {
+            durationMs = 0L
+        }
+
+        long totalSeconds = Math.round(durationMs / 1000d)
+        long hours = (long) (totalSeconds / 3600L)
+        long minutes = (long) ((totalSeconds % 3600L) / 60L)
+        long seconds = (long) (totalSeconds % 60L)
+
+        return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+    }
+
+    private String resolveStepIcon(String detail, String status) {
+        String lower = safe(detail).toLowerCase(Locale.ENGLISH)
+
+        if ('failed'.equalsIgnoreCase(status)) {
+            return '❌'
+        }
+        if ('skipped'.equalsIgnoreCase(status)) {
+            return '⏭️'
+        }
+        if (lower.contains('wait')) {
+            return '🔎'
+        }
+        if (lower.contains('click') || lower.contains('select') || lower.contains('fill') || lower.contains('import')) {
+            return '🖱️'
+        }
+        if (lower.contains('open') || lower.contains('navigate')) {
+            return '🌐'
+        }
+        return 'ℹ️'
+    }
+
+    private boolean isImage(String fileName) {
+        String lower = safe(fileName).toLowerCase(Locale.ENGLISH)
+        return lower.endsWith('.png') ||
+               lower.endsWith('.jpg') ||
+               lower.endsWith('.jpeg') ||
+               lower.endsWith('.gif') ||
+               lower.endsWith('.webp') ||
+               lower.endsWith('.bmp')
+    }
+
+    private String buildIdFromName(String value) {
+        String text = safe(value).toLowerCase(Locale.ENGLISH).replaceAll(/[^a-z0-9]+/, '-')
+        while (text.contains('--')) {
+            text = text.replace('--', '-')
+        }
+        return text.replaceAll(/^-+|-+$/, '')
+    }
+
+    private String firstLine(String value) {
+        String text = safe(value)
+        if (blank(text)) {
+            return ''
+        }
+        List<String> lines = text.readLines().collect { safe(it) }.findAll { !blank(it) }
+        return lines.isEmpty() ? '' : lines[0]
+    }
+
+    private String xmlEscape(String value) {
+        return safe(value)
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&apos;')
+    }
+
+    private String removeAnsi(String value) {
+        return safe(value).replaceAll(/\u001B\[[;\d]*m/, '')
+    }
+
+    private long toLong(def value) {
+        String raw = safe(value)
+        if (blank(raw)) {
+            return 0L
+        }
+
+        try {
+            return Long.parseLong(raw)
+        } catch (Exception ignored) {
+            return 0L
+        }
+    }
+
+    private String safe(def value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+
+    private boolean blank(def value) {
+        return safe(value).isEmpty()
+    }
 }
-
-private String safeLocal(def value) {
-    return value == null ? '' : String.valueOf(value).trim()
-}
-
-private boolean blankLocal(def value) {
-    return safeLocal(value).isEmpty()
-}
-
-
-
-
-
-import groovy.xml.MarkupBuilder
-import java.io.FileOutputStream
-import java.io.OutputStreamWriter
