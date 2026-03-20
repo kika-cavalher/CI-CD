@@ -1,121 +1,268 @@
-package jiraIntegration
+String createRuntimeJunitXmlFromKatalonLog(String reportFolder, String suiteName) {
+    return createRuntimeJunitXmlFromKatalonLog(reportFolder, suiteName, 'JUnit_Report.xml')
+}
 
-import com.kms.katalon.core.util.KeywordUtil
-
-class JiraTestPlanManager {
-
-    JiraFlowCoordinator owner
-    JiraGateway gateway
-
-    JiraTestPlanManager(JiraFlowCoordinator owner, JiraGateway gateway) {
-        this.owner = owner
-        this.gateway = gateway
-    }
-
-    String getOrCreateTestPlanKey() {
-        if (!owner.isBlank(owner.MANUAL_TEST_PLAN_KEY)) {
-            KeywordUtil.logInfo("Using manual Test Plan key: ${owner.MANUAL_TEST_PLAN_KEY}")
-            return owner.safe(owner.MANUAL_TEST_PLAN_KEY)
-        }
-
-        if (!owner.FORCE_CREATE_NEW_TEST_PLAN) {
-            String savedKey = getSavedValidTestPlanKey()
-            if (!owner.isBlank(savedKey)) {
-                return savedKey
-            }
-
-            String existingKey = findExistingTestPlanKey()
-            if (!owner.isBlank(existingKey)) {
-                owner.saveSuiteTestPlanKey(existingKey)
-                return existingKey
-            }
-        }
-
-        String createdKey = createTestPlan()
-        if (!owner.isBlank(createdKey) && !createdKey.startsWith('ERROR')) {
-            owner.saveSuiteTestPlanKey(createdKey)
-        }
-
-        return createdKey
-    }
-
-    String getSavedValidTestPlanKey() {
-        String savedKey = owner.readSavedSuiteTestPlanKey()
-        if (owner.isBlank(savedKey)) {
-            return ''
-        }
-
-        Map savedIssueResult = gateway.getIssueByKey(savedKey)
-        int statusCode = (savedIssueResult?.statusCode ?: 0) as int
-        if (statusCode != 200) {
-            KeywordUtil.logInfo("Saved Test Plan key is no longer valid: ${savedKey}")
-            return ''
-        }
-
-        String expectedSummary = owner.getTestPlanName()
-        String savedSummary = owner.safe(savedIssueResult?.issue?.fields?.summary)
-        String savedType = owner.safe(savedIssueResult?.issue?.fields?.issuetype?.name)
-
-        if (owner.normalizeTitle(savedSummary) == owner.normalizeTitle(expectedSummary) &&
-            owner.normalizeTitle(savedType) == 'test plan') {
-            KeywordUtil.logInfo("Using saved Test Plan key for suite ${owner.getCurrentSuiteName()}: ${savedKey}")
-            return savedKey
-        }
-
-        KeywordUtil.logInfo("Saved Test Plan key does not match current suite/title. Ignoring key: ${savedKey}")
+String createRuntimeJunitXmlFromKatalonLog(String reportFolder, String suiteName, String targetFileName) {
+    File reportDir = new File(safeLocal(reportFolder))
+    if (!reportDir.exists() || !reportDir.isDirectory()) {
         return ''
     }
 
-    String findExistingTestPlanKey() {
-        String expectedSummary = owner.getTestPlanName()
-        Map response = gateway.searchTestPlans(expectedSummary, owner.EPIC_KEY)
+    File logFile = findExecutionLogFile(reportDir)
+    if (logFile == null || !logFile.exists() || !logFile.isFile()) {
+        return ''
+    }
 
-        int statusCode = (response?.statusCode ?: 0) as int
-        if (statusCode != 200) {
-            KeywordUtil.logInfo("Search Test Plan failed with status: ${statusCode}")
-            return ''
+    List<Map> testCases = parseRuntimeCasesFromKatalonLog(logFile)
+
+    testCases = testCases.findAll { Map item ->
+        String name = safeLocal(item.name).toLowerCase(Locale.ENGLISH)
+        return !name.contains('/jira_import') &&
+               !name.contains('\\jira_import') &&
+               !name.contains('jiraintegration.jiraimport')
+    }
+
+    if (testCases.isEmpty()) {
+        return ''
+    }
+
+    File xmlFile = new File(reportDir, safeLocal(targetFileName).isEmpty() ? 'JUnit_Report.xml' : safeLocal(targetFileName))
+    writeRuntimeJunitXml(xmlFile, suiteName, testCases)
+    return xmlFile.absolutePath
+}
+
+private File findExecutionLogFile(File reportDir) {
+    if (reportDir == null || !reportDir.exists() || !reportDir.isDirectory()) {
+        return null
+    }
+
+    List<File> matches = []
+    collectFilesByName(reportDir, 'execution0.log', matches)
+
+    if (matches.isEmpty()) {
+        collectFilesEndingWith(reportDir, '.log', matches)
+    }
+
+    if (matches.isEmpty()) {
+        return null
+    }
+
+    matches.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
+    return matches[0]
+}
+
+private void collectFilesByName(File folder, String fileName, List<File> matches) {
+    File[] children = folder.listFiles()
+    if (children == null) {
+        return
+    }
+
+    for (File child : children) {
+        if (child.isDirectory()) {
+            collectFilesByName(child, fileName, matches)
+        } else if (safeLocal(child.name).equalsIgnoreCase(safeLocal(fileName))) {
+            matches.add(child)
+        }
+    }
+}
+
+private void collectFilesEndingWith(File folder, String suffix, List<File> matches) {
+    File[] children = folder.listFiles()
+    if (children == null) {
+        return
+    }
+
+    for (File child : children) {
+        if (child.isDirectory()) {
+            collectFilesEndingWith(child, suffix, matches)
+        } else if (safeLocal(child.name).toLowerCase(Locale.ENGLISH).endsWith(safeLocal(suffix).toLowerCase(Locale.ENGLISH))) {
+            matches.add(child)
+        }
+    }
+}
+
+private List<Map> parseRuntimeCasesFromKatalonLog(File logFile) {
+    List<String> lines = []
+    try {
+        lines = logFile.readLines('UTF-8')
+    } catch (Exception ignored) {
+        lines = logFile.readLines()
+    }
+
+    Map<String, Map> casesByName = new LinkedHashMap<String, Map>()
+
+    for (String rawLine : lines) {
+        String line = safeLocal(rawLine)
+        if (blankLocal(line)) {
+            continue
         }
 
-        List issues = response?.issues instanceof List ? (response.issues as List) : []
-        if (issues.isEmpty()) {
-            KeywordUtil.logInfo("No existing Test Plan found for summary: ${expectedSummary}")
-            return ''
+        Map parsed = parseSingleRuntimeCaseLine(line)
+        if (parsed == null) {
+            continue
         }
 
-        for (def issue : issues) {
-            String issueSummary = owner.safe(issue?.fields?.summary)
-            String issueType = owner.safe(issue?.fields?.issuetype?.name)
+        String name = safeLocal(parsed.name)
+        if (blankLocal(name)) {
+            continue
+        }
 
-            boolean sameSummary = owner.normalizeTitle(issueSummary) == owner.normalizeTitle(expectedSummary)
-            boolean sameType = owner.normalizeTitle(issueType) == 'test plan'
+        if (!casesByName.containsKey(name)) {
+            casesByName.put(name, [
+                name    : name,
+                status  : safeLocal(parsed.status),
+                duration: ((parsed.duration ?: 0L) as long),
+                message : safeLocal(parsed.message)
+            ])
+        } else {
+            Map existing = casesByName.get(name)
 
-            if (sameSummary && sameType) {
-                String key = owner.safe(issue?.key)
-                if (!owner.isBlank(key)) {
-                    KeywordUtil.logInfo("Existing Test Plan found: ${key}")
-                    return key
+            String newStatus = safeLocal(parsed.status)
+            if (!blankLocal(newStatus)) {
+                existing.status = newStatus
+            }
+
+            long newDuration = ((parsed.duration ?: 0L) as long)
+            if (newDuration > 0L) {
+                existing.duration = newDuration
+            }
+
+            String newMessage = safeLocal(parsed.message)
+            if (!blankLocal(newMessage)) {
+                existing.message = newMessage
+            }
+        }
+    }
+
+    return new ArrayList<Map>(casesByName.values())
+}
+
+private Map parseSingleRuntimeCaseLine(String line) {
+    int index = line.indexOf('Test Cases/')
+    if (index < 0) {
+        return null
+    }
+
+    String tail = line.substring(index).trim()
+    if (blankLocal(tail)) {
+        return null
+    }
+
+    String detectedStatus = ''
+    String upper = tail.toUpperCase(Locale.ENGLISH)
+
+    if (upper.contains(' FAILED')) {
+        detectedStatus = 'failed'
+    } else if (upper.contains(' ERROR')) {
+        detectedStatus = 'failed'
+    } else if (upper.contains(' SKIPPED')) {
+        detectedStatus = 'skipped'
+    } else if (upper.contains(' PASSED')) {
+        detectedStatus = 'passed'
+    }
+
+    long durationMs = 0L
+    def durationMatcher = (tail =~ /\(([\d.,]+)s\)/)
+    if (durationMatcher.find()) {
+        try {
+            String rawDuration = safeLocal(durationMatcher.group(1)).replace(',', '.')
+            durationMs = Math.round(Double.parseDouble(rawDuration) * 1000d)
+        } catch (Exception ignored) {
+            durationMs = 0L
+        }
+    }
+
+    String name = tail
+    name = name.replaceAll(/\s+\([\d.,]+s\).*$/, '')
+    name = name.replaceAll(/\s+(PASSED|FAILED|ERROR|SKIPPED)\.?$/, '')
+    name = name.trim()
+
+    if (blankLocal(name)) {
+        return null
+    }
+
+    return [
+        name    : name,
+        status  : blankLocal(detectedStatus) ? 'passed' : detectedStatus,
+        duration: durationMs,
+        message : ''
+    ]
+}
+
+private void writeRuntimeJunitXml(File xmlFile, String suiteName, List<Map> testCases) {
+    int failures = testCases.count { Map item -> safeLocal(item.status) == 'failed' }
+    int skipped = testCases.count { Map item -> safeLocal(item.status) == 'skipped' }
+
+    long totalDurationMs = 0L
+    testCases.each { Map item ->
+        totalDurationMs += ((item.duration ?: 0L) as long)
+    }
+
+    xmlFile.parentFile?.mkdirs()
+
+    OutputStreamWriter writer = null
+    try {
+        writer = new OutputStreamWriter(new FileOutputStream(xmlFile), 'UTF-8')
+        MarkupBuilder xml = new MarkupBuilder(writer)
+        xml.setDoubleQuotes(true)
+
+        xml.mkp.xmlDeclaration(version: '1.0', encoding: 'UTF-8')
+
+        xml.testsuite(
+            name: safeLocal(suiteName),
+            tests: String.valueOf(testCases.size()),
+            failures: String.valueOf(failures),
+            errors: '0',
+            skipped: String.valueOf(skipped),
+            time: toJUnitSeconds(totalDurationMs)
+        ) {
+            for (Map item : testCases) {
+                String caseName = safeLocal(item.name)
+                String status = safeLocal(item.status)
+                long durationMs = ((item.duration ?: 0L) as long)
+                String message = safeLocal(item.message)
+
+                testcase(
+                    classname: safeLocal(suiteName),
+                    name: caseName,
+                    time: toJUnitSeconds(durationMs)
+                ) {
+                    if (status == 'failed') {
+                        failure(message: blankLocal(message) ? 'Failed' : message, 'Failed')
+                    } else if (status == 'skipped') {
+                        skipped(message: 'Skipped')
+                    }
                 }
             }
         }
-
-        KeywordUtil.logInfo("Search returned Test Plans, but none matched summary exactly: ${expectedSummary}")
-        return ''
-    }
-
-    String createTestPlan() {
-        String summary = owner.getTestPlanName()
-        KeywordUtil.logInfo("Creating new Test Plan with summary: ${summary}")
-
-        String createdKey = gateway.createTestPlan(summary, owner.EPIC_KEY)
-        if (owner.isBlank(createdKey)) {
-            return 'ERROR: empty Test Plan key returned from Jira'
+    } finally {
+        try {
+            writer?.close()
+        } catch (Exception ignored) {
         }
-
-        if (createdKey.startsWith('ERROR')) {
-            return createdKey
-        }
-
-        KeywordUtil.logInfo("New Test Plan created successfully: ${createdKey}")
-        return createdKey
     }
 }
+
+private String toJUnitSeconds(long durationMs) {
+    if (durationMs <= 0L) {
+        return '0'
+    }
+    BigDecimal seconds = new BigDecimal(durationMs).divide(new BigDecimal(1000))
+    return seconds.stripTrailingZeros().toPlainString()
+}
+
+private String safeLocal(def value) {
+    return value == null ? '' : String.valueOf(value).trim()
+}
+
+private boolean blankLocal(def value) {
+    return safeLocal(value).isEmpty()
+}
+
+
+
+
+
+import groovy.xml.MarkupBuilder
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
