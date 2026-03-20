@@ -1,511 +1,6 @@
 package jiraIntegration
 
-import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.exception.StepErrorException
-
-import java.io.File
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
-
-class JiraExecutionPublisher {
-
-	private final Object owner
-	private final JiraGateway gateway
-
-	JiraExecutionPublisher() {
-		this(null, null)
-	}
-
-	JiraExecutionPublisher(Object owner) {
-		this(owner, null)
-	}
-
-	JiraExecutionPublisher(Object owner, JiraGateway gateway) {
-		this.owner = owner
-		this.gateway = gateway != null ? gateway : new JiraGateway(owner)
-	}
-
-	// =========================================================================
-	// MAIN ENTRYPOINT
-	// =========================================================================
-
-	Map publishExecution(Object... args) {
-		Map request = normalizeRequest(args)
-
-		File reportFolder = resolveReportFolder(request)
-		File xmlFile = resolveXmlFile(request, reportFolder)
-
-		if (xmlFile == null || !xmlFile.exists()) {
-			throw new StepErrorException('JUnit_Report.xml was not found in the report folder.')
-		}
-
-		String projectKey = firstNonBlank(
-			request.projectKey,
-			readOwnerText('PROJECT_KEY'),
-			readOwnerText('PROJECT'),
-			readOwnerText('JIRA_PROJECT_KEY')
-		)
-
-		String executionTitle = firstNonBlank(
-			request.executionTitle,
-			readOwnerText('EXECUTION_TITLE'),
-			reportFolder?.parentFile?.name,
-			xmlFile.name
-		)
-
-		String testPlanKey = firstNonBlank(
-			request.testPlanKey,
-			request.savedTestPlanKey,
-			readOwnerText('MANUAL_TEST_PLAN_KEY'),
-			readOwnerText('SAVED_TEST_PLAN_KEY')
-		)
-
-		KeywordUtil.logInfo("Importing XML file: ${xmlFile.absolutePath}")
-
-		Map importResponse = gateway.importJunitExecution(xmlFile, projectKey, '')
-		KeywordUtil.logInfo("Import Results status: ${importResponse.status}")
-		KeywordUtil.logInfo("Import Results response: ${safe(importResponse.body)}")
-
-		if (!(importResponse.status in [200, 201])) {
-			throw new StepErrorException("Import execution failed with status ${importResponse.status}")
-		}
-
-		String executionKey = extractExecutionKey(importResponse)
-		if (blank(executionKey)) {
-			throw new StepErrorException('Could not resolve the Test Execution key from the import response.')
-		}
-
-		Map updateResponse = gateway.updateTestExecution(executionKey, executionTitle, executionTitle)
-		KeywordUtil.logInfo("Update Test Execution status: ${updateResponse.status}")
-		KeywordUtil.logInfo("Update Test Execution response: ${safe(updateResponse.body)}")
-
-		if (!(updateResponse.status in [200, 204])) {
-			throw new StepErrorException("Update Test Execution failed with status ${updateResponse.status}")
-		}
-
-		if (!blank(testPlanKey)) {
-			Map addExecutionResponse = gateway.addExecutionToTestPlan(testPlanKey, executionKey)
-			KeywordUtil.logInfo("Add execution to Test Plan status: ${addExecutionResponse.status}")
-			KeywordUtil.logInfo("Add execution to Test Plan response: ${safe(addExecutionResponse.body)}")
-
-			if (!(addExecutionResponse.status in [200, 201, 204])) {
-				throw new StepErrorException("Add execution to Test Plan failed with status ${addExecutionResponse.status}")
-			}
-		}
-
-		publishAttachmentsAndReport([
-			executionKey : executionKey,
-			reportFolder : reportFolder,
-			htmlReport   : request.htmlReport,
-			resultZip    : request.resultZip,
-			evidenceZip  : request.evidenceZip,
-			evidenceFolder: request.evidenceFolder
-		])
-
-		return [
-			status          : 200,
-			executionKey    : executionKey,
-			testExecutionKey: executionKey,
-			importResponse  : importResponse,
-			updateResponse  : updateResponse
-		]
-	}
-
-	// =========================================================================
-	// ATTACHMENTS
-	// =========================================================================
-
-	Map publishAttachmentsAndReport(Object... args) {
-		Map request = normalizeRequest(args)
-
-		String executionKey = firstNonBlank(
-			request.executionKey,
-			request.testExecutionKey,
-			request.issueKey
-		)
-
-		if (blank(executionKey)) {
-			return [status: 0, attached: 0]
-		}
-
-		File reportFolder = resolveReportFolder(request)
-		List<File> attachments = resolveAttachmentFiles(request, reportFolder)
-
-		int attached = 0
-
-		attachments.each { File file ->
-			try {
-				Map response = gateway.addAttachmentToIssue(executionKey, file)
-				KeywordUtil.logInfo("Attach file ${file.name} status: ${response.status}")
-				KeywordUtil.logInfo("Attach file ${file.name} response: ${safe(response.body)}")
-
-				if (response.status in [200, 201]) {
-					attached++
-				}
-			} catch (Exception ex) {
-				KeywordUtil.logInfo("Attachment skipped for ${file?.absolutePath}: ${safe(ex.message)}")
-			}
-		}
-
-		return [status: 200, attached: attached]
-	}
-
-	// =========================================================================
-	// REQUEST NORMALIZATION
-	// =========================================================================
-
-	private Map normalizeRequest(Object... args) {
-		Map request = [:]
-
-		if (args == null) {
-			return request
-		}
-
-		List flatArgs = []
-		args.each { Object arg ->
-			if (arg instanceof Object[]) {
-				flatArgs.addAll((arg as Object[]).toList())
-			} else {
-				flatArgs << arg
-			}
-		}
-
-		flatArgs.each { Object arg ->
-			if (arg == null) {
-				return
-			}
-
-			if (arg instanceof Map) {
-				request.putAll(arg as Map)
-				return
-			}
-
-			if (arg instanceof File) {
-				applyFileToRequest(request, arg as File)
-				return
-			}
-
-			String text = safe(arg)
-			if (blank(text)) {
-				return
-			}
-
-			File possibleFile = new File(text)
-			if (possibleFile.exists()) {
-				applyFileToRequest(request, possibleFile)
-				return
-			}
-
-			if (looksLikeIssueKey(text)) {
-				if (blank(request.testPlanKey)) {
-					request.testPlanKey = text
-				} else if (blank(request.executionKey)) {
-					request.executionKey = text
-				}
-				return
-			}
-
-			if (blank(request.executionTitle)) {
-				request.executionTitle = text
-				return
-			}
-
-			if (blank(request.reportFolder)) {
-				request.reportFolder = text
-			}
-		}
-
-		return request
-	}
-
-	private void applyFileToRequest(Map request, File file) {
-		if (file == null) {
-			return
-		}
-
-		if (file.isDirectory()) {
-			if (blank(request.reportFolder)) {
-				request.reportFolder = file.absolutePath
-			}
-			return
-		}
-
-		String lowerName = safe(file.name).toLowerCase(Locale.ENGLISH)
-
-		if (lowerName.endsWith('.xml')) {
-			request.xmlFile = file.absolutePath
-			return
-		}
-
-		if (lowerName.endsWith('.html')) {
-			request.htmlReport = file.absolutePath
-			return
-		}
-
-		if (lowerName.endsWith('.zip')) {
-			if (lowerName.contains('evidence')) {
-				request.evidenceZip = file.absolutePath
-			} else {
-				request.resultZip = file.absolutePath
-			}
-		}
-	}
-
-	// =========================================================================
-	// RESOLUTION
-	// =========================================================================
-
-	private File resolveReportFolder(Map request) {
-		String path = firstNonBlank(
-			request.reportFolder,
-			request.folder,
-			request.baseFolder,
-			readOwnerText('CUSTOM_REPORT_PATH'),
-			readOwnerText('REPORT_FOLDER')
-		)
-
-		if (!blank(path)) {
-			File folder = new File(path)
-			if (folder.exists() && folder.isDirectory()) {
-				return folder
-			}
-		}
-
-		return null
-	}
-
-	private File resolveXmlFile(Map request, File reportFolder) {
-		String explicitXml = firstNonBlank(
-			request.xmlFile,
-			request.junitXml,
-			request.primaryXml
-		)
-
-		if (!blank(explicitXml)) {
-			File explicitFile = new File(explicitXml)
-			if (explicitFile.exists() && explicitFile.isFile()) {
-				return explicitFile
-			}
-		}
-
-		String primaryName = firstNonBlank(readOwnerText('PRIMARY_XML_FILE_NAME'), 'JUnit_Report.xml')
-		String secondaryName = firstNonBlank(readOwnerText('SECONDARY_XML_FILE_NAME'), 'cucumberReport.xml')
-
-		if (reportFolder != null && reportFolder.exists()) {
-			File primary = new File(reportFolder, primaryName)
-			if (primary.exists() && primary.isFile()) {
-				return primary
-			}
-
-			File secondary = new File(reportFolder, secondaryName)
-			if (secondary.exists() && secondary.isFile()) {
-				return secondary
-			}
-
-			List<File> xmlCandidates = reportFolder.listFiles()?.findAll { File file ->
-				file.isFile() && safe(file.name).toLowerCase(Locale.ENGLISH).endsWith('.xml')
-			} ?: []
-
-			if (!xmlCandidates.isEmpty()) {
-				xmlCandidates.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
-				return xmlCandidates[0]
-			}
-		}
-
-		return null
-	}
-
-	private List<File> resolveAttachmentFiles(Map request, File reportFolder) {
-		List<File> files = []
-
-		File htmlReport = resolveAttachmentFile(
-			firstNonBlank(request.htmlReport),
-			reportFolder,
-			firstNonBlank(readOwnerText('HTML_REPORT_FILE_NAME'), 'jiraReport.html')
-		)
-		if (htmlReport != null) {
-			files << htmlReport
-		}
-
-		File resultZip = resolveAttachmentFile(
-			firstNonBlank(request.resultZip),
-			reportFolder,
-			firstNonBlank(readOwnerText('RESULT_ZIP_NAME'), 'Results.zip')
-		)
-		if (resultZip != null) {
-			files << resultZip
-		}
-
-		File evidenceZip = resolveAttachmentFile(
-			firstNonBlank(request.evidenceZip),
-			reportFolder,
-			firstNonBlank(readOwnerText('EVIDENCE_ZIP_NAME'), 'Evidences.zip')
-		)
-
-		if (evidenceZip == null) {
-			File evidenceFolder = resolveAttachmentFile(
-				firstNonBlank(request.evidenceFolder),
-				reportFolder,
-				firstNonBlank(readOwnerText('EVIDENCE_FOLDER_NAME'), 'evidence')
-			)
-
-			if (evidenceFolder != null && evidenceFolder.exists() && evidenceFolder.isDirectory()) {
-				File generatedZip = new File(reportFolder, firstNonBlank(readOwnerText('EVIDENCE_ZIP_NAME'), 'Evidences.zip'))
-				zipFolder(evidenceFolder, generatedZip)
-				if (generatedZip.exists()) {
-					evidenceZip = generatedZip
-				}
-			}
-		}
-
-		if (evidenceZip != null) {
-			files << evidenceZip
-		}
-
-		return files.findAll { File file -> file != null && file.exists() && file.isFile() }
-	}
-
-	private File resolveAttachmentFile(String explicitPath, File reportFolder, String defaultName) {
-		if (!blank(explicitPath)) {
-			File explicitFile = new File(explicitPath)
-			if (explicitFile.exists()) {
-				return explicitFile
-			}
-		}
-
-		if (reportFolder == null || blank(defaultName)) {
-			return null
-		}
-
-		File byDefault = new File(reportFolder, defaultName)
-		if (byDefault.exists()) {
-			return byDefault
-		}
-
-		return null
-	}
-
-	private void zipFolder(File sourceFolder, File zipFile) {
-		if (sourceFolder == null || !sourceFolder.exists() || !sourceFolder.isDirectory()) {
-			return
-		}
-
-		zipFile.parentFile?.mkdirs()
-
-		ZipOutputStream zipOutput = null
-
-		try {
-			zipOutput = new ZipOutputStream(new FileOutputStream(zipFile))
-			sourceFolder.eachFileRecurse { File child ->
-				if (!child.isFile()) {
-					return
-				}
-
-				String relativePath = sourceFolder.toPath().relativize(child.toPath()).toString().replace('\\', '/')
-				zipOutput.putNextEntry(new ZipEntry(relativePath))
-				zipOutput.write(Files.readAllBytes(child.toPath()))
-				zipOutput.closeEntry()
-			}
-		} finally {
-			try {
-				zipOutput?.close()
-			} catch (Exception ignored) {
-			}
-		}
-	}
-
-	// =========================================================================
-	// RESPONSE HELPERS
-	// =========================================================================
-
-	private String extractExecutionKey(Map importResponse) {
-		Object json = importResponse?.json
-
-		if (json instanceof Map) {
-			Map map = json as Map
-
-			String key = firstNonBlank(
-				map?.testExecIssue?.key,
-				map?.testExecutionKey,
-				map?.key,
-				map?.issueKey
-			)
-
-			if (!blank(key)) {
-				return key
-			}
-		}
-
-		String body = safe(importResponse?.body)
-		def matcher = (body =~ /"key"\s*:\s*"([A-Z][A-Z0-9_]+-\d+)"/)
-		if (matcher.find()) {
-			return safe(matcher.group(1))
-		}
-
-		return ''
-	}
-
-	// =========================================================================
-	// SMALL HELPERS
-	// =========================================================================
-
-	Map publish(Map request) {
-		return publishExecution(request)
-	}
-
-	private String readOwnerText(String propertyName) {
-		if (owner == null || blank(propertyName)) {
-			return ''
-		}
-
-		try {
-			def value = owner."${propertyName}"
-			return safe(value)
-		} catch (MissingPropertyException ignored) {
-			return ''
-		} catch (Exception ignored) {
-			return ''
-		}
-	}
-
-	private boolean looksLikeIssueKey(String text) {
-		return safe(text) ==~ /^[A-Z][A-Z0-9_]+-\d+$/
-	}
-
-	private String safe(Object value) {
-		return value == null ? '' : String.valueOf(value).trim()
-	}
-
-	private boolean blank(Object value) {
-		return safe(value).isEmpty()
-	}
-
-	private String firstNonBlank(Object... values) {
-		if (values == null) {
-			return ''
-		}
-
-		for (Object value : values) {
-			String text = safe(value)
-			if (!text.isEmpty()) {
-				return text
-			}
-		}
-
-		return ''
-	}
-}
-
-
-
-
-
-
-
-
-package jiraIntegration
 
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
@@ -527,6 +22,50 @@ class JiraGateway {
 
 	JiraGateway(Object owner) {
 		this.owner = owner
+	}
+
+	// =========================================================================
+	// VALIDATION
+	// =========================================================================
+
+	Map validateRequiredConfiguration() {
+		String baseUrl = firstNonBlank(
+			readOwnerText('JIRA_BASE_URL'),
+			readOwnerText('BASE_URL'),
+			readOwnerText('JIRA_URL')
+		)
+
+		String projectKey = firstNonBlank(
+			readOwnerText('PROJECT_KEY'),
+			readOwnerText('PROJECT'),
+			readOwnerText('JIRA_PROJECT_KEY')
+		)
+
+		String authHeader = resolveAuthorizationHeader()
+
+		List<String> missing = []
+
+		if (blank(baseUrl)) {
+			missing << 'JIRA_BASE_URL'
+		}
+
+		if (blank(projectKey)) {
+			missing << 'PROJECT_KEY'
+		}
+
+		if (blank(authHeader)) {
+			missing << 'JIRA_TOKEN / AUTHORIZATION_HEADER'
+		}
+
+		if (!missing.isEmpty()) {
+			throw new StepErrorException('Missing Jira required configuration: ' + missing.join(', '))
+		}
+
+		return [
+			baseUrl   : baseUrl,
+			projectKey: projectKey,
+			authHeader: authHeader
+		]
 	}
 
 	// =========================================================================
@@ -564,8 +103,16 @@ class JiraGateway {
 	}
 
 	Map createTestPlan(String summary, String description = '') {
-		String projectKey = firstNonBlank(readOwnerText('PROJECT_KEY'), readOwnerText('PROJECT'), readOwnerText('JIRA_PROJECT_KEY'))
-		String issueTypeName = firstNonBlank(readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'), 'Test Plan')
+		String projectKey = firstNonBlank(
+			readOwnerText('PROJECT_KEY'),
+			readOwnerText('PROJECT'),
+			readOwnerText('JIRA_PROJECT_KEY')
+		)
+
+		String issueTypeName = firstNonBlank(
+			readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'),
+			'Test Plan'
+		)
 
 		Map payload = [
 			fields: [
@@ -617,7 +164,12 @@ class JiraGateway {
 	}
 
 	Map importExecutionResults(File xmlFile) {
-		String projectKey = firstNonBlank(readOwnerText('PROJECT_KEY'), readOwnerText('PROJECT'), readOwnerText('JIRA_PROJECT_KEY'))
+		String projectKey = firstNonBlank(
+			readOwnerText('PROJECT_KEY'),
+			readOwnerText('PROJECT'),
+			readOwnerText('JIRA_PROJECT_KEY')
+		)
+
 		return importJunitExecution(xmlFile, projectKey, '')
 	}
 
@@ -781,8 +333,14 @@ class JiraGateway {
 
 	private String buildTestPlanJql(String projectKey, String summary) {
 		String project = safe(projectKey)
-		String testPlanIssueType = firstNonBlank(readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'), 'Test Plan')
-		String escapedSummary = safe(summary).replace('\\', '\\\\').replace('"', '\\"')
+		String testPlanIssueType = firstNonBlank(
+			readOwnerText('TEST_PLAN_ISSUE_TYPE_NAME'),
+			'Test Plan'
+		)
+
+		String escapedSummary = safe(summary)
+			.replace('\\', '\\\\')
+			.replace('"', '\\"')
 
 		return "project = \"${project}\" AND issuetype = \"${testPlanIssueType}\" AND summary ~ \"\\\"${escapedSummary}\\\"\" ORDER BY created DESC"
 	}
@@ -794,12 +352,24 @@ class JiraGateway {
 			readOwnerText('JIRA_URL')
 		)
 
+		String normalizedBase = safe(baseUrl)
+		if (normalizedBase.endsWith('/')) {
+			normalizedBase = normalizedBase.substring(0, normalizedBase.length() - 1)
+		}
+
 		String normalizedPath = safe(path)
+		if (!normalizedPath.startsWith('/')) {
+			normalizedPath = '/' + normalizedPath
+		}
+
 		StringBuilder builder = new StringBuilder()
-		builder.append(baseUrl)
+		builder.append(normalizedBase)
 		builder.append(normalizedPath)
 
-		Map cleanQuery = query.findAll { key, value -> !blank(value) }
+		Map cleanQuery = query.findAll { key, value ->
+			!blank(value)
+		}
+
 		if (!cleanQuery.isEmpty()) {
 			builder.append('?')
 			builder.append(cleanQuery.collect { key, value ->
@@ -887,4 +457,3 @@ class JiraGateway {
 		return ''
 	}
 }
-
