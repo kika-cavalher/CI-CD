@@ -1,23 +1,35 @@
 package jiraIntegration
 
 import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.net.URI
+import java.text.SimpleDateFormat
+import java.util.ArrayList
+import java.util.Date
+import java.util.LinkedHashSet
+import java.util.List
+import java.util.Locale
+import java.util.Set
 
-class JiraGaiaHtmlTemplateBuilder {
+class JiraHtmlTemplateBuilder {
 
-	private static final String APP_NAME = 'GAIA'
+	/*
+	 * Change this path only when you want to swap the logo image.
+	 */
+	private static final String LOGO_SRC = 'Image/ematch-logo.png'
+
+	private static final String APP_NAME = 'EMATCH'
 	private static final String REPORT_TITLE_PREFIX = 'Test report - '
-	private static final String LOGO_SRC = 'Image/gaia-logo.png'
 
 	private static final String STATUS_PASS = '#68b84b'
 	private static final String STATUS_FAIL = '#e05b4d'
 	private static final String STATUS_SKIP = '#d7b436'
-	private static final String STATUS_INFO = '#2f86eb'
+	private static final String STATUS_INFO = '#8b2cf5'
 
-	JiraGaiaHtmlTemplateBuilder() {
+	private static final String BANNER_START = '#1c22d6'
+	private static final String BANNER_MIDDLE = '#5b19ff'
+	private static final String BANNER_END = '#c21bb6'
+
+	JiraHtmlTemplateBuilder() {
 	}
 
 	String build(Map model) {
@@ -49,12 +61,12 @@ class JiraGaiaHtmlTemplateBuilder {
 		html.append('  <div class="top-banner-left">\n')
 		html.append('    <img class="brand-logo" src="')
 		html.append(htmlEscape(resolveLogoHref(view)))
-		html.append('" alt="GAIA logo">\n')
+		html.append('" alt="EMatch logo">\n')
 		html.append('    <div class="brand-copy">\n')
 		html.append('      <div class="banner-title">')
 		html.append(htmlEscape(view.reportTitle))
 		html.append('</div>\n')
-		html.append('      <div class="banner-subtitle">GAIA execution overview</div>\n')
+		html.append('      <div class="banner-subtitle">EMatch execution overview</div>\n')
 		html.append('    </div>\n')
 		html.append('  </div>\n')
 		html.append('  <div class="top-banner-right">\n')
@@ -119,6 +131,7 @@ class JiraGaiaHtmlTemplateBuilder {
 				safeModel.suite,
 				safeModel.executionName,
 				safeModel.title,
+				safeModel.collectionName,
 				'Execution'
 				)
 
@@ -134,7 +147,7 @@ class JiraGaiaHtmlTemplateBuilder {
 			reportTitle   : reportTitle,
 			suiteName     : suiteName,
 			generatedLabel: buildGeneratedLabel(safeModel),
-			reportFolder  : pickFirst(safeModel.reportFolder, safeModel.baseFolder, safeModel.executionFolder),
+			reportFolder  : pickFirst(safeModel.reportFolder, safeModel.baseFolder, safeModel.executionFolder, safeModel.folderPath),
 			logoSrc       : pickFirst(safeModel.logoSrc, LOGO_SRC),
 			scenarios     : scenarios,
 			passedCount   : passedCount,
@@ -145,18 +158,31 @@ class JiraGaiaHtmlTemplateBuilder {
 	}
 
 	private List<Map> normalizeScenarios(Map model) {
-		List rawList = asList(pickFirstObject(
+		List rawList = []
+		Object firstCollection = pickFirstObject(
 				model.scenarios,
 				model.tests,
+				model.testCases,
 				model.cases,
 				model.executions,
-				model.items
-				))
+				model.items,
+				model.children,
+				model.results
+				)
+
+		if (firstCollection != null) {
+			rawList = expandScenarioCandidates(firstCollection)
+		}
+
+		if (rawList.isEmpty()) {
+			rawList = findNestedScenarioMaps(model)
+		}
 
 		List<Map> result = []
+		Set<String> seen = new LinkedHashSet<String>()
 
 		rawList.eachWithIndex { def rawItem, int index ->
-			Map item = rawItem instanceof Map ? rawItem : [name: safeValue(rawItem)]
+			Map item = rawItem instanceof Map ? (rawItem as Map) : [name: safeValue(rawItem)]
 
 			String scenarioName = pickFirst(
 					item.scenarioName,
@@ -165,19 +191,36 @@ class JiraGaiaHtmlTemplateBuilder {
 					item.displayName,
 					item.shortName,
 					item.caseName,
+					item.testCaseName,
 					item.testName,
+					item.keyword,
 					"Scenario ${index + 1}"
 					)
 
-			String scenarioId = pickFirst(item.id, item.key, "scenario-${index + 1}")
-			String status = normalizeStatus(pickFirst(item.status, item.result, item.outcome, item.finalStatus))
+			String scenarioId = pickFirst(
+					item.id,
+					item.key,
+					item.caseId,
+					item.testCaseId,
+					item.uuid,
+					"scenario-${index + 1}"
+					)
+
+			String status = normalizeStatus(pickFirst(
+					item.status,
+					item.result,
+					item.outcome,
+					item.finalStatus,
+					item.executionStatus
+					))
 
 			String shortError = shorten(pickFirst(
 					item.visualError,
 					item.errorSummary,
 					item.errorShort,
 					item.failureMessage,
-					item.message
+					item.message,
+					item.errorMessage
 					), 95)
 
 			String rawStart = pickFirst(
@@ -213,14 +256,28 @@ class JiraGaiaHtmlTemplateBuilder {
 						item.stacktrace,
 						item.details,
 						item.rawLog,
-						item.stepTrace
+						item.stepTrace,
+						item.log,
+						item.logsText,
+						item.console,
+						item.logViewer
 						))
 			}
 
-			List<Map> evidence = normalizeEvidence(item, model)
-			if (status == 'failed' && evidence.size() > 1) {
-				evidence = [evidence.last()]
+			List<Map> evidence = normalizeEvidence(item, model, scenarioName)
+
+			String signature = [
+				safeValue(scenarioId),
+				safeValue(scenarioName),
+				safeValue(status),
+				safeValue(rawStart),
+				safeValue(rawEnd)
+			].join('|')
+
+			if (seen.contains(signature)) {
+				return
 			}
+			seen.add(signature)
 
 			result << [
 				id           : scenarioId,
@@ -237,7 +294,8 @@ class JiraGaiaHtmlTemplateBuilder {
 				item.errorSummary,
 				item.errorShort,
 				item.failureMessage,
-				item.message
+				item.message,
+				item.errorMessage
 				),
 				fullError    : pickFirst(
 				item.errorFull,
@@ -246,7 +304,10 @@ class JiraGaiaHtmlTemplateBuilder {
 				item.stackTrace,
 				item.stacktrace,
 				item.details,
-				item.errorLog
+				item.errorLog,
+				item.rawLog,
+				item.log,
+				item.console
 				),
 				steps        : steps,
 				evidence     : evidence
@@ -254,6 +315,137 @@ class JiraGaiaHtmlTemplateBuilder {
 		}
 
 		return result
+	}
+
+	private List<Map> expandScenarioCandidates(def node) {
+		List<Map> result = []
+
+		if (node == null) {
+			return result
+		}
+
+		if (node instanceof Map) {
+			Map map = node as Map
+
+			if (looksLikeScenario(map)) {
+				result << map
+				return result
+			}
+
+			[
+				map.scenarios,
+				map.tests,
+				map.testCases,
+				map.cases,
+				map.executions,
+				map.items,
+				map.children,
+				map.results,
+				map.nodes
+			].each { def nested ->
+				result.addAll(expandScenarioCandidates(nested))
+			}
+
+			return result
+		}
+
+		if (node instanceof Collection) {
+			(node as Collection).each { def child ->
+				result.addAll(expandScenarioCandidates(child))
+			}
+			return result
+		}
+
+		if (node.getClass().isArray()) {
+			(node as Object[]).each { def child ->
+				result.addAll(expandScenarioCandidates(child))
+			}
+		}
+
+		return result
+	}
+
+	private List<Map> findNestedScenarioMaps(def node) {
+		List<Map> result = []
+
+		if (node == null) {
+			return result
+		}
+
+		if (node instanceof Map) {
+			Map map = node as Map
+
+			if (looksLikeScenario(map)) {
+				result << map
+			}
+
+			map.values().each { def value ->
+				result.addAll(findNestedScenarioMaps(value))
+			}
+
+			return result
+		}
+
+		if (node instanceof Collection) {
+			(node as Collection).each { def value ->
+				result.addAll(findNestedScenarioMaps(value))
+			}
+			return result
+		}
+
+		if (node.getClass().isArray()) {
+			(node as Object[]).each { def value ->
+				result.addAll(findNestedScenarioMaps(value))
+			}
+		}
+
+		return result
+	}
+
+	private boolean looksLikeScenario(Map item) {
+		if (item == null || item.isEmpty()) {
+			return false
+		}
+
+		boolean hasName = hasAnyValue(
+				item.scenarioName,
+				item.name,
+				item.title,
+				item.displayName,
+				item.caseName,
+				item.testCaseName,
+				item.testName,
+				item.keyword
+				)
+
+		boolean hasTestSignal = hasAnyValue(
+				item.status,
+				item.result,
+				item.outcome,
+				item.finalStatus,
+				item.executionStatus,
+				item.steps,
+				item.stepRows,
+				item.logs,
+				item.rawLog,
+				item.log,
+				item.errorSummary,
+				item.errorMessage,
+				item.failureMessage,
+				item.duration,
+				item.durationMs,
+				item.elapsedMs,
+				item.evidence,
+				item.evidences,
+				item.images,
+				item.attachments
+				)
+
+		return hasName && hasTestSignal
+	}
+
+	private boolean hasAnyValue(Object... values) {
+		return pickFirstObject(values) != null
 	}
 
 	private List<Map> normalizeSteps(Map item) {
@@ -320,7 +512,29 @@ class JiraGaiaHtmlTemplateBuilder {
 
 		rawText.readLines().each { String rawLine ->
 			String line = safeValue(rawLine)
+
 			if (line.isEmpty()) {
+				return
+			}
+			if (line ==~ /^=+$/) {
+				return
+			}
+			if (line ==~ /^-+$/) {
+				return
+			}
+			if (line.startsWith('at ')) {
+				return
+			}
+			if (line.startsWith('java.')) {
+				return
+			}
+			if (line.startsWith('groovy.')) {
+				return
+			}
+			if (line.startsWith('com.kms.')) {
+				return
+			}
+			if (line.startsWith('internal.')) {
 				return
 			}
 
@@ -349,60 +563,80 @@ class JiraGaiaHtmlTemplateBuilder {
 					detail   : detail,
 					icon     : resolveStepIcon(detail, status)
 				]
+				return
+			}
+
+			def matcherC = (line =~ /^(\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?)\\s+(.*)$/)
+			if (matcherC.find()) {
+				String detail = safeValue(matcherC.group(2))
+				if (!detail.isEmpty()) {
+					result << [
+						status   : 'info',
+						timestamp: cleanClock(matcherC.group(1)),
+						detail   : detail,
+						icon     : resolveStepIcon(detail, 'info')
+					]
+				}
+				return
+			}
+
+			if (isHumanLogLine(line)) {
+				result << [
+					status   : 'info',
+					timestamp: '',
+					detail   : line,
+					icon     : resolveStepIcon(line, 'info')
+				]
 			}
 		}
 
 		return result
 	}
 
-	private Object firstPresent(Object... values) {
-		if (values == null) {
-			return null
+	private boolean isHumanLogLine(String line) {
+		String lower = safeValue(line).toLowerCase(Locale.ENGLISH)
+		if (lower.isEmpty()) {
+			return false
 		}
 
-		for (Object value : values) {
-			if (value == null) {
-				continue
-			}
+		List<String> allowedStarts = [
+			'starting',
+			'using',
+			'suite name',
+			'execution title',
+			'test plan',
+			'epic',
+			'assignee',
+			'junit xml',
+			'custom',
+			'search',
+			'create',
+			'new test plan',
+			'importing',
+			'import',
+			'update',
+			'add execution',
+			'attach',
+			'attaching',
+			'jira import completed',
+			'video recording',
+			'report generated',
+			'html report',
+			'csv report',
+			'screenshot',
+			'evidence'
+		]
 
-			if (value instanceof CharSequence && safeValue(value).isEmpty()) {
-				continue
-			}
-
-			return value
-		}
-
-		return null
-	}
-
-	private String firstNonBlank(Object... values) {
-		if (values == null) {
-			return ''
-		}
-
-		return firstNonBlankFromCollection(values.toList())
-	}
-
-	private String firstNonBlank(Collection values) {
-		return firstNonBlankFromCollection(values)
-	}
-
-	private String firstNonBlankFromCollection(Collection values) {
-		if (values == null) {
-			return ''
-		}
-
-		for (def value : values) {
-			String text = safeValue(value)
-			if (!text.isEmpty()) {
-				return text
+		for (String prefix : allowedStarts) {
+			if (lower.startsWith(prefix)) {
+				return true
 			}
 		}
 
-		return ''
+		return false
 	}
 
-	private List<Map> normalizeEvidence(Map item, Map model) {
+	private List<Map> normalizeEvidence(Map item, Map model, String scenarioName) {
 		List rawEvidence = []
 
 		if (item?.evidence instanceof Collection) {
@@ -418,12 +652,12 @@ class JiraGaiaHtmlTemplateBuilder {
 			rawEvidence.addAll(item.attachments as Collection)
 		}
 
-		if (rawEvidence.isEmpty()) {
-			return []
-		}
-
 		String baseFolder = firstNonBlank(
 				item?.reportFolder,
+				item?.folderPath,
+				item?.caseFolder,
+				item?.actualFolder,
+				item?.screenshotFolder,
 				model?.reportFolder,
 				model?.baseFolder,
 				model?.executionFolder
@@ -496,7 +730,93 @@ class JiraGaiaHtmlTemplateBuilder {
 			}
 		}
 
+		if (result.isEmpty()) {
+			result.addAll(discoverEvidenceFromFolder(baseFolder, scenarioName))
+		}
+
 		return result
+	}
+
+	private String firstNonBlank(Object... values) {
+		if (values == null) {
+			return ''
+		}
+
+		for (Object value : values) {
+			String text = safeValue(value)
+			if (!text.isEmpty()) {
+				return text
+			}
+		}
+
+		return ''
+	}
+
+	private List<Map> discoverEvidenceFromFolder(String baseFolder, String scenarioName) {
+		List<Map> result = []
+		File root = resolveFile(baseFolder, '')
+		if (root == null || !root.exists()) {
+			return result
+		}
+
+		List<File> images = []
+		try {
+			if (root.isFile()) {
+				if (isImageFile(root.name)) {
+					images << root
+				}
+			} else {
+				root.eachFileRecurse { File file ->
+					if (file != null && file.isFile() && isImageFile(file.name)) {
+						images << file
+					}
+				}
+			}
+		} catch (Exception ignored) {
+		}
+
+		if (images.isEmpty()) {
+			return result
+		}
+
+		String normalizedScenario = normalizePathToken(scenarioName)
+
+		List<File> prioritized = images.findAll { File file ->
+			String path = normalizePathToken(file.absolutePath)
+			if (normalizedScenario.isEmpty()) {
+				return path.contains('error') || path.contains('failed') || path.contains('screenshot')
+			}
+			return path.contains(normalizedScenario) ||
+					path.contains('error') ||
+					path.contains('failed') ||
+					path.contains('screenshot')
+		}
+
+		if (prioritized.isEmpty()) {
+			prioritized = images
+		}
+
+		prioritized.sort { File a, File b ->
+			(b.lastModified() <=> a.lastModified())
+		}
+
+		prioritized.take(3).each { File file ->
+			result << [
+				name  : file.name,
+				href  : file.toURI().toString(),
+				image : true,
+				imgSrc: file.toURI().toString()
+			]
+		}
+
+		return result
+	}
+
+	private String normalizePathToken(String text) {
+		return safeValue(text)
+				.toLowerCase(Locale.ENGLISH)
+				.replaceAll(/[^a-z0-9]+/, ' ')
+				.trim()
 	}
 
 	// =========================================================================
@@ -600,8 +920,10 @@ class JiraGaiaHtmlTemplateBuilder {
 				String href = safeValue(ev.href).toLowerCase(Locale.ENGLISH)
 				return name.contains('error') ||
 						name.contains('fail') ||
+						name.contains('screenshot') ||
 						href.contains('error') ||
-						href.contains('fail')
+						href.contains('fail') ||
+						href.contains('screenshot')
 			}
 
 			if (failedEvidence == null) {
@@ -677,38 +999,37 @@ class JiraGaiaHtmlTemplateBuilder {
 			}
 
 			sb.append('</div>')
-
-			sb.append('<div class="evidence-block">')
-			sb.append('<div class="evidence-title">Evidence</div>')
-
-			if (failedEvidence != null) {
-				sb.append('<details class="evidence-item">')
-				sb.append('<summary>🖼 ')
-				sb.append(htmlEscape(evidenceName.isEmpty() ? 'Open failed evidence' : evidenceName))
-				sb.append('</summary>')
-
-				if (!evidenceHref.isEmpty()) {
-					sb.append('<div class="evidence-links">')
-					sb.append('<a href="')
-					sb.append(htmlEscape(evidenceHref))
-					sb.append('" target="_blank" rel="noopener noreferrer">🔎 Open evidence</a>')
-					sb.append('</div>')
-				}
-
-				if (evidenceIsImage && !evidenceImgSrc.isEmpty()) {
-					sb.append('<img class="evidence-image" src="')
-					sb.append(htmlEscape(evidenceImgSrc))
-					sb.append('" alt="Evidence">')
-				}
-
-				sb.append('</details>')
-			} else {
-				sb.append('<div class="evidence-empty">No failed evidence was found for this scenario.</div>')
-			}
-
-			sb.append('</div>')
 		}
 
+		sb.append('<div class="evidence-block">')
+		sb.append('<div class="evidence-title">Evidence</div>')
+
+		if (failedEvidence != null) {
+			sb.append('<details class="evidence-item" open>')
+			sb.append('<summary>🖼 ')
+			sb.append(htmlEscape(evidenceName.isEmpty() ? 'Open evidence' : evidenceName))
+			sb.append('</summary>')
+
+			if (!evidenceHref.isEmpty()) {
+				sb.append('<div class="evidence-links">')
+				sb.append('<a href="')
+				sb.append(htmlEscape(evidenceHref))
+				sb.append('" target="_blank" rel="noopener noreferrer">🔎 Open evidence</a>')
+				sb.append('</div>')
+			}
+
+			if (evidenceIsImage && !evidenceImgSrc.isEmpty()) {
+				sb.append('<img class="evidence-image" src="')
+				sb.append(htmlEscape(evidenceImgSrc))
+				sb.append('" alt="Evidence">')
+			}
+
+			sb.append('</details>')
+		} else {
+			sb.append('<div class="evidence-empty">No evidence was found for this scenario.</div>')
+		}
+
+		sb.append('</div>')
 		sb.append('</section>')
 		return sb.toString()
 	}
@@ -909,6 +1230,8 @@ class JiraGaiaHtmlTemplateBuilder {
 		List<String> patterns = [
 			'dd.MM.yyyy HH:mm:ss',
 			'dd.MM.yyyy hh:mm:ss a',
+			'MM-dd-yyyy hh:mm:ss a',
+			'MM-dd-yyyy HH:mm:ss',
 			'yyyy-MM-dd HH:mm:ss',
 			'yyyy-MM-dd HH:mm:ss.SSS',
 			'yyyy-MM-dd\'T\'HH:mm:ss',
@@ -986,6 +1309,9 @@ class JiraGaiaHtmlTemplateBuilder {
 		}
 		if (lower.contains('open') || lower.contains('navigate')) {
 			return '🌐'
+		}
+		if (lower.contains('attach') || lower.contains('screenshot') || lower.contains('evidence')) {
+			return '🖼️'
 		}
 		return 'ℹ️'
 	}
@@ -1206,7 +1532,7 @@ body {
     justify-content: space-between;
     gap: 24px;
     padding: 10px 18px;
-    background: linear-gradient(90deg, #3f00ff 0%, #6f1dff 50%, #c92aa0 100%);
+    background: linear-gradient(90deg, ''' + BANNER_START + ''' 0%, ''' + BANNER_MIDDLE + ''' 50%, ''' + BANNER_END + ''' 100%);
     color: #ffffff;
 }
 .top-banner-left {
@@ -1383,7 +1709,7 @@ body {
     color: #ffffff;
 }
 .status-pill.info {
-    background: #c92aa0;
+    background: #8b2cf5;
 }
 .scenario-panel {
     display: none;
@@ -1421,7 +1747,7 @@ body {
     color: #1e2a35;
 }
 .meta-chip.gradient {
-    background: linear-gradient(90deg, rgba(90,0,255,0.88) 0%, rgba(201,42,160,0.88) 100%); 
+    background: linear-gradient(90deg, rgba(91,25,255,0.88) 0%, rgba(194,27,182,0.88) 100%);
     color: #ffffff;
 }
 .meta-chip.passed {
@@ -1434,6 +1760,10 @@ body {
 }
 .meta-chip.skipped {
     background: #d7b436;
+    color: #ffffff;
+}
+.meta-chip.info {
+    background: #8b2cf5;
     color: #ffffff;
 }
 .meta-label {
@@ -1481,7 +1811,6 @@ body {
     height: 1px;
     background: #edf2f7;
 }
-
 .step-row:last-child::after {
     display: none;
 }
