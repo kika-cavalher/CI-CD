@@ -1,361 +1,1434 @@
 package jiraIntegration
 
-import com.kms.katalon.core.annotation.Keyword
-import com.kms.katalon.core.configuration.RunConfiguration
-import com.kms.katalon.core.util.KeywordUtil
+import groovy.io.FileType
+import groovy.util.Node
+import groovy.util.XmlParser
 
-import internal.GlobalVariable
-
-import java.io.File
-import java.io.FileOutputStream
+import java.math.BigDecimal
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.LinkedHashSet
 import java.util.Locale
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 
-class JiraFlowCoordinator {
+class JiraReportBuilder {
 
-	private static final String JIRA_BASE_URL = 'https://jira-mut.d.bbg'
-	private static final String PROJECT_KEY = 'GI5PRD'
-	private static final String TEST_PLAN_ISSUE_TYPE_ID = '10604'
-	private static final String EPIC_LINK_FIELD_ID = 'customfield_10006'
-
-	private static final String DEFAULT_EPIC_KEY = 'GI5PRD-9877'
-	private static final String TEST_PLAN_ASSIGNEE = 'cavalherer'
-
-	private static final boolean FORCE_CREATE_NEW_TEST_PLAN = false
+	private static final String APP_NAME = 'EMATCH'
 
 	/*
-	 * Leave empty if your token already comes from:
-	 * 1) GlobalVariable.JIRA_TOKEN
-	 * 2) GlobalVariable.jiraToken
-	 * 3) System env JIRA_TOKEN
+	 * Change only this variable if you want to use another logo.
 	 */
-	private static final String JIRA_TOKEN = ''
+	private static final String LOGO_SRC = 'Image/ematch-logo.png'
 
-	@Keyword
-	String jiraImport(String epicKey = '') {
+	private static final List<String> PREFIX_DATE_PATTERNS = [
+		'yyyy-MM-dd HH:mm:ss.SSS',
+		'yyyy-MM-dd HH:mm:ss',
+		'MM-dd-yyyy HH:mm:ss',
+		'MM-dd-yyyy hh:mm:ss'
+	]
+
+	private static final SimpleDateFormat OUTPUT_DATE_TIME =
+		new SimpleDateFormat('dd/MM/yyyy HH:mm:ss', Locale.ENGLISH)
+
+	private static final SimpleDateFormat OUTPUT_CLOCK =
+		new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH)
+
+	private File cachedLogRoot
+	private List<String> cachedLogLines = []
+
+	private File cachedImageRoot
+	private List<File> cachedImageFiles = []
+
+	File buildReport(String reportFolderPath) {
+		return buildReport(
+			new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath),
+			'',
+			''
+		)
+	}
+
+	File buildReport(File reportFolder) {
+		return buildReport(reportFolder, '', '')
+	}
+
+	File buildReport(String reportFolderPath, String suiteName, String executionTitle) {
+		return buildReport(
+			new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath),
+			suiteName,
+			executionTitle
+		)
+	}
+
+	File buildReport(File reportFolder, String suiteName, String executionTitle) {
+		File root = reportFolder ?: new File('.')
+		Map model = buildModel(root, suiteName, executionTitle)
+
+		String html = new JiraHtmlTemplateBuilder().build(model)
+
+		File targetFile = new File(root, 'eMatchReport.html')
+		targetFile.write(html, 'UTF-8')
+
+		return targetFile
+	}
+
+	Map buildModel(File reportFolder, String suiteName = '', String executionTitle = '') {
+		File root = reportFolder ?: new File('.')
+
+		if (!root.exists()) {
+			return emptyModel(root)
+		}
+
+		cachedLogRoot = null
+		cachedLogLines = []
+		cachedImageRoot = null
+		cachedImageFiles = []
+
+		List<File> junitFiles = collectJUnitFiles(root)
+		List<Map> scenarios = []
+
+		junitFiles.each { File junitFile ->
+			scenarios.addAll(buildScenariosFromJUnit(junitFile, root))
+		}
+
+		if (scenarios.isEmpty()) {
+			scenarios = buildFallbackScenarios(root)
+		}
+
+		scenarios = scenarios.findAll { Map item -> item != null }
+
+		String detectedSuiteName = detectSuiteName(root, scenarios)
+		String finalSuiteName = sanitizeSuiteNameForDisplay(firstNonBlank(suiteName, detectedSuiteName))
+		String finalExecutionTitle = firstNonBlank(executionTitle, finalSuiteName)
+
+		if (finalSuiteName.isEmpty()) {
+			finalSuiteName = 'Execution'
+		}
+		if (finalExecutionTitle.isEmpty()) {
+			finalExecutionTitle = finalSuiteName
+		}
+
+		if (scenarios.isEmpty()) {
+			scenarios << [
+				id            : 'scenario-1',
+				name          : finalSuiteName,
+				scenarioName  : finalSuiteName,
+				status        : 'blocked',
+				result        : 'blocked',
+				summary       : 'Test did not run.',
+				visualError   : 'Test did not run.',
+				fullError     : '',
+				errorSummary  : 'Test did not run.',
+				errorDetail   : '',
+				durationMs    : 0L,
+				durationLabel : formatDuration(0L),
+				startMs       : 0L,
+				endMs         : 0L,
+				startTime     : '',
+				endTime       : '',
+				startShort    : '',
+				endShort      : '',
+				startLong     : '',
+				endLong       : '',
+				reportFolder  : root.absolutePath,
+				steps         : [],
+				evidence      : []
+			]
+		}
+
+		return [
+			appName         : APP_NAME,
+			suiteName       : finalSuiteName,
+			executionName   : finalExecutionTitle,
+			title           : finalExecutionTitle,
+			generatedAt     : OUTPUT_DATE_TIME.format(new Date()),
+			reportFolder    : root.absolutePath,
+			baseFolder      : root.absolutePath,
+			executionFolder : root.absolutePath,
+			logoSrc         : LOGO_SRC,
+			scenarios       : scenarios
+		]
+	}
+
+	private Map emptyModel(File root) {
+		String absolute = root != null ? root.absolutePath : new File('.').absolutePath
+
+		return [
+			appName         : APP_NAME,
+			suiteName       : 'Execution',
+			executionName   : 'Execution',
+			title           : 'Execution',
+			generatedAt     : OUTPUT_DATE_TIME.format(new Date()),
+			reportFolder    : absolute,
+			baseFolder      : absolute,
+			executionFolder : absolute,
+			logoSrc         : LOGO_SRC,
+			scenarios       : []
+		]
+	}
+
+	private List<Map> buildScenariosFromJUnit(File junitFile, File reportRoot) {
+		List<Map> result = []
+
+		Node xmlRoot
 		try {
-			KeywordUtil.logInfo('============================================================')
-			KeywordUtil.logInfo('Starting Jira import flow')
-			KeywordUtil.logInfo('============================================================')
+			xmlRoot = new XmlParser(false, false).parse(junitFile)
+		} catch (Throwable ignored) {
+			return result
+		}
 
-			String token = resolveToken()
+		List<Node> testcaseNodes = collectTestCaseNodes(xmlRoot)
 
-			if (blank(token)) {
-				throw new RuntimeException('JIRA token is empty. Fill JIRA_TOKEN or GlobalVariable.JIRA_TOKEN or env JIRA_TOKEN.')
-			}
-
-			String effectiveEpicKey = !blank(epicKey) ? safe(epicKey) : DEFAULT_EPIC_KEY
-
-			File reportFolder = locateTargetReportFolder()
-			File latestRunFolder = findLatestRunFolder(new File(RunConfiguration.getProjectDir(), 'Reports'))
-			File junitXml = findJUnitXml(reportFolder)
-
-			if (reportFolder == null || !reportFolder.exists()) {
-				throw new RuntimeException('Could not locate the target report folder.')
-			}
-
-			if (junitXml == null || !junitXml.exists()) {
-				throw new RuntimeException('JUnit XML was not found inside the selected report folder.')
-			}
-
-			String suiteName = safe(reportFolder.parentFile?.name)
-			String suiteDisplayName = safe(reportFolder.name)
-			String executionTitle = buildExecutionTitle(suiteName, latestRunFolder)
-
-			KeywordUtil.logInfo('Using report folder: ' + reportFolder.absolutePath)
-			KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
-			KeywordUtil.logInfo('Execution title used: ' + executionTitle)
-			KeywordUtil.logInfo('Test Plan title used: ' + suiteName + ' Test Plan')
-			KeywordUtil.logInfo('Epic key used: ' + effectiveEpicKey)
-			KeywordUtil.logInfo('Assignee used on Test Plan: ' + TEST_PLAN_ASSIGNEE)
-			KeywordUtil.logInfo('JUnit XML found: ' + junitXml.absolutePath)
-
-			File customReport = buildCustomHtmlReport(reportFolder, suiteDisplayName, executionTitle)
-			KeywordUtil.logInfo('Custom Jira report created: ' + customReport.absolutePath)
-
-			File resultsZip = new File(reportFolder, 'Results.zip')
-			createZipFromFolder(reportFolder, resultsZip, [
-				'Results.zip',
-				'Evidences.zip'
-			])
-			KeywordUtil.logInfo('Results ZIP created: ' + resultsZip.absolutePath)
-
-			File evidencesZip = createEvidencesZip(reportFolder)
-			if (evidencesZip != null && evidencesZip.exists()) {
-				KeywordUtil.logInfo('Evidences ZIP created: ' + evidencesZip.absolutePath)
-			}
-
-			JiraGateway gateway = new JiraGateway(JIRA_BASE_URL, token)
-
-			JiraTestPlanManager testPlanManager = new JiraTestPlanManager(
-				gateway,
-				PROJECT_KEY,
-				TEST_PLAN_ISSUE_TYPE_ID,
-				EPIC_LINK_FIELD_ID,
-				effectiveEpicKey,
-				TEST_PLAN_ASSIGNEE
+		testcaseNodes.eachWithIndex { Node testcaseNode, int index ->
+			String rawName = firstNonBlank(
+				attr(testcaseNode, 'name'),
+				attr(testcaseNode, 'classname'),
+				"Scenario ${index + 1}"
 			)
 
-			String testPlanKey = testPlanManager.getOrCreateTestPlanKey(
-				suiteName,
-				'',
-				FORCE_CREATE_NEW_TEST_PLAN
-			)
+			String className = safe(attr(testcaseNode, 'classname'))
+			String displayName = buildDisplayName(className, rawName)
+			String scenarioId = buildScenarioId(displayName, index + 1)
 
-			List<File> attachments = []
-			attachments << customReport
-			attachments << resultsZip
+			Node failureNode = firstChildByName(testcaseNode, 'failure')
+			Node errorNode = firstChildByName(testcaseNode, 'error')
+			Node skippedNode = firstChildByName(testcaseNode, 'skipped')
 
-			if (evidencesZip != null && evidencesZip.exists()) {
-				attachments << evidencesZip
+			String status = 'passed'
+			Node resultNode = null
+
+			if (failureNode != null) {
+				status = 'failed'
+				resultNode = failureNode
+			} else if (errorNode != null) {
+				status = 'failed'
+				resultNode = errorNode
+			} else if (skippedNode != null) {
+				status = 'blocked'
+				resultNode = skippedNode
 			}
 
-			JiraExecutionPublisher publisher = new JiraExecutionPublisher(gateway)
+			String fullError = normalizeMultilineText(firstNonBlank(
+				textOf(resultNode),
+				attr(resultNode, 'message')
+			))
 
-			Map publishResponse = publisher.publishExecution([
-				junitXml      : junitXml,
-				customReport  : customReport,
-				reportFolder  : reportFolder,
-				projectKey    : PROJECT_KEY,
-				testPlanKey   : testPlanKey,
-				executionTitle: executionTitle,
-				attachments   : attachments
-			])
+			String shortError = buildShortError(fullError, status)
+			long junitDurationMs = toDurationMillis(attr(testcaseNode, 'time'))
 
-			String executionKey = safe(publishResponse.executionKey)
+			Map timing = extractTimingFromLogs(reportRoot, displayName, rawName, junitDurationMs)
+			List<Map> steps = extractStepsFromLogs(reportRoot, displayName, rawName, status)
+			List<Map> evidence = extractEvidence(
+				reportRoot,
+				displayName,
+				rawName,
+				status,
+				timing.startMs as long,
+				timing.endMs as long
+			)
 
-			KeywordUtil.logInfo('Jira import completed successfully.')
-			KeywordUtil.logInfo('Test Plan key: ' + testPlanKey)
-			KeywordUtil.logInfo('Execution key: ' + executionKey)
-			KeywordUtil.logInfo('============================================================')
+			result << [
+				id            : scenarioId,
+				name          : displayName,
+				scenarioName  : displayName,
+				status        : status,
+				result        : status,
+				summary       : shortError,
+				visualError   : shortError,
+				fullError     : fullError,
+				errorSummary  : shortError,
+				errorDetail   : fullError,
+				durationMs    : timing.durationMs as long,
+				durationLabel : formatDuration(timing.durationMs as long),
+				startMs       : timing.startMs as long,
+				endMs         : timing.endMs as long,
+				startTime     : safe(timing.startLabel),
+				endTime       : safe(timing.endLabel),
+				startShort    : safe(timing.startClock),
+				endShort      : safe(timing.endClock),
+				startLong     : safe(timing.startLabel),
+				endLong       : safe(timing.endLabel),
+				reportFolder  : reportRoot.absolutePath,
+				steps         : steps,
+				evidence      : evidence
+			]
+		}
 
-			return executionKey
-		} catch (Exception e) {
-			KeywordUtil.markFailed('Jira import failed: ' + safe(e.message))
-			throw e
+		return result
+	}
+
+	private List<Map> buildFallbackScenarios(File reportRoot) {
+		List<Map> result = []
+		List<String> lines = readMergedLogLines(reportRoot)
+
+		if (lines.isEmpty()) {
+			return result
+		}
+
+		List<Integer> startIndexes = []
+
+		for (int i = 0; i < lines.size(); i++) {
+			String line = safe(lines[i])
+			if (line.contains('START Test Cases/')) {
+				startIndexes << i
+			}
+		}
+
+		if (startIndexes.isEmpty()) {
+			return result
+		}
+
+		startIndexes.eachWithIndex { Integer startIndex, int idx ->
+			int endIndex = lines.size() - 1
+
+			for (int next = idx + 1; next < startIndexes.size(); next++) {
+				if (startIndexes[next] > startIndex) {
+					endIndex = startIndexes[next] - 1
+					break
+				}
+			}
+
+			List<String> block = new ArrayList<String>(lines.subList(startIndex, Math.min(endIndex + 1, lines.size())))
+			String name = extractNameFromStartLine(lines[startIndex])
+
+			if (name.isEmpty()) {
+				name = "Scenario ${idx + 1}"
+			}
+
+			String blockText = normalizeMultilineText(block.join('\n'))
+			String status = deriveScenarioStatusFromBlock(blockText)
+			Map timing = extractTimingFromBlock(block, 0L)
+			List<Map> steps = convertBlockToSteps(block, status)
+			List<Map> evidence = extractEvidence(
+				reportRoot,
+				name,
+				name,
+				status,
+				timing.startMs as long,
+				timing.endMs as long
+			)
+
+			String shortError = buildShortError(blockText, status)
+
+			result << [
+				id            : buildScenarioId(name, idx + 1),
+				name          : name,
+				scenarioName  : name,
+				status        : status,
+				result        : status,
+				summary       : shortError,
+				visualError   : shortError,
+				fullError     : status == 'failed' ? blockText : '',
+				errorSummary  : shortError,
+				errorDetail   : status == 'failed' ? blockText : '',
+				durationMs    : timing.durationMs as long,
+				durationLabel : formatDuration(timing.durationMs as long),
+				startMs       : timing.startMs as long,
+				endMs         : timing.endMs as long,
+				startTime     : safe(timing.startLabel),
+				endTime       : safe(timing.endLabel),
+				startShort    : safe(timing.startClock),
+				endShort      : safe(timing.endClock),
+				startLong     : safe(timing.startLabel),
+				endLong       : safe(timing.endLabel),
+				reportFolder  : reportRoot.absolutePath,
+				steps         : steps,
+				evidence      : evidence
+			]
+		}
+
+		return result
+	}
+
+	private List<Node> collectTestCaseNodes(Node xmlRoot) {
+		List<Node> nodes = []
+
+		if (xmlRoot == null) {
+			return nodes
+		}
+
+		String rootName = safe(xmlRoot.name())
+
+		if (rootName == 'testsuite') {
+			xmlRoot.children().each { def child ->
+				if (child instanceof Node && safe(child.name()) == 'testcase') {
+					nodes << (Node) child
+				}
+			}
+		} else if (rootName == 'testsuites') {
+			xmlRoot.children().each { def suiteNode ->
+				if (!(suiteNode instanceof Node)) {
+					return
+				}
+
+				if (safe(((Node) suiteNode).name()) != 'testsuite') {
+					return
+				}
+
+				((Node) suiteNode).children().each { def child ->
+					if (child instanceof Node && safe(child.name()) == 'testcase') {
+						nodes << (Node) child
+					}
+				}
+			}
+		}
+
+		return nodes
+	}
+
+	private List<File> collectJUnitFiles(File root) {
+		List<File> result = []
+
+		if (root == null || !root.exists()) {
+			return result
+		}
+
+		root.eachFileRecurse(FileType.FILES) { File file ->
+			String lowerName = file.name.toLowerCase(Locale.ENGLISH)
+
+			if (lowerName == 'junit_report.xml' ||
+				lowerName == 'junitreport.xml' ||
+				lowerName == 'junit.xml' ||
+				lowerName == 'cucumber.xml' ||
+				lowerName == 'junit-report.xml') {
+				result << file
+				return
+			}
+
+			if (lowerName.endsWith('.xml') && looksLikeJUnitXml(file)) {
+				result << file
+			}
+		}
+
+		result = result.unique { File file -> file.absolutePath }
+		result.sort { File a, File b ->
+			a.absolutePath.toLowerCase(Locale.ENGLISH) <=> b.absolutePath.toLowerCase(Locale.ENGLISH)
+		}
+
+		return result
+	}
+
+	private boolean looksLikeJUnitXml(File file) {
+		try {
+			List<String> lines = readLinesSafely(file)
+			String head = lines.take(20).join('\n').toLowerCase(Locale.ENGLISH)
+			return head.contains('<testsuite') || head.contains('<testsuites')
+		} catch (Throwable ignored) {
+			return false
 		}
 	}
 
-	private File buildCustomHtmlReport(File reportFolder, String suiteDisplayName, String executionTitle) {
-		JiraReportBuilder reportBuilder = new JiraReportBuilder()
-		File customReport = reportBuilder.buildReport(reportFolder, suiteDisplayName, executionTitle)
-
-		if (customReport == null || !customReport.exists()) {
-			throw new RuntimeException('Custom HTML report was not generated.')
-		}
-
-		return customReport
+	private Map extractTimingFromLogs(File reportRoot, String displayName, String rawName, long fallbackDurationMs) {
+		List<String> block = findLogBlock(reportRoot, displayName, rawName)
+		return extractTimingFromBlock(block, fallbackDurationMs)
 	}
 
-	private String resolveToken() {
-		if (!blank(JIRA_TOKEN)) {
-			return JIRA_TOKEN
+	private Map extractTimingFromBlock(List<String> block, long fallbackDurationMs) {
+		long startMs = 0L
+		long endMs = 0L
+
+		block.each { String line ->
+			long currentMs = extractPrefixDateMillis(line)
+
+			if (currentMs <= 0L) {
+				return
+			}
+
+			if (startMs <= 0L) {
+				startMs = currentMs
+			}
+
+			endMs = currentMs
 		}
 
-		String envToken = System.getenv('JIRA_TOKEN')
-		if (!blank(envToken)) {
-			return envToken
+		long durationMs = fallbackDurationMs
+		if (startMs > 0L && endMs >= startMs) {
+			durationMs = endMs - startMs
 		}
 
-		List<String> candidates = [
-			'JIRA_TOKEN',
-			'jiraToken',
-			'jira_token',
-			'JiraToken',
-			'TOKEN'
+		if (startMs > 0L && endMs <= 0L && fallbackDurationMs > 0L) {
+			endMs = startMs + fallbackDurationMs
+			durationMs = fallbackDurationMs
+		}
+
+		if (durationMs < 0L) {
+			durationMs = 0L
+		}
+
+		return [
+			startMs    : startMs,
+			endMs      : endMs,
+			startLabel : formatDateTime(startMs),
+			endLabel   : formatDateTime(endMs),
+			startClock : formatClock(startMs),
+			endClock   : formatClock(endMs),
+			durationMs : durationMs
+		]
+	}
+
+	private List<Map> extractStepsFromLogs(File reportRoot, String displayName, String rawName, String scenarioStatus) {
+		List<String> block = findLogBlock(reportRoot, displayName, rawName)
+		return convertBlockToSteps(block, scenarioStatus)
+	}
+
+	private List<Map> convertBlockToSteps(List<String> block, String scenarioStatus) {
+		List<Map> steps = []
+
+		block.each { String line ->
+			String stepDetail = extractMeaningfulStepDetail(line)
+			if (stepDetail.isEmpty()) {
+				return
+			}
+
+			String stepStatus = deriveStepStatus(stepDetail, scenarioStatus)
+
+			steps << [
+				status    : stepStatus,
+				timestamp : extractPrefixClock(line),
+				detail    : stepDetail,
+				icon      : resolveStepIcon(stepDetail, stepStatus)
+			]
+		}
+
+		if (steps.size() > 40) {
+			steps = steps.take(40)
+		}
+
+		return steps
+	}
+
+	private String extractMeaningfulStepDetail(String line) {
+		String value = stripLogPrefix(line)
+		if (value.isEmpty()) {
+			return ''
+		}
+
+		String message = extractXmlMessage(value)
+		if (!message.isEmpty()) {
+			value = message
+		}
+
+		if (value.startsWith('Start action :')) {
+			value = safe(value.substring('Start action :'.length()))
+		} else if (value.startsWith('End action :')) {
+			return ''
+		} else if (value.startsWith('Start listener action :')) {
+			return ''
+		} else if (value.startsWith('End listener action :')) {
+			return ''
+		}
+
+		value = decodeHtmlEntities(value)
+		value = normalizeInlineSpaces(value)
+
+		if (value.isEmpty()) {
+			return ''
+		}
+
+		String lower = value.toLowerCase(Locale.ENGLISH)
+
+		if (lower.startsWith('start test case')) {
+			return ''
+		}
+		if (lower.startsWith('start test cases/')) {
+			return ''
+		}
+		if (lower.startsWith('end test cases/')) {
+			return ''
+		}
+		if (lower.startsWith('hostname =')) {
+			return ''
+		}
+		if (lower.startsWith('hostaddress =')) {
+			return ''
+		}
+		if (lower.startsWith('os =')) {
+			return ''
+		}
+		if (lower.startsWith('katalonversion =')) {
+			return ''
+		}
+		if (lower.startsWith('beforesuite')) {
+			return ''
+		}
+		if (lower.startsWith('aftersuite')) {
+			return ''
+		}
+		if (lower.startsWith('beforecase')) {
+			return ''
+		}
+		if (lower.startsWith('aftercase')) {
+			return ''
+		}
+		if (lower.startsWith('video')) {
+			return ''
+		}
+		if (lower.contains('using report folder:')) {
+			return ''
+		}
+		if (lower.contains('junit xml found:')) {
+			return ''
+		}
+		if (lower.contains('execution title used:')) {
+			return ''
+		}
+		if (lower.contains('test plan title used:')) {
+			return ''
+		}
+		if (lower.contains('assignee used on test plan:')) {
+			return ''
+		}
+		if (lower.contains('starting jira import flow')) {
+			return ''
+		}
+
+		if (value.startsWith('<record') ||
+			value.startsWith('</record') ||
+			value.startsWith('<property') ||
+			value.startsWith('<nestedLevel') ||
+			value.startsWith('<millis') ||
+			value.startsWith('<nanos') ||
+			value.startsWith('<sequence') ||
+			value.startsWith('<thread') ||
+			value.startsWith('<class') ||
+			value.startsWith('<method') ||
+			value.startsWith('<level') ||
+			value.startsWith('<escapedJava')) {
+			return ''
+		}
+
+		if (value == 'Reason:' || value == 'error(s)') {
+			return ''
+		}
+
+		if (looksLikeVariableAssignment(value)) {
+			return ''
+		}
+
+		if (looksLikeTechnicalNoise(value)) {
+			return ''
+		}
+
+		if (lower.contains('cannot recognise image on screen')) {
+			return 'Cannot recognise image on screen'
+		}
+		if (lower.contains('text of test object:')) {
+			return value
+		}
+		if (lower.contains('starting application')) {
+			return value
+		}
+		if (lower.contains('the application at location:')) {
+			return value
+		}
+		if (lower.contains('call test case')) {
+			return value
+		}
+		if (lower.contains('unable to')) {
+			return value
+		}
+		if (lower.contains('failed because')) {
+			return value
+		}
+		if (lower.contains('verify')) {
+			return value
+		}
+		if (lower.contains('click')) {
+			return value
+		}
+		if (lower.contains('set text')) {
+			return value
+		}
+		if (lower.contains('send keys')) {
+			return value
+		}
+		if (lower.contains('select')) {
+			return value
+		}
+		if (lower.contains('wait for')) {
+			return value
+		}
+		if (lower.contains('switchto')) {
+			return value
+		}
+		if (lower.contains('close application')) {
+			return value
+		}
+		if (lower.contains('take screenshot')) {
+			return value
+		}
+		if (lower.contains('test cases/') && lower.contains('failed')) {
+			return value
+		}
+
+		return ''
+	}
+
+	private boolean looksLikeVariableAssignment(String value) {
+		String clean = safe(value)
+
+		if (clean.isEmpty()) {
+			return false
+		}
+
+		if (clean.contains('Text of test object:')) {
+			return false
+		}
+		if (clean.contains('The application at location:')) {
+			return false
+		}
+		if (clean.contains('Call Test Case')) {
+			return false
+		}
+		if (clean.contains('Verify')) {
+			return false
+		}
+		if (clean.contains('Starting application')) {
+			return false
+		}
+
+		return clean ==~ /^[A-Za-z_][A-Za-z0-9_\.\[\]]*\s*=.+$/
+	}
+
+	private boolean looksLikeTechnicalNoise(String value) {
+		String lower = safe(value).toLowerCase(Locale.ENGLISH)
+
+		if (lower.startsWith('at com.kms.')) {
+			return true
+		}
+		if (lower.startsWith('at java.')) {
+			return true
+		}
+		if (lower.startsWith('at sun.')) {
+			return true
+		}
+		if (lower.startsWith('at jdk.')) {
+			return true
+		}
+		if (lower.startsWith('... ')) {
+			return true
+		}
+		if (lower.contains('.groovy:') || lower.contains('.java:')) {
+			return true
+		}
+
+		return false
+	}
+
+	private String extractXmlMessage(String value) {
+		def matcher = safe(value) =~ /<message>(.*?)<\/message>/
+		if (matcher.find()) {
+			return safe(matcher.group(1))
+		}
+		return ''
+	}
+
+	private List<Map> extractEvidence(
+		File reportRoot,
+		String displayName,
+		String rawName,
+		String status,
+		long startMs,
+		long endMs
+	) {
+		List<File> images = collectImageFiles(reportRoot)
+
+		if (images.isEmpty()) {
+			return []
+		}
+
+		String primaryKey = normalizeSearchKey(displayName)
+		String secondaryKey = normalizeSearchKey(rawName)
+
+		List<String> tokens = new ArrayList<String>()
+		tokens.addAll(tokensFromText(displayName))
+		tokens.addAll(tokensFromText(rawName))
+		tokens = tokens.unique()
+
+		List<Map> scored = []
+
+		images.each { File imageFile ->
+			String lowerPath = imageFile.absolutePath.toLowerCase(Locale.ENGLISH)
+			long fileTime = imageFile.lastModified()
+			int score = 0
+
+			if (!primaryKey.isEmpty() && normalizeSearchKey(lowerPath).contains(primaryKey)) {
+				score += 14
+			}
+
+			if (!secondaryKey.isEmpty() && normalizeSearchKey(lowerPath).contains(secondaryKey)) {
+				score += 10
+			}
+
+			tokens.each { String token ->
+				if (token.length() >= 4 && lowerPath.contains(token.toLowerCase(Locale.ENGLISH))) {
+					score += 2
+				}
+			}
+
+			if (status == 'failed') {
+				if (lowerPath.contains('fail') || lowerPath.contains('failed') || lowerPath.contains('error')) {
+					score += 4
+				}
+			}
+
+			if (startMs > 0L && endMs > 0L) {
+				long from = startMs - 180000L
+				long to = endMs + 180000L
+
+				if (fileTime >= from && fileTime <= to) {
+					score += 8
+				}
+			}
+
+			scored << [
+				file  : imageFile,
+				score : score
+			]
+		}
+
+		scored.sort { Map a, Map b ->
+			int scoreDiff = (b.score as int) <=> (a.score as int)
+			if (scoreDiff != 0) {
+				return scoreDiff
+			}
+			return ((b.file as File).lastModified()) <=> ((a.file as File).lastModified())
+		}
+
+		List<Map> result = []
+
+		if (!scored.isEmpty()) {
+			Map best = scored[0]
+			File bestFile = best.file as File
+			int bestScore = best.score as int
+
+			if (bestScore > 0 || status == 'failed') {
+				result << [
+					name   : bestFile.name,
+					href   : bestFile.toURI().toString(),
+					image  : true,
+					imgSrc : bestFile.toURI().toString()
+				]
+			}
+		}
+
+		return result
+	}
+
+	private List<File> collectImageFiles(File root) {
+		if (root == null || !root.exists()) {
+			return []
+		}
+
+		if (cachedImageRoot != null &&
+			cachedImageRoot.absolutePath == root.absolutePath &&
+			cachedImageFiles != null) {
+			return cachedImageFiles
+		}
+
+		LinkedHashSet<File> result = new LinkedHashSet<File>()
+		List<File> candidateRoots = []
+
+		candidateRoots << root
+		if (root.parentFile != null) {
+			candidateRoots << root.parentFile
+		}
+		if (root.parentFile?.parentFile != null) {
+			candidateRoots << root.parentFile.parentFile
+		}
+
+		candidateRoots.unique { File file -> file.absolutePath }.each { File base ->
+			if (base == null || !base.exists()) {
+				return
+			}
+
+			base.eachFileRecurse(FileType.FILES) { File file ->
+				String lower = file.name.toLowerCase(Locale.ENGLISH)
+				if (lower.endsWith('.png') ||
+					lower.endsWith('.jpg') ||
+					lower.endsWith('.jpeg') ||
+					lower.endsWith('.gif') ||
+					lower.endsWith('.bmp') ||
+					lower.endsWith('.webp')) {
+					result << file
+				}
+			}
+		}
+
+		List<File> files = new ArrayList<File>(result)
+		files.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
+
+		cachedImageRoot = root
+		cachedImageFiles = files
+
+		return files
+	}
+
+	private List<String> findLogBlock(File reportRoot, String displayName, String rawName) {
+		List<String> lines = readMergedLogLines(reportRoot)
+		if (lines.isEmpty()) {
+			return []
+		}
+
+		List<String> candidates = new ArrayList<String>()
+		candidates << safe(displayName)
+		candidates << safe(rawName)
+		candidates = candidates.findAll { String item -> !safe(item).isEmpty() }.unique()
+
+		int startIndex = -1
+
+		for (int i = 0; i < lines.size(); i++) {
+			String line = safe(lines[i])
+
+			boolean matched = false
+			candidates.each { String candidate ->
+				if (matched) {
+					return
+				}
+
+				if (line.contains("START ${candidate}") || line.contains("START Test Cases/${candidate}")) {
+					startIndex = i
+					matched = true
+				}
+			}
+
+			if (matched) {
+				break
+			}
+		}
+
+		if (startIndex < 0) {
+			for (int i = 0; i < lines.size(); i++) {
+				String normalizedLine = normalizeSearchKey(lines[i])
+				boolean matched = false
+
+				candidates.each { String candidate ->
+					String normalizedCandidate = normalizeSearchKey(candidate)
+					if (!normalizedCandidate.isEmpty() && normalizedLine.contains(normalizedCandidate)) {
+						startIndex = i
+						matched = true
+					}
+				}
+
+				if (matched) {
+					break
+				}
+			}
+		}
+
+		if (startIndex < 0) {
+			return []
+		}
+
+		int endIndex = Math.min(lines.size() - 1, startIndex + 600)
+
+		for (int i = startIndex + 1; i < lines.size(); i++) {
+			String line = safe(lines[i])
+
+			if (line.contains('END Test Cases/')) {
+				endIndex = i
+				break
+			}
+
+			if (line.contains('START Test Cases/')) {
+				endIndex = i - 1
+				break
+			}
+		}
+
+		if (endIndex < startIndex) {
+			endIndex = startIndex
+		}
+
+		return new ArrayList<String>(lines.subList(startIndex, Math.min(endIndex + 1, lines.size())))
+	}
+
+	private List<String> readMergedLogLines(File root) {
+		if (root == null || !root.exists()) {
+			return []
+		}
+
+		if (cachedLogRoot != null &&
+			cachedLogRoot.absolutePath == root.absolutePath &&
+			cachedLogLines != null) {
+			return cachedLogLines
+		}
+
+		List<File> logFiles = []
+
+		root.eachFileRecurse(FileType.FILES) { File file ->
+			String lower = file.name.toLowerCase(Locale.ENGLISH)
+			if (lower.endsWith('.log') || lower.endsWith('.txt')) {
+				logFiles << file
+			}
+		}
+
+		logFiles.sort { File a, File b ->
+			int pa = logPriority(a)
+			int pb = logPriority(b)
+
+			if (pa != pb) {
+				return pa <=> pb
+			}
+
+			return a.absolutePath.toLowerCase(Locale.ENGLISH) <=> b.absolutePath.toLowerCase(Locale.ENGLISH)
+		}
+
+		List<String> merged = []
+		logFiles.each { File file ->
+			merged.addAll(readLinesSafely(file))
+		}
+
+		cachedLogRoot = root
+		cachedLogLines = merged
+
+		return merged
+	}
+
+	private int logPriority(File file) {
+		String lower = file.name.toLowerCase(Locale.ENGLISH)
+
+		if (lower == 'execution0.log') {
+			return 0
+		}
+		if (lower.contains('execution')) {
+			return 1
+		}
+		if (lower.contains('console')) {
+			return 2
+		}
+		if (lower.contains('report')) {
+			return 3
+		}
+
+		return 10
+	}
+
+	private String detectSuiteName(File root, List<Map> scenarios) {
+		if (root != null && root.parentFile != null) {
+			String parentName = sanitizeSuiteNameForDisplay(root.parentFile.name)
+			if (!parentName.isEmpty()) {
+				return parentName
+			}
+		}
+
+		String folderName = sanitizeSuiteNameForDisplay(root != null ? root.name : '')
+		if (!folderName.isEmpty()) {
+			return folderName
+		}
+
+		if (scenarios != null && !scenarios.isEmpty()) {
+			return safe(scenarios[0].name)
+		}
+
+		return 'Execution'
+	}
+
+	private String sanitizeSuiteNameForDisplay(String value) {
+		String name = safe(value)
+
+		if (name ==~ /^\d{8}_\d{6}$/) {
+			return ''
+		}
+
+		if (name ==~ /^\d+$/) {
+			return ''
+		}
+
+		return name
+	}
+
+	private String buildDisplayName(String className, String rawName) {
+		String cleanClass = safe(className)
+		String cleanName = safe(rawName)
+
+		if (!cleanClass.isEmpty()) {
+			if (cleanClass.startsWith('Test Cases/')) {
+				if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+					return cleanClass + '/' + cleanName
+				}
+				return cleanClass
+			}
+
+			if (cleanClass.contains('/')) {
+				if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+					return cleanClass + '/' + cleanName
+				}
+				return cleanClass
+			}
+		}
+
+		return cleanName
+	}
+
+	private String buildScenarioId(String value, int index) {
+		String normalized = safe(value)
+			.replace('\\', '/')
+			.replaceAll(/[^A-Za-z0-9\/_-]+/, '-')
+			.replaceAll(/-+/, '-')
+			.replaceAll(/^[-\/]+|[-\/]+$/, '')
+
+		if (normalized.isEmpty()) {
+			normalized = "scenario-${index}"
+		}
+
+		return normalized
+	}
+
+	private String extractNameFromStartLine(String line) {
+		String value = safe(line)
+		int index = value.indexOf('START ')
+		if (index >= 0) {
+			return value.substring(index + 6).trim()
+		}
+		return ''
+	}
+
+	private String deriveScenarioStatusFromBlock(String blockText) {
+		String lower = safe(blockText).toLowerCase(Locale.ENGLISH)
+
+		if (lower.contains('failed') || lower.contains('error')) {
+			return 'failed'
+		}
+		if (lower.contains('skipped') || lower.contains('blocked')) {
+			return 'blocked'
+		}
+		if (lower.contains('passed') || lower.contains('success')) {
+			return 'passed'
+		}
+
+		return 'blocked'
+	}
+
+	private String deriveStepStatus(String detail, String scenarioStatus) {
+		String lower = safe(detail).toLowerCase(Locale.ENGLISH)
+
+		if (lower.contains('cannot recognise image on screen')) {
+			return 'failed'
+		}
+		if (lower.contains('failed because') || lower.contains('failed') || lower.contains('error')) {
+			return 'failed'
+		}
+		if (lower.contains('did not run') || lower.contains('blocked') || lower.contains('skipped')) {
+			return 'blocked'
+		}
+		if (lower.contains('text of test object:') || lower.contains('the application at location:')) {
+			return 'passed'
+		}
+		if (scenarioStatus == 'blocked') {
+			return 'blocked'
+		}
+
+		return 'info'
+	}
+
+	private String resolveStepIcon(String detail, String status) {
+		String lower = safe(detail).toLowerCase(Locale.ENGLISH)
+
+		if (status == 'failed') {
+			return '❌'
+		}
+		if (status == 'passed') {
+			return '✅'
+		}
+		if (status == 'blocked') {
+			return '⛔'
+		}
+		if (lower.contains('click') || lower.contains('select') || lower.contains('tap')) {
+			return '🖱️'
+		}
+		if (lower.contains('open') || lower.contains('navigate') || lower.contains('starting application')) {
+			return '🌐'
+		}
+		if (lower.contains('wait')) {
+			return '⏳'
+		}
+		if (lower.contains('text of test object') || lower.contains('verify')) {
+			return '🔎'
+		}
+		return 'ℹ️'
+	}
+
+	private long extractPrefixDateMillis(String line) {
+		String prefix = extractPrefixDateText(line)
+		if (prefix.isEmpty()) {
+			return 0L
+		}
+
+		for (String pattern : PREFIX_DATE_PATTERNS) {
+			try {
+				return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(prefix).time
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return 0L
+	}
+
+	private String extractPrefixDateText(String line) {
+		String text = safe(line)
+
+		List<String> patterns = [
+			/^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})/,
+			/^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/,
+			/^\s*(\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2})/
 		]
 
-		for (String fieldName : candidates) {
-			try {
-				def value = GlobalVariable."${fieldName}"
-				if (!blank(safe(value))) {
-					return safe(value)
-				}
-			} catch (Exception ignored) {
+		for (def pattern : patterns) {
+			def matcher = text =~ pattern
+			if (matcher.find()) {
+				return safe(matcher.group(1))
 			}
 		}
 
 		return ''
 	}
 
-	private File locateTargetReportFolder() {
-		File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
-		File latestRunFolder = findLatestRunFolder(reportsRoot)
-
-		if (latestRunFolder == null || !latestRunFolder.exists()) {
-			throw new RuntimeException('No timestamp report folder was found under Reports.')
+	private String extractPrefixClock(String line) {
+		String prefix = extractPrefixDateText(line)
+		if (prefix.isEmpty()) {
+			return ''
 		}
 
-		List<File> candidates = []
-
-		latestRunFolder.eachFileRecurse { File dir ->
-			if (dir.isDirectory()) {
-				boolean hasJUnit = new File(dir, 'JUnit_Report.xml').exists()
-				String lowerName = dir.name.toLowerCase(Locale.ENGLISH)
-
-				if (hasJUnit && !lowerName.contains('jira import') && !lowerName.contains('collection')) {
-					candidates << dir
-				}
-			}
+		def matcher = prefix =~ /(\d{2}:\d{2}:\d{2})/
+		if (matcher.find()) {
+			return safe(matcher.group(1))
 		}
 
-		if (candidates.isEmpty()) {
-			throw new RuntimeException('No main suite report folder with JUnit_Report.xml was found.')
-		}
-
-		candidates = candidates.sort { File a, File b ->
-			b.lastModified() <=> a.lastModified()
-		}
-
-		return candidates[0]
+		return ''
 	}
 
-	private File findLatestRunFolder(File reportsRoot) {
-		if (reportsRoot == null || !reportsRoot.exists()) {
-			return null
+	private long toDurationMillis(String secondsValue) {
+		String value = safe(secondsValue)
+		if (value.isEmpty()) {
+			return 0L
 		}
-
-		List<File> folders = reportsRoot.listFiles()?.findAll { File f ->
-			f.isDirectory()
-		} ?: []
-
-		if (folders.isEmpty()) {
-			return null
-		}
-
-		folders = folders.sort { File a, File b ->
-			b.lastModified() <=> a.lastModified()
-		}
-
-		return folders[0]
-	}
-
-	private File findJUnitXml(File reportFolder) {
-		if (reportFolder == null || !reportFolder.exists()) {
-			return null
-		}
-
-		List<File> xmls = []
-
-		reportFolder.eachFileRecurse { File file ->
-			if (file.isFile() && file.name.equalsIgnoreCase('JUnit_Report.xml')) {
-				xmls << file
-			}
-		}
-
-		if (xmls.isEmpty()) {
-			return null
-		}
-
-		xmls = xmls.sort { File a, File b ->
-			b.lastModified() <=> a.lastModified()
-		}
-
-		return xmls[0]
-	}
-
-	private String buildExecutionTitle(String suiteName, File latestRunFolder) {
-		String formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
-
-		if (latestRunFolder != null) {
-			try {
-				Date parsed = new SimpleDateFormat('yyyyMMdd_HHmmss').parse(latestRunFolder.name)
-				formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(parsed)
-			} catch (Exception ignored) {
-			}
-		}
-
-		return safe(suiteName) + ' ' + formattedDate
-	}
-
-	private void createZipFromFolder(File sourceFolder, File targetZip, List<String> excludedNames) {
-		if (sourceFolder == null || !sourceFolder.exists()) {
-			return
-		}
-
-		if (targetZip.exists()) {
-			targetZip.delete()
-		}
-
-		ZipOutputStream zos = null
 
 		try {
-			zos = new ZipOutputStream(new FileOutputStream(targetZip))
-
-			sourceFolder.eachFileRecurse { File file ->
-				if (file.isFile()) {
-					if (excludedNames?.contains(file.name)) {
-						return
-					}
-
-					String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
-					ZipEntry entry = new ZipEntry(relativePath)
-					zos.putNextEntry(entry)
-					zos << file.bytes
-					zos.closeEntry()
-				}
-			}
-		} finally {
-			try {
-				zos?.close()
-			} catch (Exception ignored) {
-			}
+			BigDecimal seconds = new BigDecimal(value.replace(',', '.'))
+			return seconds.multiply(new BigDecimal('1000')).longValue()
+		} catch (Throwable ignored) {
+			return 0L
 		}
 	}
 
-	private File createEvidencesZip(File sourceFolder) {
-		if (sourceFolder == null || !sourceFolder.exists()) {
-			return null
+	private String buildShortError(String fullError, String status) {
+		if (status != 'failed') {
+			if (status == 'blocked') {
+				return 'Test did not run.'
+			}
+			return ''
 		}
 
-		List<File> images = []
+		List<String> rawLines = safe(fullError).readLines()
+		List<String> cleaned = []
 
-		sourceFolder.eachFileRecurse { File file ->
-			if (file.isFile()) {
-				String name = file.name.toLowerCase(Locale.ENGLISH)
-				if (name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.gif') || name.endsWith('.bmp') || name.endsWith('.webp')) {
-					images << file
-				}
+		rawLines.each { String rawLine ->
+			String line = normalizeInlineSpaces(rawLine)
+
+			if (line.isEmpty()) {
+				return
+			}
+			if (line == 'Reason:') {
+				return
+			}
+			if (line.startsWith('at ')) {
+				return
+			}
+			if (line.startsWith('...')) {
+				return
+			}
+			if (line.toLowerCase(Locale.ENGLISH).startsWith('caused by:')) {
+				line = line.substring('Caused by:'.length()).trim()
+			}
+
+			cleaned << line
+		}
+
+		if (cleaned.isEmpty()) {
+			return 'Execution failed.'
+		}
+
+		List<String> selected = []
+		cleaned.each { String line ->
+			if (selected.size() >= 2) {
+				return
+			}
+
+			String lower = line.toLowerCase(Locale.ENGLISH)
+			boolean relevant = lower.contains('failed') ||
+				lower.contains('exception') ||
+				lower.contains('cannot') ||
+				lower.contains('unable') ||
+				lower.contains('timeout') ||
+				lower.contains('connection') ||
+				lower.contains('call test case')
+
+			if (relevant || selected.isEmpty()) {
+				selected << line
 			}
 		}
 
-		if (images.isEmpty()) {
+		if (selected.isEmpty()) {
+			selected = cleaned.take(2)
+		}
+
+		return normalizeInlineSpaces(selected.join(' | '))
+	}
+
+	private String stripLogPrefix(String line) {
+		String value = safe(line)
+		if (value.isEmpty()) {
+			return ''
+		}
+
+		String prefixDate = extractPrefixDateText(value)
+		if (!prefixDate.isEmpty() && value.startsWith(prefixDate)) {
+			value = value.substring(prefixDate.length()).trim()
+		}
+
+		value = value.replaceFirst(/^(TRACE|DEBUG|INFO|WARNING|ERROR)\s+/, '')
+		value = value.replaceFirst(/^[^-]+-\s*/, '')
+		value = value.replace('\t', ' ').trim()
+
+		return normalizeInlineSpaces(value)
+	}
+
+	private String normalizeMultilineText(String value) {
+		if (safe(value).isEmpty()) {
+			return ''
+		}
+
+		List<String> lines = []
+		safe(value).readLines().each { String rawLine ->
+			String line = rawLine == null ? '' : rawLine.trim()
+			if (!line.isEmpty()) {
+				lines << line
+			}
+		}
+
+		return lines.join('\n')
+	}
+
+	private String normalizeInlineSpaces(String value) {
+		String text = safe(value)
+		while (text.contains('  ')) {
+			text = text.replace('  ', ' ')
+		}
+		return text.trim()
+	}
+
+	private String decodeHtmlEntities(String value) {
+		return safe(value)
+			.replace('&quot;', '"')
+			.replace('&apos;', '\'')
+			.replace('&lt;', '<')
+			.replace('&gt;', '>')
+			.replace('&amp;', '&')
+	}
+
+	private List<String> tokensFromText(String value) {
+		return safe(value)
+			.toLowerCase(Locale.ENGLISH)
+			.split(/[^a-z0-9]+/)
+			.findAll { String token -> token != null && token.trim().length() >= 4 }
+	}
+
+	private String normalizeSearchKey(String value) {
+		return safe(value)
+			.toLowerCase(Locale.ENGLISH)
+			.replaceAll(/[^a-z0-9]+/, '')
+	}
+
+	private Node firstChildByName(Node node, String childName) {
+		if (node == null) {
 			return null
 		}
 
-		File zipFile = new File(sourceFolder, 'Evidences.zip')
-
-		if (zipFile.exists()) {
-			zipFile.delete()
+		for (def child : node.children()) {
+			if (child instanceof Node && safe(((Node) child).name()) == safe(childName)) {
+				return (Node) child
+			}
 		}
 
-		ZipOutputStream zos = null
+		return null
+	}
+
+	private String textOf(Node node) {
+		if (node == null) {
+			return ''
+		}
 
 		try {
-			zos = new ZipOutputStream(new FileOutputStream(zipFile))
+			return safe(node.text())
+		} catch (Throwable ignored) {
+			return ''
+		}
+	}
 
-			images.each { File file ->
-				String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
-				ZipEntry entry = new ZipEntry(relativePath)
-				zos.putNextEntry(entry)
-				zos << file.bytes
-				zos.closeEntry()
-			}
-		} finally {
+	private String attr(Node node, String attributeName) {
+		if (node == null) {
+			return ''
+		}
+
+		try {
+			def value = node.attribute(attributeName)
+			return safe(value)
+		} catch (Throwable ignored) {
+			return ''
+		}
+	}
+
+	private List<String> readLinesSafely(File file) {
+		try {
+			return file.readLines('UTF-8')
+		} catch (Throwable ignored) {
 			try {
-				zos?.close()
-			} catch (Exception ignored) {
+				return file.readLines()
+			} catch (Throwable ignoredAgain) {
+				return []
+			}
+		}
+	}
+
+	private String firstNonBlank(Object... values) {
+		if (values == null) {
+			return ''
+		}
+
+		for (Object value : values) {
+			String text = safe(value)
+			if (!text.isEmpty()) {
+				return text
 			}
 		}
 
-		return zipFile
+		return ''
 	}
 
-	private boolean blank(String value) {
-		return safe(value).isEmpty()
+	private String formatDateTime(long millis) {
+		if (millis <= 0L) {
+			return '--'
+		}
+		return OUTPUT_DATE_TIME.format(new Date(millis))
+	}
+
+	private String formatClock(long millis) {
+		if (millis <= 0L) {
+			return '--'
+		}
+		return OUTPUT_CLOCK.format(new Date(millis))
+	}
+
+	private String formatDuration(long durationMs) {
+		if (durationMs < 0L) {
+			durationMs = 0L
+		}
+
+		long totalSeconds = Math.round(durationMs / 1000d)
+		long hours = (long) (totalSeconds / 3600L)
+		long minutes = (long) ((totalSeconds % 3600L) / 60L)
+		long seconds = (long) (totalSeconds % 60L)
+
+		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
 	}
 
 	private String safe(Object value) {
