@@ -3,6 +3,7 @@ package jiraIntegration
 import java.io.File
 import java.net.URI
 import java.text.SimpleDateFormat
+import java.util.ArrayList
 import java.util.Date
 import java.util.Locale
 
@@ -16,11 +17,11 @@ class JiraHtmlTemplateBuilder {
 	 */
 	private static final String LOGO_SRC = 'Image/ematch-logo.png'
 
-	private static final String PRODUCT_PURPLE = '#5b238e'
 	private static final String STATUS_PASS = '#68b84b'
 	private static final String STATUS_FAIL = '#e05b4d'
 	private static final String STATUS_SKIP = '#d7b436'
-	private static final String STATUS_INFO = PRODUCT_PURPLE
+	private static final String STATUS_INFO = '#6c2bd9'
+	private static final String PRODUCT_PURPLE = '#5c2483'
 
 	JiraHtmlTemplateBuilder() {
 	}
@@ -89,8 +90,8 @@ class JiraHtmlTemplateBuilder {
 		if (view.scenarios.isEmpty()) {
 			html.append('<div class="empty-state">No scenarios were found for this execution.</div>')
 		} else {
-			view.scenarios.eachWithIndex { Map scenario, int index ->
-				html.append(buildScenarioListItem(scenario, index == 0))
+			view.scenarios.eachWithIndex { scenario, index ->
+				html.append(buildScenarioListItem(scenario as Map, index == 0))
 			}
 		}
 
@@ -109,8 +110,8 @@ class JiraHtmlTemplateBuilder {
 			html.append('<div class="scenario-title">No execution data found</div>')
 			html.append('</section>')
 		} else {
-			view.scenarios.eachWithIndex { Map scenario, int index ->
-				html.append(buildScenarioPanel(scenario, view, index == 0))
+			view.scenarios.eachWithIndex { scenario, index ->
+				html.append(buildScenarioPanel(scenario as Map, view, index == 0))
 			}
 		}
 
@@ -138,52 +139,32 @@ class JiraHtmlTemplateBuilder {
 		)
 
 		List<Map> scenarios = []
-		asList(safeModel.scenarios).eachWithIndex { def rawItem, int index ->
+		asList(safeModel.scenarios).eachWithIndex { rawItem, index ->
 			Map item = rawItem instanceof Map ? (rawItem as Map) : [name: safeValue(rawItem)]
 
-			long durationMs = toLong(pickFirstObject(
-				item.durationMs,
-				item.elapsedMs,
-				item.timeMs,
-				item.duration
-			))
-
-			String startLong = pickFirst(
-				item.startLong,
-				item.startTime,
-				item.startLabel,
-				item.startDateTime,
-				item.startDate
-			)
-
-			String endLong = pickFirst(
-				item.endLong,
-				item.endTime,
-				item.endLabel,
-				item.endDateTime,
-				item.endDate
-			)
+			long durationMs = toLong(item.durationMs)
+			String durationLabel = pickFirst(item.durationLabel, formatDuration(durationMs))
 
 			scenarios << [
 				id            : pickFirst(item.id, "scenario-${index + 1}"),
 				name          : pickFirst(item.name, item.scenarioName, item.title, "Scenario ${index + 1}"),
 				summary       : pickFirst(item.summary, item.visualError, item.errorSummary, ''),
-				status        : normalizeStatus(pickFirst(item.status, item.result, 'info')),
-				startShort    : pickFirst(item.startShort, extractClockLabel(startLong)),
-				endShort      : pickFirst(item.endShort, extractClockLabel(endLong)),
-				startLong     : startLong,
-				endLong       : endLong,
-				durationLabel : pickFirst(item.durationLabel, formatDuration(durationMs)),
+				status        : normalizeStatus(pickFirst(item.status, 'info')),
+				startShort    : pickFirst(item.startShort, '--'),
+				endShort      : pickFirst(item.endShort, '--'),
+				startLong     : pickFirst(item.startLong, item.startTime, '--'),
+				endLong       : pickFirst(item.endLong, item.endTime, '--'),
+				durationLabel : durationLabel,
 				visualError   : pickFirst(item.visualError, item.summary, ''),
 				fullError     : pickFirst(item.fullError, item.errorDetail, ''),
 				steps         : normalizeSteps(item.steps),
-				evidence      : normalizeEvidence(item.evidence, safeModel)
+				evidence      : normalizeEvidence(item.evidence)
 			]
 		}
 
-		int passedCount = scenarios.count { Map it -> it.status == 'passed' }
-		int failedCount = scenarios.count { Map it -> it.status == 'failed' }
-		int skippedCount = scenarios.count { Map it -> it.status == 'skipped' }
+		int passedCount = scenarios.count { Map row -> row.status == 'passed' }
+		int failedCount = scenarios.count { Map row -> row.status == 'failed' }
+		int skippedCount = scenarios.count { Map row -> row.status == 'skipped' }
 		int totalCount = scenarios.size()
 
 		return [
@@ -203,7 +184,7 @@ class JiraHtmlTemplateBuilder {
 	private List<Map> normalizeSteps(def rawSteps) {
 		List<Map> result = []
 
-		asList(rawSteps).each { def raw ->
+		asList(rawSteps).each { raw ->
 			Map row = raw instanceof Map ? (raw as Map) : [detail: safeValue(raw)]
 
 			String detail = pickFirst(row.detail, row.message, row.text, row.title, row.name)
@@ -212,49 +193,41 @@ class JiraHtmlTemplateBuilder {
 			}
 
 			String status = normalizeStatus(pickFirst(row.status, row.result, row.outcome, 'info'))
-			String timestamp = pickFirst(row.timestamp, row.time, row.label, '')
+			String timestamp = pickFirst(row.timestamp, row.time, row.label, '--')
 
 			result << [
-				status   : status,
-				timestamp: timestamp,
-				detail   : detail,
-				icon     : pickFirst(row.icon, resolveStepIcon(detail, status))
+				status    : status,
+				timestamp : timestamp,
+				detail    : detail,
+				icon      : pickFirst(row.icon, resolveStepIcon(detail, status))
 			]
 		}
 
 		return result
 	}
 
-	private List<Map> normalizeEvidence(def rawEvidence, Map model) {
+	private List<Map> normalizeEvidence(def rawEvidence) {
 		List<Map> result = []
-		String baseFolder = pickFirst(model.reportFolder, model.baseFolder, model.executionFolder)
 
-		asList(rawEvidence).each { def raw ->
+		asList(rawEvidence).each { raw ->
 			if (raw instanceof Map) {
 				Map item = raw as Map
-
-				String href = pickFirst(item.href, item.url, item.path, '')
-				String imgSrc = pickFirst(item.imgSrc, item.imageSrc, href)
-
-				File resolvedHref = resolveFile(href, baseFolder)
-				File resolvedImg = resolveFile(imgSrc, baseFolder)
+				String imgSrc = pickFirst(item.imgSrc, item.imageSrc, '')
+				boolean isImage = Boolean.valueOf(String.valueOf(item.image)) || imgSrc.startsWith('data:image')
 
 				result << [
 					name  : pickFirst(item.name, item.fileName, 'Evidence'),
-					href  : resolvedHref != null && resolvedHref.exists() ? resolvedHref.toURI().toString() : href,
-					image : Boolean.valueOf(String.valueOf(item.image)),
-					imgSrc: resolvedImg != null && resolvedImg.exists() ? resolvedImg.toURI().toString() : imgSrc
+					href  : pickFirst(item.href, item.url, item.path, ''),
+					image : isImage,
+					imgSrc: pickFirst(item.imgSrc, item.imageSrc, item.href, item.url, '')
 				]
 			} else if (!safeValue(raw).isEmpty()) {
 				String href = safeValue(raw)
-				File resolved = resolveFile(href, baseFolder)
-				String finalHref = resolved != null && resolved.exists() ? resolved.toURI().toString() : href
-
 				result << [
-					name  : resolved != null ? resolved.name : new File(href).name,
-					href  : finalHref,
-					image : isImageFile(finalHref),
-					imgSrc: isImageFile(finalHref) ? finalHref : ''
+					name  : new File(href).name,
+					href  : href,
+					image : isImageFile(href),
+					imgSrc: isImageFile(href) ? href : ''
 				]
 			}
 		}
@@ -284,7 +257,7 @@ class JiraHtmlTemplateBuilder {
 		sb.append(htmlEscape(shortError))
 		sb.append('</div>')
 		sb.append('<div class="scenario-list-meta">')
-		sb.append(htmlEscape(pickFirst(scenario.startShort, '')))
+		sb.append(htmlEscape(pickFirst(scenario.startShort, '--')))
 		sb.append('</div>')
 		sb.append('</div>')
 
@@ -310,33 +283,12 @@ class JiraHtmlTemplateBuilder {
 		String scenarioName = safeValue(scenario.name)
 		String scenarioStatus = safeValue(scenario.status)
 
-		String visualError = pickFirst(
-			scenario.visualError,
-			scenario.summary,
-			''
-		)
+		String visualError = pickFirst(scenario.visualError, scenario.summary, '')
+		String fullError = pickFirst(scenario.fullError, visualError)
 
-		String fullError = pickFirst(
-			scenario.fullError,
-			visualError
-		)
-
-		String startLabel = pickFirst(
-			scenario.startLong,
-			scenario.startShort,
-			'--'
-		)
-
-		String endLabel = pickFirst(
-			scenario.endLong,
-			scenario.endShort,
-			'--'
-		)
-
-		String durationLabel = pickFirst(
-			scenario.durationLabel,
-			'00h 00m 00s'
-		)
+		String startLabel = pickFirst(scenario.startLong, scenario.startShort, '--')
+		String endLabel = pickFirst(scenario.endLong, scenario.endShort, '--')
+		String durationLabel = pickFirst(scenario.durationLabel, '00h 00m 00s')
 
 		List<Map> evidenceList = scenario.evidence instanceof List ? (scenario.evidence as List<Map>) : []
 		Map firstEvidence = evidenceList.isEmpty() ? null : evidenceList[0]
@@ -357,9 +309,9 @@ class JiraHtmlTemplateBuilder {
 		sb.append('<div class="scenario-meta-row">')
 		sb.append(buildMetaChip('Suite', suiteLabel, 'plain'))
 		sb.append(buildMetaChip('Status', statusLabel(scenarioStatus), scenarioStatus))
-		sb.append(buildMetaChip('Start', startLabel, 'accent'))
-		sb.append(buildMetaChip('End', endLabel, 'accent'))
-		sb.append(buildMetaChip('Duration', durationLabel, 'accent'))
+		sb.append(buildMetaChip('Start', startLabel, 'purple'))
+		sb.append(buildMetaChip('End', endLabel, 'purple'))
+		sb.append(buildMetaChip('Duration', durationLabel, 'purple'))
 		sb.append('</div>')
 		sb.append('</div>')
 
@@ -390,9 +342,7 @@ class JiraHtmlTemplateBuilder {
 		if ('failed'.equalsIgnoreCase(scenarioStatus) || !visualError.isEmpty()) {
 			sb.append('<div class="error-block">')
 			sb.append('<div class="error-title">Visual Error Log</div>')
-			sb.append('<div class="error-summary" title="')
-			sb.append(htmlEscape(visualError))
-			sb.append('">')
+			sb.append('<div class="error-summary">')
 			sb.append(htmlEscape(visualError))
 			sb.append('</div>')
 
@@ -489,9 +439,9 @@ class JiraHtmlTemplateBuilder {
 		sb.append('<div class="chart-side-wrap">')
 		sb.append('<div class="chart-side-title">Execution Status</div>')
 		sb.append('<div class="legend-list">')
-		sb.append(buildLegendLine('Passed', STATUS_PASS, view.passedCount as int))
-		sb.append(buildLegendLine('Failed', STATUS_FAIL, view.failedCount as int))
-		sb.append(buildLegendLine('Skipped', STATUS_SKIP, view.skippedCount as int))
+		sb.append(buildLegendLine('Passed', STATUS_PASS, view.passedCount))
+		sb.append(buildLegendLine('Failed', STATUS_FAIL, view.failedCount))
+		sb.append(buildLegendLine('Skipped', STATUS_SKIP, view.skippedCount))
 		sb.append('</div>')
 		sb.append('</div>')
 		return sb.toString()
@@ -614,14 +564,17 @@ class JiraHtmlTemplateBuilder {
 		if (status == 'skipped') {
 			return '⏭️'
 		}
-		if (lower.contains('wait') || lower.contains('retry')) {
+		if (lower.contains('wait')) {
 			return '⏳'
 		}
-		if (lower.contains('click') || lower.contains('select') || lower.contains('fill') || lower.contains('import') || lower.contains('keys')) {
+		if (lower.contains('click') || lower.contains('select') || lower.contains('fill') || lower.contains('import')) {
 			return '🖱️'
 		}
 		if (lower.contains('open') || lower.contains('navigate')) {
 			return '🌐'
+		}
+		if (lower.contains('type') || lower.contains('input') || lower.contains('keys')) {
+			return '⌨️'
 		}
 		return 'ℹ️'
 	}
@@ -701,11 +654,11 @@ class JiraHtmlTemplateBuilder {
 	private boolean isImageFile(String fileName) {
 		String lower = safeValue(fileName).toLowerCase(Locale.ENGLISH)
 		return lower.endsWith('.png') ||
-			lower.endsWith('.jpg') ||
-			lower.endsWith('.jpeg') ||
-			lower.endsWith('.gif') ||
-			lower.endsWith('.webp') ||
-			lower.endsWith('.bmp')
+			   lower.endsWith('.jpg') ||
+			   lower.endsWith('.jpeg') ||
+			   lower.endsWith('.gif') ||
+			   lower.endsWith('.webp') ||
+			   lower.endsWith('.bmp')
 	}
 
 	private List asList(def value) {
@@ -724,24 +677,6 @@ class JiraHtmlTemplateBuilder {
 		return [value]
 	}
 
-	private Object pickFirstObject(Object... values) {
-		if (values == null) {
-			return null
-		}
-
-		for (Object value : values) {
-			if (value == null) {
-				continue
-			}
-			if (value instanceof CharSequence && safeValue(value).isEmpty()) {
-				continue
-			}
-			return value
-		}
-
-		return null
-	}
-
 	private long toLong(def value) {
 		String raw = safeValue(value)
 		if (raw.isEmpty()) {
@@ -750,7 +685,7 @@ class JiraHtmlTemplateBuilder {
 
 		try {
 			return Long.parseLong(raw)
-		} catch (Throwable ignored) {
+		} catch (Exception ignored) {
 			return 0L
 		}
 	}
@@ -766,20 +701,6 @@ class JiraHtmlTemplateBuilder {
 		long seconds = (long) (totalSeconds % 60L)
 
 		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
-	}
-
-	private String extractClockLabel(String raw) {
-		String text = safeValue(raw)
-		if (text.isEmpty()) {
-			return ''
-		}
-
-		def matcher = (text =~ /(\d{2}:\d{2}:\d{2})/)
-		if (matcher.find()) {
-			return safeValue(matcher.group(1))
-		}
-
-		return text
 	}
 
 	private double percent(int value, int total) {
@@ -853,7 +774,7 @@ body {
     justify-content: space-between;
     gap: 24px;
     padding: 10px 18px;
-    background: #5b238e;
+    background: #5c2483;
     color: #ffffff;
 }
 .top-banner-left {
@@ -915,8 +836,8 @@ body {
     color: #4f5d6d;
 }
 .sidebar-tab.active {
-    color: #5b238e;
-    border-bottom-color: #5b238e;
+    color: #5c2483;
+    border-bottom-color: #5c2483;
     font-weight: 700;
 }
 .search-wrap {
@@ -931,8 +852,8 @@ body {
     outline: none;
 }
 .search-input:focus {
-    border-color: #5b238e;
-    box-shadow: 0 0 0 2px rgba(91,35,142,0.14);
+    border-color: #5c2483;
+    box-shadow: 0 0 0 2px rgba(92,36,131,0.12);
 }
 .scenario-list {
     padding: 0 12px 18px 12px;
@@ -965,12 +886,12 @@ body {
     display: none;
 }
 .scenario-list-item:hover {
-    background: #faf5ff;
+    background: #faf6fd;
 }
 .scenario-list-item.selected {
-    border-left: 4px solid #5b238e;
+    border-left: 4px solid #5c2483;
     padding-left: 10px;
-    background: #f7edff;
+    background: #f7f0fb;
 }
 .scenario-list-main {
     min-width: 0;
@@ -1028,7 +949,7 @@ body {
     background: #d7b436;
 }
 .status-pill.info {
-    background: #5b238e;
+    background: #6c2bd9;
 }
 .scenario-panel {
     display: none;
@@ -1065,8 +986,8 @@ body {
     background: #eef3f8;
     color: #1e2a35;
 }
-.meta-chip.accent {
-    background: #5b238e;
+.meta-chip.purple {
+    background: #5c2483;
     color: #ffffff;
 }
 .meta-chip.passed {
@@ -1082,7 +1003,7 @@ body {
     color: #ffffff;
 }
 .meta-chip.info {
-    background: #5b238e;
+    background: #6c2bd9;
     color: #ffffff;
 }
 .meta-label {
@@ -1184,13 +1105,8 @@ body {
     font-size: 13px;
     color: #253341;
     margin-bottom: 8px;
-    line-height: 1.45;
-    white-space: normal;
+    white-space: pre-wrap;
     word-break: break-word;
-    overflow: hidden;
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
 }
 .details-box,
 .evidence-item {
@@ -1206,7 +1122,7 @@ body {
     padding: 12px 14px;
     font-size: 13px;
     font-weight: 700;
-    color: #5b238e;
+    color: #5c2483;
     list-style: none;
 }
 .details-box summary::-webkit-details-marker,
@@ -1230,7 +1146,7 @@ body {
     font-size: 13px;
 }
 .evidence-links a {
-    color: #5b238e;
+    color: #5c2483;
     text-decoration: none;
     font-weight: 700;
 }
@@ -1467,10 +1383,6 @@ function filterScenarios() {
 
 
 
-
-
-
-
 package jiraIntegration
 
 import groovy.io.FileType
@@ -1480,20 +1392,23 @@ import groovy.util.XmlParser
 import java.io.File
 import java.math.BigDecimal
 import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 class JiraReportBuilder {
 
 	private static final String APP_NAME = 'EMATCH'
-	private static final String CUSTOM_REPORT_NAME = 'eMatchReport.html'
 
 	/*
 	 * Change only this variable if you want to replace the logo.
 	 */
 	private static final String LOGO_SRC = 'Image/ematch-logo.png'
 
+	private static final String REPORT_FILE_NAME = 'eMatchReport.html'
+
 	private static final List<String> DATE_PATTERNS = [
-		"yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+		"yyyy-MM-dd'T'HH:mm:ss.SSSX",
+		"yyyy-MM-dd'T'HH:mm:ssX",
 		"yyyy-MM-dd'T'HH:mm:ss.SSS",
 		"yyyy-MM-dd'T'HH:mm:ss",
 		'yyyy-MM-dd HH:mm:ss.SSS',
@@ -1523,7 +1438,7 @@ class JiraReportBuilder {
 	}
 
 	File buildReport(String reportFolderPath) {
-		return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), '', '')
+		return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath))
 	}
 
 	File buildReport(String reportFolderPath, String suiteName, String executionTitle) {
@@ -1535,12 +1450,12 @@ class JiraReportBuilder {
 	}
 
 	File buildReport(File reportFolder) {
-		return buildReport(reportFolder, '', '')
+		Map model = buildModel(reportFolder)
+		return writeReport(reportFolder, model)
 	}
 
 	File buildReport(File reportFolder, String suiteName, String executionTitle) {
-		File root = reportFolder ?: new File('.')
-		Map model = buildModel(root)
+		Map model = buildModel(reportFolder)
 
 		String resolvedSuiteName = safe(suiteName)
 		String resolvedExecutionTitle = safe(executionTitle)
@@ -1552,32 +1467,28 @@ class JiraReportBuilder {
 		if (!resolvedExecutionTitle.isEmpty()) {
 			model.executionName = resolvedExecutionTitle
 			model.title = resolvedExecutionTitle
-		} else {
-			if (safe(model.executionName).isEmpty()) {
-				model.executionName = safe(model.suiteName)
-			}
-			if (safe(model.title).isEmpty()) {
-				model.title = safe(model.executionName)
-			}
 		}
 
-		if (safe(model.logoSrc).isEmpty()) {
-			model.logoSrc = LOGO_SRC
+		model.generatedAt = OUTPUT_DATE_TIME.format(new Date())
+		model.logoSrc = LOGO_SRC
+
+		return writeReport(reportFolder, model)
+	}
+
+	private File writeReport(File reportFolder, Map model) {
+		File targetFolder = reportFolder ?: new File('.')
+
+		if (!targetFolder.exists()) {
+			targetFolder.mkdirs()
 		}
 
-		if (safe(model.generatedAt).isEmpty()) {
-			model.generatedAt = OUTPUT_DATE_TIME.format(new Date())
-		}
+		JiraHtmlTemplateBuilder templateBuilder = new JiraHtmlTemplateBuilder()
+		String html = templateBuilder.build(model)
 
-		if (!root.exists()) {
-			root.mkdirs()
-		}
+		File reportFile = new File(targetFolder, REPORT_FILE_NAME)
+		reportFile.setText(html, 'UTF-8')
 
-		File htmlFile = new File(root, CUSTOM_REPORT_NAME)
-		String html = new JiraHtmlTemplateBuilder().build(model)
-		htmlFile.setText(html, 'UTF-8')
-
-		return htmlFile
+		return reportFile
 	}
 
 	private Map buildModel(File reportFolder) {
@@ -1592,18 +1503,11 @@ class JiraReportBuilder {
 		cachedImageRoot = null
 		cachedImageFiles = []
 
-		List<Map> katalonCases = readKatalonCases(root)
-		Map<String, Map> katalonIndex = indexKatalonCases(katalonCases)
-
 		List<File> junitFiles = collectJUnitFiles(root)
 		List<Map> scenarios = []
 
 		junitFiles.each { File junitFile ->
-			scenarios.addAll(buildScenariosFromJUnit(junitFile, root, katalonIndex))
-		}
-
-		if (scenarios.isEmpty() && !katalonCases.isEmpty()) {
-			scenarios = buildScenariosFromKatalonCases(root, katalonCases)
+			scenarios.addAll(buildScenariosFromJUnit(junitFile, root))
 		}
 
 		if (scenarios.isEmpty()) {
@@ -1623,19 +1527,17 @@ class JiraReportBuilder {
 				durationLabel : formatDuration(0L),
 				startTime     : '',
 				endTime       : '',
-				startLabel    : '',
-				endLabel      : '',
-				startShort    : '',
-				endShort      : '',
-				startLong     : '',
-				endLong       : '',
-				reportFolder  : root.absolutePath,
-				steps         : [],
-				evidence      : [],
+				startShort    : '--',
+				endShort      : '--',
+				startLong     : '--',
+				endLong       : '--',
 				visualError   : '',
 				errorSummary  : '',
 				fullError     : '',
-				errorDetail   : ''
+				errorDetail   : '',
+				reportFolder  : root.absolutePath,
+				steps         : [],
+				evidence      : []
 			]
 		}
 
@@ -1672,7 +1574,7 @@ class JiraReportBuilder {
 		]
 	}
 
-	private List<Map> buildScenariosFromJUnit(File junitFile, File reportRoot, Map<String, Map> katalonIndex) {
+	private List<Map> buildScenariosFromJUnit(File junitFile, File reportRoot) {
 		List<Map> result = []
 
 		Node xmlRoot
@@ -1713,67 +1615,22 @@ class JiraReportBuilder {
 				resultNode = skippedNode
 			}
 
-			String failureMessage = firstNonBlank(
-				attr(resultNode, 'message'),
-				textOf(resultNode)
-			)
+			String fullError = firstNonBlank(textOf(resultNode), attr(resultNode, 'message'))
+			String visualError = buildShortError(fullError)
 
-			String fullError = textOf(resultNode)
-			if (fullError.isEmpty()) {
-				fullError = failureMessage
-			}
+			long durationMs = toDurationMillis(attr(testcaseNode, 'time'))
+			Map timing = extractTimingFromLogs(reportRoot, displayName, rawName, durationMs)
+			long resolvedDuration = (timing.durationMs as long) > 0L ? (timing.durationMs as long) : durationMs
 
-			Map katalonCase = findKatalonCase(katalonIndex, displayName, rawName, className)
-
-			long junitDurationMs = toDurationMillis(attr(testcaseNode, 'time'))
-			long startMs = toLong(katalonCase?.startMs)
-			long endMs = toLong(katalonCase?.endMs)
-
-			String startRaw = safe(katalonCase?.startRaw)
-			String endRaw = safe(katalonCase?.endRaw)
-
-			long durationMs = junitDurationMs
-			if (startMs > 0L && endMs >= startMs) {
-				durationMs = endMs - startMs
-			}
-
-			if (durationMs <= 0L) {
-				durationMs = toLong(katalonCase?.durationMs)
-			}
-
-			if (durationMs <= 0L) {
-				Map timingFromLogs = extractTimingFromLogs(reportRoot, displayName, rawName, junitDurationMs)
-				if (safe(startRaw).isEmpty()) {
-					startRaw = safe(timingFromLogs.startRaw)
-					startMs = parseDateMillis(startRaw)
-				}
-				if (safe(endRaw).isEmpty()) {
-					endRaw = safe(timingFromLogs.endRaw)
-					endMs = parseDateMillis(endRaw)
-				}
-				if (durationMs <= 0L) {
-					durationMs = toLong(timingFromLogs.durationMs)
-				}
-			}
-
-			List<Map> steps = []
-			if (katalonCase?.steps instanceof List && !((List) katalonCase.steps).isEmpty()) {
-				steps = normalizeKatalonSteps(katalonCase.steps as List<String>)
-			}
-			if (steps.isEmpty()) {
-				steps = extractStepsFromLogs(reportRoot, displayName, rawName)
-			}
-
+			List<Map> steps = extractStepsFromLogs(reportRoot, displayName, rawName)
 			List<Map> evidence = extractEvidence(
 				reportRoot,
 				displayName,
 				rawName,
-				status,
-				startMs,
-				endMs
+				(timing.startMs ?: 0L) as long,
+				(timing.endMs ?: 0L) as long,
+				status
 			)
-
-			String compactError = buildCompactError(failureMessage, fullError)
 
 			result << [
 				id            : scenarioId,
@@ -1781,64 +1638,18 @@ class JiraReportBuilder {
 				scenarioName  : displayName,
 				status        : status,
 				result        : status,
-				durationMs    : durationMs,
-				durationLabel : formatDuration(durationMs),
-				startTime     : startRaw,
-				endTime       : endRaw,
-				startLabel    : startRaw,
-				endLabel      : endRaw,
-				startShort    : extractClockOnly(startRaw),
-				endShort      : extractClockOnly(endRaw),
-				startLong     : startRaw,
-				endLong       : endRaw,
-				visualError   : compactError,
-				errorSummary  : compactError,
+				durationMs    : resolvedDuration,
+				durationLabel : formatDuration(resolvedDuration),
+				startTime     : safe(timing.startRaw),
+				endTime       : safe(timing.endRaw),
+				startShort    : displayClock(timing.startRaw),
+				endShort      : displayClock(timing.endRaw),
+				startLong     : displayDateTime(timing.startRaw),
+				endLong       : displayDateTime(timing.endRaw),
+				visualError   : visualError,
+				errorSummary  : visualError,
 				fullError     : fullError,
 				errorDetail   : fullError,
-				reportFolder  : reportRoot.absolutePath,
-				steps         : steps,
-				evidence      : evidence
-			]
-		}
-
-		return result
-	}
-
-	private List<Map> buildScenariosFromKatalonCases(File reportRoot, List<Map> katalonCases) {
-		List<Map> result = []
-
-		katalonCases.eachWithIndex { Map item, int index ->
-			String name = firstNonBlank(item.fullName, item.name, "Scenario ${index + 1}")
-			long durationMs = toLong(item.durationMs)
-			long startMs = toLong(item.startMs)
-			long endMs = toLong(item.endMs)
-			String status = normalizeStatus(firstNonBlank(item.status, 'info'))
-
-			List<Map> steps = normalizeKatalonSteps(item.steps instanceof List ? (item.steps as List<String>) : [])
-			List<Map> evidence = extractEvidence(reportRoot, name, safe(item.name), status, startMs, endMs)
-
-			String compactError = buildCompactError(safe(item.visualError), safe(item.fullError))
-
-			result << [
-				id            : buildScenarioId(name, index + 1),
-				name          : name,
-				scenarioName  : name,
-				status        : status,
-				result        : status,
-				durationMs    : durationMs,
-				durationLabel : formatDuration(durationMs),
-				startTime     : safe(item.startRaw),
-				endTime       : safe(item.endRaw),
-				startLabel    : safe(item.startRaw),
-				endLabel      : safe(item.endRaw),
-				startShort    : extractClockOnly(safe(item.startRaw)),
-				endShort      : extractClockOnly(safe(item.endRaw)),
-				startLong     : safe(item.startRaw),
-				endLong       : safe(item.endRaw),
-				visualError   : compactError,
-				errorSummary  : compactError,
-				fullError     : safe(item.fullError),
-				errorDetail   : safe(item.fullError),
 				reportFolder  : reportRoot.absolutePath,
 				steps         : steps,
 				evidence      : evidence
@@ -1860,7 +1671,7 @@ class JiraReportBuilder {
 
 		for (int i = 0; i < lines.size(); i++) {
 			String line = safe(lines[i])
-			if (line.contains('START Test Cases/')) {
+			if (line.contains('Start Test Case :') || line.contains('START Test Cases/')) {
 				startIndexes << i
 			}
 		}
@@ -1894,15 +1705,10 @@ class JiraReportBuilder {
 				status = 'failed'
 			} else if (lowerBlock.contains(' passed')) {
 				status = 'passed'
-			} else if (lowerBlock.contains(' skipped')) {
-				status = 'skipped'
 			}
 
 			Map timing = extractTimingFromBlock(block, 0L)
-			long startMs = parseDateMillis(safe(timing.startRaw))
-			long endMs = parseDateMillis(safe(timing.endRaw))
-
-			String compactError = buildCompactError(firstMeaningfulFailureLine(block), blockText)
+			long resolvedDuration = (timing.durationMs ?: 0L) as long
 
 			result << [
 				id            : buildScenarioId(name, idx + 1),
@@ -1910,23 +1716,28 @@ class JiraReportBuilder {
 				scenarioName  : name,
 				status        : status,
 				result        : status,
-				durationMs    : toLong(timing.durationMs),
-				durationLabel : formatDuration(toLong(timing.durationMs)),
+				durationMs    : resolvedDuration,
+				durationLabel : formatDuration(resolvedDuration),
 				startTime     : safe(timing.startRaw),
 				endTime       : safe(timing.endRaw),
-				startLabel    : safe(timing.startRaw),
-				endLabel      : safe(timing.endRaw),
-				startShort    : extractClockOnly(safe(timing.startRaw)),
-				endShort      : extractClockOnly(safe(timing.endRaw)),
-				startLong     : safe(timing.startRaw),
-				endLong       : safe(timing.endRaw),
-				visualError   : status == 'failed' ? compactError : '',
-				errorSummary  : status == 'failed' ? compactError : '',
+				startShort    : displayClock(timing.startRaw),
+				endShort      : displayClock(timing.endRaw),
+				startLong     : displayDateTime(timing.startRaw),
+				endLong       : displayDateTime(timing.endRaw),
+				visualError   : status == 'failed' ? buildShortError(blockText) : '',
+				errorSummary  : status == 'failed' ? buildShortError(blockText) : '',
 				fullError     : status == 'failed' ? blockText : '',
 				errorDetail   : status == 'failed' ? blockText : '',
 				reportFolder  : reportRoot.absolutePath,
 				steps         : convertBlockToSteps(block),
-				evidence      : extractEvidence(reportRoot, name, name, status, startMs, endMs)
+				evidence      : extractEvidence(
+					reportRoot,
+					name,
+					name,
+					(timing.startMs ?: 0L) as long,
+					(timing.endMs ?: 0L) as long,
+					status
+				)
 			]
 		}
 
@@ -2050,40 +1861,134 @@ class JiraReportBuilder {
 		return [
 			startRaw   : startRaw,
 			endRaw     : endRaw,
+			startMs    : startMs,
+			endMs      : endMs,
 			durationMs : durationMs
 		]
 	}
 
 	private List<Map> extractStepsFromLogs(File reportRoot, String displayName, String rawName) {
 		List<String> block = findLogBlock(reportRoot, displayName, rawName)
+		List<Map> xmlSteps = convertXmlRecordBlockToSteps(block)
+
+		if (!xmlSteps.isEmpty()) {
+			return xmlSteps
+		}
+
 		return convertBlockToSteps(block)
 	}
 
-	private List<Map> normalizeKatalonSteps(List<String> stepLines) {
+	private List<Map> convertXmlRecordBlockToSteps(List<String> block) {
 		List<Map> steps = []
 
-		stepLines.each { String raw ->
-			String detail = cleanStepText(raw)
-			if (detail.isEmpty()) {
+		boolean insideRecord = false
+		Map current = [:]
+
+		block.each { String line ->
+			String raw = safe(line)
+
+			if (raw.contains('<record>')) {
+				insideRecord = true
+				current = [:]
 				return
 			}
 
-			steps << [
-				status    : deriveLineStatus(detail),
-				timestamp : '',
-				detail    : detail,
-				icon      : resolveStepIcon(detail, deriveLineStatus(detail))
-			]
+			if (!insideRecord) {
+				return
+			}
+
+			String dateValue = extractTagValue(raw, 'date')
+			if (!dateValue.isEmpty()) {
+				current.date = dateValue
+			}
+
+			String levelValue = extractTagValue(raw, 'level')
+			if (!levelValue.isEmpty()) {
+				current.level = levelValue
+			}
+
+			String messageValue = extractTagValue(raw, 'message')
+			if (!messageValue.isEmpty()) {
+				current.message = xmlUnescape(messageValue)
+			}
+
+			if (raw.contains('</record>')) {
+				insideRecord = false
+
+				String message = safe(current.message)
+				String level = safe(current.level)
+				String timestamp = displayClock(current.date)
+
+				String detail = normalizeRecordMessage(message)
+				if (detail.isEmpty()) {
+					current = [:]
+					return
+				}
+
+				String status = deriveLineStatus(level + ' ' + detail)
+
+				steps << [
+					status    : status,
+					timestamp : timestamp,
+					detail    : detail,
+					icon      : resolveStepIcon(detail, status)
+				]
+
+				current = [:]
+			}
+		}
+
+		if (steps.size() > 80) {
+			steps = steps.take(80)
 		}
 
 		return steps
+	}
+
+	private String normalizeRecordMessage(String message) {
+		String text = safe(message)
+
+		if (text.isEmpty()) {
+			return ''
+		}
+
+		if (text.startsWith('Start Test Case :')) {
+			return ''
+		}
+		if (text.startsWith('End Test Case :')) {
+			return ''
+		}
+		if (text.startsWith('Start Test Suite :')) {
+			return ''
+		}
+		if (text.startsWith('End Test Suite :')) {
+			return ''
+		}
+		if (text.startsWith('Start listener action :')) {
+			return ''
+		}
+		if (text.startsWith('End listener action :')) {
+			return ''
+		}
+		if (text.equalsIgnoreCase('Video')) {
+			return ''
+		}
+		if (text.startsWith('End action :')) {
+			return ''
+		}
+
+		if (text.startsWith('Start action :')) {
+			text = text.substring('Start action :'.length()).trim()
+		}
+
+		return text
 	}
 
 	private List<Map> convertBlockToSteps(List<String> block) {
 		List<Map> steps = []
 
 		block.each { String line ->
-			String detail = cleanStepText(stripLinePrefix(line))
+			String detail = stripLinePrefix(line)
 			if (detail.isEmpty()) {
 				return
 			}
@@ -2100,9 +2005,6 @@ class JiraReportBuilder {
 			if (lower.startsWith('end test cases/')) {
 				return
 			}
-			if (lower.startsWith('<')) {
-				return
-			}
 
 			String derivedStatus = deriveLineStatus(detail)
 
@@ -2114,23 +2016,18 @@ class JiraReportBuilder {
 			]
 		}
 
-		if (steps.size() > 60) {
-			steps = steps.take(60)
+		if (steps.size() > 80) {
+			steps = steps.take(80)
 		}
 
 		return steps
 	}
 
-	private List<Map> extractEvidence(
-		File reportRoot,
-		String displayName,
-		String rawName,
-		String status,
-		long startMs,
-		long endMs
-	) {
+	private List<Map> extractEvidence(File reportRoot, String displayName, String rawName, long startMs, long endMs, String status) {
+		List<Map> inlineEvidence = extractInlineEvidenceFromHtml(reportRoot)
 		List<File> images = collectImageFiles(reportRoot)
-		if (images.isEmpty()) {
+
+		if (images.isEmpty() && inlineEvidence.isEmpty()) {
 			return []
 		}
 
@@ -2146,19 +2043,20 @@ class JiraReportBuilder {
 
 		images.each { File imageFile ->
 			String lowerPath = imageFile.absolutePath.toLowerCase(Locale.ENGLISH)
+			String lowerName = imageFile.name.toLowerCase(Locale.ENGLISH)
 
-			if (lowerPath.contains('logo') || lowerPath.contains('icon') || lowerPath.contains('favicon')) {
+			if (lowerName.contains('logo')) {
 				return
 			}
 
 			int score = 0
 
 			if (!primaryKey.isEmpty() && normalizeSearchKey(lowerPath).contains(primaryKey)) {
-				score += 14
+				score += 12
 			}
 
 			if (!secondaryKey.isEmpty() && normalizeSearchKey(lowerPath).contains(secondaryKey)) {
-				score += 10
+				score += 8
 			}
 
 			tokens.each { String token ->
@@ -2167,31 +2065,16 @@ class JiraReportBuilder {
 				}
 			}
 
-			if (lowerPath.contains('screenshot') ||
-				lowerPath.contains('screen') ||
-				lowerPath.contains('capture') ||
-				lowerPath.contains('evidence')) {
-				score += 4
+			if (status == 'failed' && (lowerPath.contains('error') || lowerPath.contains('fail') || lowerPath.contains('failed'))) {
+				score += 3
 			}
 
-			if (status == 'failed' &&
-				(lowerPath.contains('error') || lowerPath.contains('fail') || lowerPath.contains('failed'))) {
-				score += 4
-			}
+			long fileTime = imageFile.lastModified()
 
-			if (startMs > 0L || endMs > 0L) {
-				long reference = endMs > 0L ? endMs : startMs
-				long delta = Math.abs(imageFile.lastModified() - reference)
-
-				if (startMs > 0L && endMs > 0L &&
-					imageFile.lastModified() >= (startMs - 120000L) &&
-					imageFile.lastModified() <= (endMs + 120000L)) {
-					score += 25
-				} else if (delta <= 300000L) {
-					score += 12
-				} else if (delta <= 900000L) {
-					score += 6
-				}
+			if (startMs > 0L && endMs >= startMs && fileTime >= (startMs - 120000L) && fileTime <= (endMs + 120000L)) {
+				score += 10
+			} else if (startMs > 0L && Math.abs(fileTime - startMs) <= 180000L) {
+				score += 6
 			}
 
 			scored << [
@@ -2218,16 +2101,59 @@ class JiraReportBuilder {
 				return
 			}
 
-			if (score <= 0 && index == 0 && status != 'failed') {
-				return
-			}
-
 			result << [
 				name   : file.name,
 				href   : file.toURI().toString(),
 				image  : true,
 				imgSrc : file.toURI().toString()
 			]
+		}
+
+		if (result.isEmpty() && !inlineEvidence.isEmpty()) {
+			return [inlineEvidence[0]]
+		}
+
+		return result
+	}
+
+	private List<Map> extractInlineEvidenceFromHtml(File root) {
+		List<Map> result = []
+
+		if (root == null || !root.exists()) {
+			return result
+		}
+
+		root.eachFileRecurse(FileType.FILES) { File file ->
+			String lower = file.name.toLowerCase(Locale.ENGLISH)
+
+			if (!lower.endsWith('.html')) {
+				return
+			}
+
+			if (lower == REPORT_FILE_NAME.toLowerCase(Locale.ENGLISH)) {
+				return
+			}
+
+			String text = ''
+			try {
+				text = file.getText('UTF-8')
+			} catch (Throwable ignored) {
+				return
+			}
+
+			def matcher = text =~ /(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+\/=\r\n]+)/
+
+			if (matcher.find()) {
+				String dataUri = safe(matcher.group(1)).replace('\r', '').replace('\n', '')
+				if (!dataUri.isEmpty()) {
+					result << [
+						name   : 'Inline evidence',
+						href   : '',
+						image  : true,
+						imgSrc : dataUri
+					]
+				}
+			}
 		}
 
 		return result
@@ -2240,7 +2166,8 @@ class JiraReportBuilder {
 
 		if (cachedImageRoot != null &&
 			cachedImageRoot.absolutePath == root.absolutePath &&
-			cachedImageFiles != null) {
+			cachedImageFiles != null &&
+			!cachedImageFiles.isEmpty()) {
 			return cachedImageFiles
 		}
 
@@ -2272,23 +2199,28 @@ class JiraReportBuilder {
 			return []
 		}
 
-		String exactStartCandidate = ''
-		if (!safe(displayName).isEmpty()) {
-			exactStartCandidate = "START ${safe(displayName)}"
-			if (!exactStartCandidate.contains('Test Cases/')) {
-				exactStartCandidate = "START Test Cases/${safe(displayName)}"
-			}
-		}
+		List<String> possibleStarts = [
+			'Start Test Case : ' + safe(displayName),
+			'Start Test Case : ' + safe(rawName),
+			'START ' + safe(displayName),
+			'START ' + safe(rawName)
+		].findAll { !safe(it).isEmpty() }
 
 		int startIndex = -1
 
-		if (!exactStartCandidate.isEmpty()) {
-			for (int i = 0; i < lines.size(); i++) {
-				String line = safe(lines[i])
-				if (line.contains(exactStartCandidate)) {
+		for (int i = 0; i < lines.size(); i++) {
+			String currentLine = safe(lines[i])
+
+			boolean matched = false
+			possibleStarts.each { String pattern ->
+				if (!matched && currentLine.contains(pattern)) {
 					startIndex = i
-					break
+					matched = true
 				}
+			}
+
+			if (matched) {
+				break
 			}
 		}
 
@@ -2319,18 +2251,18 @@ class JiraReportBuilder {
 			return []
 		}
 
-		int endIndex = Math.min(lines.size() - 1, startIndex + 220)
+		int endIndex = Math.min(lines.size() - 1, startIndex + 260)
 
 		for (int i = startIndex + 1; i < lines.size(); i++) {
 			String line = safe(lines[i])
 
-			if (line.contains('END Test Cases/')) {
-				endIndex = i
+			if (line.contains('Start Test Case : ') || line.contains('START Test Cases/')) {
+				endIndex = i - 1
 				break
 			}
 
-			if (line.contains('START Test Cases/')) {
-				endIndex = i - 1
+			if (line.contains('END Test Cases/')) {
+				endIndex = i
 				break
 			}
 		}
@@ -2349,7 +2281,8 @@ class JiraReportBuilder {
 
 		if (cachedLogRoot != null &&
 			cachedLogRoot.absolutePath == root.absolutePath &&
-			cachedLogLines != null) {
+			cachedLogLines != null &&
+			!cachedLogLines.isEmpty()) {
 			return cachedLogLines
 		}
 
@@ -2357,15 +2290,7 @@ class JiraReportBuilder {
 
 		root.eachFileRecurse(FileType.FILES) { File file ->
 			String lower = file.name.toLowerCase(Locale.ENGLISH)
-			boolean accepted = false
-
-			if (lower == 'execution0.log') {
-				accepted = true
-			} else if (lower.endsWith('.log') || lower.endsWith('.txt')) {
-				accepted = true
-			}
-
-			if (accepted) {
+			if (lower.endsWith('.log') || lower.endsWith('.txt')) {
 				logFiles << file
 			}
 		}
@@ -2411,243 +2336,19 @@ class JiraReportBuilder {
 		return 10
 	}
 
-	private List<Map> readKatalonCases(File root) {
-		File htmlFile = locatePrimaryKatalonHtml(root)
-		if (htmlFile == null || !htmlFile.exists()) {
-			return []
-		}
-
-		String rawHtml = readFileSafely(htmlFile)
-		if (rawHtml.isEmpty()) {
-			return []
-		}
-
-		String plainText = htmlToPlainText(rawHtml)
-		List<String> lines = plainText.readLines()
-			.collect { normalizeSpace(it) }
-			.findAll { !it.isEmpty() }
-
-		List<Map> cases = []
-		List<String> block = []
-
-		lines.each { String line ->
-			if (line.startsWith('TEST CASE:')) {
-				if (!block.isEmpty()) {
-					Map parsed = parseKatalonCaseBlock(block, cases.size() + 1)
-					if (parsed != null) {
-						cases << parsed
-					}
-					block = []
-				}
-			}
-
-			if (!block.isEmpty() || line.startsWith('TEST CASE:')) {
-				block << line
-			}
-		}
-
-		if (!block.isEmpty()) {
-			Map parsed = parseKatalonCaseBlock(block, cases.size() + 1)
-			if (parsed != null) {
-				cases << parsed
-			}
-		}
-
-		return cases
-	}
-
-	private File locatePrimaryKatalonHtml(File root) {
-		if (root == null || !root.exists()) {
-			return null
-		}
-
-		List<File> htmlFiles = []
-
-		root.eachFileRecurse(FileType.FILES) { File file ->
-			String lower = file.name.toLowerCase(Locale.ENGLISH)
-			if (lower.endsWith('.html') &&
-				lower != CUSTOM_REPORT_NAME.toLowerCase(Locale.ENGLISH) &&
-				!lower.contains('index')) {
-				htmlFiles << file
-			}
-		}
-
-		if (htmlFiles.isEmpty()) {
-			return null
-		}
-
-		htmlFiles.sort { File a, File b ->
-			int bySize = (int) (b.length() <=> a.length())
-			if (bySize != 0) {
-				return bySize
-			}
-			return ((b.lastModified()) <=> (a.lastModified()))
-		}
-
-		return htmlFiles[0]
-	}
-
-	private Map parseKatalonCaseBlock(List<String> block, int index) {
-		if (block == null || block.isEmpty()) {
-			return null
-		}
-
-		String name = afterPrefix(findFirstLine(block, 'TEST CASE:'), 'TEST CASE:')
-		if (name.isEmpty()) {
-			return null
-		}
-
-		String fullName = afterPrefix(findFirstLine(block, 'Full Name:'), 'Full Name:')
-		String description = afterPrefix(findFirstLine(block, 'Description:'), 'Description:')
-		String tag = afterPrefix(findFirstLine(block, 'Tag:'), 'Tag:')
-		String timeLine = afterPrefix(findFirstLine(block, 'Start / End / Elapsed:'), 'Start / End / Elapsed:')
-		String statusLine = afterPrefix(findLastStatusLine(block), 'Status:')
-
-		Map timing = parseStartEndElapsed(timeLine)
-		List<String> steps = []
-
-		block.each { String line ->
-			if (line.startsWith('TEST STEP:')) {
-				String step = afterPrefix(line, 'TEST STEP:')
-				if (!step.isEmpty()) {
-					steps << step
-				}
-			}
-		}
-
-		return [
-			id         : buildScenarioId(firstNonBlank(fullName, name), index),
-			name       : name,
-			fullName   : firstNonBlank(fullName, name),
-			description: description,
-			tag        : tag,
-			status     : normalizeStatus(statusLine),
-			startRaw   : safe(timing.startRaw),
-			endRaw     : safe(timing.endRaw),
-			startMs    : toLong(timing.startMs),
-			endMs      : toLong(timing.endMs),
-			durationMs : toLong(timing.durationMs),
-			steps      : steps,
-			visualError: '',
-			fullError  : ''
-		]
-	}
-
-	private Map parseStartEndElapsed(String value) {
-		String raw = safe(value)
-		if (raw.isEmpty()) {
-			return [startRaw: '', endRaw: '', startMs: 0L, endMs: 0L, durationMs: 0L]
-		}
-
-		List<String> parts = raw.split(/\s*\/\s*/).collect { safe(it) }
-
-		String startRaw = parts.size() > 0 ? parts[0] : ''
-		String endRaw = parts.size() > 1 ? parts[1] : ''
-		String elapsedRaw = parts.size() > 2 ? parts[2] : ''
-
-		long startMs = parseDateMillis(startRaw)
-		long endMs = parseDateMillis(endRaw)
-		long durationMs = parseElapsedDuration(elapsedRaw)
-
-		if (durationMs <= 0L && startMs > 0L && endMs >= startMs) {
-			durationMs = endMs - startMs
-		}
-
-		return [
-			startRaw   : startRaw,
-			endRaw     : endRaw,
-			startMs    : startMs,
-			endMs      : endMs,
-			durationMs : durationMs
-		]
-	}
-
-	private long parseElapsedDuration(String value) {
-		String raw = safe(value)
-		if (raw.isEmpty()) {
-			return 0L
-		}
-
-		def matcher = raw =~ /(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?/
-		if (matcher.find()) {
-			long hours = Long.parseLong(matcher.group(1))
-			long minutes = Long.parseLong(matcher.group(2))
-			long seconds = Long.parseLong(matcher.group(3))
-			long millis = 0L
-
-			if (matcher.groupCount() >= 4 && matcher.group(4) != null) {
-				String ms = matcher.group(4).padRight(3, '0' as char)
-				millis = Long.parseLong(ms.substring(0, 3))
-			}
-
-			return (hours * 3600000L) + (minutes * 60000L) + (seconds * 1000L) + millis
-		}
-
-		return 0L
-	}
-
-	private Map<String, Map> indexKatalonCases(List<Map> cases) {
-		Map<String, Map> result = [:]
-
-		cases.each { Map item ->
-			List<String> keys = [
-				normalizeSearchKey(item.fullName),
-				normalizeSearchKey(item.name),
-				normalizeSearchKey(buildTailCasePath(safe(item.fullName))),
-				normalizeSearchKey(buildTailCasePath(safe(item.name)))
-			].findAll { !safe(it).isEmpty() }.unique()
-
-			keys.each { String key ->
-				result[key] = item
-			}
-		}
-
-		return result
-	}
-
-	private Map findKatalonCase(Map<String, Map> index, String displayName, String rawName, String className) {
-		List<String> keys = [
-			normalizeSearchKey(displayName),
-			normalizeSearchKey(rawName),
-			normalizeSearchKey(className),
-			normalizeSearchKey(buildTailCasePath(displayName)),
-			normalizeSearchKey(buildTailCasePath(rawName)),
-			normalizeSearchKey(buildTailCasePath(className))
-		].findAll { !safe(it).isEmpty() }.unique()
-
-		for (String key : keys) {
-			if (index.containsKey(key)) {
-				return index[key]
-			}
-		}
-
-		return null
-	}
-
-	private String buildTailCasePath(String value) {
-		String raw = safe(value)
-		int idx = raw.indexOf('Test Cases/')
-		if (idx >= 0) {
-			return raw.substring(idx)
-		}
-		return raw
-	}
-
 	private String detectSuiteName(File root, List<Map> scenarios) {
-		String folderName = root != null ? safe(root.name) : ''
-
-		folderName = folderName.replaceAll(/\d{8}_\d{6}$/, '').trim()
-		folderName = folderName.replaceAll(/\d{4}-\d{2}-\d{2}[ _]\d{2}\.\d{2}\.\d{2}$/, '').trim()
+		String folderName = root != null ? safe(root.parentFile?.name) : ''
 
 		if (!folderName.isEmpty() && !folderName.matches(/\d+/)) {
 			return folderName
 		}
 
-		if (root != null && root.parentFile != null) {
-			String parentName = safe(root.parentFile.name)
-			if (!parentName.isEmpty() && !parentName.matches(/\d+/)) {
-				return parentName
-			}
+		folderName = root != null ? safe(root.name) : ''
+		folderName = folderName.replaceAll(/\d{8}_\d{6}$/, '').trim()
+		folderName = folderName.replaceAll(/\d{4}-\d{2}-\d{2}[ _]\d{2}\.\d{2}\.\d{2}$/, '').trim()
+
+		if (!folderName.isEmpty() && !folderName.matches(/\d+/)) {
+			return folderName
 		}
 
 		if (scenarios != null && !scenarios.isEmpty()) {
@@ -2662,13 +2363,19 @@ class JiraReportBuilder {
 		String cleanName = safe(rawName)
 
 		if (!cleanClass.isEmpty()) {
-			if (cleanClass == cleanName || cleanClass.endsWith('/' + cleanName)) {
+			if (cleanClass.startsWith('Test Cases/')) {
+				if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+					return cleanClass + '/' + cleanName
+				}
 				return cleanClass
 			}
-			if (!cleanName.isEmpty()) {
-				return cleanClass + '/' + cleanName
+
+			if (cleanClass.contains('/')) {
+				if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+					return cleanClass + '/' + cleanName
+				}
+				return cleanClass
 			}
-			return cleanClass
 		}
 
 		return cleanName
@@ -2688,76 +2395,70 @@ class JiraReportBuilder {
 		return normalized
 	}
 
-	private String firstMeaningfulFailureLine(List<String> block) {
-		for (String line : block) {
-			String detail = cleanStepText(stripLinePrefix(line))
-			if (detail.isEmpty()) {
-				continue
-			}
-
-			String lower = detail.toLowerCase(Locale.ENGLISH)
-			if (lower.contains('failed') || lower.contains('error') || lower.contains('exception')) {
-				return detail
-			}
+	private String buildShortError(String fullError) {
+		String text = safe(fullError)
+		if (text.isEmpty()) {
+			return ''
 		}
 
-		return ''
-	}
-
-	private String extractNameFromStartLine(String line) {
-		String value = safe(line)
-		int index = value.indexOf('START ')
-		if (index >= 0) {
-			return value.substring(index + 6).trim()
-		}
-		return ''
-	}
-
-	private String buildCompactError(String shortText, String fullText) {
-		List<String> lines = []
-
-		splitMeaningfulLines(shortText).each { String line ->
-			if (!line.isEmpty()) {
-				lines << line
-			}
-		}
-
-		splitMeaningfulLines(fullText).each { String line ->
-			String lower = line.toLowerCase(Locale.ENGLISH)
-
-			if (line.startsWith('at ')) {
-				return
-			}
-			if (lower == 'reason:' || lower == 'caused by:') {
-				return
-			}
-			if (line.startsWith('--')) {
-				return
-			}
-
-			if (!line.isEmpty() && !lines.contains(line)) {
-				lines << line
-			}
-		}
+		List<String> lines = text
+			.replace('\r', '\n')
+			.split('\n')
+			collect { String it -> safe(it) }
+			.findAll { String it -> !it.isEmpty() && !it.startsWith('at ') }
 
 		if (lines.isEmpty()) {
 			return ''
 		}
 
-		return lines.take(2).join('\n')
+		List<String> summary = []
+
+		int reasonIndex = lines.findIndexOf { String line ->
+			line.equalsIgnoreCase('Reason:') || line.toLowerCase(Locale.ENGLISH).startsWith('reason:')
+		}
+
+		if (reasonIndex >= 0) {
+			summary << trimToSize(lines[reasonIndex], 220)
+			if (reasonIndex + 1 < lines.size()) {
+				summary << trimToSize(lines[reasonIndex + 1], 220)
+			}
+		} else {
+			summary << trimToSize(lines[0], 220)
+			if (lines.size() > 1) {
+				summary << trimToSize(lines[1], 220)
+			}
+		}
+
+		return summary.findAll { !safe(it).isEmpty() }.join('\n')
 	}
 
-	private List<String> splitMeaningfulLines(String raw) {
-		return safe(raw)
-			.readLines()
-			.collect { normalizeSpace(it) }
-			.findAll { !it.isEmpty() }
+	private String trimToSize(String value, int max) {
+		String text = safe(value)
+		if (text.length() <= max) {
+			return text
+		}
+		return text.substring(0, Math.max(0, max - 3)) + '...'
+	}
+
+	private String extractNameFromStartLine(String line) {
+		String value = stripLinePrefix(line)
+
+		if (value.startsWith('Start Test Case :')) {
+			return safe(value.substring('Start Test Case :'.length()))
+		}
+
+		int index = value.indexOf('START ')
+		if (index >= 0) {
+			return value.substring(index + 6).trim()
+		}
+
+		return ''
 	}
 
 	private String deriveLineStatus(String detail) {
 		String lower = safe(detail).toLowerCase(Locale.ENGLISH)
 
-		if (lower.contains(' fail') || lower.contains('failed') || lower.contains('error') || lower.contains('exception')) {
+		if (lower.contains(' fail') || lower.contains('failed') || lower.contains('error')) {
 			return 'failed'
 		}
 		if (lower.contains(' pass') || lower.contains('passed') || lower.contains('success')) {
@@ -2788,7 +2489,7 @@ class JiraReportBuilder {
 		if (lower.contains('open') || lower.contains('navigate') || lower.contains('url')) {
 			return '🌐'
 		}
-		if (lower.contains('wait') || lower.contains('retry')) {
+		if (lower.contains('wait') || lower.contains('delay')) {
 			return '⏳'
 		}
 		if (lower.contains('fill') || lower.contains('input') || lower.contains('type') || lower.contains('keys')) {
@@ -2808,31 +2509,33 @@ class JiraReportBuilder {
 			return true
 		}
 
-		if (lower.startsWith('<')) {
+		if (lower.startsWith('<record') ||
+			lower.startsWith('</record') ||
+			lower.startsWith('<date>') ||
+			lower.startsWith('<millis>') ||
+			lower.startsWith('<nanos>') ||
+			lower.startsWith('<sequence>') ||
+			lower.startsWith('<level>') ||
+			lower.startsWith('<class>') ||
+			lower.startsWith('<method>') ||
+			lower.startsWith('<thread>') ||
+			lower.startsWith('<nestedlevel>') ||
+			lower.startsWith('<escapedjava>') ||
+			lower.startsWith('<property')) {
 			return true
 		}
-		if (lower.startsWith('at com.kms.')) {
+
+		if (lower.startsWith('at com.kms.') ||
+			lower.startsWith('at java.') ||
+			lower.startsWith('at sun.') ||
+			lower.startsWith('at org.codehaus.')) {
 			return true
 		}
-		if (lower.startsWith('at java.')) {
-			return true
-		}
-		if (lower.startsWith('at sun.')) {
-			return true
-		}
-		if (lower.startsWith('hostname =')) {
-			return true
-		}
-		if (lower.startsWith('hostaddress =')) {
-			return true
-		}
-		if (lower.startsWith('os =')) {
-			return true
-		}
-		if (lower.startsWith('katalonversion =')) {
-			return true
-		}
-		if (lower == 'video') {
+
+		if (lower.startsWith('hostname =') ||
+			lower.startsWith('hostaddress =') ||
+			lower.startsWith('os =') ||
+			lower.startsWith('katalonversion =')) {
 			return true
 		}
 
@@ -2845,14 +2548,19 @@ class JiraReportBuilder {
 			return ''
 		}
 
+		String tagDate = extractTagValue(text, 'date')
+		if (!tagDate.isEmpty()) {
+			return tagDate
+		}
+
 		List patterns = [
-			/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{3})?(?:[+-]\d{2}:?\d{2}|Z)?/,
-			/\d{2}\/\d{2}\/\d{4}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{3})?/,
-			/\d{2}\.\d{2}\.\d{4}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{3})?/,
-			/\d{2}:\d{2}:\d{2}(?:\.\d{3})?/
+			/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)?/,
+			/\d{2}\/\d{2}\/\d{4}[ T]\d{2}:\d{2}:\d{2}/,
+			/\d{2}\.\d{2}\.\d{4}[ T]\d{2}:\d{2}:\d{2}/,
+			/\d{2}:\d{2}:\d{2}/
 		]
 
-		for (pattern in patterns) {
+		for (def pattern : patterns) {
 			def matcher = text =~ pattern
 			if (matcher.find()) {
 				return safe(matcher.group(0))
@@ -2864,20 +2572,11 @@ class JiraReportBuilder {
 
 	private String extractClockOnly(String line) {
 		String timestamp = extractTimestamp(line)
-		if (timestamp.isEmpty()) {
-			return ''
-		}
-
-		def matcher = timestamp =~ /\d{2}:\d{2}:\d{2}/
-		if (matcher.find()) {
-			return safe(matcher.group(0))
-		}
-
-		return timestamp
+		return displayClock(timestamp)
 	}
 
 	private long parseDateMillis(String raw) {
-		String value = safe(raw)
+		String value = normalizeTimestampForParsing(raw)
 		if (value.isEmpty()) {
 			return 0L
 		}
@@ -2890,6 +2589,53 @@ class JiraReportBuilder {
 		}
 
 		return 0L
+	}
+
+	private String normalizeTimestampForParsing(String raw) {
+		String value = safe(raw)
+		if (value.isEmpty()) {
+			return ''
+		}
+
+		def matcher = value =~ /(\.\d{3})\d+(Z|[+-]\d{2}:?\d{2})?$/
+		if (matcher.find()) {
+			value = value.replaceFirst(/\.\d+(Z|[+-]\d{2}:?\d{2})?$/, matcher.group(1) + (matcher.group(2) ?: ''))
+		}
+
+		return value
+	}
+
+	private String displayClock(String raw) {
+		String value = safe(raw)
+		if (value.isEmpty()) {
+			return '--'
+		}
+
+		def matcher = value =~ /\d{2}:\d{2}:\d{2}/
+		if (matcher.find()) {
+			return safe(matcher.group(0))
+		}
+
+		long millis = parseDateMillis(value)
+		if (millis > 0L) {
+			return new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH).format(new Date(millis))
+		}
+
+		return '--'
+	}
+
+	private String displayDateTime(String raw) {
+		String value = safe(raw)
+		if (value.isEmpty()) {
+			return '--'
+		}
+
+		long millis = parseDateMillis(value)
+		if (millis > 0L) {
+			return OUTPUT_DATE_TIME.format(new Date(millis))
+		}
+
+		return value
 	}
 
 	private long toDurationMillis(String secondsValue) {
@@ -2906,17 +2652,17 @@ class JiraReportBuilder {
 		}
 	}
 
-	private long toLong(def value) {
-		String raw = safe(value)
-		if (raw.isEmpty()) {
-			return 0L
+	private String formatDuration(long durationMs) {
+		if (durationMs < 0L) {
+			durationMs = 0L
 		}
 
-		try {
-			return Long.parseLong(raw)
-		} catch (Throwable ignored) {
-			return 0L
-		}
+		long totalSeconds = Math.round(durationMs / 1000d)
+		long hours = (long) (totalSeconds / 3600L)
+		long minutes = (long) ((totalSeconds % 3600L) / 60L)
+		long seconds = (long) (totalSeconds % 60L)
+
+		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
 	}
 
 	private String stripLinePrefix(String line) {
@@ -2948,24 +2694,42 @@ class JiraReportBuilder {
 			value = value.substring(errorIndex + 7).trim()
 		}
 
-		return normalizeSpace(value.replace('\t', ' '))
-	}
+		value = xmlUnescape(value)
+		value = value.replace('\t', ' ').trim()
 
-	private String cleanStepText(String value) {
-		String detail = normalizeSpace(
-			safe(value)
-				.replace('&quot;', '"')
-				.replace('&amp;', '&')
-				.replace('&lt;', '<')
-				.replace('&gt;', '>')
-				.replaceAll(/<[^>]+>/, ' ')
-		)
-
-		if (detail.startsWith('TEST STEP:')) {
-			detail = normalizeSpace(detail.substring('TEST STEP:'.length()))
+		while (value.contains('  ')) {
+			value = value.replace('  ', ' ')
 		}
 
-		return detail
+		return value
+	}
+
+	private String extractTagValue(String text, String tagName) {
+		String safeText = safe(text)
+		if (safeText.isEmpty()) {
+			return ''
+		}
+
+		def matcher = safeText =~ /<${tagName}>(.*?)<\/${tagName}>/
+		if (matcher.find()) {
+			return safe(matcher.group(1))
+		}
+
+		return ''
+	}
+
+	private String xmlUnescape(String value) {
+		return safe(value)
+			.replace('&amp;quot;', '"')
+			.replace('&quot;', '"')
+			.replace('&amp;apos;', "'")
+			.replace('&apos;', "'")
+			.replace('&amp;lt;', '<')
+			.replace('&lt;', '<')
+			.replace('&amp;gt;', '>')
+			.replace('&gt;', '>')
+			.replace('&amp;amp;', '&')
+			.replace('&amp;', '&')
 	}
 
 	private List<String> tokensFromText(String value) {
@@ -2979,61 +2743,6 @@ class JiraReportBuilder {
 		return safe(value)
 			.toLowerCase(Locale.ENGLISH)
 			.replaceAll(/[^a-z0-9]+/, '')
-	}
-
-	private String htmlToPlainText(String html) {
-		String text = safe(html)
-
-		text = text.replaceAll(/(?is)<script.*?>.*?<\/script>/, ' ')
-		text = text.replaceAll(/(?is)<style.*?>.*?<\/style>/, ' ')
-		text = text.replaceAll(/(?i)<br\s*\/?>/, '\n')
-		text = text.replaceAll(/(?i)<\/(div|p|tr|li|ul|ol|table|section|article|h1|h2|h3|h4|h5|h6|td|th)>/, '\n')
-		text = text.replaceAll(/(?i)<(td|th)[^>]*>/, ' ')
-		text = text.replaceAll(/<[^>]+>/, ' ')
-		text = text
-			.replace('&nbsp;', ' ')
-			.replace('&amp;', '&')
-			.replace('&quot;', '"')
-			.replace('&#39;', "'")
-			.replace('&lt;', '<')
-			.replace('&gt;', '>')
-			.replace('\u00A0', ' ')
-
-		return text
-	}
-
-	private String normalizeStatus(String raw) {
-		String text = safe(raw).toLowerCase(Locale.ENGLISH)
-
-		switch (text) {
-			case 'pass':
-			case 'passed':
-			case 'success':
-				return 'passed'
-			case 'fail':
-			case 'failed':
-			case 'error':
-				return 'failed'
-			case 'skip':
-			case 'skipped':
-			case 'ignored':
-				return 'skipped'
-			default:
-				return 'info'
-		}
-	}
-
-	private String formatDuration(long durationMs) {
-		if (durationMs < 0L) {
-			durationMs = 0L
-		}
-
-		long totalSeconds = Math.round(durationMs / 1000d)
-		long hours = (long) (totalSeconds / 3600L)
-		long minutes = (long) ((totalSeconds % 3600L) / 60L)
-		long seconds = (long) (totalSeconds % 60L)
-
-		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
 	}
 
 	private Node firstChildByName(Node node, String childName) {
@@ -3085,53 +2794,6 @@ class JiraReportBuilder {
 				return []
 			}
 		}
-	}
-
-	private String readFileSafely(File file) {
-		if (file == null || !file.exists()) {
-			return ''
-		}
-
-		try {
-			return file.getText('UTF-8')
-		} catch (Throwable ignored) {
-			try {
-				return file.getText()
-			} catch (Throwable ignoredAgain) {
-				return ''
-			}
-		}
-	}
-
-	private String findFirstLine(List<String> lines, String prefix) {
-		for (String line : lines) {
-			if (safe(line).startsWith(prefix)) {
-				return line
-			}
-		}
-		return ''
-	}
-
-	private String findLastStatusLine(List<String> lines) {
-		String found = ''
-		lines.each { String line ->
-			if (safe(line).startsWith('Status:')) {
-				found = line
-			}
-		}
-		return found
-	}
-
-	private String afterPrefix(String value, String prefix) {
-		String raw = safe(value)
-		if (raw.startsWith(prefix)) {
-			return normalizeSpace(raw.substring(prefix.length()))
-		}
-		return raw
-	}
-
-	private String normalizeSpace(String value) {
-		return safe(value).replaceAll(/[ \t]+/, ' ').trim()
 	}
 
 	private String firstNonBlank(Object... values) {
