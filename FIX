@@ -1,27 +1,403 @@
-import com.kms.katalon.core.annotation.*
-import com.kms.katalon.core.context.*
+package jiraIntegration
 
-import jiraIntegration.JiraImagesEvidence
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
 
-class ematchReport {
+import internal.GlobalVariable
 
-    @BeforeTestCase
-    def before(TestCaseContext ctx) {
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
-        JiraImagesEvidence.init(ctx.getTestCaseId())
-    }
+class JiraFlowCoordinator {
 
-    @AfterTestCase
-    def after(TestCaseContext ctx) {
+	private static final String JIRA_BASE_URL = 'https://jira-mut.d.bbg'
+	private static final String PROJECT_KEY = 'GI5PRD'
+	private static final String TEST_PLAN_ISSUE_TYPE_ID = '10604'
+	private static final String EPIC_LINK_FIELD_ID = 'customfield_10006'
 
-        String status = ctx.getTestCaseStatus()
+	private static final String DEFAULT_EPIC_KEY = 'GI5PRD-9877'
+	private static final String TEST_PLAN_ASSIGNEE = 'cavalherer'
 
-        if (status in ["FAILED", "ERROR"]) {
+	private static final boolean FORCE_CREATE_NEW_TEST_PLAN = false
 
-            JiraImagesEvidence.captureAutoFailure()
-        }
-    }
+	/*
+	 * Leave empty if your token already comes from:
+	 * 1) GlobalVariable.JIRA_TOKEN
+	 * 2) GlobalVariable.jiraToken
+	 * 3) System env JIRA_TOKEN
+	 */
+	private static final String JIRA_TOKEN = ''
+
+	@Keyword
+	String jiraImport(String epicKey = '') {
+		try {
+			KeywordUtil.logInfo('============================================================')
+			KeywordUtil.logInfo('Starting Jira import flow')
+			KeywordUtil.logInfo('============================================================')
+
+			String token = resolveToken()
+
+			if (blank(token)) {
+				throw new RuntimeException('JIRA token is empty. Fill JIRA_TOKEN or GlobalVariable.JIRA_TOKEN or env JIRA_TOKEN.')
+			}
+
+			String effectiveEpicKey = !blank(epicKey) ? safe(epicKey) : DEFAULT_EPIC_KEY
+
+			File reportFolder = locateTargetReportFolder()
+			File latestRunFolder = findLatestRunFolder(new File(RunConfiguration.getProjectDir(), 'Reports'))
+			File junitXml = findJUnitXml(reportFolder)
+
+			if (reportFolder == null || !reportFolder.exists()) {
+				throw new RuntimeException('Could not locate the target report folder.')
+			}
+
+			if (junitXml == null || !junitXml.exists()) {
+				throw new RuntimeException('JUnit XML was not found inside the selected report folder.')
+			}
+
+			String suiteName = safe(reportFolder.parentFile?.name)
+			String suiteDisplayName = safe(reportFolder.name)
+			String executionTitle = buildExecutionTitle(suiteName, latestRunFolder)
+
+			KeywordUtil.logInfo('Using report folder: ' + reportFolder.absolutePath)
+			KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
+			KeywordUtil.logInfo('Execution title used: ' + executionTitle)
+			KeywordUtil.logInfo('Test Plan title used: ' + suiteName + ' Test Plan')
+			KeywordUtil.logInfo('Epic key used: ' + effectiveEpicKey)
+			KeywordUtil.logInfo('Assignee used on Test Plan: ' + TEST_PLAN_ASSIGNEE)
+			KeywordUtil.logInfo('JUnit XML found: ' + junitXml.absolutePath)
+
+			File customReport = buildCustomHtmlReport(reportFolder, suiteDisplayName, executionTitle)
+			KeywordUtil.logInfo('Custom Jira report created: ' + customReport.absolutePath)
+
+			File resultsZip = new File(reportFolder, 'Results.zip')
+			createZipFromFolder(reportFolder, resultsZip, [
+				'Results.zip',
+				'Evidences.zip'
+			])
+			KeywordUtil.logInfo('Results ZIP created: ' + resultsZip.absolutePath)
+
+			File evidencesZip = createEvidencesZip(reportFolder)
+			if (evidencesZip != null && evidencesZip.exists()) {
+				KeywordUtil.logInfo('Evidences ZIP created: ' + evidencesZip.absolutePath)
+			}
+
+			JiraGateway gateway = new JiraGateway(JIRA_BASE_URL, token)
+
+			JiraTestPlanManager testPlanManager = new JiraTestPlanManager(
+				gateway,
+				PROJECT_KEY,
+				TEST_PLAN_ISSUE_TYPE_ID,
+				EPIC_LINK_FIELD_ID,
+				effectiveEpicKey,
+				TEST_PLAN_ASSIGNEE
+			)
+
+			String testPlanKey = testPlanManager.getOrCreateTestPlanKey(
+				suiteName,
+				'',
+				FORCE_CREATE_NEW_TEST_PLAN
+			)
+
+			List<File> attachments = []
+			attachments << customReport
+			attachments << resultsZip
+
+			if (evidencesZip != null && evidencesZip.exists()) {
+				attachments << evidencesZip
+			}
+
+			JiraExecutionPublisher publisher = new JiraExecutionPublisher(gateway)
+
+			Map publishResponse = publisher.publishExecution([
+				junitXml      : junitXml,
+				customReport  : customReport,
+				reportFolder  : reportFolder,
+				projectKey    : PROJECT_KEY,
+				testPlanKey   : testPlanKey,
+				executionTitle: executionTitle,
+				attachments   : attachments
+			])
+
+			String executionKey = safe(publishResponse.executionKey)
+
+			KeywordUtil.logInfo('Jira import completed successfully.')
+			KeywordUtil.logInfo('Test Plan key: ' + testPlanKey)
+			KeywordUtil.logInfo('Execution key: ' + executionKey)
+			KeywordUtil.logInfo('============================================================')
+
+			return executionKey
+		} catch (Exception e) {
+			KeywordUtil.markFailed('Jira import failed: ' + safe(e.message))
+			throw e
+		}
+	}
+
+	private File buildCustomHtmlReport(File reportFolder, String suiteDisplayName, String executionTitle) {
+		JiraReportBuilder reportBuilder = new JiraReportBuilder()
+		def reportResult = reportBuilder.buildReport(reportFolder, suiteDisplayName, executionTitle)
+
+		if (reportResult == null) {
+			throw new RuntimeException('Custom HTML report was not generated. JiraReportBuilder returned null.')
+		}
+
+		if (reportResult instanceof File) {
+			File customReportFile = (File) reportResult
+
+			if (!customReportFile.exists()) {
+				throw new RuntimeException('Custom HTML report file does not exist: ' + customReportFile.absolutePath)
+			}
+
+			return customReportFile
+		}
+
+		if (reportResult instanceof Map) {
+			JiraHtmlTemplateBuilder htmlTemplateBuilder = new JiraHtmlTemplateBuilder()
+			String html = htmlTemplateBuilder.build((Map) reportResult)
+			return writeCustomHtmlFile(reportFolder, html)
+		}
+
+		if (reportResult instanceof CharSequence) {
+			return writeCustomHtmlFile(reportFolder, String.valueOf(reportResult))
+		}
+
+		throw new RuntimeException('Unsupported custom report result type: ' + reportResult.getClass().getName())
+	}
+
+	private File writeCustomHtmlFile(File reportFolder, String html) {
+		File customReport = new File(reportFolder, 'eMatchReport.html')
+		customReport.setText(safe(html), 'UTF-8')
+
+		if (!customReport.exists() || customReport.length() <= 0L) {
+			throw new RuntimeException('Custom HTML report was not generated.')
+		}
+
+		return customReport
+	}
+
+	private String resolveToken() {
+		if (!blank(JIRA_TOKEN)) {
+			return JIRA_TOKEN
+		}
+
+		String envToken = System.getenv('JIRA_TOKEN')
+		if (!blank(envToken)) {
+			return envToken
+		}
+
+		List<String> candidates = [
+			'JIRA_TOKEN',
+			'jiraToken',
+			'jira_token',
+			'JiraToken',
+			'TOKEN'
+		]
+
+		for (String fieldName : candidates) {
+			try {
+				def value = GlobalVariable."${fieldName}"
+				if (!blank(safe(value))) {
+					return safe(value)
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		return ''
+	}
+
+	private File locateTargetReportFolder() {
+		File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+		File latestRunFolder = findLatestRunFolder(reportsRoot)
+
+		if (latestRunFolder == null || !latestRunFolder.exists()) {
+			throw new RuntimeException('No timestamp report folder was found under Reports.')
+		}
+
+		List<File> candidates = []
+
+		latestRunFolder.eachFileRecurse { File dir ->
+			if (dir.isDirectory()) {
+				boolean hasJUnit = new File(dir, 'JUnit_Report.xml').exists()
+				String lowerName = dir.name.toLowerCase(Locale.ENGLISH)
+
+				if (hasJUnit && !lowerName.contains('jira import') && !lowerName.contains('collection')) {
+					candidates << dir
+				}
+			}
+		}
+
+		if (candidates.isEmpty()) {
+			throw new RuntimeException('No main suite report folder with JUnit_Report.xml was found.')
+		}
+
+		candidates = candidates.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		return candidates[0]
+	}
+
+	private File findLatestRunFolder(File reportsRoot) {
+		if (reportsRoot == null || !reportsRoot.exists()) {
+			return null
+		}
+
+		List<File> folders = reportsRoot.listFiles()?.findAll { File f ->
+			f.isDirectory()
+		} ?: []
+
+		if (folders.isEmpty()) {
+			return null
+		}
+
+		folders = folders.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		return folders[0]
+	}
+
+	private File findJUnitXml(File reportFolder) {
+		if (reportFolder == null || !reportFolder.exists()) {
+			return null
+		}
+
+		List<File> xmls = []
+
+		reportFolder.eachFileRecurse { File file ->
+			if (file.isFile() && file.name.equalsIgnoreCase('JUnit_Report.xml')) {
+				xmls << file
+			}
+		}
+
+		if (xmls.isEmpty()) {
+			return null
+		}
+
+		xmls = xmls.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		return xmls[0]
+	}
+
+	private String buildExecutionTitle(String suiteName, File latestRunFolder) {
+		String formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+
+		if (latestRunFolder != null) {
+			try {
+				Date parsed = new SimpleDateFormat('yyyyMMdd_HHmmss').parse(latestRunFolder.name)
+				formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(parsed)
+			} catch (Exception ignored) {
+			}
+		}
+
+		return safe(suiteName) + ' ' + formattedDate
+	}
+
+	private void createZipFromFolder(File sourceFolder, File targetZip, List<String> excludedNames) {
+		if (sourceFolder == null || !sourceFolder.exists()) {
+			return
+		}
+
+		if (targetZip.exists()) {
+			targetZip.delete()
+		}
+
+		ZipOutputStream zos = null
+
+		try {
+			zos = new ZipOutputStream(new FileOutputStream(targetZip))
+
+			sourceFolder.eachFileRecurse { File file ->
+				if (file.isFile()) {
+					if (excludedNames?.contains(file.name)) {
+						return
+					}
+
+					String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+					ZipEntry entry = new ZipEntry(relativePath)
+					zos.putNextEntry(entry)
+					zos << file.bytes
+					zos.closeEntry()
+				}
+			}
+		} finally {
+			try {
+				zos?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private File createEvidencesZip(File sourceFolder) {
+		if (sourceFolder == null || !sourceFolder.exists()) {
+			return null
+		}
+
+		File evidencesRoot = new File(sourceFolder, 'Evidences')
+		File scanRoot = evidencesRoot.exists() ? evidencesRoot : sourceFolder
+
+		List<File> images = []
+
+		scanRoot.eachFileRecurse { File file ->
+			if (file.isFile()) {
+				String name = file.name.toLowerCase(Locale.ENGLISH)
+				if (name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.gif') || name.endsWith('.bmp') || name.endsWith('.webp')) {
+					images << file
+				}
+			}
+		}
+
+		if (images.isEmpty()) {
+			return null
+		}
+
+		File zipFile = new File(sourceFolder, 'Evidences.zip')
+
+		if (zipFile.exists()) {
+			zipFile.delete()
+		}
+
+		ZipOutputStream zos = null
+
+		try {
+			zos = new ZipOutputStream(new FileOutputStream(zipFile))
+
+			images.each { File file ->
+				String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+				ZipEntry entry = new ZipEntry(relativePath)
+				zos.putNextEntry(entry)
+				zos << file.bytes
+				zos.closeEntry()
+			}
+		} finally {
+			try {
+				zos?.close()
+			} catch (Exception ignored) {
+			}
+		}
+
+		return zipFile
+	}
+
+	private boolean blank(String value) {
+		return safe(value).isEmpty()
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
 }
+
+
 
 
 
@@ -29,106 +405,138 @@ class ematchReport {
 
 package jiraIntegration
 
-import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.annotation.*
+import com.kms.katalon.core.context.*
+import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.configuration.RunConfiguration
-import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
-import org.openqa.selenium.OutputType
 
-import java.awt.*
-import java.awt.image.BufferedImage
 import java.text.SimpleDateFormat
-import javax.imageio.ImageIO
 
-class JiraImagesEvidence {
+class ematchReport {
 
-    private static final SimpleDateFormat FILE_STAMP =
-        new SimpleDateFormat("yyyyMMdd_HHmmss_SSS")
+	private static final SimpleDateFormat TIME_FORMAT =
+		new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS")
 
-    private static final ThreadLocal<File> CURRENT_CASE_FOLDER = new ThreadLocal<>()
+	private static long suiteStartTime = 0
 
-    // ===============================
-    // INIT PER TEST CASE
-    // ===============================
-    static void init(String testCaseId) {
+	@BeforeTestSuite
+	def beforeSuite(TestSuiteContext testSuiteContext) {
+		suiteStartTime = System.currentTimeMillis()
 
-        String reportFolder = RunConfiguration.getReportFolder()
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("🚀 STARTING TEST SUITE: " + testSuiteContext.getTestSuiteId())
+		KeywordUtil.logInfo("============================================================")
+	}
 
-        File base = new File(reportFolder, "Evidences")
-        base.mkdirs()
+	@BeforeTestCase
+	def beforeCase(TestCaseContext testCaseContext) {
 
-        String safeName = testCaseId.replaceAll("[^a-zA-Z0-9]", "_")
+		String caseName = testCaseContext.getTestCaseId()
 
-        File caseFolder = new File(base, safeName)
-        caseFolder.mkdirs()
+		KeywordUtil.logInfo("------------------------------------------------------------")
+		KeywordUtil.logInfo("🎬 START TEST CASE: " + caseName)
+		KeywordUtil.logInfo("🕒 START TIME: " + now())
+		KeywordUtil.logInfo("------------------------------------------------------------")
 
-        CURRENT_CASE_FOLDER.set(caseFolder)
-    }
+		try {
+			CustomKeywords.'jiraIntegration.ImagesEvidence.startCase'(caseName)
+		} catch (Exception e) {
+			KeywordUtil.logInfo("⚠️ Could not initialize evidence for case")
+		}
+	}
 
-    // ===============================
-    // AUTO FAILURE SCREENSHOT
-    // ===============================
-    static String captureAutoFailure() {
+	@AfterTestCase
+	def afterCase(TestCaseContext testCaseContext) {
 
-        try {
-            File folder = CURRENT_CASE_FOLDER.get()
-            if (folder == null) return null
+		String caseName = testCaseContext.getTestCaseId()
+		String status = testCaseContext.getTestCaseStatus()
 
-            String name = FILE_STAMP.format(new Date()) + "_auto-failure.png"
-            File file = new File(folder, name)
+		long duration = System.currentTimeMillis() - testCaseContext.getStartTime()
 
-            BufferedImage img = captureDesktop()
-            ImageIO.write(img, "png", file)
+		KeywordUtil.logInfo("------------------------------------------------------------")
+		KeywordUtil.logInfo("🏁 END TEST CASE: " + caseName)
+		KeywordUtil.logInfo("📊 STATUS: " + status)
+		KeywordUtil.logInfo("⏱️ DURATION: " + formatDuration(duration))
+		KeywordUtil.logInfo("🕒 END TIME: " + now())
+		KeywordUtil.logInfo("------------------------------------------------------------")
 
-            println "📸 Evidence screenshot saved: ${file.absolutePath}"
+		// 📸 captura automática se falhou
+		if (status != "PASSED") {
+			try {
+				CustomKeywords.'jiraIntegration.ImagesEvidence.captureNow'('auto-failure')
+			} catch (Exception e) {
+				KeywordUtil.logInfo("⚠️ Failed to capture auto screenshot")
+			}
+		}
 
-            return file.absolutePath
+		try {
+			CustomKeywords.'jiraIntegration.ImagesEvidence.endCase'(
+				status,
+				duration,
+				testCaseContext.getMessage()
+			)
+		} catch (Exception e) {
+			KeywordUtil.logInfo("⚠️ Could not finalize evidence")
+		}
+	}
 
-        } catch (Exception e) {
-            println "⚠ Failed to capture auto screenshot: ${e.message}"
-            return null
-        }
-    }
+	@AfterTestSuite
+	def afterSuite(TestSuiteContext testSuiteContext) {
 
-    // ===============================
-    // MANUAL KEYWORDS (OPTIONAL)
-    // ===============================
-    @Keyword
-    def note(String msg) {
-        println "📝 NOTE: ${msg}"
-    }
+		long totalDuration = System.currentTimeMillis() - suiteStartTime
 
-    @Keyword
-    def captureNow(String name) {
-        saveCustom(name)
-    }
+		KeywordUtil.logInfo("============================================================")
+		KeywordUtil.logInfo("🏁 END TEST SUITE: " + testSuiteContext.getTestSuiteId())
+		KeywordUtil.logInfo("⏱️ TOTAL DURATION: " + formatDuration(totalDuration))
+		KeywordUtil.logInfo("============================================================")
 
-    @Keyword
-    def noteAndCapture(String msg, String name) {
-        note(msg)
-        saveCustom(name)
-    }
+		try {
+			generateHtmlReport(testSuiteContext)
+		} catch (Exception e) {
+			KeywordUtil.markWarning("⚠️ Failed to generate HTML report: " + e.message)
+		}
+	}
 
-    private static void saveCustom(String name) {
-        try {
-            File folder = CURRENT_CASE_FOLDER.get()
-            if (folder == null) return
+	// ============================================================
+	// 🔥 HTML REPORT GENERATION
+	// ============================================================
 
-            String fileName = FILE_STAMP.format(new Date()) + "_" + name + ".png"
-            File file = new File(folder, fileName)
+	private void generateHtmlReport(TestSuiteContext ctx) {
 
-            BufferedImage img = captureDesktop()
-            ImageIO.write(img, "png", file)
+		File reportFolder = new File(RunConfiguration.getReportFolder())
 
-            println "📸 Manual screenshot saved: ${file.absolutePath}"
+		def reportData = [
+			suiteName : ctx.getTestSuiteId(),
+			startTime : now(),
+			testCases : CustomKeywords.'jiraIntegration.ImagesEvidence.getAllCases'()
+		]
 
-        } catch (Exception e) {
-            println "⚠ Failed manual screenshot: ${e.message}"
-        }
-    }
+		JiraHtmlTemplateBuilder builder = new JiraHtmlTemplateBuilder()
+		String html = builder.build(reportData)
 
-    private static BufferedImage captureDesktop() {
-        Robot robot = new Robot()
-        Rectangle screen = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
-        return robot.createScreenCapture(screen)
-    }
+		File htmlFile = new File(reportFolder, "eMatchReport.html")
+		htmlFile.setText(html, "UTF-8")
+
+		KeywordUtil.logInfo("✅ eMatch HTML report generated at: " + htmlFile.absolutePath)
+	}
+
+	// ============================================================
+	// 🧠 UTILS
+	// ============================================================
+
+	private String now() {
+		return TIME_FORMAT.format(new Date())
+	}
+
+	private String formatDuration(long ms) {
+		long seconds = (long)(ms / 1000)
+		long minutes = (long)(seconds / 60)
+		long hours = (long)(minutes / 60)
+
+		return String.format("%02dh %02dm %02ds",
+			hours,
+			minutes % 60,
+			seconds % 60
+		)
+	}
 }
