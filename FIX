@@ -1,362 +1,842 @@
-import com.kms.katalon.core.annotation.AfterTestCase
-import com.kms.katalon.core.annotation.BeforeTestCase
-import com.kms.katalon.core.context.TestCaseContext
-
-import jiraIntegration.ImagesEvidence
-
-class WindowsFailureReportListener {
-
-    @BeforeTestCase
-    def beforeCase(TestCaseContext testCaseCtx) {
-        ImagesEvidence.startCase(testCaseCtx)
-    }
-
-    @AfterTestCase
-    def afterCase(TestCaseContext testCaseCtx) {
-        ImagesEvidence.finishCase(testCaseCtx)
-    }
-}
-
-
-
-
-
-
-
-
-
-
-package jiraIntegration
-
-import com.kms.katalon.core.annotation.Keyword
-import com.kms.katalon.core.configuration.RunConfiguration
-import com.kms.katalon.core.context.TestCaseContext
-import com.kms.katalon.core.util.KeywordUtil
-import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
-
-import org.openqa.selenium.OutputType
-
-import javax.imageio.ImageIO
-import java.awt.GraphicsEnvironment
-import java.awt.Rectangle
-import java.awt.Robot
-import java.awt.Toolkit
-import java.awt.image.BufferedImage
-import java.text.SimpleDateFormat
-import java.util.Locale
-
-class ImagesEvidence {
-
-    private static final SimpleDateFormat FILE_STAMP =
-        new SimpleDateFormat('yyyyMMdd_HHmmss_SSS', Locale.ENGLISH)
-
-    private static final SimpleDateFormat LOG_STAMP =
-        new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS', Locale.ENGLISH)
-
-    private static final ThreadLocal<File> CURRENT_CASE_FOLDER = new ThreadLocal<File>()
-    private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
-
-    /*
-     * Adds a controlled note line for the custom report.
-     */
-    @Keyword
-    def note(String message) {
-        writeEntry('NOTE', message)
-    }
-
-    /*
-     * Adds a controlled checkpoint line for the custom report.
-     */
-    @Keyword
-    def checkpoint(String message) {
-        writeEntry('CHECKPOINT', message)
-    }
-
-    /*
-     * Captures a manual screenshot in the current evidence folder.
-     */
-    @Keyword
-    File captureNow(String label = 'manual') {
-        return saveScreenshot(label)
-    }
-
-    /*
-     * Adds a note and captures a manual screenshot.
-     */
-    @Keyword
-    File noteAndCapture(String message, String label = 'manual') {
-        writeEntry('NOTE', message)
-        return saveScreenshot(label)
-    }
-
-    /*
-     * Opens the evidence context for the current test case.
-     */
-    static void startCase(TestCaseContext context) {
-        File caseFolder = resolveCaseFolder(context)
-
-        CURRENT_CASE_FOLDER.set(caseFolder)
-        CURRENT_CASE_ID.set(safe(context?.getTestCaseId()))
-
-        appendLine(caseFolder, buildLine('CASE_START', safe(context?.getTestCaseId())))
-    }
-
-    /*
-     * Closes the evidence context for the current test case.
-     * If the test failed, it automatically captures a screenshot.
-     */
-    static void finishCase(TestCaseContext context) {
-        try {
-            File caseFolder = resolveActiveCaseFolder(context)
-            String status = normalizeStatus(context?.getTestCaseStatus())
-
-            appendLine(caseFolder, buildLine('CASE_END', status))
-
-            if (status == 'FAILED' || status == 'ERROR') {
-                String compactMessage = compactFailureMessage(context?.getMessage())
-                if (!compactMessage.isEmpty()) {
-                    appendLine(caseFolder, buildLine('AUTO_FAIL', compactMessage))
-                }
-
-                saveFailureScreenshot(caseFolder, 'auto-failure')
-            }
-        } finally {
-            CURRENT_CASE_FOLDER.remove()
-            CURRENT_CASE_ID.remove()
-        }
-    }
-
-    /*
-     * Writes a user-controlled entry to evidence-notes.log.
-     */
-    private static void writeEntry(String type, String message) {
-        File caseFolder = resolveActiveCaseFolder(null)
-        appendLine(caseFolder, buildLine(type, message))
-    }
-
-    /*
-     * Saves a screenshot in the active evidence folder.
-     * It tries driver screenshot first, then desktop screenshot.
-     */
-    private static File saveScreenshot(String label) {
-        File caseFolder = resolveActiveCaseFolder(null)
-        return saveFailureScreenshot(caseFolder, label)
-    }
-
-    /*
-     * Saves screenshot bytes from driver if possible.
-     * Falls back to full desktop capture.
-     */
-    private static File saveFailureScreenshot(File caseFolder, String label) {
-        if (caseFolder == null) {
-            return null
-        }
-
-        String safeLabel = sanitizeFileName(label)
-        if (safeLabel.isEmpty()) {
-            safeLabel = 'screenshot'
-        }
-
-        File target = new File(caseFolder, FILE_STAMP.format(new Date()) + '_' + safeLabel + '.png')
-
-        try {
-            byte[] driverBytes = captureDriverBytes()
-            if (driverBytes != null && driverBytes.length > 0) {
-                target.bytes = driverBytes
-                appendLine(caseFolder, buildLine('SCREENSHOT', target.absolutePath))
-                KeywordUtil.logInfo('Evidence screenshot saved from driver: ' + target.absolutePath)
-                return target
-            }
-        } catch (Throwable ignored) {
-        }
-
-        try {
-            if (GraphicsEnvironment.isHeadless()) {
-                appendLine(caseFolder, buildLine('SCREENSHOT_ERROR', 'Headless environment. Screenshot was not captured.'))
-                return null
-            }
-
-            BufferedImage image = new Robot().createScreenCapture(
-                new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
-            )
-
-            ImageIO.write(image, 'png', target)
-
-            appendLine(caseFolder, buildLine('SCREENSHOT', target.absolutePath))
-            KeywordUtil.logInfo('Evidence screenshot saved from desktop: ' + target.absolutePath)
-
-            return target
-        } catch (Throwable t) {
-            appendLine(caseFolder, buildLine('SCREENSHOT_ERROR', safe(t?.getMessage())))
-            KeywordUtil.logInfo('Evidence screenshot could not be captured: ' + safe(t?.getMessage()))
-            return null
-        }
-    }
-
-    /*
-     * Tries to capture screenshot directly from the Windows driver.
-     */
-    private static byte[] captureDriverBytes() {
-        try {
-            def driver = Windows.getDriver()
-            if (driver != null) {
-                return driver.getScreenshotAs(OutputType.BYTES)
-            }
-        } catch (Throwable ignored) {
-        }
-
-        return null
-    }
-
-    /*
-     * Resolves the active case folder already bound to the thread.
-     */
-    private static File resolveActiveCaseFolder(TestCaseContext context) {
-        File active = CURRENT_CASE_FOLDER.get()
-
-        if (active != null && active.exists()) {
-            return active
-        }
-
-        File caseFolder = resolveCaseFolder(context)
-        CURRENT_CASE_FOLDER.set(caseFolder)
-
-        return caseFolder
-    }
-
-    /*
-     * Builds the evidence path inside the current Katalon report folder.
-     */
-    private static File resolveCaseFolder(TestCaseContext context) {
-        String reportFolderPath = safe(getCurrentReportFolder())
-
-        File reportFolder = reportFolderPath.isEmpty()
-            ? new File(new File(getProjectDirSafe(), 'Reports'), '_fallbackEvidence')
-            : new File(reportFolderPath)
-
-        File evidencesRoot = new File(reportFolder, 'Evidences')
-        if (!evidencesRoot.exists()) {
-            evidencesRoot.mkdirs()
-        }
-
-        String caseId = safe(context?.getTestCaseId())
-        if (caseId.isEmpty()) {
-            caseId = safe(CURRENT_CASE_ID.get())
-        }
-        if (caseId.isEmpty()) {
-            caseId = 'general'
-        }
-
-        File caseFolder = new File(evidencesRoot, sanitizeFileName(caseId))
-        if (!caseFolder.exists()) {
-            caseFolder.mkdirs()
-        }
-
-        return caseFolder
-    }
-
-    /*
-     * Appends a line into evidence-notes.log.
-     */
-    private static void appendLine(File caseFolder, String line) {
-        if (caseFolder == null) {
-            return
-        }
-
-        if (!caseFolder.exists()) {
-            caseFolder.mkdirs()
-        }
-
-        File logFile = new File(caseFolder, 'evidence-notes.log')
-        logFile << line + System.lineSeparator()
-    }
-
-    /*
-     * Standard line format:
-     * yyyy-MM-dd HH:mm:ss.SSS|TYPE|message
-     */
-    private static String buildLine(String type, String message) {
-        return LOG_STAMP.format(new Date()) + '|' + safe(type) + '|' + safe(message)
-    }
-
-    /*
-     * Extracts a short and stable failure summary.
-     */
-    private static String compactFailureMessage(String raw) {
-        String value = safe(raw)
-        if (value.isEmpty()) {
-            return ''
-        }
-
-        List<String> lines = value.readLines()
-            .collect { safe(it) }
-            .findAll { !it.isEmpty() }
-
-        if (lines.isEmpty()) {
-            return ''
-        }
-
-        for (String line : lines) {
-            String lower = line.toLowerCase(Locale.ENGLISH)
-            if (lower.startsWith('reason:')) {
-                return line.replaceFirst(/(?i)^reason:\s*/, '').trim()
-            }
-        }
-
-        return lines[0]
-    }
-
-    private static String normalizeStatus(String status) {
-        String value = safe(status).toUpperCase(Locale.ENGLISH)
-
-        if (value == 'PASSED') {
-            return 'PASSED'
-        }
-        if (value == 'FAILED' || value == 'ERROR') {
-            return 'FAILED'
-        }
-
-        return 'BLOCKED'
-    }
-
-    private static String sanitizeFileName(String value) {
-        return safe(value)
-            .replace('\\', '_')
-            .replace('/', '_')
-            .replace(':', '_')
-            .replace('*', '_')
-            .replace('?', '_')
-            .replace('"', '_')
-            .replace('<', '_')
-            .replace('>', '_')
-            .replace('|', '_')
-            .replaceAll(/\s+/, '_')
-    }
-
-    private static String getCurrentReportFolder() {
-        try {
-            return RunConfiguration.getReportFolder()
-        } catch (Throwable ignored) {
-            return ''
-        }
-    }
-
-    private static String getProjectDirSafe() {
-        try {
-            return RunConfiguration.getProjectDir()
-        } catch (Throwable ignored) {
-            return new File('.').absolutePath
-        }
-    }
-
-    private static String safe(Object value) {
-        return value == null ? '' : String.valueOf(value).trim()
-    }
-}
-
-
-
-
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$sendKeys.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword.execute(SendKeysKeyword.groovy:30)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.sendKeys(WindowsBuiltinKeywords.java:695)
+ at eMatch - Login REC.run(eMatch - Login REC:183)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:92)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword.sendKeys(SendKeysKeyword.groovy:34)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$sendKeys.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword.execute(SendKeysKeyword.groovy:30)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.sendKeys(WindowsBuiltinKeywords.java:695)
+ at eMatch - Login REC.run(eMatch - Login REC:183)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Window[1]/Pane[2]/ComboBox[2]/List[1]}
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:42)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElement(RemoteWebDriver.java:323)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElement(DefaultGenericMobileDriver.java:62)
+ at io.appium.java_client.AppiumDriver.findElement(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElement(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElementByXPath(RemoteWebDriver.java:428)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElementByXPath(DefaultGenericMobileDriver.java:152)
+ at io.appium.java_client.AppiumDriver.findElementByXPath(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElementByXPath(WindowsDriver.java:1)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:136)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:1)
+ at org.openqa.selenium.support.ui.FluentWait.until(FluentWait.java:249)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:120)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:77)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:69)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.sendKeys(WindowsActionHelper.java:317)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$_sendKeys_closure1.doCall(SendKeysKeyword.groovy:40)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$_sendKeys_closure1.doCall(SendKeysKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ ... 22 more, errorDetail=Test Cases/Connection/eMatch - Login REC FAILED.
+Reason:
+com.kms.katalon.core.exception.StepFailedException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Window[1]/Pane[2]/ComboBox[2]/List[1]} (Root cause: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Window[1]/Pane[2]/ComboBox[2]/List[1]}
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:42)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElement(RemoteWebDriver.java:323)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElement(DefaultGenericMobileDriver.java:62)
+ at io.appium.java_client.AppiumDriver.findElement(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElement(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElementByXPath(RemoteWebDriver.java:428)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElementByXPath(DefaultGenericMobileDriver.java:152)
+ at io.appium.java_client.AppiumDriver.findElementByXPath(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElementByXPath(WindowsDriver.java:1)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:136)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:1)
+ at org.openqa.selenium.support.ui.FluentWait.until(FluentWait.java:249)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:120)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:77)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:69)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.sendKeys(WindowsActionHelper.java:317)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$_sendKeys_closure1.doCall(SendKeysKeyword.groovy:40)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$_sendKeys_closure1.doCall(SendKeysKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword.sendKeys(SendKeysKeyword.groovy:34)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$sendKeys.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword.execute(SendKeysKeyword.groovy:30)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.sendKeys(WindowsBuiltinKeywords.java:695)
+ at eMatch - Login REC.run(eMatch - Login REC:183)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:92)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword.sendKeys(SendKeysKeyword.groovy:34)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$sendKeys.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword.execute(SendKeysKeyword.groovy:30)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.sendKeys(WindowsBuiltinKeywords.java:695)
+ at eMatch - Login REC.run(eMatch - Login REC:183)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Window[1]/Pane[2]/ComboBox[2]/List[1]}
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:42)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElement(RemoteWebDriver.java:323)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElement(DefaultGenericMobileDriver.java:62)
+ at io.appium.java_client.AppiumDriver.findElement(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElement(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElementByXPath(RemoteWebDriver.java:428)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElementByXPath(DefaultGenericMobileDriver.java:152)
+ at io.appium.java_client.AppiumDriver.findElementByXPath(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElementByXPath(WindowsDriver.java:1)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:136)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:1)
+ at org.openqa.selenium.support.ui.FluentWait.until(FluentWait.java:249)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:120)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:77)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:69)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.sendKeys(WindowsActionHelper.java:317)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$_sendKeys_closure1.doCall(SendKeysKeyword.groovy:40)
+ at com.kms.katalon.core.windows.keyword.builtin.SendKeysKeyword$_sendKeys_closure1.doCall(SendKeysKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ ... 22 more, reportFolder=C:\Users\BGS32GG\Workspace\ematch\Reports\20260324_160952\PasserelleBilan\Passerelle Bilan H Bilan French IFRS\20260324_160953, steps=[], evidence=[]}, {id=Test-Cases/Passerelle-Bilan-H-Bilan-French-IFRS/Passerelle-Bilan-H-Bilan-French-IFRS, name=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan H Bilan French IFRS, scenarioName=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan H Bilan French IFRS, status=failed, result=failed, durationMs=4728, durationLabel=00h 00m 05s, startTime=, endTime=, startLabel=--, endLabel=--, startShort=--, endShort=--, startLong=--, endLong=--, visualError=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan H Bilan French IFRS FAILED. | Reason:, errorSummary=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan H Bilan French IFRS FAILED. | Reason:, fullError=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan H Bilan French IFRS FAILED.
+Reason:
+com.kms.katalon.core.exception.StepFailedException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Pane[2]/Text[4]} (Root cause: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Pane[2]/Text[4]}
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:42)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElement(RemoteWebDriver.java:323)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElement(DefaultGenericMobileDriver.java:62)
+ at io.appium.java_client.AppiumDriver.findElement(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElement(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElementByXPath(RemoteWebDriver.java:428)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElementByXPath(DefaultGenericMobileDriver.java:152)
+ at io.appium.java_client.AppiumDriver.findElementByXPath(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElementByXPath(WindowsDriver.java:1)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:136)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:1)
+ at org.openqa.selenium.support.ui.FluentWait.until(FluentWait.java:249)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:120)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:77)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:69)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.getText(WindowsActionHelper.java:227)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$getText$2.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy:42)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.getText(GetTextKeyword.groovy:36)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$getText.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.execute(GetTextKeyword.groovy:32)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.getText(WindowsBuiltinKeywords.java:434)
+ at Passerelle Bilan H Bilan French IFRS.run(Passerelle Bilan H Bilan French IFRS:33)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:92)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.getText(GetTextKeyword.groovy:36)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$getText.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.execute(GetTextKeyword.groovy:32)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.getText(WindowsBuiltinKeywords.java:434)
+ at Passerelle Bilan H Bilan French IFRS.run(Passerelle Bilan H Bilan French IFRS:33)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Pane[2]/Text[4]}
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:42)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElement(RemoteWebDriver.java:323)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElement(DefaultGenericMobileDriver.java:62)
+ at io.appium.java_client.AppiumDriver.findElement(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElement(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElementByXPath(RemoteWebDriver.java:428)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElementByXPath(DefaultGenericMobileDriver.java:152)
+ at io.appium.java_client.AppiumDriver.findElementByXPath(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElementByXPath(WindowsDriver.java:1)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:136)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:1)
+ at org.openqa.selenium.support.ui.FluentWait.until(FluentWait.java:249)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:120)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:77)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:69)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.getText(WindowsActionHelper.java:227)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$getText$2.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy:42)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ ... 22 more, errorDetail=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan H Bilan French IFRS FAILED.
+Reason:
+com.kms.katalon.core.exception.StepFailedException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Pane[2]/Text[4]} (Root cause: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Pane[2]/Text[4]}
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:42)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElement(RemoteWebDriver.java:323)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElement(DefaultGenericMobileDriver.java:62)
+ at io.appium.java_client.AppiumDriver.findElement(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElement(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElementByXPath(RemoteWebDriver.java:428)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElementByXPath(DefaultGenericMobileDriver.java:152)
+ at io.appium.java_client.AppiumDriver.findElementByXPath(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElementByXPath(WindowsDriver.java:1)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:136)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:1)
+ at org.openqa.selenium.support.ui.FluentWait.until(FluentWait.java:249)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:120)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:77)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:69)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.getText(WindowsActionHelper.java:227)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$getText$2.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy:42)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.getText(GetTextKeyword.groovy:36)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$getText.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.execute(GetTextKeyword.groovy:32)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.getText(WindowsBuiltinKeywords.java:434)
+ at Passerelle Bilan H Bilan French IFRS.run(Passerelle Bilan H Bilan French IFRS:33)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:92)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.getText(GetTextKeyword.groovy:36)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$getText.callCurrent(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword.execute(GetTextKeyword.groovy:32)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.getText(WindowsBuiltinKeywords.java:434)
+ at Passerelle Bilan H Bilan French IFRS.run(Passerelle Bilan H Bilan French IFRS:33)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+*** Element info: {Using=xpath, value=//Window/Pane[2]/Text[4]}
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:42)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElement(RemoteWebDriver.java:323)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElement(DefaultGenericMobileDriver.java:62)
+ at io.appium.java_client.AppiumDriver.findElement(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElement(WindowsDriver.java:1)
+ at org.openqa.selenium.remote.RemoteWebDriver.findElementByXPath(RemoteWebDriver.java:428)
+ at io.appium.java_client.DefaultGenericMobileDriver.findElementByXPath(DefaultGenericMobileDriver.java:152)
+ at io.appium.java_client.AppiumDriver.findElementByXPath(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.findElementByXPath(WindowsDriver.java:1)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:136)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$1.apply(WindowsActionHelper.java:1)
+ at org.openqa.selenium.support.ui.FluentWait.until(FluentWait.java:249)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:120)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:77)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.findElement(WindowsActionHelper.java:69)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.getText(WindowsActionHelper.java:227)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$getText$2.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy:42)
+ at com.kms.katalon.core.windows.keyword.builtin.GetTextKeyword$_getText_closure1.doCall(GetTextKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ ... 22 more, reportFolder=C:\Users\BGS32GG\Workspace\ematch\Reports\20260324_160952\PasserelleBilan\Passerelle Bilan H Bilan French IFRS\20260324_160953, steps=[], evidence=[]}, {id=Test-Cases/Passerelle-Bilan-H-Bilan-French-IFRS/Passerelle-Bilan-DB, name=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan DB, scenarioName=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan DB, status=failed, result=failed, durationMs=17589, durationLabel=00h 00m 18s, startTime=, endTime=, startLabel=--, endLabel=--, startShort=--, endShort=--, startLong=--, endLong=--, visualError=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan DB FAILED. | Reason:, errorSummary=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan DB FAILED. | Reason:, fullError=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan DB FAILED.
+Reason:
+java.lang.IllegalArgumentException: Cannot find test data with id 'Data Files/Database/PROD_DB' because (of) 'com.microsoft.sqlserver.jdbc.SQLServerException: The TCP/IP connection to the host LWPLFRNXN22100A.cib.net, port 1433 has failed. Error: "Connection timed out: no further information. Verify the connection properties. Make sure that an instance of SQL Server is running on the host and accepting TCP/IP connections at the port. Make sure that TCP connections to the port are not blocked by a firewall.".'
+ at com.kms.katalon.core.testdata.TestDataFactory.findTestData(TestDataFactory.java:132)
+ at database.Db.<init>(Db.groovy:12)
+ at Passerelle Bilan DB.run(Passerelle Bilan DB:4)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43), errorDetail=Test Cases/Passerelle Bilan H Bilan French IFRS/Passerelle Bilan DB FAILED.
+Reason:
+java.lang.IllegalArgumentException: Cannot find test data with id 'Data Files/Database/PROD_DB' because (of) 'com.microsoft.sqlserver.jdbc.SQLServerException: The TCP/IP connection to the host LWPLFRNXN22100A.cib.net, port 1433 has failed. Error: "Connection timed out: no further information. Verify the connection properties. Make sure that an instance of SQL Server is running on the host and accepting TCP/IP connections at the port. Make sure that TCP connections to the port are not blocked by a firewall.".'
+ at com.kms.katalon.core.testdata.TestDataFactory.findTestData(TestDataFactory.java:132)
+ at database.Db.<init>(Db.groovy:12)
+ at Passerelle Bilan DB.run(Passerelle Bilan DB:4)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43), reportFolder=C:\Users\BGS32GG\Workspace\ematch\Reports\20260324_160952\PasserelleBilan\Passerelle Bilan H Bilan French IFRS\20260324_160953, steps=[], evidence=[]}, {id=Test-Cases/Connection/eMatch-Close-Application, name=Test Cases/Connection/eMatch - Close Application, scenarioName=Test Cases/Connection/eMatch - Close Application, status=failed, result=failed, durationMs=7415, durationLabel=00h 00m 07s, startTime=, endTime=, startLabel=--, endLabel=--, startShort=--, endShort=--, startLong=--, endLong=--, visualError=Test Cases/Connection/eMatch - Close Application FAILED. | Reason:, errorSummary=Test Cases/Connection/eMatch - Close Application FAILED. | Reason:, fullError=Test Cases/Connection/eMatch - Close Application FAILED.
+Reason:
+com.kms.katalon.core.exception.StepFailedException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401 (Root cause: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:46)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at io.appium.java_client.InteractsWithApps.closeApp(InteractsWithApps.java:139)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.closeApp(WindowsActionHelper.java:341)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$closeApp$3.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy:39)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.closeApplication(CloseApplicationKeyword.groovy:33)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.execute(CloseApplicationKeyword.groovy:29)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.closeApplication(WindowsBuiltinKeywords.java:564)
+ at eMatch - Close Application.run(eMatch - Close Application:9)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:92)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.closeApplication(CloseApplicationKeyword.groovy:33)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.execute(CloseApplicationKeyword.groovy:29)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.closeApplication(WindowsBuiltinKeywords.java:564)
+ at eMatch - Close Application.run(eMatch - Close Application:9)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:46)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at io.appium.java_client.InteractsWithApps.closeApp(InteractsWithApps.java:139)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.closeApp(WindowsActionHelper.java:341)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$closeApp$3.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy:39)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ ... 21 more, errorDetail=Test Cases/Connection/eMatch - Close Application FAILED.
+Reason:
+com.kms.katalon.core.exception.StepFailedException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401 (Root cause: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:46)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at io.appium.java_client.InteractsWithApps.closeApp(InteractsWithApps.java:139)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.closeApp(WindowsActionHelper.java:341)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$closeApp$3.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy:39)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.closeApplication(CloseApplicationKeyword.groovy:33)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.execute(CloseApplicationKeyword.groovy:29)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.closeApplication(WindowsBuiltinKeywords.java:564)
+ at eMatch - Close Application.run(eMatch - Close Application:9)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy:51)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.stepFailed(KeywordMain.groovy)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:92)
+ at com.kms.katalon.core.keyword.internal.KeywordMain$runKeyword.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.closeApplication(CloseApplicationKeyword.groovy:33)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword.execute(CloseApplicationKeyword.groovy:29)
+ at com.kms.katalon.core.keyword.internal.KeywordExecutor.executeKeywordForPlatform(KeywordExecutor.groovy:74)
+ at com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords.closeApplication(WindowsBuiltinKeywords.java:564)
+ at eMatch - Close Application.run(eMatch - Close Application:9)
+ at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+ at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+ at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+ at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+ at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+ at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+ at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+ at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+ at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+ at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+ at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+ at TempTestSuite1774368593667.run(TempTestSuite1774368593667.groovy:35)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+Caused by: org.openqa.selenium.NoSuchWindowException: Currently selected window has been closed (WARNING: The server did not provide any stacktrace information)
+Command duration or timeout: 0 milliseconds
+Build info: version: '3.141.59', revision: 'e82be7d358', time: '2018-11-14T08:25:53'
+System info: host: 'L0028033', ip: '10.133.19.12', os.name: 'Windows 11', os.arch: 'amd64', os.version: '10.0', java.version: '17.0.7'
+Driver info: io.appium.java_client.windows.WindowsDriver
+Capabilities {appTopLevelWindow: 1318cc, javascriptEnabled: true, ms:waitForAppLaunch: 60, platform: WINDOWS, platformName: WINDOWS}
+Session ID: BA52AB97-832A-4ED9-8C31-5BFCAEAE0401
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+ at java.base/jdk.internal.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+ at org.openqa.selenium.remote.ErrorHandler.createThrowable(ErrorHandler.java:214)
+ at org.openqa.selenium.remote.ErrorHandler.throwIfResponseFailed(ErrorHandler.java:166)
+ at org.openqa.selenium.remote.http.JsonHttpResponseCodec.reconstructValue(JsonHttpResponseCodec.java:40)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:80)
+ at org.openqa.selenium.remote.http.AbstractHttpResponseCodec.decode(AbstractHttpResponseCodec.java:44)
+ at org.openqa.selenium.remote.HttpCommandExecutor.execute(HttpCommandExecutor.java:158)
+ at io.appium.java_client.remote.AppiumCommandExecutor.execute(AppiumCommandExecutor.java:239)
+ at org.openqa.selenium.remote.RemoteWebDriver.execute(RemoteWebDriver.java:552)
+ at io.appium.java_client.DefaultGenericMobileDriver.execute(DefaultGenericMobileDriver.java:46)
+ at io.appium.java_client.AppiumDriver.execute(AppiumDriver.java:1)
+ at io.appium.java_client.windows.WindowsDriver.execute(WindowsDriver.java:1)
+ at io.appium.java_client.InteractsWithApps.closeApp(InteractsWithApps.java:139)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper.closeApp(WindowsActionHelper.java:341)
+ at com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper$closeApp$3.call(Unknown Source)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy:39)
+ at com.kms.katalon.core.windows.keyword.builtin.CloseApplicationKeyword$_closeApplication_closure1.doCall(CloseApplicationKeyword.groovy)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+ at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+ at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+ at com.kms.katalon.core.keyword.internal.KeywordMain.runKeyword(KeywordMain.groovy:90)
+ ... 21 more, reportFolder=C:\Users\BGS32GG\Workspace\ematch\Reports\20260324_160952\PasserelleBilan\Passerelle Bilan H Bilan French IFRS\20260324_160953, steps=[], evidence=[]}]}' with class 'java.util.LinkedHashMap' to class 'java.io.File' due to: org.codehaus.groovy.runtime.metaclass.MethodSelectionException: Could not find which method <init>() to invoke from this list:
+  public java.io.File#<init>(java.lang.String)
+  public java.io.File#<init>(java.lang.String, java.lang.String)
+  public java.io.File#<init>(java.net.URI)
+  public java.io.File#<init>(java.io.File, java.lang.String)
+	at com.kms.katalon.core.util.KeywordUtil.markFailed(KeywordUtil.java:19)
+	at jiraIntegration.JiraFlowCoordinator.jiraImport(JiraFlowCoordinator.groovy:137)
+	at jiraIntegration.JiraIntegration.jiraImport(JiraIntegration.groovy:9)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:55)
+	at Jira_Import_Passerelle Bilan.run(Jira_Import_Passerelle Bilan:20)
+	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
+	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
+	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
+	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
+	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
+	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
+	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
+	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
+	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
+	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
+	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
+	at TempTestSuite1774368595376.run(TempTestSuite1774368595376.groovy:35)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+
+2026-03-24 16:12:42.443 INFO  com.kms.katalon.core.util.KeywordUtil    - Evidence screenshot saved from desktop: C:\Users\BGS32GG\Workspace\ematch\Reports\20260324_160952\PasserelleBilan\Passerelle Bilan Jira Import\20260324_160955\Evidences\Test_Cases_Passerelle_Bilan_H_Bilan_French_IFRS_Jira_Import_Passerelle_Bilan\20260324_161242_138_auto-failure.png
+2026-03-24 16:12:44.896 INFO  c.k.k.c.c.internal.VideoRecorderService  - Video recording for test case 'Test Cases/Passerelle Bilan H Bilan French IFRS/Jira_Import_Passerelle Bilan' .
+2026-03-24 16:12:44.898 INFO  c.k.katalon.core.main.TestCaseExecutor   - END Test Cases/Passerelle Bilan H Bilan French IFRS/Jira_Import_Passerelle Bilan
+✅ eMatch HTML report generated at: C:\Users\BGS32GG\Workspace\ematch\Reports\20260324_160952\PasserelleBilan\Passerelle Bilan Jira Import\20260324_160955/eMatchReport.html
+2026-03-24 16:12:45.474 INFO  com.kms.katalon.core.util.KeywordUtil    - Start generating HTML report folder at: C:\Users\BGS32GG\Workspace\ematch\Reports\20260324_160952\PasserelleBilan\Passerelle Bilan Jira Import\20260324_160955...
+2026-03-24 16:12:45.595 INFO  com.kms.katalon.core.util.KeywordUtil    - HTML report generated
+2026-03-24 16:12:45.596 INFO  com.kms.katalon.core.util.KeywordUtil    - Start generating C
+
+
+
+Tambem nao sie muito bem o porque usar esse s comandos abaixo, não cria automatico?
 
 
 CustomKeywords.'jiraIntegration.ImagesEvidence.note'('Open login page')
