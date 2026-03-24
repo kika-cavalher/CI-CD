@@ -1,977 +1,243 @@
-
-
 package jiraIntegration
 
-import groovy.io.FileType
-import groovy.util.Node
-import groovy.xml.XmlParser
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.context.TestCaseContext
+import com.kms.katalon.core.util.KeywordUtil
 
-import java.io.File
+import javax.imageio.ImageIO
+import java.awt.GraphicsEnvironment
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.image.BufferedImage
 import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.LinkedHashSet
 import java.util.Locale
 
-class JiraReportBuilder {
+class ImagesEvidence {
 
-    private static final String APP_NAME = 'EMATCH'
-    private static final String LOGO_SRC = 'Image/ematch-logo.png'
+    private static final SimpleDateFormat FILE_STAMP =
+        new SimpleDateFormat('yyyyMMdd_HHmmss_SSS', Locale.ENGLISH)
 
-    private static final String REPORT_STEP = '[REPORT_STEP]'
-    private static final String REPORT_FAIL = '[REPORT_FAIL]'
-    private static final String REPORT_BLOCKED = '[REPORT_BLOCKED]'
-    private static final String REPORT_SCREENSHOT = '[REPORT_SCREENSHOT]'
+    private static final SimpleDateFormat LOG_STAMP =
+        new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS', Locale.ENGLISH)
 
-    private static final List<String> DATE_PATTERNS = [
-        "yyyy-MM-dd HH:mm:ss.SSS",
-        "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
-        "yyyy-MM-dd'T'HH:mm:ss.SSS",
-        "yyyy-MM-dd'T'HH:mm:ss",
-        'dd/MM/yyyy HH:mm:ss',
-        'dd.MM.yyyy HH:mm:ss',
-        'MM/dd/yyyy HH:mm:ss',
-        'HH:mm:ss'
-    ]
+    private static final ThreadLocal<File> CURRENT_CASE_FOLDER = new ThreadLocal<File>()
+    private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
 
-    private static final SimpleDateFormat OUTPUT_DATE_TIME =
-        new SimpleDateFormat('dd/MM/yyyy HH:mm:ss', Locale.ENGLISH)
-
-    private static final SimpleDateFormat OUTPUT_CLOCK =
-        new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH)
-
-    private File cachedLogRoot
-    private List<String> cachedLogLines = []
-
-    Map build(String reportFolderPath) {
-        return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath))
+    /*
+     * Manual note that will be saved in the evidence log.
+     * Use this when you want the report to show only controlled steps.
+     */
+    @Keyword
+    def note(String message) {
+        appendNoteLine('NOTE', message)
     }
 
-    Map buildReport(String reportFolderPath) {
-        return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath))
+    /*
+     * Manual controlled checkpoint.
+     * This is useful for validations you want to expose in the custom report.
+     */
+    @Keyword
+    def checkpoint(String message) {
+        appendNoteLine('CHECKPOINT', message)
     }
 
-    Map buildReport(String reportFolderPath, String suiteName, String executionTitle) {
-        return buildReport(
-            new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath),
-            suiteName,
-            executionTitle
-        )
+    /*
+     * Manual screenshot when you explicitly want one.
+     */
+    @Keyword
+    File captureNow(String label = 'manual') {
+        return captureScreenshot(label)
     }
 
-    Map buildReport(File reportFolder) {
-        return buildModel(reportFolder, '', '')
+    /*
+     * Manual note plus screenshot in one command.
+     */
+    @Keyword
+    File noteAndCapture(String message, String label = 'manual') {
+        appendNoteLine('NOTE', message)
+        return captureScreenshot(label)
     }
 
-    Map buildReport(File reportFolder, String suiteName, String executionTitle) {
-        return buildModel(reportFolder, suiteName, executionTitle)
+    /*
+     * Global start hook.
+     * This is called automatically from the listener.
+     */
+    static void startCase(TestCaseContext context) {
+        File caseFolder = resolveCaseFolder(context)
+        CURRENT_CASE_FOLDER.set(caseFolder)
+        CURRENT_CASE_ID.set(safe(context?.getTestCaseId()))
+        appendLine(caseFolder, buildLogLine('CASE_START', safe(context?.getTestCaseId())))
     }
 
-    Map buildModel(String reportFolderPath) {
-        return buildReport(reportFolderPath)
-    }
-
-    Map buildModel(File reportFolder) {
-        return buildReport(reportFolder)
-    }
-
-    Map buildModel(File reportFolder, String suiteName, String executionTitle) {
-        File root = reportFolder ?: new File('.')
-
-        if (!root.exists()) {
-            return emptyModel(root, suiteName, executionTitle)
-        }
-
-        cachedLogRoot = null
-        cachedLogLines = []
-
-        List<File> junitFiles = collectJUnitFiles(root)
-        List<Map> scenarios = []
-
-        junitFiles.each { File junitFile ->
-            scenarios.addAll(buildScenariosFromJUnit(junitFile, root))
-        }
-
-        if (scenarios.isEmpty()) {
-            scenarios = buildFallbackScenarios(root)
-        }
-
-        String resolvedSuiteName = !safe(suiteName).isEmpty() ? safe(suiteName) : detectSuiteName(root, scenarios)
-        String resolvedExecutionTitle = !safe(executionTitle).isEmpty() ? safe(executionTitle) : resolvedSuiteName
-
-        return [
-            appName         : APP_NAME,
-            suiteName       : resolvedSuiteName,
-            executionName   : resolvedExecutionTitle,
-            title           : resolvedExecutionTitle,
-            generatedAt     : OUTPUT_DATE_TIME.format(new Date()),
-            reportFolder    : root.absolutePath,
-            baseFolder      : root.absolutePath,
-            executionFolder : root.absolutePath,
-            logoSrc         : LOGO_SRC,
-            scenarios       : scenarios
-        ]
-    }
-
-    private Map emptyModel(File root, String suiteName, String executionTitle) {
-        String absolute = root != null ? root.absolutePath : new File('.').absolutePath
-        String resolvedSuiteName = !safe(suiteName).isEmpty() ? safe(suiteName) : 'Execution'
-        String resolvedExecutionTitle = !safe(executionTitle).isEmpty() ? safe(executionTitle) : resolvedSuiteName
-
-        return [
-            appName         : APP_NAME,
-            suiteName       : resolvedSuiteName,
-            executionName   : resolvedExecutionTitle,
-            title           : resolvedExecutionTitle,
-            generatedAt     : OUTPUT_DATE_TIME.format(new Date()),
-            reportFolder    : absolute,
-            baseFolder      : absolute,
-            executionFolder : absolute,
-            logoSrc         : LOGO_SRC,
-            scenarios       : []
-        ]
-    }
-
-    private List<Map> buildScenariosFromJUnit(File junitFile, File reportRoot) {
-        List<Map> result = []
-
-        Node xmlRoot
+    /*
+     * Global end hook.
+     * If the test failed or errored, it captures a screenshot automatically.
+     */
+    static void finishCase(TestCaseContext context) {
         try {
-            xmlRoot = new XmlParser(false, false).parse(junitFile)
-        } catch (Throwable ignored) {
-            return result
+            File caseFolder = resolveActiveCaseFolder(context)
+            String status = normalizeStatus(context?.getTestCaseStatus())
+
+            appendLine(caseFolder, buildLogLine('CASE_END', status))
+
+            if (status == 'FAILED' || status == 'ERROR') {
+                captureScreenshot('auto-failure')
+            }
+        } finally {
+            CURRENT_CASE_FOLDER.remove()
+            CURRENT_CASE_ID.remove()
+        }
+    }
+
+    /*
+     * Captures the current desktop screen and stores it in the current test evidence folder.
+     */
+    private static File captureScreenshot(String label) {
+        File caseFolder = resolveActiveCaseFolder(null)
+        String safeLabel = sanitizeFileName(label)
+
+        if (safeLabel.isEmpty()) {
+            safeLabel = 'manual'
         }
 
-        List<Node> testcaseNodes = collectTestCaseNodes(xmlRoot)
+        File target = new File(caseFolder, FILE_STAMP.format(new Date()) + '_' + safeLabel + '.png')
 
-        testcaseNodes.eachWithIndex { Node testcaseNode, int index ->
-            String rawName = firstNonBlank(
-                attr(testcaseNode, 'name'),
-                attr(testcaseNode, 'classname'),
-                "Scenario ${index + 1}"
+        try {
+            if (GraphicsEnvironment.isHeadless()) {
+                appendLine(caseFolder, buildLogLine('SCREENSHOT_ERROR', 'Headless environment. Screenshot was not captured.'))
+                KeywordUtil.logInfo('Evidence screenshot was not captured because the environment is headless.')
+                return null
+            }
+
+            BufferedImage image = new Robot().createScreenCapture(
+                new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
             )
 
-            String className = safe(attr(testcaseNode, 'classname'))
-            String displayName = buildDisplayName(className, rawName)
-            String scenarioId = buildScenarioId(displayName, index + 1)
+            ImageIO.write(image, 'png', target)
 
-            Node failureNode = firstChildByName(testcaseNode, 'failure')
-            Node errorNode = firstChildByName(testcaseNode, 'error')
-            Node skippedNode = firstChildByName(testcaseNode, 'skipped')
+            appendLine(caseFolder, buildLogLine('SCREENSHOT', target.absolutePath))
+            KeywordUtil.logInfo('Evidence screenshot saved: ' + target.absolutePath)
 
-            String status = 'passed'
-            Node resultNode = null
-
-            if (failureNode != null) {
-                status = 'failed'
-                resultNode = failureNode
-            } else if (errorNode != null) {
-                status = 'failed'
-                resultNode = errorNode
-            } else if (skippedNode != null) {
-                status = 'blocked'
-                resultNode = skippedNode
-            }
-
-            String fullError = firstNonBlank(textOf(resultNode), attr(resultNode, 'message'))
-            String shortError = buildShortError(fullError)
-
-            List<String> block = findScenarioBlock(reportRoot, displayName, rawName)
-            Map timing = extractTimingFromBlock(block)
-            List<Map> steps = extractControlledSteps(block)
-            List<Map> evidence = extractEvidenceFromBlock(block, reportRoot)
-
-            if (status == 'blocked' && steps.find { it.status == 'failed' }) {
-                status = 'failed'
-            }
-
-            long durationMs = timing.durationMs
-            if (durationMs <= 0L) {
-                durationMs = toDurationMillis(attr(testcaseNode, 'time'))
-            }
-
-            result << [
-                id            : scenarioId,
-                name          : displayName,
-                scenarioName  : displayName,
-                status        : status,
-                result        : status,
-                durationMs    : durationMs,
-                durationLabel : formatDuration(durationMs),
-                startTime     : timing.startRaw,
-                endTime       : timing.endRaw,
-                startLabel    : formatDateTime(timing.startMs),
-                endLabel      : formatDateTime(timing.endMs),
-                startShort    : formatClock(timing.startMs),
-                endShort      : formatClock(timing.endMs),
-                startLong     : formatDateTime(timing.startMs),
-                endLong       : formatDateTime(timing.endMs),
-                visualError   : shortError,
-                errorSummary  : shortError,
-                fullError     : fullError,
-                errorDetail   : fullError,
-                reportFolder  : reportRoot.absolutePath,
-                steps         : steps,
-                evidence      : evidence
-            ]
-        }
-
-        return result
-    }
-
-    private List<Map> buildFallbackScenarios(File reportRoot) {
-        List<Map> result = []
-        List<String> lines = readMergedLogLines(reportRoot)
-
-        if (lines.isEmpty()) {
-            return result
-        }
-
-        List<Integer> startIndexes = []
-
-        for (int i = 0; i < lines.size(); i++) {
-            String line = safe(lines[i])
-            if (line.contains('START Test Cases/')) {
-                startIndexes << i
-            }
-        }
-
-        startIndexes.eachWithIndex { Integer startIndex, int idx ->
-            int endIndex = lines.size() - 1
-
-            for (int next = idx + 1; next < startIndexes.size(); next++) {
-                if (startIndexes[next] > startIndex) {
-                    endIndex = startIndexes[next] - 1
-                    break
-                }
-            }
-
-            List<String> block = new ArrayList<String>(lines.subList(startIndex, Math.min(endIndex + 1, lines.size())))
-            String name = extractNameFromStartLine(lines[startIndex])
-
-            if (name.isEmpty()) {
-                name = "Scenario ${idx + 1}"
-            }
-
-            String status = detectStatusFromBlock(block)
-            Map timing = extractTimingFromBlock(block)
-            List<Map> steps = extractControlledSteps(block)
-            List<Map> evidence = extractEvidenceFromBlock(block, reportRoot)
-            String fullError = findFirstFailureDetail(block)
-            String shortError = buildShortError(fullError)
-
-            result << [
-                id            : buildScenarioId(name, idx + 1),
-                name          : name,
-                scenarioName  : name,
-                status        : status,
-                result        : status,
-                durationMs    : timing.durationMs,
-                durationLabel : formatDuration(timing.durationMs),
-                startTime     : timing.startRaw,
-                endTime       : timing.endRaw,
-                startLabel    : formatDateTime(timing.startMs),
-                endLabel      : formatDateTime(timing.endMs),
-                startShort    : formatClock(timing.startMs),
-                endShort      : formatClock(timing.endMs),
-                startLong     : formatDateTime(timing.startMs),
-                endLong       : formatDateTime(timing.endMs),
-                visualError   : shortError,
-                errorSummary  : shortError,
-                fullError     : fullError,
-                errorDetail   : fullError,
-                reportFolder  : reportRoot.absolutePath,
-                steps         : steps,
-                evidence      : evidence
-            ]
-        }
-
-        return result
-    }
-
-    private List<Node> collectTestCaseNodes(Node xmlRoot) {
-        List<Node> nodes = []
-
-        if (xmlRoot == null) {
-            return nodes
-        }
-
-        String rootName = safe(xmlRoot.name())
-
-        if ('testsuite'.equals(rootName)) {
-            xmlRoot.children().each { def child ->
-                if (child instanceof Node && 'testcase'.equals(safe(((Node) child).name()))) {
-                    nodes << (Node) child
-                }
-            }
-        } else if ('testsuites'.equals(rootName)) {
-            xmlRoot.children().each { def suiteNode ->
-                if (!(suiteNode instanceof Node)) {
-                    return
-                }
-
-                Node suite = (Node) suiteNode
-                if (!'testsuite'.equals(safe(suite.name()))) {
-                    return
-                }
-
-                suite.children().each { def child ->
-                    if (child instanceof Node && 'testcase'.equals(safe(((Node) child).name()))) {
-                        nodes << (Node) child
-                    }
-                }
-            }
-        }
-
-        return nodes
-    }
-
-    private List<File> collectJUnitFiles(File root) {
-        List<File> result = []
-
-        if (root == null || !root.exists()) {
-            return result
-        }
-
-        root.eachFileRecurse(FileType.FILES) { File file ->
-            String lowerName = file.name.toLowerCase(Locale.ENGLISH)
-            if (lowerName == 'junit_report.xml' ||
-                lowerName == 'junitreport.xml' ||
-                lowerName == 'junit.xml' ||
-                lowerName == 'junit-report.xml' ||
-                lowerName == 'cucumber.xml') {
-                result << file
-            }
-        }
-
-        result = result.unique { it.absolutePath }
-        result.sort { File a, File b -> a.absolutePath <=> b.absolutePath }
-
-        return result
-    }
-
-    private List<String> findScenarioBlock(File reportRoot, String displayName, String rawName) {
-        List<String> lines = readMergedLogLines(reportRoot)
-        if (lines.isEmpty()) {
-            return []
-        }
-
-        List<String> candidates = []
-        if (!safe(displayName).isEmpty()) {
-            candidates << safe(displayName)
-        }
-        if (!safe(rawName).isEmpty()) {
-            candidates << safe(rawName)
-        }
-        candidates = candidates.unique()
-
-        int startIndex = -1
-
-        for (int i = 0; i < lines.size(); i++) {
-            String line = safe(lines[i])
-            if (!line.contains('START Test Cases/')) {
-                continue
-            }
-
-            boolean matched = false
-            for (String candidate : candidates) {
-                if (!safe(candidate).isEmpty() && line.contains(candidate)) {
-                    matched = true
-                    break
-                }
-            }
-
-            if (matched) {
-                startIndex = i
-                break
-            }
-        }
-
-        if (startIndex < 0) {
-            return []
-        }
-
-        int endIndex = lines.size() - 1
-
-        for (int i = startIndex + 1; i < lines.size(); i++) {
-            String line = safe(lines[i])
-
-            if (line.contains('END Test Cases/')) {
-                endIndex = i
-                break
-            }
-
-            if (line.contains('START Test Cases/')) {
-                endIndex = i - 1
-                break
-            }
-        }
-
-        if (endIndex < startIndex) {
-            endIndex = startIndex
-        }
-
-        return new ArrayList<String>(lines.subList(startIndex, Math.min(endIndex + 1, lines.size())))
-    }
-
-    private Map extractTimingFromBlock(List<String> block) {
-        long startMs = 0L
-        long endMs = 0L
-        String startRaw = ''
-        String endRaw = ''
-
-        for (String line : block) {
-            long currentMs = extractTimestampMillis(line)
-            if (currentMs <= 0L) {
-                continue
-            }
-
-            if (startMs <= 0L) {
-                startMs = currentMs
-                startRaw = extractTimestampText(line)
-            }
-
-            endMs = currentMs
-            endRaw = extractTimestampText(line)
-        }
-
-        long durationMs = 0L
-        if (startMs > 0L && endMs >= startMs) {
-            durationMs = endMs - startMs
-        }
-
-        return [
-            startMs   : startMs,
-            endMs     : endMs,
-            startRaw  : startRaw,
-            endRaw    : endRaw,
-            durationMs: durationMs
-        ]
-    }
-
-    private List<Map> extractControlledSteps(List<String> block) {
-        List<Map> steps = []
-
-        for (String line : block) {
-            Map step = parseControlledStep(line)
-            if (step != null) {
-                steps << step
-            }
-        }
-
-        return steps
-    }
-
-    private Map parseControlledStep(String line) {
-        String text = safe(line)
-        if (text.isEmpty()) {
+            return target
+        } catch (Throwable t) {
+            appendLine(caseFolder, buildLogLine('SCREENSHOT_ERROR', safe(t?.getMessage())))
+            KeywordUtil.logInfo('Evidence screenshot could not be captured: ' + safe(t?.getMessage()))
             return null
         }
-
-        long timestampMs = extractTimestampMillis(text)
-        String timestampLabel = formatClock(timestampMs)
-
-        if (text.contains(REPORT_STEP)) {
-            String detail = text.substring(text.indexOf(REPORT_STEP) + REPORT_STEP.length()).trim()
-            return buildStep('passed', timestampLabel, detail, '✅')
-        }
-
-        if (text.contains(REPORT_FAIL)) {
-            String detail = text.substring(text.indexOf(REPORT_FAIL) + REPORT_FAIL.length()).trim()
-            return buildStep('failed', timestampLabel, detail, '❌')
-        }
-
-        if (text.contains(REPORT_BLOCKED)) {
-            String detail = text.substring(text.indexOf(REPORT_BLOCKED) + REPORT_BLOCKED.length()).trim()
-            return buildStep('blocked', timestampLabel, detail, '⛔')
-        }
-
-        if (text.contains(REPORT_SCREENSHOT)) {
-            String payload = text.substring(text.indexOf(REPORT_SCREENSHOT) + REPORT_SCREENSHOT.length()).trim()
-            String label = payload
-            int sep = payload.indexOf('|')
-            if (sep >= 0 && sep < payload.length() - 1) {
-                label = payload.substring(sep + 1).trim()
-            }
-            return buildStep('passed', timestampLabel, label, '🖼️')
-        }
-
-        return null
     }
 
-    private Map buildStep(String status, String timestamp, String detail, String icon) {
-        return [
-            status   : safe(status),
-            timestamp: safe(timestamp),
-            detail   : safe(detail),
-            icon     : safe(icon)
-        ]
+    /*
+     * Saves controlled notes in a simple log file.
+     * The report builder can later read only this file and ignore noisy execution logs.
+     */
+    private static void appendNoteLine(String type, String message) {
+        File caseFolder = resolveActiveCaseFolder(null)
+        appendLine(caseFolder, buildLogLine(type, message))
     }
 
-    private List<Map> extractEvidenceFromBlock(List<String> block, File reportRoot) {
-        List<Map> result = []
+    /*
+     * Returns the active case folder if it already exists in the thread.
+     * Otherwise it resolves it again safely.
+     */
+    private static File resolveActiveCaseFolder(TestCaseContext context) {
+        File active = CURRENT_CASE_FOLDER.get()
 
-        for (String line : block) {
-            String text = safe(line)
-            if (!text.contains(REPORT_SCREENSHOT)) {
-                continue
-            }
-
-            String payload = text.substring(text.indexOf(REPORT_SCREENSHOT) + REPORT_SCREENSHOT.length()).trim()
-            String pathValue = payload
-            String labelValue = 'Evidence'
-
-            int sep = payload.indexOf('|')
-            if (sep >= 0) {
-                pathValue = payload.substring(0, sep).trim()
-                labelValue = payload.substring(sep + 1).trim()
-            }
-
-            File imageFile = resolveEvidenceFile(pathValue, reportRoot)
-            if (imageFile != null && imageFile.exists()) {
-                result << [
-                    name  : !safe(labelValue).isEmpty() ? safe(labelValue) : imageFile.name,
-                    href  : imageFile.toURI().toString(),
-                    image : true,
-                    imgSrc: imageFile.toURI().toString()
-                ]
-            }
+        if (active != null && active.exists()) {
+            return active
         }
 
-        if (!result.isEmpty()) {
-            return result
-        }
+        File caseFolder = resolveCaseFolder(context)
+        CURRENT_CASE_FOLDER.set(caseFolder)
 
-        File evidencesFolder = new File(reportRoot, 'Evidences')
-        if (!evidencesFolder.exists()) {
-            return result
-        }
-
-        List<File> images = []
-        evidencesFolder.eachFile(FileType.FILES) { File file ->
-            String lower = file.name.toLowerCase(Locale.ENGLISH)
-            if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg')) {
-                images << file
-            }
-        }
-
-        images.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
-
-        if (!images.isEmpty()) {
-            File file = images[0]
-            result << [
-                name  : file.name,
-                href  : file.toURI().toString(),
-                image : true,
-                imgSrc: file.toURI().toString()
-            ]
-        }
-
-        return result
+        return caseFolder
     }
 
-    private File resolveEvidenceFile(String pathValue, File reportRoot) {
-        String value = safe(pathValue)
-        if (value.isEmpty()) {
-            return null
-        }
-
-        File direct = new File(value)
-        if (direct.exists()) {
-            return direct
-        }
-
-        File byReport = new File(reportRoot, value)
-        if (byReport.exists()) {
-            return byReport
-        }
-
-        return direct
-    }
-
-    private List<String> readMergedLogLines(File root) {
-        if (root == null || !root.exists()) {
-            return []
-        }
-
-        if (cachedLogRoot != null &&
-            cachedLogRoot.absolutePath == root.absolutePath &&
-            cachedLogLines != null &&
-            !cachedLogLines.isEmpty()) {
-            return cachedLogLines
-        }
-
-        List<File> logFiles = []
-
-        root.eachFileRecurse(FileType.FILES) { File file ->
-            String lower = file.name.toLowerCase(Locale.ENGLISH)
-            if (lower == 'execution0.log' || lower.endsWith('.log') || lower.endsWith('.txt')) {
-                logFiles << file
-            }
-        }
-
-        logFiles.sort { File a, File b ->
-            int pa = logPriority(a)
-            int pb = logPriority(b)
-            if (pa != pb) {
-                return pa <=> pb
-            }
-            return a.absolutePath <=> b.absolutePath
-        }
-
-        List<String> merged = []
-        logFiles.each { File file ->
-            merged.addAll(readLinesSafely(file))
-        }
-
-        cachedLogRoot = root
-        cachedLogLines = merged
-
-        return merged
-    }
-
-    private int logPriority(File file) {
-        String lower = file.name.toLowerCase(Locale.ENGLISH)
-
-        if (lower == 'execution0.log') {
-            return 0
-        }
-        if (lower.contains('execution')) {
-            return 1
-        }
-        if (lower.contains('console')) {
-            return 2
-        }
-        return 10
-    }
-
-    private String detectSuiteName(File root, List<Map> scenarios) {
-        if (root != null && root.parentFile != null) {
-            String parentName = safe(root.parentFile.name)
-            if (!parentName.isEmpty() && !parentName.matches(/\d+/)) {
-                return parentName
-            }
-        }
-
-        if (root != null) {
-            String folderName = safe(root.name)
-            if (!folderName.isEmpty() && !folderName.matches(/\d+/)) {
-                return folderName
-            }
-        }
-
-        if (scenarios != null && !scenarios.isEmpty()) {
-            return safe(scenarios[0].name)
-        }
-
-        return 'Execution'
-    }
-
-    private String buildDisplayName(String className, String rawName) {
-        String cleanClass = safe(className)
-        String cleanName = safe(rawName)
-
-        if (!cleanClass.isEmpty()) {
-            if (cleanClass.startsWith('Test Cases/')) {
-                return cleanClass
-            }
-
-            if (cleanClass.contains('/')) {
-                return cleanClass
-            }
-        }
-
-        return cleanName
-    }
-
-    private String buildScenarioId(String value, int index) {
-        String normalized = safe(value)
-            .replace('\\', '/')
-            .replaceAll(/[^A-Za-z0-9\/_-]+/, '-')
-            .replaceAll(/-+/, '-')
-            .replaceAll(/^[-\/]+|[-\/]+$/, '')
-
-        if (normalized.isEmpty()) {
-            normalized = "scenario-${index}"
-        }
-
-        return normalized
-    }
-
-    private String detectStatusFromBlock(List<String> block) {
-        for (String line : block) {
-            String text = safe(line)
-            if (text.contains(REPORT_FAIL)) {
-                return 'failed'
-            }
-            if (text.contains(REPORT_BLOCKED)) {
-                return 'blocked'
-            }
-        }
-
-        String joined = block.join('\n').toLowerCase(Locale.ENGLISH)
-        if (joined.contains(' failed')) {
-            return 'failed'
-        }
-        if (joined.contains(' skipped')) {
-            return 'blocked'
-        }
-
-        return 'passed'
-    }
-
-    private String findFirstFailureDetail(List<String> block) {
-        for (String line : block) {
-            String text = safe(line)
-            if (text.contains(REPORT_FAIL)) {
-                return text.substring(text.indexOf(REPORT_FAIL) + REPORT_FAIL.length()).trim()
-            }
-        }
-
-        for (String line : block) {
-            String cleaned = stripLinePrefix(line)
-            String lower = cleaned.toLowerCase(Locale.ENGLISH)
-            if (lower.contains('failed') || lower.contains('error')) {
-                return cleaned
-            }
-        }
-
-        return ''
-    }
-
-    private String buildShortError(String value) {
-        String text = safe(value)
-        if (text.isEmpty()) {
-            return ''
-        }
-
-        List<String> lines = text.readLines()
-        List<String> selected = []
-
-        for (String rawLine : lines) {
-            String line = safe(rawLine)
-            if (line.isEmpty()) {
-                continue
-            }
-            if (line.startsWith('at ')) {
-                continue
-            }
-            if (line.startsWith('... ')) {
-                continue
-            }
-
-            selected << line
-            if (selected.size() == 2) {
-                break
-            }
-        }
-
-        if (selected.isEmpty()) {
-            return text.length() > 220 ? text.substring(0, 220) + '...' : text
-        }
-
-        return selected.join(' | ')
-    }
-
-    private String extractNameFromStartLine(String line) {
-        String value = safe(line)
-        int index = value.indexOf('START ')
-        if (index >= 0) {
-            return value.substring(index + 6).trim()
-        }
-        return ''
-    }
-
-    private long extractTimestampMillis(String line) {
-        String raw = extractTimestampText(line)
-        return parseDateMillis(raw)
-    }
-
-    private String extractTimestampText(String line) {
-        String text = safe(line)
-        if (text.isEmpty()) {
-            return ''
-        }
-
-        List<String> patterns = [
-            /\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.\d{3}/,
-            /\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/,
-            /\d{2}\/\d{2}\/\d{4}[ T]\d{2}:\d{2}:\d{2}/,
-            /\d{2}\.\d{2}\.\d{4}[ T]\d{2}:\d{2}:\d{2}/,
-            /\d{2}:\d{2}:\d{2}/
-        ]
-
-        for (String pattern : patterns) {
-            def matcher = text =~ pattern
-            if (matcher.find()) {
-                return safe(matcher.group(0))
-            }
-        }
-
-        return ''
-    }
-
-    private long parseDateMillis(String raw) {
-        String value = safe(raw)
-        if (value.isEmpty()) {
-            return 0L
-        }
-
-        for (String pattern : DATE_PATTERNS) {
-            try {
-                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(value).time
-            } catch (Throwable ignored) {
-            }
-        }
-
-        return 0L
-    }
-
-    private long toDurationMillis(String secondsValue) {
-        String value = safe(secondsValue)
-        if (value.isEmpty()) {
-            return 0L
-        }
+    /*
+     * Builds a stable folder inside the current Katalon report folder.
+     * Structure:
+     * <current report folder>/Evidences/<sanitized test case id>/
+     */
+    private static File resolveCaseFolder(TestCaseContext context) {
+        String reportFolderPath = ''
 
         try {
-            double seconds = Double.parseDouble(value.replace(',', '.'))
-            return Math.round(seconds * 1000d)
+            reportFolderPath = safe(RunConfiguration.getReportFolder())
         } catch (Throwable ignored) {
-            return 0L
         }
+
+        File reportFolder
+        if (!reportFolderPath.isEmpty()) {
+            reportFolder = new File(reportFolderPath)
+        } else {
+            reportFolder = new File(new File(RunConfiguration.getProjectDir(), 'Reports'), '_genericEvidence')
+        }
+
+        File evidencesRoot = new File(reportFolder, 'Evidences')
+        if (!evidencesRoot.exists()) {
+            evidencesRoot.mkdirs()
+        }
+
+        String caseId = safe(context?.getTestCaseId())
+        if (caseId.isEmpty()) {
+            caseId = safe(CURRENT_CASE_ID.get())
+        }
+        if (caseId.isEmpty()) {
+            caseId = 'general'
+        }
+
+        File caseFolder = new File(evidencesRoot, sanitizeFileName(caseId))
+        if (!caseFolder.exists()) {
+            caseFolder.mkdirs()
+        }
+
+        return caseFolder
     }
 
-    private String stripLinePrefix(String line) {
-        String value = safe(line)
-        if (value.isEmpty()) {
-            return ''
+    /*
+     * Appends one line into evidence-notes.log.
+     */
+    private static void appendLine(File caseFolder, String line) {
+        if (caseFolder == null) {
+            return
         }
 
-        String timestamp = extractTimestampText(value)
-        if (!timestamp.isEmpty()) {
-            int idx = value.indexOf(timestamp)
-            if (idx >= 0) {
-                value = value.substring(idx + timestamp.length()).trim()
-            }
+        if (!caseFolder.exists()) {
+            caseFolder.mkdirs()
         }
 
-        int infoIndex = value.indexOf(' INFO ')
-        if (infoIndex >= 0) {
-            value = value.substring(infoIndex + 6).trim()
-        }
-
-        int warnIndex = value.indexOf(' WARNING ')
-        if (warnIndex >= 0) {
-            value = value.substring(warnIndex + 9).trim()
-        }
-
-        int errorIndex = value.indexOf(' ERROR ')
-        if (errorIndex >= 0) {
-            value = value.substring(errorIndex + 7).trim()
-        }
-
-        value = value.replace('\t', ' ').trim()
-
-        while (value.contains('  ')) {
-            value = value.replace('  ', ' ')
-        }
-
-        return value
+        File logFile = new File(caseFolder, 'evidence-notes.log')
+        logFile << line + System.lineSeparator()
     }
 
-    private Node firstChildByName(Node node, String childName) {
-        if (node == null) {
-            return null
-        }
-
-        for (def child : node.children()) {
-            if (child instanceof Node && safe(((Node) child).name()) == safe(childName)) {
-                return (Node) child
-            }
-        }
-
-        return null
+    /*
+     * Standard evidence log format:
+     * 2026-03-24 14:10:52.221|NOTE|Opened menu
+     */
+    private static String buildLogLine(String type, String value) {
+        return LOG_STAMP.format(new Date()) + '|' + safe(type) + '|' + safe(value)
     }
 
-    private String textOf(Node node) {
-        if (node == null) {
-            return ''
-        }
-
-        try {
-            return safe(node.text())
-        } catch (Throwable ignored) {
-            return ''
-        }
+    private static String normalizeStatus(String status) {
+        return safe(status).toUpperCase(Locale.ENGLISH)
     }
 
-    private String attr(Node node, String attributeName) {
-        if (node == null) {
-            return ''
-        }
-
-        try {
-            def value = node.attribute(attributeName)
-            return safe(value)
-        } catch (Throwable ignored) {
-            return ''
-        }
+    private static String sanitizeFileName(String value) {
+        return safe(value)
+            .replace('\\', '_')
+            .replace('/', '_')
+            .replace(':', '_')
+            .replace('*', '_')
+            .replace('?', '_')
+            .replace('"', '_')
+            .replace('<', '_')
+            .replace('>', '_')
+            .replace('|', '_')
+            .replaceAll(/\s+/, '_')
     }
 
-    private List<String> readLinesSafely(File file) {
-        try {
-            return file.readLines('UTF-8')
-        } catch (Throwable ignored) {
-            try {
-                return file.readLines()
-            } catch (Throwable ignoredAgain) {
-                return []
-            }
-        }
-    }
-
-    private String firstNonBlank(Object... values) {
-        if (values == null) {
-            return ''
-        }
-
-        for (Object value : values) {
-            String text = safe(value)
-            if (!text.isEmpty()) {
-                return text
-            }
-        }
-
-        return ''
-    }
-
-    private String formatDateTime(long millis) {
-        if (millis <= 0L) {
-            return '--'
-        }
-        return OUTPUT_DATE_TIME.format(new Date(millis))
-    }
-
-    private String formatClock(long millis) {
-        if (millis <= 0L) {
-            return '--'
-        }
-        return OUTPUT_CLOCK.format(new Date(millis))
-    }
-
-    private String formatDuration(long durationMs) {
-        if (durationMs < 0L) {
-            durationMs = 0L
-        }
-
-        long totalSeconds = Math.round(durationMs / 1000d)
-        long hours = (long) (totalSeconds / 3600L)
-        long minutes = (long) ((totalSeconds % 3600L) / 60L)
-        long seconds = (long) (totalSeconds % 60L)
-
-        return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
-    }
-
-    private String safe(Object value) {
+    private static String safe(Object value) {
         return value == null ? '' : String.valueOf(value).trim()
     }
 }
@@ -983,789 +249,32 @@ class JiraReportBuilder {
 
 
 
-package jiraIntegration
+import com.kms.katalon.core.annotation.AfterTestCase
+import com.kms.katalon.core.annotation.BeforeTestCase
+import com.kms.katalon.core.context.TestCaseContext
 
-import java.io.File
-import java.net.URI
-import java.text.SimpleDateFormat
-import java.util.ArrayList
-import java.util.Collection
-import java.util.Date
-import java.util.Locale
+import jiraIntegration.ImagesEvidence
 
-class JiraHtmlTemplateBuilder {
+class GlobalEvidenceListener {
 
-    private static final String APP_NAME = 'EMATCH'
-    private static final String REPORT_TITLE_PREFIX = 'Test report - '
-    private static final String LOGO_SRC = 'Image/ematch-logo.png'
-
-    private static final String STATUS_PASS = '#68b84b'
-    private static final String STATUS_FAIL = '#e05b4d'
-    private static final String STATUS_BLOCKED = '#d7b436'
-    private static final String STATUS_INFO = '#8c35ff'
-
-    JiraHtmlTemplateBuilder() {
+    @BeforeTestCase
+    def beforeTestCase(TestCaseContext testCaseContext) {
+        ImagesEvidence.startCase(testCaseContext)
     }
 
-    String build(Map model) {
-        return buildHtml(model)
+    @AfterTestCase
+    def afterTestCase(TestCaseContext testCaseContext) {
+        ImagesEvidence.finishCase(testCaseContext)
     }
-
-    String render(Map model) {
-        return buildHtml(model)
-    }
-
-    String buildHtml(Map model) {
-        Map view = normalizeModel(model)
-
-        StringBuilder html = new StringBuilder()
-
-        html.append('<!DOCTYPE html>\n')
-        html.append('<html lang="en">\n')
-        html.append('<head>\n')
-        html.append('<meta charset="UTF-8">\n')
-        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
-        html.append('<title>')
-        html.append(htmlEscape(view.reportTitle))
-        html.append('</title>\n')
-        html.append(buildStyles())
-        html.append('</head>\n')
-        html.append('<body>\n')
-
-        html.append('<header class="top-banner">\n')
-        html.append('  <div class="top-banner-left">\n')
-        html.append('    <img class="brand-logo" src="')
-        html.append(htmlEscape(resolveLogoHref(view)))
-        html.append('" alt="EMATCH logo">\n')
-        html.append('    <div class="brand-copy">\n')
-        html.append('      <div class="banner-title">')
-        html.append(htmlEscape(view.reportTitle))
-        html.append('</div>\n')
-        html.append('      <div class="banner-subtitle">EMATCH execution overview</div>\n')
-        html.append('    </div>\n')
-        html.append('  </div>\n')
-        html.append('  <div class="top-banner-right">\n')
-        html.append('    <div>')
-        html.append(htmlEscape(view.generatedLabel))
-        html.append('</div>\n')
-        html.append('    <div>Project ')
-        html.append(htmlEscape(APP_NAME))
-        html.append('</div>\n')
-        html.append('  </div>\n')
-        html.append('</header>\n')
-
-        html.append('<div class="page">\n')
-
-        html.append('  <aside class="sidebar">\n')
-        html.append('    <div class="sidebar-tabs">\n')
-        html.append('      <button id="tab-tests" class="sidebar-tab active" type="button" onclick="showTab(\'tests\')">Tests</button>\n')
-        html.append('      <button id="tab-charts" class="sidebar-tab" type="button" onclick="showTab(\'charts\')">Charts</button>\n')
-        html.append('    </div>\n')
-
-        html.append('    <div id="tests-sidebar-block">\n')
-        html.append('      <div class="search-wrap">\n')
-        html.append('        <input id="scenarioSearch" class="search-input" type="text" placeholder="Search test name, path, or status." onkeyup="filterScenarios()">\n')
-        html.append('      </div>\n')
-        html.append('      <div id="scenarioList" class="scenario-list">\n')
-
-        if (view.scenarios.isEmpty()) {
-            html.append('<div class="empty-state">No scenarios were found for this execution.</div>')
-        } else {
-            view.scenarios.eachWithIndex { scenario, index ->
-                html.append(buildScenarioListItem(scenario as Map, index == 0))
-            }
-        }
-
-        html.append('      </div>\n')
-        html.append('    </div>\n')
-
-        html.append('    <div id="charts-sidebar-block" class="hidden">\n')
-        html.append(buildChartsSidebar(view))
-        html.append('    </div>\n')
-        html.append('  </aside>\n')
-
-        html.append('  <main class="content">\n')
-
-        if (view.scenarios.isEmpty()) {
-            html.append('<section class="scenario-panel active">')
-            html.append('<div class="scenario-title">No execution data found</div>')
-            html.append('</section>')
-        } else {
-            view.scenarios.eachWithIndex { scenario, index ->
-                html.append(buildScenarioPanel(scenario as Map, view, index == 0))
-            }
-        }
-
-        html.append(buildChartsPanel(view))
-        html.append('  </main>\n')
-
-        html.append('</div>\n')
-        html.append(buildScripts())
-        html.append('</body>\n')
-        html.append('</html>\n')
-
-        return html.toString()
-    }
-
-    private Map normalizeModel(Map model) {
-        Map safeModel = model ?: [:]
-
-        String suiteName = pickFirst(
-            safeModel.suiteName,
-            safeModel.testSuiteName,
-            safeModel.suite,
-            safeModel.executionName,
-            safeModel.title,
-            'Execution'
-        )
-
-        List<Map> scenarios = []
-        asList(safeModel.scenarios).eachWithIndex { rawItem, index ->
-            Map item = rawItem instanceof Map ? (rawItem as Map) : [name: safeValue(rawItem)]
-
-            scenarios << [
-                id            : pickFirst(item.id, "scenario-${index + 1}"),
-                name          : pickFirst(item.name, item.scenarioName, item.title, "Scenario ${index + 1}"),
-                summary       : pickFirst(item.summary, item.visualError, item.errorSummary, ''),
-                status        : normalizeStatus(pickFirst(item.status, 'blocked')),
-                startShort    : pickFirst(item.startShort, '--'),
-                endShort      : pickFirst(item.endShort, '--'),
-                startLong     : pickFirst(item.startLong, item.startLabel, '--'),
-                endLong       : pickFirst(item.endLong, item.endLabel, '--'),
-                durationLabel : pickFirst(item.durationLabel, '00h 00m 00s'),
-                visualError   : pickFirst(item.visualError, item.summary, ''),
-                fullError     : pickFirst(item.fullError, ''),
-                steps         : normalizeSteps(item.steps),
-                evidence      : normalizeEvidence(item.evidence, safeModel)
-            ]
-        }
-
-        int passedCount = scenarios.count { Map it -> it.status == 'passed' }
-        int failedCount = scenarios.count { Map it -> it.status == 'failed' }
-        int blockedCount = scenarios.count { Map it -> it.status == 'blocked' }
-        int totalCount = scenarios.size()
-
-        return [
-            reportTitle   : REPORT_TITLE_PREFIX + suiteName,
-            suiteName     : suiteName,
-            generatedLabel: buildGeneratedLabel(safeModel),
-            reportFolder  : pickFirst(safeModel.reportFolder, safeModel.baseFolder, safeModel.executionFolder),
-            logoSrc       : pickFirst(safeModel.logoSrc, LOGO_SRC),
-            scenarios     : scenarios,
-            passedCount   : passedCount,
-            failedCount   : failedCount,
-            blockedCount  : blockedCount,
-            totalCount    : totalCount
-        ]
-    }
-
-    private List<Map> normalizeSteps(def rawSteps) {
-        List<Map> result = []
-
-        asList(rawSteps).each { raw ->
-            Map row = raw instanceof Map ? (raw as Map) : [detail: safeValue(raw)]
-
-            String detail = pickFirst(row.detail, row.message, row.text, row.title, row.name)
-            if (detail.isEmpty()) {
-                return
-            }
-
-            String status = normalizeStatus(pickFirst(row.status, row.result, row.outcome, 'passed'))
-            String timestamp = pickFirst(row.timestamp, row.time, row.label, '--')
-
-            result << [
-                status   : status,
-                timestamp: timestamp,
-                detail   : detail,
-                icon     : pickFirst(row.icon, resolveStepIcon(detail, status))
-            ]
-        }
-
-        return result
-    }
-
-    private List<Map> normalizeEvidence(def rawEvidence, Map model) {
-        List<Map> result = []
-
-        asList(rawEvidence).each { raw ->
-            if (raw instanceof Map) {
-                Map item = raw as Map
-                result << [
-                    name  : pickFirst(item.name, item.fileName, 'Evidence'),
-                    href  : pickFirst(item.href, item.url, item.path, ''),
-                    image : Boolean.valueOf(String.valueOf(item.image)),
-                    imgSrc: pickFirst(item.imgSrc, item.imageSrc, item.href, item.url, '')
-                ]
-            } else if (!safeValue(raw).isEmpty()) {
-                String href = safeValue(raw)
-                result << [
-                    name  : new File(href).name,
-                    href  : href,
-                    image : isImageFile(href),
-                    imgSrc: isImageFile(href) ? href : ''
-                ]
-            }
-        }
-
-        return result
-    }
-
-    private String buildScenarioListItem(Map scenario, boolean selected) {
-        String borderClass = selected ? 'scenario-list-item selected' : 'scenario-list-item'
-        String shortName = shorten(scenario.name, 55)
-        String shortError = shorten(scenario.summary, 70)
-
-        StringBuilder sb = new StringBuilder()
-        sb.append('<button type="button" class="')
-        sb.append(borderClass)
-        sb.append('" data-sid="')
-        sb.append(htmlEscape(scenario.id))
-        sb.append('" onclick="showScenario(\'')
-        sb.append(jsEscape(scenario.id))
-        sb.append('\')">')
-
-        sb.append('<div class="scenario-list-main">')
-        sb.append('<div class="scenario-list-title">')
-        sb.append(htmlEscape(shortName))
-        sb.append('</div>')
-        sb.append('<div class="scenario-list-summary">')
-        sb.append(htmlEscape(shortError))
-        sb.append('</div>')
-        sb.append('<div class="scenario-list-meta">')
-        sb.append(htmlEscape(pickFirst(scenario.startShort, '--')))
-        sb.append('</div>')
-        sb.append('</div>')
-
-        sb.append('<div class="scenario-list-side">')
-        sb.append('<span class="status-pill ')
-        sb.append(htmlEscape(scenario.status))
-        sb.append('">')
-        sb.append(htmlEscape(statusLabel(scenario.status)))
-        sb.append('</span>')
-        sb.append('<div class="scenario-list-duration">')
-        sb.append(htmlEscape(pickFirst(scenario.durationLabel, '00h 00m 00s')))
-        sb.append('</div>')
-        sb.append('</div>')
-
-        sb.append('</button>')
-        return sb.toString()
-    }
-
-    private String buildScenarioPanel(Map scenario, Map view, boolean selected) {
-        String panelClass = selected ? 'scenario-panel active' : 'scenario-panel'
-
-        String suiteLabel = safeValue(view.suiteName)
-        String scenarioName = safeValue(scenario.name)
-        String scenarioStatus = safeValue(scenario.status)
-
-        String visualError = pickFirst(scenario.visualError, scenario.summary, '')
-        String fullError = pickFirst(scenario.fullError, visualError)
-
-        String startLabel = pickFirst(scenario.startLong, scenario.startShort, '--')
-        String endLabel = pickFirst(scenario.endLong, scenario.endShort, '--')
-        String durationLabel = pickFirst(scenario.durationLabel, '00h 00m 00s')
-
-        List<Map> evidenceList = scenario.evidence instanceof List ? (scenario.evidence as List<Map>) : []
-        Map firstEvidence = evidenceList.isEmpty() ? null : evidenceList[0]
-
-        StringBuilder sb = new StringBuilder()
-
-        sb.append('<section class="')
-        sb.append(panelClass)
-        sb.append('" id="panel-')
-        sb.append(htmlEscape(safeValue(scenario.id)))
-        sb.append('">')
-
-        sb.append('<div class="scenario-header">')
-        sb.append('<div class="scenario-title">')
-        sb.append(htmlEscape(scenarioName))
-        sb.append('</div>')
-
-        sb.append('<div class="scenario-meta-row">')
-        sb.append(buildMetaChip('Suite', suiteLabel, 'plain'))
-        sb.append(buildMetaChip('Status', statusLabel(scenarioStatus), scenarioStatus))
-        sb.append(buildMetaChip('Start', startLabel, 'gradient'))
-        sb.append(buildMetaChip('End', endLabel, 'gradient'))
-        sb.append(buildMetaChip('Duration', durationLabel, 'gradient'))
-        sb.append('</div>')
-        sb.append('</div>')
-
-        sb.append('<div class="section-title">Steps</div>')
-        sb.append('<div class="steps-table">')
-        sb.append('<div class="steps-head">')
-        sb.append('<div class="col-status">STATUS</div>')
-        sb.append('<div class="col-time">TIMESTAMP</div>')
-        sb.append('<div class="col-detail">DETAILS</div>')
-        sb.append('</div>')
-
-        List<Map> steps = scenario.steps instanceof List ? (scenario.steps as List<Map>) : []
-
-        if (steps.isEmpty()) {
-            sb.append('<div class="step-row empty">')
-            sb.append('<div class="col-status"></div>')
-            sb.append('<div class="col-time"></div>')
-            sb.append('<div class="col-detail">No controlled steps were found for this scenario.</div>')
-            sb.append('</div>')
-        } else {
-            steps.each { Map step ->
-                sb.append(buildStepRow(step))
-            }
-        }
-
-        sb.append('</div>')
-
-        if ('failed'.equalsIgnoreCase(scenarioStatus) || !visualError.isEmpty()) {
-            sb.append('<div class="error-block">')
-            sb.append('<div class="error-title">Visual Error Log</div>')
-            sb.append('<div class="error-summary">')
-            sb.append(htmlEscape(visualError))
-            sb.append('</div>')
-
-            if (!safeValue(fullError).isEmpty()) {
-                sb.append('<details class="details-box">')
-                sb.append('<summary>🔎 View full error</summary>')
-                sb.append('<pre>')
-                sb.append(htmlEscape(fullError))
-                sb.append('</pre>')
-                sb.append('</details>')
-            }
-
-            sb.append('</div>')
-        }
-
-        sb.append('<div class="evidence-block">')
-        sb.append('<div class="evidence-title">Evidence</div>')
-
-        if (firstEvidence != null) {
-            sb.append('<details class="evidence-item" open>')
-            sb.append('<summary>🖼 ')
-            sb.append(htmlEscape(pickFirst(firstEvidence.name, 'Open evidence')))
-            sb.append('</summary>')
-
-            if (!pickFirst(firstEvidence.href, '').isEmpty()) {
-                sb.append('<div class="evidence-links">')
-                sb.append('<a href="')
-                sb.append(htmlEscape(firstEvidence.href))
-                sb.append('" target="_blank" rel="noopener noreferrer">🔎 Open evidence</a>')
-                sb.append('</div>')
-            }
-
-            if (Boolean.TRUE.equals(firstEvidence.image) && !pickFirst(firstEvidence.imgSrc, '').isEmpty()) {
-                sb.append('<img class="evidence-image" src="')
-                sb.append(htmlEscape(firstEvidence.imgSrc))
-                sb.append('" alt="Evidence">')
-            }
-
-            sb.append('</details>')
-        } else {
-            sb.append('<div class="evidence-empty">No evidence was found for this scenario.</div>')
-        }
-
-        sb.append('</div>')
-        sb.append('</section>')
-
-        return sb.toString()
-    }
-
-    private String buildStepRow(Map step) {
-        StringBuilder sb = new StringBuilder()
-
-        sb.append('<div class="step-row">')
-        sb.append('<div class="col-status">')
-        sb.append('<span class="status-pill ')
-        sb.append(htmlEscape(step.status))
-        sb.append('">')
-        sb.append(htmlEscape(statusLabel(step.status)))
-        sb.append('</span>')
-        sb.append('</div>')
-
-        sb.append('<div class="col-time">')
-        sb.append(htmlEscape(pickFirst(step.timestamp, '--')))
-        sb.append('</div>')
-
-        sb.append('<div class="col-detail">')
-        sb.append('<span class="step-icon">')
-        sb.append(htmlEscape(pickFirst(step.icon, '✅')))
-        sb.append('</span> ')
-        sb.append(htmlEscape(pickFirst(step.detail, '')))
-        sb.append('</div>')
-        sb.append('</div>')
-
-        return sb.toString()
-    }
-
-    private String buildMetaChip(String label, String value, String type) {
-        StringBuilder sb = new StringBuilder()
-        sb.append('<div class="meta-chip ')
-        sb.append(htmlEscape(type))
-        sb.append('">')
-        sb.append('<span class="meta-label">')
-        sb.append(htmlEscape(label))
-        sb.append(':</span> ')
-        sb.append('<span class="meta-value">')
-        sb.append(htmlEscape(value))
-        sb.append('</span>')
-        sb.append('</div>')
-        return sb.toString()
-    }
-
-    private String buildChartsSidebar(Map view) {
-        StringBuilder sb = new StringBuilder()
-        sb.append('<div class="chart-side-wrap">')
-        sb.append('<div class="chart-side-title">Execution Status</div>')
-        sb.append('<div class="legend-list">')
-        sb.append(buildLegendLine('Passed', STATUS_PASS, view.passedCount))
-        sb.append(buildLegendLine('Failed', STATUS_FAIL, view.failedCount))
-        sb.append(buildLegendLine('Blocked', STATUS_BLOCKED, view.blockedCount))
-        sb.append('</div>')
-        sb.append('</div>')
-        return sb.toString()
-    }
-
-    private String buildChartsPanel(Map view) {
-        double failPercent = percent(view.failedCount as int, view.totalCount as int)
-        double passPercent = percent(view.passedCount as int, view.totalCount as int)
-        double blockedPercent = percent(view.blockedCount as int, view.totalCount as int)
-
-        String donutStyle = 'background: conic-gradient(' +
-            STATUS_FAIL + ' 0 ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '%,' +
-            STATUS_PASS + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '% ' +
-            String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '%,' +
-            STATUS_BLOCKED + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '% 100%);'
-
-        StringBuilder sb = new StringBuilder()
-
-        sb.append('<section id="charts-panel" class="charts-panel hidden">')
-        sb.append('<div class="chart-main-title">Global Overview</div>')
-        sb.append('<div class="charts-layout">')
-
-        sb.append('<div>')
-        sb.append('<div class="donut-card">')
-        sb.append('<div class="donut" style="')
-        sb.append(donutStyle)
-        sb.append('">')
-        sb.append('<div class="donut-center">')
-        sb.append('<div class="donut-number">')
-        sb.append(String.valueOf(view.totalCount))
-        sb.append('</div>')
-        sb.append('<div class="donut-label">Tests</div>')
-        sb.append('</div>')
-        sb.append('</div>')
-        sb.append('</div>')
-        sb.append('</div>')
-
-        sb.append('<div>')
-        sb.append('<div class="chart-bars">')
-        sb.append(buildBarRow('Passed', view.passedCount as int, view.totalCount as int, STATUS_PASS))
-        sb.append(buildBarRow('Failed', view.failedCount as int, view.totalCount as int, STATUS_FAIL))
-        sb.append(buildBarRow('Blocked', view.blockedCount as int, view.totalCount as int, STATUS_BLOCKED))
-        sb.append('</div>')
-        sb.append('</div>')
-
-        sb.append('</div>')
-        sb.append('</section>')
-
-        return sb.toString()
-    }
-
-    private String buildLegendLine(String label, String color, int value) {
-        StringBuilder sb = new StringBuilder()
-        sb.append('<div class="legend-line">')
-        sb.append('<span class="legend-dot" style="background:')
-        sb.append(color)
-        sb.append('"></span>')
-        sb.append('<span class="legend-text">')
-        sb.append(htmlEscape(label))
-        sb.append('</span>')
-        sb.append('<span class="legend-value">')
-        sb.append(String.valueOf(value))
-        sb.append('</span>')
-        sb.append('</div>')
-        return sb.toString()
-    }
-
-    private String buildBarRow(String label, int value, int total, String color) {
-        double width = percent(value, total)
-
-        StringBuilder sb = new StringBuilder()
-        sb.append('<div class="bar-row">')
-        sb.append('<div class="bar-row-top">')
-        sb.append('<span class="bar-label">')
-        sb.append(htmlEscape(label))
-        sb.append('</span>')
-        sb.append('<span class="bar-value">')
-        sb.append(String.valueOf(value))
-        sb.append('</span>')
-        sb.append('</div>')
-        sb.append('<div class="bar-track">')
-        sb.append('<div class="bar-fill" style="width:')
-        sb.append(String.format(Locale.ENGLISH, '%.2f', width))
-        sb.append('%; background:')
-        sb.append(color)
-        sb.append('"></div>')
-        sb.append('</div>')
-        sb.append('<div class="bar-foot">')
-        sb.append(String.valueOf(total == 0 ? 0 : Math.round(width)))
-        sb.append('% of execution')
-        sb.append('</div>')
-        sb.append('</div>')
-        return sb.toString()
-    }
-
-    private String buildGeneratedLabel(Map model) {
-        String raw = pickFirst(
-            model.generatedAt,
-            model.generatedLabel,
-            model.createdAt,
-            model.executionDate
-        )
-
-        if (!raw.isEmpty()) {
-            return 'Generated ' + raw
-        }
-
-        return 'Generated ' + new SimpleDateFormat('dd/MM/yyyy HH:mm:ss').format(new Date())
-    }
-
-    private String resolveStepIcon(String detail, String status) {
-        String normalizedStatus = normalizeStatus(status)
-
-        if ('failed'.equals(normalizedStatus)) {
-            return '❌'
-        }
-        if ('blocked'.equals(normalizedStatus)) {
-            return '⛔'
-        }
-        return '✅'
-    }
-
-    private String normalizeStatus(String raw) {
-        String text = safeValue(raw).toLowerCase(Locale.ENGLISH)
-
-        switch (text) {
-            case 'pass':
-            case 'passed':
-            case 'success':
-                return 'passed'
-            case 'fail':
-            case 'failed':
-            case 'error':
-                return 'failed'
-            case 'blocked':
-            case 'skip':
-            case 'skipped':
-            case 'notrun':
-            case 'not_run':
-            case 'not executed':
-                return 'blocked'
-            default:
-                return 'blocked'
-        }
-    }
-
-    private String statusLabel(String status) {
-        switch (safeValue(status)) {
-            case 'passed':
-                return 'Passed'
-            case 'failed':
-                return 'Failed'
-            case 'blocked':
-                return 'Blocked'
-            default:
-                return 'Blocked'
-        }
-    }
-
-    private String resolveLogoHref(Map view) {
-        File logoFile = resolveFile(pickFirst(view.logoSrc, LOGO_SRC), pickFirst(view.reportFolder))
-        if (logoFile != null && logoFile.exists()) {
-            return logoFile.toURI().toString()
-        }
-        return pickFirst(view.logoSrc, LOGO_SRC)
-    }
-
-    private File resolveFile(String path, String baseFolder) {
-        String raw = safeValue(path)
-        if (raw.isEmpty()) {
-            return null
-        }
-
-        try {
-            if (raw.toLowerCase(Locale.ENGLISH).startsWith('file:/')) {
-                File uriFile = new File(new URI(raw))
-                if (uriFile.exists()) {
-                    return uriFile
-                }
-            }
-        } catch (Exception ignored) {
-        }
-
-        File direct = new File(raw)
-        if (direct.exists()) {
-            return direct
-        }
-
-        if (!safeValue(baseFolder).isEmpty()) {
-            File byBase = new File(baseFolder, raw)
-            if (byBase.exists()) {
-                return byBase
-            }
-        }
-
-        return direct
-    }
-
-    private boolean isImageFile(String fileName) {
-        String lower = safeValue(fileName).toLowerCase(Locale.ENGLISH)
-        return lower.endsWith('.png') ||
-               lower.endsWith('.jpg') ||
-               lower.endsWith('.jpeg') ||
-               lower.endsWith('.gif') ||
-               lower.endsWith('.webp') ||
-               lower.endsWith('.bmp')
-    }
-
-    private List asList(def value) {
-        if (value == null) {
-            return []
-        }
-
-        if (value instanceof Collection) {
-            return new ArrayList(value as Collection)
-        }
-
-        if (value.getClass().isArray()) {
-            return (value as Object[]).toList()
-        }
-
-        return [value]
-    }
-
-    private double percent(int value, int total) {
-        if (total <= 0) {
-            return 0d
-        }
-        return ((double) value / (double) total) * 100d
-    }
-
-    private String shorten(String text, int max) {
-        String value = safeValue(text)
-        if (value.length() <= max) {
-            return value
-        }
-        return value.substring(0, Math.max(0, max - 3)) + '...'
-    }
-
-    private String safeValue(def value) {
-        return value == null ? '' : String.valueOf(value).trim()
-    }
-
-    private String pickFirst(Object... values) {
-        if (values == null) {
-            return ''
-        }
-
-        for (Object value : values) {
-            String text = safeValue(value)
-            if (!text.isEmpty()) {
-                return text
-            }
-        }
-
-        return ''
-    }
-
-    private String htmlEscape(def value) {
-        String text = safeValue(value)
-        return text
-            .replace('&', '&amp;')
-            .replace('<', '&lt;')
-            .replace('>', '&gt;')
-            .replace('"', '&quot;')
-            .replace("'", '&#39;')
-    }
-
-    private String jsEscape(def value) {
-        String text = safeValue(value)
-        return text
-            .replace('\\', '\\\\')
-            .replace("'", "\\'")
-            .replace('\r', '')
-            .replace('\n', '\\n')
-    }
-
-    private String buildStyles() {
-        return '''
-<style>
-* {
-    box-sizing: border-box;
 }
-body {
-    margin: 0;
-    font-family: Arial, Helvetica, sans-serif;
-    color: #15212b;
-    background: #ffffff;
-}
-.top-banner {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 24px;
-    padding: 10px 18px;
-    background: #4b1979;
-    color: #ffffff;
-}
-.top-banner-left {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-}
-.brand-logo {
-    width: 92px;
-    height: 92px;
-    object-fit: contain;
-    display: block;
-}
-.brand-copy {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-.banner-title {
-    font-size: 18px;
-    font-weight: 700;
-    line-height: 1.2;
-}
-.banner-subtitle {
-    font-size: 12px;
-    opacity: 0.92;
-}
-.top-banner-right {
-    font-size: 10px;
-    text-align: right;
-    opacity: 0.94;
-    line-height: 1.5;
-    color: #ffffff !important;
-}
-.page {
-    display: grid;
-    grid-template-columns: 520px 1fr;
-    min-height: calc(100vh - 114px);
-}
-.sidebar {
-    border-right: 1px solid #dfe6ef;
-    background: #ffffff;
-}
-.content {
-    padding: 32px 38px;
-}
-.sidebar-tabs {
-    display: flex;
-    border-bottom: 1px solid #e3e8ef;
-}
-.sidebar-tab {
-    flex: 1;
-    padding: 18px 16px;
-    background: #ffffff;
-    border: 0;
-    border-bottom
+
+
+
+
+
+
+
+CustomKeywords.'jiraIntegration.ImagesEvidence.note'('Opened login page')
+CustomKeywords.'jiraIntegration.ImagesEvidence.checkpoint'('Validated current date')
+CustomKeywords.'jiraIntegration.ImagesEvidence.captureNow'('before-save')
+CustomKeywords.'jiraIntegration.ImagesEvidence.noteAndCapture'('Before clicking Save', 'before-save')
