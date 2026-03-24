@@ -1,845 +1,2454 @@
 package jiraIntegration
 
 import groovy.io.FileType
-import groovy.util.XmlSlurper
+import groovy.util.Node
+import groovy.util.XmlParser
 
-import java.math.BigDecimal
 import java.text.SimpleDateFormat
 import java.util.Locale
 
 class JiraReportBuilder {
 
-	private static final String APP_NAME = 'EMATCH'
-
-	private static final List<String> DATE_PATTERNS = [
-		"yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
-		"yyyy-MM-dd'T'HH:mm:ssXXX",
-		"yyyy-MM-dd'T'HH:mm:ss.SSS",
-		"yyyy-MM-dd'T'HH:mm:ss",
-		"yyyy-MM-dd HH:mm:ss.SSS",
-		"yyyy-MM-dd HH:mm:ss"
-	]
-
-	private static final SimpleDateFormat OUTPUT_DATE_TIME = new SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.ENGLISH)
-	private static final SimpleDateFormat REPORT_STAMP = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ENGLISH)
-
-	Map build(String reportFolderPath) {
-		return build(new File(reportFolderPath))
-	}
-
-	Map buildReport(String reportFolderPath) {
-		return build(new File(reportFolderPath))
-	}
-
-	Map buildExecutionReport(String reportFolderPath) {
-		return build(new File(reportFolderPath))
-	}
-
-	Map buildReportModel(String reportFolderPath) {
-		return build(new File(reportFolderPath))
-	}
-
-	Map build(File reportFolder) {
-		if (reportFolder == null || !reportFolder.exists()) {
-			throw new IllegalArgumentException("Report folder not found: ${reportFolder}")
-		}
-
-		List<File> scenarioFolders = discoverScenarioFolders(reportFolder)
-		List<Map> scenarios = []
-
-		scenarioFolders.eachWithIndex { File scenarioFolder, int index ->
-			Map scenario = buildScenario(scenarioFolder, reportFolder, index + 1)
-			if (scenario != null) {
-				scenarios << scenario
-			}
-		}
-
-		long totalDurationMs = 0L
-		int passedCount = 0
-		int failedCount = 0
-		int skippedCount = 0
-
-		scenarios.each { Map scenario ->
-			totalDurationMs += toLong(scenario.durationMs)
-			String normalized = normalizeStatus(scenario.status)
-
-			if (normalized == 'PASSED') {
-				passedCount++
-			} else if (normalized == 'FAILED') {
-				failedCount++
-			} else {
-				skippedCount++
-			}
-		}
-
-		String executionName = extractExecutionName(reportFolder)
-		String generatedAt = OUTPUT_DATE_TIME.format(new Date())
-		String reportTitle = "Test report - ${REPORT_STAMP.format(new Date())}"
-
-		return [
-			appName           : APP_NAME,
-			projectName       : APP_NAME,
-			project           : APP_NAME,
-
-			reportTitle       : reportTitle,
-			title             : reportTitle,
-
-			generatedAt       : generatedAt,
-			generatedAtLabel  : generatedAt,
-
-			executionName     : executionName,
-			executionTitle    : executionName,
-			suiteName         : executionName,
-			suite             : executionName,
-
-			totalCount        : scenarios.size(),
-			totalPassed       : passedCount,
-			totalFailed       : failedCount,
-			totalSkipped      : skippedCount,
-
-			durationMs        : totalDurationMs,
-			totalDurationMs   : totalDurationMs,
-			duration          : formatDurationMillis(totalDurationMs),
-			totalDuration     : formatDurationMillis(totalDurationMs),
-			durationLabel     : formatDurationMillis(totalDurationMs),
-
-			scenarios         : scenarios,
-			testCases         : scenarios,
-			items             : scenarios
-		]
-	}
-
-	private Map buildScenario(File scenarioFolder, File reportRootFolder, int sequence) {
-		Map junitMeta = readJunitMeta(scenarioFolder)
-		Map names = resolveNames(junitMeta.rawName as String, scenarioFolder, reportRootFolder)
-		List<Map> steps = readSteps(scenarioFolder, junitMeta)
-		String finalStatus = normalizeStatus(firstNonBlank(
-			junitMeta.status,
-			steps ? steps.last().status : null,
-			'SKIPPED'
-		))
-
-		List<Map> evidenceItems = readEvidenceItems(scenarioFolder, steps, finalStatus)
-		String errorLog = firstNonBlank(
-			junitMeta.failureBody,
-			junitMeta.failureMessage,
-			readStackTraceFromLogs(scenarioFolder),
-			''
-		)
-
-		String startLabel = firstNonBlank(junitMeta.startLabel, '-')
-		String endLabel = firstNonBlank(junitMeta.endLabel, '-')
-		String durationLabel = firstNonBlank(junitMeta.durationLabel, '00h 00m 00s')
-
-		String displayTitle = firstNonBlank(
-			junitMeta.rawName,
-			names.fullTitle,
-			scenarioFolder.name
-		)
-
-		String suiteName = firstNonBlank(
-			names.suiteName,
-			scenarioFolder.parentFile?.name,
-			reportRootFolder.name
-		)
-
-		String shortName = firstNonBlank(
-			names.caseName,
-			scenarioFolder.name
-		)
-
-		return [
-			id               : buildScenarioId(sequence, scenarioFolder.name),
-			index            : sequence,
-
-			title            : displayTitle,
-			name             : displayTitle,
-			displayName      : displayTitle,
-
-			shortTitle       : shortName,
-			testCaseName     : shortName,
-			scenarioName     : shortName,
-
-			suiteName        : suiteName,
-			suite            : suiteName,
-
-			status           : finalStatus,
-			statusLabel      : formatStatusLabel(finalStatus),
-			statusClass      : finalStatus.toLowerCase(Locale.ENGLISH),
-			statusCss        : finalStatus.toLowerCase(Locale.ENGLISH),
-
-			start            : startLabel,
-			startLabel       : startLabel,
-
-			end              : endLabel,
-			endLabel         : endLabel,
-
-			duration         : durationLabel,
-			durationLabel    : durationLabel,
-			durationMs       : toLong(junitMeta.durationMs),
-
-			steps            : steps,
-			stepList         : steps,
-
-			errorLog         : errorLog,
-			visualErrorLog   : errorLog,
-			errorMessage     : firstNonBlank(junitMeta.failureMessage, ''),
-
-			evidenceItems    : evidenceItems,
-			evidence         : evidenceItems,
-			evidences        : evidenceItems,
-			evidenceText     : buildEvidenceText(steps)
-		]
-	}
-
-	private List<File> discoverScenarioFolders(File rootFolder) {
-		Map<String, File> uniqueFolders = [:]
-
-		if (hasScenarioArtifacts(rootFolder)) {
-			uniqueFolders[rootFolder.canonicalPath] = rootFolder
-		}
-
-		rootFolder.eachFileRecurse(FileType.DIRECTORIES) { File dir ->
-			if (hasScenarioArtifacts(dir)) {
-				uniqueFolders[dir.canonicalPath] = dir
-			}
-		}
-
-		List<File> candidates = uniqueFolders.values().toList()
-
-		List<File> leafFolders = candidates.findAll { File candidate ->
-			!candidates.any { File other ->
-				other.canonicalPath != candidate.canonicalPath &&
-				other.canonicalPath.startsWith(candidate.canonicalPath + File.separator)
-			}
-		}
-
-		leafFolders.sort { File a, File b ->
-			a.absolutePath <=> b.absolutePath
-		}
-
-		return leafFolders
-	}
-
-	private boolean hasScenarioArtifacts(File dir) {
-		if (dir == null || !dir.exists() || !dir.isDirectory()) {
-			return false
-		}
-
-		File[] children = dir.listFiles()
-		if (children == null || children.length == 0) {
-			return false
-		}
-
-		boolean hasJunit = children.any { File f ->
-			f.isFile() && isJunitFileName(f.name)
-		}
-
-		boolean hasHtml = children.any { File f ->
-			f.isFile() && f.name.toLowerCase(Locale.ENGLISH).endsWith('.html')
-		}
-
-		boolean hasLog = children.any { File f ->
-			f.isFile() && (
-				f.name.toLowerCase(Locale.ENGLISH).endsWith('.log') ||
-				f.name.toLowerCase(Locale.ENGLISH).endsWith('.txt')
-			)
-		}
-
-		return hasJunit || (hasHtml && hasLog)
-	}
-
-	private Map readJunitMeta(File scenarioFolder) {
-		File junitFile = findBestJunitFile(scenarioFolder)
-		if (junitFile == null) {
-			return [
-				rawName       : scenarioFolder.name,
-				status        : 'SKIPPED',
-				startLabel    : '-',
-				endLabel      : '-',
-				durationLabel : '00h 00m 00s',
-				durationMs    : 0L,
-				failureMessage: '',
-				failureBody   : ''
-			]
-		}
-
-		def xml = new XmlSlurper(false, false).parse(junitFile)
-		def suiteNode = xml.name() == 'testsuite' ? xml : xml.testsuite?.getAt(0)
-		def caseNode = suiteNode?.testcase?.getAt(0)
-
-		String rawName = firstNonBlank(
-			textOf(suiteNode?.@name),
-			textOf(caseNode?.@name),
-			scenarioFolder.name
-		)
-
-		String timestampRaw = firstNonBlank(
-			textOf(suiteNode?.@timestamp),
-			textOf(caseNode?.@timestamp),
-			''
-		)
-
-		BigDecimal durationSeconds = firstNonBlank(
-			textOf(suiteNode?.@time),
-			textOf(caseNode?.@time),
-			''
-		) ? safeDecimal(firstNonBlank(textOf(suiteNode?.@time), textOf(caseNode?.@time), '0')) : BigDecimal.ZERO
-
-		Date startDate = parseDate(timestampRaw)
-		Date endDate = null
-		long durationMs = 0L
-
-		if (durationSeconds != null) {
-			durationMs = durationSeconds.multiply(new BigDecimal('1000')).longValue()
-		}
-
-		if (startDate != null) {
-			endDate = new Date(startDate.time + durationMs)
-		}
-
-		boolean failed = hasFailureOrError(caseNode, suiteNode)
-		boolean skipped = hasSkipped(caseNode, suiteNode)
-		String status = skipped ? 'SKIPPED' : (failed ? 'FAILED' : 'PASSED')
-
-		String failureMessage = firstNonBlank(
-			textOf(caseNode?.failure?.@message),
-			textOf(caseNode?.error?.@message),
-			textOf(suiteNode?.failure?.@message),
-			textOf(suiteNode?.error?.@message),
-			''
-		)
-
-		String failureBody = firstNonBlank(
-			cleanBlockText(textOf(caseNode?.failure)),
-			cleanBlockText(textOf(caseNode?.error)),
-			cleanBlockText(textOf(caseNode?.'system-err')),
-			cleanBlockText(textOf(suiteNode?.'system-err')),
-			''
-		)
-
-		return [
-			rawName       : rawName,
-			status        : status,
-
-			startDate     : startDate,
-			endDate       : endDate,
-			startLabel    : startDate ? OUTPUT_DATE_TIME.format(startDate) : '-',
-			endLabel      : endDate ? OUTPUT_DATE_TIME.format(endDate) : '-',
-
-			durationMs    : durationMs,
-			durationLabel : formatDurationSeconds(durationSeconds),
-
-			failureMessage: failureMessage,
-			failureBody   : failureBody
-		]
-	}
-
-	private List<Map> readSteps(File scenarioFolder, Map junitMeta) {
-		List<Map> steps = []
-
-		steps.addAll(readStepsFromLogs(scenarioFolder))
-
-		if (steps.isEmpty()) {
-			steps.addAll(readSyntheticStepsFromFailure(junitMeta))
-		}
-
-		Map<String, Map> uniqueSteps = [:]
-		steps.each { Map step ->
-			String key = "${step.status}|${step.timestamp}|${step.details}"
-			if (!uniqueSteps.containsKey(key)) {
-				uniqueSteps[key] = step
-			}
-		}
-
-		return uniqueSteps.values().toList()
-	}
-
-	private List<Map> readStepsFromLogs(File scenarioFolder) {
-		List<Map> steps = []
-		List<File> logFiles = findLogFiles(scenarioFolder)
-
-		logFiles.each { File logFile ->
-			List<String> lines = readLinesSafely(logFile)
-
-			lines.each { String rawLine ->
-				Map parsed = parseStepLine(rawLine)
-				if (parsed != null) {
-					steps << parsed
-				}
-			}
-		}
-
-		if (steps.size() > 50) {
-			steps = steps.takeRight(50)
-		}
-
-		return steps
-	}
-
-	private Map parseStepLine(String rawLine) {
-		String line = sanitizeLine(rawLine)
-		if (!line) {
-			return null
-		}
-
-		if (isNoiseLine(line)) {
-			return null
-		}
-
-		String status = null
-
-		if (line.toUpperCase(Locale.ENGLISH).contains('FAILED')) {
-			status = 'FAILED'
-		} else if (line.toUpperCase(Locale.ENGLISH).contains('ERROR')) {
-			status = 'FAILED'
-		} else if (line.toUpperCase(Locale.ENGLISH).contains('PASSED')) {
-			status = 'PASSED'
-		} else if (line.toUpperCase(Locale.ENGLISH).contains('WARNING')) {
-			status = 'WARNING'
-		} else if (looksLikeFunctionalStep(line)) {
-			status = 'INFO'
-		} else {
-			return null
-		}
-
-		String timestamp = extractTimestamp(line)
-		String details = stripLinePrefix(line)
-
-		if (!details) {
-			return null
-		}
-
-		return [
-			status   : status,
-			timestamp: firstNonBlank(timestamp, '-'),
-			details  : details
-		]
-	}
-
-	private boolean isNoiseLine(String line) {
-		String normalized = line.trim()
-
-		if (!normalized) {
-			return true
-		}
-
-		if (normalized.startsWith('at ') && normalized.contains('(') && normalized.contains(')')) {
-			return true
-		}
-
-		if (normalized.startsWith('Caused by:')) {
-			return false
-		}
-
-		if (normalized.contains('com.kms.katalon.core.main.TestCaseExecutor')) {
-			return true
-		}
-
-		if (normalized.contains('com.kms.katalon.core.context.internal.ExecutionEventManager')) {
-			return true
-		}
-
-		if (normalized.contains('org.codehaus.groovy.runtime')) {
-			return true
-		}
-
-		return false
-	}
-
-	private boolean looksLikeFunctionalStep(String line) {
-		String upper = line.toUpperCase(Locale.ENGLISH)
-
-		return upper.contains('OPEN BROWSER') ||
-			upper.contains('NAVIGATE') ||
-			upper.contains('CLICK') ||
-			upper.contains('SET TEXT') ||
-			upper.contains('SET ENCRYPTED TEXT') ||
-			upper.contains('SEND KEYS') ||
-			upper.contains('VERIFY') ||
-			upper.contains('WAIT FOR') ||
-			upper.contains('TAKE SCREENSHOT') ||
-			upper.contains('CALL TEST CASE') ||
-			upper.contains('START TEST CASE') ||
-			upper.contains('STARTING TEST CASE') ||
-			upper.contains('CLOSE BROWSER') ||
-			upper.contains('CANNOT') ||
-			upper.contains('UNABLE')
-	}
-
-	private List<Map> readSyntheticStepsFromFailure(Map junitMeta) {
-		List<Map> steps = []
-
-		String failureMessage = firstNonBlank(junitMeta.failureMessage, '')
-		String failureBody = firstNonBlank(junitMeta.failureBody, '')
-		String timestamp = firstNonBlank(junitMeta.startLabel, '-')
-
-		if (failureMessage) {
-			steps << [
-				status   : 'FAILED',
-				timestamp: timestamp,
-				details  : failureMessage
-			]
-		}
-
-		if (failureBody) {
-			List<String> lines = failureBody.readLines()
-				.collect { it?.trim() }
-				.findAll { it }
-
-			lines.take(8).each { String line ->
-				steps << [
-					status   : line.toLowerCase(Locale.ENGLISH).contains('exception') ? 'FAILED' : 'INFO',
-					timestamp: timestamp,
-					details  : line
-				]
-			}
-		}
-
-		return steps
-	}
-
-	private String readStackTraceFromLogs(File scenarioFolder) {
-		List<File> logFiles = findLogFiles(scenarioFolder)
-
-		for (File logFile : logFiles) {
-			List<String> lines = readLinesSafely(logFile)
-
-			int startIndex = -1
-			for (int i = 0; i < lines.size(); i++) {
-				String line = sanitizeLine(lines[i])
-				if (line.toLowerCase(Locale.ENGLISH).contains('exception') || line.contains('Caused by:')) {
-					startIndex = i
-					break
-				}
-			}
-
-			if (startIndex >= 0) {
-				List<String> block = lines.subList(startIndex, Math.min(startIndex + 25, lines.size()))
-					.collect { sanitizeLine(it) }
-					.findAll { it }
-
-				if (!block.isEmpty()) {
-					return block.join('\n')
-				}
-			}
-		}
-
-		return ''
-	}
-
-	private List<Map> readEvidenceItems(File scenarioFolder, List<Map> steps, String finalStatus) {
-		List<File> images = []
-
-		scenarioFolder.eachFileRecurse(FileType.FILES) { File file ->
-			String name = file.name.toLowerCase(Locale.ENGLISH)
-			if (name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.webp')) {
-				images << file
-			}
-		}
-
-		images.sort { File a, File b ->
-			a.absolutePath <=> b.absolutePath
-		}
-
-		if (!images.isEmpty()) {
-			return images.collect { File img ->
-				[
-					type : 'image',
-					name : img.name,
-					title: img.name,
-					path : img.absolutePath,
-					uri  : img.toURI().toString()
-				]
-			}
-		}
-
-		if (normalizeStatus(finalStatus) == 'FAILED' && steps && !steps.isEmpty()) {
-			return [[
-				type : 'text',
-				title: 'Execution steps',
-				lines: steps.collect { Map step ->
-					"[${step.status}] ${step.timestamp} | ${step.details}"
-				}
-			]]
-		}
-
-		return []
-	}
-
-	private File findBestJunitFile(File scenarioFolder) {
-		List<File> xmlFiles = []
-
-		scenarioFolder.eachFileRecurse(FileType.FILES) { File file ->
-			if (isJunitFileName(file.name)) {
-				xmlFiles << file
-			}
-		}
-
-		if (xmlFiles.isEmpty()) {
-			return null
-		}
-
-		xmlFiles.sort { File a, File b ->
-			junitPriority(a.name) <=> junitPriority(b.name)
-		}
-
-		return xmlFiles.first()
-	}
-
-	private boolean isJunitFileName(String fileName) {
-		String name = fileName.toLowerCase(Locale.ENGLISH)
-		return name.endsWith('.xml') && (
-			name == 'junit_report.xml' ||
-			name.contains('junit') ||
-			name.contains('report')
-		)
-	}
-
-	private int junitPriority(String fileName) {
-		String name = fileName.toLowerCase(Locale.ENGLISH)
-
-		if (name == 'junit_report.xml') return 0
-		if (name.contains('junit')) return 1
-		if (name.contains('report')) return 2
-		return 99
-	}
-
-	private List<File> findLogFiles(File scenarioFolder) {
-		List<File> logs = []
-
-		scenarioFolder.eachFileRecurse(FileType.FILES) { File file ->
-			String name = file.name.toLowerCase(Locale.ENGLISH)
-
-			if (name.endsWith('.log') || name.endsWith('.txt')) {
-				logs << file
-			}
-		}
-
-		logs.sort { File a, File b ->
-			a.absolutePath <=> b.absolutePath
-		}
-
-		return logs
-	}
-
-	private Map resolveNames(String rawName, File scenarioFolder, File reportRootFolder) {
-		String fullTitle = firstNonBlank(rawName, scenarioFolder.name).replace('\\', '/')
-
-		List<String> rawParts = fullTitle.split('/')
-			.collect { it?.trim() }
-			.findAll { it }
-
-		List<String> logicalParts = rawParts.findAll { String part ->
-			!part.equalsIgnoreCase('Test Cases') &&
-			!part.equalsIgnoreCase('Test Suites')
-		}
-
-		String caseName = logicalParts ? logicalParts.last() : scenarioFolder.name
-		String suiteName = logicalParts.size() >= 2
-			? logicalParts[logicalParts.size() - 2]
-			: firstNonBlank(scenarioFolder.parentFile?.name, reportRootFolder.name)
-
-		return [
-			fullTitle: fullTitle,
-			caseName : caseName,
-			suiteName: suiteName
-		]
-	}
-
-	private String extractExecutionName(File reportFolder) {
-		File[] firstLevelFolders = reportFolder.listFiles()?.findAll { it.isDirectory() } as File[]
-
-		if (firstLevelFolders != null && firstLevelFolders.length == 1) {
-			return firstLevelFolders[0].name
-		}
-
-		return reportFolder.name
-	}
-
-	private boolean hasFailureOrError(def caseNode, def suiteNode) {
-		boolean caseFailed = caseNode?.failure?.size() > 0 || caseNode?.error?.size() > 0
-		boolean suiteFailed = safeInt(textOf(suiteNode?.@failures)) > 0 || safeInt(textOf(suiteNode?.@errors)) > 0
-		return caseFailed || suiteFailed
-	}
-
-	private boolean hasSkipped(def caseNode, def suiteNode) {
-		boolean caseSkipped = caseNode?.skipped?.size() > 0
-		boolean suiteSkipped = safeInt(textOf(suiteNode?.@skipped)) > 0
-		return caseSkipped || suiteSkipped
-	}
-
-	private String buildScenarioId(int sequence, String name) {
-		String base = firstNonBlank(name, "scenario_${sequence}")
-			.toLowerCase(Locale.ENGLISH)
-			.replaceAll('[^a-z0-9]+', '_')
-			.replaceAll('^_+', '')
-			.replaceAll('_+$', '')
-
-		return "scenario_${sequence}_${base}"
-	}
-
-	private String buildEvidenceText(List<Map> steps) {
-		if (steps == null || steps.isEmpty()) {
-			return ''
-		}
-
-		return steps.collect { Map step ->
-			"[${step.status}] ${step.timestamp} | ${step.details}"
-		}.join('\n')
-	}
-
-	private String extractTimestamp(String line) {
-		def matcher = (line =~ /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{3})?)/)
-		return matcher.find() ? matcher.group(1).replace(',', '.') : ''
-	}
-
-	private String stripLinePrefix(String line) {
-		String value = line
-
-		value = value.replaceFirst(/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{3})?\s*/, '')
-		value = value.replaceFirst(/^\[(PASSED|FAILED|ERROR|WARNING|INFO)\]\s*/i, '')
-		value = value.replaceFirst(/^(PASSED|FAILED|ERROR|WARNING|INFO)\s*[:\-]?\s*/i, '')
-		value = value.replaceFirst(/^([A-Z]+)\s+[a-zA-Z0-9\._\$]+\s+\-\s*/, '')
-		value = value.replaceAll(/\s+/, ' ').trim()
-
-		return value
-	}
-
-	private List<String> readLinesSafely(File file) {
-		try {
-			return file.readLines('UTF-8')
-		} catch (Throwable ignored) {
-			try {
-				return file.readLines()
-			} catch (Throwable ignoredAgain) {
-				return []
-			}
-		}
-	}
-
-	private String sanitizeLine(String value) {
-		if (value == null) {
-			return ''
-		}
-
-		return value
-			.replaceAll(/\u001B\[[;\d]*m/, '')
-			.replace('\u0000', '')
-			.trim()
-	}
-
-	private String textOf(def value) {
-		try {
-			return value?.text()?.toString()?.trim()
-		} catch (Throwable ignored) {
-			try {
-				return value?.toString()?.trim()
-			} catch (Throwable ignoredAgain) {
-				return ''
-			}
-		}
-	}
-
-	private String cleanBlockText(String value) {
-		if (!value) {
-			return ''
-		}
-
-		return value
-			.replace('\r\n', '\n')
-			.replace('\r', '\n')
-			.split('\n')
-			.collect { it?.trim() }
-			.findAll { it }
-			.join('\n')
-	}
-
-	private Date parseDate(String rawValue) {
-		if (!rawValue) {
-			return null
-		}
-
-		for (String pattern : DATE_PATTERNS) {
-			try {
-				return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(rawValue)
-			} catch (Throwable ignored) {
-			}
-		}
-
-		return null
-	}
-
-	private BigDecimal safeDecimal(String rawValue) {
-		try {
-			return rawValue ? new BigDecimal(rawValue.trim()) : BigDecimal.ZERO
-		} catch (Throwable ignored) {
-			return BigDecimal.ZERO
-		}
-	}
-
-	private int safeInt(String rawValue) {
-		try {
-			return rawValue ? Integer.parseInt(rawValue.trim()) : 0
-		} catch (Throwable ignored) {
-			return 0
-		}
-	}
-
-	private long toLong(def value) {
-		try {
-			return value ? Long.parseLong(value.toString()) : 0L
-		} catch (Throwable ignored) {
-			return 0L
-		}
-	}
-
-	private String formatDurationSeconds(BigDecimal seconds) {
-		if (seconds == null) {
-			return '00h 00m 00s'
-		}
-
-		return formatDurationMillis(seconds.multiply(new BigDecimal('1000')).longValue())
-	}
-
-	private String formatDurationMillis(long millis) {
-		long totalSeconds = Math.max(0L, Math.round(millis / 1000.0d))
-		long hours = (long) (totalSeconds / 3600)
-		long minutes = (long) ((totalSeconds % 3600) / 60)
-		long seconds = (long) (totalSeconds % 60)
-
-		return String.format('%02dh %02dm %02ds', hours, minutes, seconds)
-	}
-
-	private String normalizeStatus(String rawStatus) {
-		String value = firstNonBlank(rawStatus, 'SKIPPED').toUpperCase(Locale.ENGLISH)
-
-		if (value.contains('FAIL') || value.contains('ERROR')) return 'FAILED'
-		if (value.contains('PASS')) return 'PASSED'
-		if (value.contains('SKIP')) return 'SKIPPED'
-		if (value.contains('WARN')) return 'WARNING'
-
-		return 'SKIPPED'
-	}
-
-	private String formatStatusLabel(String normalizedStatus) {
-		String value = normalizeStatus(normalizedStatus)
-
-		if (value == 'PASSED') return 'Passed'
-		if (value == 'FAILED') return 'Failed'
-		if (value == 'WARNING') return 'Warning'
-		return 'Skipped'
-	}
-
-	private String firstNonBlank(Object... values) {
-		for (Object value : values) {
-			if (value != null) {
-				String text = value.toString().trim()
-				if (text) {
-					return text
-				}
-			}
-		}
-		return ''
-	}
+    private static final String APP_NAME = 'EMATCH'
+
+    /*
+     * Troque somente esta variável se quiser mudar o logo.
+     */
+    private static final String LOGO_SRC = 'Image/ematch-logo.png'
+
+    private static final List<String> DATE_PATTERNS = [
+        'yyyy-MM-dd\'T\'HH:mm:ss.SSSXXX',
+        'yyyy-MM-dd\'T\'HH:mm:ss.SSS',
+        'yyyy-MM-dd\'T\'HH:mm:ss',
+        'yyyy-MM-dd HH:mm:ss.SSS',
+        'yyyy-MM-dd HH:mm:ss',
+        'MM-dd-yyyy HH:mm:ss',
+        'dd/MM/yyyy HH:mm:ss'
+    ]
+
+    private static final SimpleDateFormat OUTPUT_DATE_TIME =
+            new SimpleDateFormat('dd/MM/yyyy HH:mm:ss', Locale.ENGLISH)
+
+    Map build(String reportFolderPath) {
+        return build(new File(reportFolderPath))
+    }
+
+    Map buildReport(String reportFolderPath) {
+        return build(new File(reportFolderPath))
+    }
+
+    Map build(File reportFolder) {
+        File root = reportFolder ?: new File('.')
+
+        if (!root.exists()) {
+            return [
+                suiteName     : 'Execution',
+                generatedAt   : OUTPUT_DATE_TIME.format(new Date()),
+                reportFolder  : root.absolutePath,
+                baseFolder    : root.absolutePath,
+                executionFolder: root.absolutePath,
+                logoSrc       : LOGO_SRC,
+                scenarios     : []
+            ]
+        }
+
+        List<File> scenarioDirs = findScenarioDirectories(root)
+        List<Map> scenarios = []
+
+        scenarioDirs.each { File dir ->
+            scenarios.addAll(buildScenariosFromDirectory(dir, root))
+        }
+
+        if (scenarios.isEmpty()) {
+            scenarios = buildFallbackScenario(root)
+        }
+
+        scenarios = scenarios.findAll { it != null }
+
+        scenarios.sort { a, b ->
+            safe(a.name).toLowerCase(Locale.ENGLISH) <=> safe(b.name).toLowerCase(Locale.ENGLISH)
+        }
+
+        return [
+            suiteName      : detectSuiteName(root, scenarios),
+            generatedAt    : OUTPUT_DATE_TIME.format(new Date()),
+            reportFolder   : root.absolutePath,
+            baseFolder     : root.absolutePath,
+            executionFolder: root.absolutePath,
+            logoSrc        : LOGO_SRC,
+            scenarios      : scenarios
+        ]
+    }
+
+    // =========================================================================
+    // SCENARIO DISCOVERY
+    // =========================================================================
+
+    private List<File> findScenarioDirectories(File root) {
+        LinkedHashSet<File> dirs = new LinkedHashSet<File>()
+
+        if (findJUnitFile(root) != null) {
+            dirs << root
+        }
+
+        root.eachFileRecurse(FileType.FILES) { File file ->
+            if (isJUnitFile(file)) {
+                dirs << file.parentFile
+            }
+        }
+
+        return dirs.toList().sort { a, b ->
+            a.absolutePath <=> b.absolutePath
+        }
+    }
+
+    private boolean isJUnitFile(File file) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return false
+        }
+
+        String lower = file.name.toLowerCase(Locale.ENGLISH)
+        return lower == 'junit_report.xml' || (lower.startsWith('test-') && lower.endsWith('.xml'))
+    }
+
+    private File findJUnitFile(File dir) {
+        if (dir == null || !dir.exists() || !dir.isDirectory()) {
+            return null
+        }
+
+        File exact = new File(dir, 'JUnit_Report.xml')
+        if (exact.exists()) {
+            return exact
+        }
+
+        List<File> xmls = []
+        dir.eachFile(FileType.FILES) { File file ->
+            if (isJUnitFile(file)) {
+                xmls << file
+            }
+        }
+
+        if (xmls.isEmpty()) {
+            return null
+        }
+
+        xmls.sort { a, b -> a.name <=> b.name }
+        return xmls[0]
+    }
+
+    // =========================================================================
+    // SCENARIO BUILD
+    // =========================================================================
+
+    private List<Map> buildScenariosFromDirectory(File scenarioDir, File root) {
+        List<Map> scenarios = []
+
+        File junitFile = findJUnitFile(scenarioDir)
+        Node xmlRoot = parseXml(junitFile)
+        List<Node> testCases = findTestCases(xmlRoot)
+
+        String rawLog = loadRelevantLogText(scenarioDir, root)
+        List<Map> folderEvidence = collectEvidence(scenarioDir, root)
+
+        if (testCases.isEmpty()) {
+            scenarios << buildScenarioMap(
+                scenarioDir,
+                root,
+                null,
+                xmlRoot,
+                rawLog,
+                folderEvidence,
+                0
+            )
+            return scenarios
+        }
+
+        int index = 0
+        testCases.each { Node tc ->
+            scenarios << buildScenarioMap(
+                scenarioDir,
+                root,
+                tc,
+                xmlRoot,
+                rawLog,
+                folderEvidence,
+                index
+            )
+            index++
+        }
+
+        return scenarios.findAll { it != null }
+    }
+
+    private Map buildScenarioMap(
+        File scenarioDir,
+        File root,
+        Node testCase,
+        Node xmlRoot,
+        String rawLog,
+        List<Map> folderEvidence,
+        int index
+    ) {
+        String scenarioName = detectScenarioName(scenarioDir, testCase, xmlRoot, index)
+        String narrowedLog = narrowLogForScenario(rawLog, scenarioName, scenarioDir.name)
+        String workingLog = safe(narrowedLog).isEmpty() ? rawLog : narrowedLog
+
+        Map timeInfo = parseTimeInfo(workingLog, scenarioDir, testCase, xmlRoot)
+        List<Map> steps = extractSteps(workingLog)
+
+        if (steps.isEmpty() && !safe(rawLog).isEmpty() && workingLog != rawLog) {
+            steps = extractSteps(rawLog)
+        }
+
+        String fullError = extractFullError(testCase, xmlRoot, workingLog)
+        String visualError = extractVisualError(fullError, workingLog)
+
+        List<Map> evidence = folderEvidence ?: []
+
+        String status = detectScenarioStatus(testCase, xmlRoot, fullError, workingLog)
+
+        return [
+            id            : buildScenarioId(scenarioDir, scenarioName, index),
+            name          : scenarioName,
+            status        : status,
+            summary       : visualError,
+            startShort    : safe(timeInfo.startShort),
+            endShort      : safe(timeInfo.endShort),
+            startLong     : safe(timeInfo.startLong),
+            endLong       : safe(timeInfo.endLong),
+            durationLabel : safe(timeInfo.durationLabel),
+            visualError   : visualError,
+            fullError     : fullError,
+            steps         : steps,
+            evidence      : evidence
+        ]
+    }
+
+    private String buildScenarioId(File dir, String scenarioName, int index) {
+        String seed = safe(dir?.absolutePath) + '|' + safe(scenarioName) + '|' + index
+        return seed.replace('\\', '-').replace('/', '-').replace(':', '-').replace(' ', '-')
+    }
+
+    private String detectScenarioName(File scenarioDir, Node testCase, Node xmlRoot, int index) {
+        String fromCase = safe(attr(testCase, 'name'))
+        if (!fromCase.isEmpty()) {
+            return fromCase
+        }
+
+        String fromClass = safe(attr(testCase, 'classname'))
+        if (!fromClass.isEmpty()) {
+            return fromClass
+        }
+
+        String fromSuite = safe(attr(xmlRoot, 'name'))
+        if (!fromSuite.isEmpty()) {
+            return fromSuite
+        }
+
+        if (scenarioDir != null && scenarioDir.exists()) {
+            return scenarioDir.name
+        }
+
+        return 'Scenario ' + (index + 1)
+    }
+
+    private String detectScenarioStatus(Node testCase, Node xmlRoot, String fullError, String rawLog) {
+        if (hasChild(testCase, 'failure') || hasChild(testCase, 'error')) {
+            return 'failed'
+        }
+
+        if (hasChild(testCase, 'skipped')) {
+            return 'skipped'
+        }
+
+        if (xmlRoot != null) {
+            if (toInt(attr(xmlRoot, 'failures')) > 0 || toInt(attr(xmlRoot, 'errors')) > 0) {
+                return 'failed'
+            }
+            if (toInt(attr(xmlRoot, 'skipped')) > 0) {
+                return 'skipped'
+            }
+        }
+
+        String lower = (safe(fullError) + '\n' + safe(rawLog)).toLowerCase(Locale.ENGLISH)
+
+        if (lower.contains(' stepfailedexception') ||
+            lower.contains(' failed.') ||
+            lower.contains(' reason:') ||
+            lower.contains('exception') ||
+            lower.contains('assertion failed') ||
+            lower.contains('org.codehaus.groovy.runtime.invokerinvocationexception')) {
+            return 'failed'
+        }
+
+        return 'passed'
+    }
+
+    // =========================================================================
+    // XML
+    // =========================================================================
+
+    private Node parseXml(File file) {
+        if (file == null || !file.exists()) {
+            return null
+        }
+
+        try {
+            return new XmlParser(false, false).parse(file)
+        } catch (Throwable ignored) {
+            return null
+        }
+    }
+
+    private List<Node> findTestCases(Node xmlRoot) {
+        List<Node> result = []
+
+        if (xmlRoot == null) {
+            return result
+        }
+
+        if ('testcase'.equals(String.valueOf(xmlRoot.name()))) {
+            result << xmlRoot
+            return result
+        }
+
+        xmlRoot.depthFirst().each { Object item ->
+            if (item instanceof Node && 'testcase'.equals(String.valueOf(((Node) item).name()))) {
+                result << (Node) item
+            }
+        }
+
+        return result
+    }
+
+    private boolean hasChild(Node node, String childName) {
+        if (node == null) {
+            return false
+        }
+
+        return childNodes(node, childName).size() > 0
+    }
+
+    private List<Node> childNodes(Node node, String childName) {
+        if (node == null) {
+            return []
+        }
+
+        List<Node> result = []
+        node.children().each { Object child ->
+            if (child instanceof Node && childName.equals(String.valueOf(((Node) child).name()))) {
+                result << (Node) child
+            }
+        }
+        return result
+    }
+
+    private String attr(Node node, String attrName) {
+        if (node == null) {
+            return ''
+        }
+
+        Object value = node.attribute(attrName)
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+
+    // =========================================================================
+    // LOGS / STEPS
+    // =========================================================================
+
+    private String loadRelevantLogText(File scenarioDir, File root) {
+        List<File> candidates = []
+
+        if (scenarioDir != null && scenarioDir.exists()) {
+            scenarioDir.eachFileRecurse(FileType.FILES) { File file ->
+                if (isTextLog(file)) {
+                    candidates << file
+                }
+            }
+        }
+
+        if (root != null && root.exists()) {
+            root.eachFileRecurse(FileType.FILES) { File file ->
+                if (isTextLog(file) && !candidates.contains(file)) {
+                    candidates << file
+                }
+            }
+        }
+
+        candidates.sort { a, b ->
+            scoreLogFile(b) <=> scoreLogFile(a)
+        }
+
+        StringBuilder sb = new StringBuilder()
+        int used = 0
+
+        candidates.each { File file ->
+            if (used >= 8) {
+                return
+            }
+
+            List<String> lines = readLinesSafely(file)
+            if (!lines.isEmpty()) {
+                sb.append('\n')
+                sb.append('### FILE: ').append(file.absolutePath).append('\n')
+                lines.each { String line ->
+                    sb.append(line).append('\n')
+                }
+                used++
+            }
+        }
+
+        return sb.toString().trim()
+    }
+
+    private boolean isTextLog(File file) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return false
+        }
+
+        String lower = file.name.toLowerCase(Locale.ENGLISH)
+        return lower.endsWith('.log') ||
+               lower.endsWith('.txt') ||
+               lower == 'execution0.log' ||
+               lower == 'execution.properties'
+    }
+
+    private int scoreLogFile(File file) {
+        String name = file.name.toLowerCase(Locale.ENGLISH)
+        int score = 0
+
+        if (name.contains('execution')) score += 50
+        if (name.contains('console')) score += 30
+        if (name.endsWith('.log')) score += 20
+        if (name.endsWith('.txt')) score += 10
+
+        return score
+    }
+
+    private String narrowLogForScenario(String rawLog, String scenarioName, String folderName) {
+        String text = safe(rawLog)
+        if (text.isEmpty()) {
+            return ''
+        }
+
+        List<String> lines = text.readLines()
+        List<String> result = []
+        boolean capture = false
+        int countdown = 0
+
+        lines.each { String rawLine ->
+            String line = safe(rawLine)
+            String normalized = stripLinePrefix(removeTimestamp(line))
+
+            boolean hitsScenario =
+                (!safe(scenarioName).isEmpty() && line.toLowerCase(Locale.ENGLISH).contains(scenarioName.toLowerCase(Locale.ENGLISH))) ||
+                (!safe(folderName).isEmpty() && line.toLowerCase(Locale.ENGLISH).contains(folderName.toLowerCase(Locale.ENGLISH)))
+
+            if (hitsScenario) {
+                capture = true
+                countdown = 40
+            }
+
+            if (capture) {
+                result << line
+                countdown--
+
+                if (countdown <= 0 ||
+                    normalized.startsWith('END Test Cases/') ||
+                    normalized.startsWith('afterSuite') ||
+                    normalized.startsWith('exportKatalonReports')) {
+                    capture = false
+                }
+            }
+        }
+
+        return result.join('\n').trim()
+    }
+
+    private List<Map> extractSteps(String rawLog) {
+        List<Map> steps = []
+
+        if (safe(rawLog).isEmpty()) {
+            return steps
+        }
+
+        boolean started = false
+
+        rawLog.readLines().each { String rawLine ->
+            String timestamp = extractTimestamp(rawLine)
+            String noTime = removeTimestamp(rawLine)
+            String line = stripLinePrefix(noTime)
+
+            if (line.isEmpty()) {
+                return
+            }
+
+            if (line.contains('Starting Jira import flow')) {
+                started = true
+                steps << buildStep('info', timestamp, line)
+                return
+            }
+
+            if (started && (
+                line.startsWith('afterCase') ||
+                line.startsWith('afterSuite') ||
+                line.startsWith('beforeSuite') ||
+                line.startsWith('exportKatalonReports') ||
+                line.startsWith('Video')
+            )) {
+                return
+            }
+
+            if (!started) {
+                if (isPreStepLine(line)) {
+                    started = true
+                } else {
+                    return
+                }
+            }
+
+            if (isNoiseLine(line) || isStackTraceLine(line) || isSeparatorLine(line)) {
+                return
+            }
+
+            steps << buildStep(resolveStepStatus(line), timestamp, line)
+        }
+
+        return compactSteps(steps)
+    }
+
+    private boolean isPreStepLine(String line) {
+        return line.startsWith('Using report folder:') ||
+               line.startsWith('Suite name detected from report path:') ||
+               line.startsWith('Execution title used:') ||
+               line.startsWith('Test Plan title used:') ||
+               line.startsWith('Epic key used:') ||
+               line.startsWith('Assignee used on Test Plan:') ||
+               line.startsWith('JUnit XML found:') ||
+               line.startsWith('Custom Jira report created:') ||
+               line.startsWith('Results ZIP created:') ||
+               line.startsWith('Search Test Plan status:') ||
+               line.startsWith('Creating new Test Plan') ||
+               line.startsWith('New Test Plan created successfully:') ||
+               line.startsWith('Importing XML file:') ||
+               line.startsWith('Import Results status:') ||
+               line.startsWith('Imported Test Execution key:') ||
+               line.startsWith('Update execution title status:') ||
+               line.startsWith('Attaching file to Test Execution:') ||
+               line.startsWith('Attachment status:') ||
+               line.startsWith('Jira import completed successfully.')
+    }
+
+    private boolean isNoiseLine(String line) {
+        return line.startsWith('hostName') ||
+               line.startsWith('os =') ||
+               line.startsWith('hostAddress') ||
+               line.startsWith('katalonVersion') ||
+               line.startsWith('beforeSuite') ||
+               line.startsWith('beforeTestSuite') ||
+               line.startsWith('afterTestSuite') ||
+               line.startsWith('START Test Cases/') ||
+               line.startsWith('END Test Cases/')
+    }
+
+    private boolean isStackTraceLine(String line) {
+        return line.startsWith('at ') ||
+               line.startsWith('Caused by:') ||
+               line.startsWith('com.kms.') ||
+               line.startsWith('java.') ||
+               line.startsWith('groovy.') ||
+               line.startsWith('org.codehaus.') ||
+               line.startsWith('internal.GlobalVariable')
+    }
+
+    private boolean isSeparatorLine(String line) {
+        String compact = line.replace('=', '').replace('-', '').trim()
+        return compact.isEmpty()
+    }
+
+    private Map buildStep(String status, String timestamp, String detail) {
+        return [
+            status   : safe(status).isEmpty() ? 'info' : status,
+            timestamp: safe(timestamp),
+            detail   : safe(detail),
+            icon     : resolveStepIcon(detail, status)
+        ]
+    }
+
+    private List<Map> compactSteps(List<Map> steps) {
+        List<Map> result = []
+        LinkedHashSet<String> seen = new LinkedHashSet<String>()
+
+        steps.each { Map step ->
+            String key = safe(step.status) + '|' + safe(step.timestamp) + '|' + safe(step.detail)
+            if (!seen.contains(key) && !safe(step.detail).isEmpty()) {
+                seen << key
+                result << step
+            }
+        }
+
+        return result
+    }
+
+    private String extractTimestamp(String line) {
+        String value = safe(line)
+        if (value.isEmpty()) {
+            return ''
+        }
+
+        List patterns = [
+            ~/(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{3})?)/,
+            ~/(\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2})/,
+            ~/(\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2})/
+        ]
+
+        for (def pattern : patterns) {
+            def matcher = value =~ pattern
+            if (matcher.find()) {
+                return matcher.group(1)
+            }
+        }
+
+        return ''
+    }
+
+    private String removeTimestamp(String line) {
+        String value = safe(line)
+        String timestamp = extractTimestamp(value)
+
+        if (!timestamp.isEmpty()) {
+            value = value.replace(timestamp, '').trim()
+        }
+
+        return value
+    }
+
+    private String stripLinePrefix(String line) {
+        String value = safe(line)
+
+        value = value.replaceAll('^\\[[^\\]]+\\]\\s*', '')
+        value = value.replaceAll('^(PASSED|FAILED|ERROR|WARNING|INFO)\\s*[:\\-]?\\s*', '')
+        value = value.replaceAll('^[0-9]+\\s*-\\s*', '')
+        value = value.replace('\t', ' ')
+        value = value.trim()
+
+        return value
+    }
+
+    private String resolveStepStatus(String line) {
+        String lower = safe(line).toLowerCase(Locale.ENGLISH)
+
+        if (lower.contains('failed') || lower.contains('error') || lower.contains('exception')) {
+            return 'failed'
+        }
+
+        if (lower.contains('skipped')) {
+            return 'skipped'
+        }
+
+        if (lower.contains('passed') || lower.contains('successfully')) {
+            return 'passed'
+        }
+
+        return 'info'
+    }
+
+    private String resolveStepIcon(String detail, String status) {
+        String lower = safe(detail).toLowerCase(Locale.ENGLISH)
+
+        if ('failed'.equals(status)) {
+            return '❌'
+        }
+        if ('skipped'.equals(status)) {
+            return '⏭️'
+        }
+        if (lower.contains('wait')) {
+            return '🔎'
+        }
+        if (lower.contains('click') || lower.contains('select') || lower.contains('fill') || lower.contains('attach')) {
+            return '🖱️'
+        }
+        if (lower.contains('open') || lower.contains('navigate') || lower.contains('import')) {
+            return '🌐'
+        }
+
+        return 'ℹ️'
+    }
+
+    // =========================================================================
+    // TIME
+    // =========================================================================
+
+    private Map parseTimeInfo(String rawLog, File scenarioDir, Node testCase, Node xmlRoot) {
+        long durationMs = detectDurationMs(rawLog, testCase, xmlRoot)
+
+        Date startDate = null
+        Date endDate = null
+
+        List<Date> dates = extractAllDates(rawLog)
+        if (!dates.isEmpty()) {
+            startDate = dates[0]
+            endDate = dates[dates.size() - 1]
+        }
+
+        if (startDate == null && scenarioDir != null && scenarioDir.exists()) {
+            endDate = new Date(scenarioDir.lastModified())
+            if (durationMs > 0L) {
+                startDate = new Date(endDate.time - durationMs)
+            } else {
+                startDate = endDate
+            }
+        }
+
+        if (startDate != null && endDate == null) {
+            if (durationMs > 0L) {
+                endDate = new Date(startDate.time + durationMs)
+            } else {
+                endDate = startDate
+            }
+        }
+
+        if (startDate != null && endDate != null && endDate.time < startDate.time) {
+            if (durationMs > 0L) {
+                endDate = new Date(startDate.time + durationMs)
+            } else {
+                endDate = startDate
+            }
+        }
+
+        if (durationMs <= 0L && startDate != null && endDate != null) {
+            durationMs = Math.max(0L, endDate.time - startDate.time)
+        }
+
+        return [
+            startShort   : startDate != null ? new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH).format(startDate) : '',
+            endShort     : endDate != null ? new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH).format(endDate) : '',
+            startLong    : startDate != null ? OUTPUT_DATE_TIME.format(startDate) : '',
+            endLong      : endDate != null ? OUTPUT_DATE_TIME.format(endDate) : '',
+            durationLabel: formatDuration(durationMs)
+        ]
+    }
+
+    private long detectDurationMs(String rawLog, Node testCase, Node xmlRoot) {
+        long durationMs = secondsToMillis(attr(testCase, 'time'))
+        if (durationMs > 0L) {
+            return durationMs
+        }
+
+        durationMs = secondsToMillis(attr(xmlRoot, 'time'))
+        if (durationMs > 0L) {
+            return durationMs
+        }
+
+        String text = safe(rawLog)
+        if (!text.isEmpty()) {
+            def matcher = (text =~ /Elapsed time:\s*([\d\.,]+)s/i)
+            if (matcher.find()) {
+                return secondsToMillis(matcher.group(1))
+            }
+        }
+
+        return 0L
+    }
+
+    private List<Date> extractAllDates(String rawLog) {
+        List<Date> result = []
+
+        if (safe(rawLog).isEmpty()) {
+            return result
+        }
+
+        rawLog.readLines().each { String line ->
+            String raw = extractTimestamp(line)
+            if (!raw.isEmpty()) {
+                Date parsed = parseDate(raw)
+                if (parsed != null) {
+                    result << parsed
+                }
+            }
+        }
+
+        return result
+    }
+
+    private Date parseDate(String raw) {
+        String value = safe(raw)
+        if (value.isEmpty()) {
+            return null
+        }
+
+        for (String pattern : DATE_PATTERNS) {
+            try {
+                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(value)
+            } catch (Throwable ignored) {
+            }
+        }
+
+        return null
+    }
+
+    private long secondsToMillis(String raw) {
+        String value = safe(raw).replace(',', '.')
+        if (value.isEmpty()) {
+            return 0L
+        }
+
+        try {
+            double seconds = Double.parseDouble(value)
+            return Math.round(seconds * 1000d)
+        } catch (Throwable ignored) {
+            return 0L
+        }
+    }
+
+    private String formatDuration(long durationMs) {
+        long safeDuration = Math.max(0L, durationMs)
+        long totalSeconds = Math.round(safeDuration / 1000d)
+        long hours = (long) (totalSeconds / 3600L)
+        long minutes = (long) ((totalSeconds % 3600L) / 60L)
+        long seconds = (long) (totalSeconds % 60L)
+
+        return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+    }
+
+    // =========================================================================
+    // ERROR
+    // =========================================================================
+
+    private String extractFullError(Node testCase, Node xmlRoot, String rawLog) {
+        List<String> parts = []
+
+        childNodes(testCase, 'failure').each { Node node ->
+            String text = safe(node.text())
+            if (!text.isEmpty()) {
+                parts << text
+            }
+        }
+
+        childNodes(testCase, 'error').each { Node node ->
+            String text = safe(node.text())
+            if (!text.isEmpty()) {
+                parts << text
+            }
+        }
+
+        childNodes(xmlRoot, 'system-err').each { Node node ->
+            String text = safe(node.text())
+            if (!text.isEmpty()) {
+                parts << text
+            }
+        }
+
+        if (!safe(rawLog).isEmpty()) {
+            List<String> errorLines = []
+
+            rawLog.readLines().each { String line ->
+                String clean = safe(line)
+                String lower = clean.toLowerCase(Locale.ENGLISH)
+
+                if (lower.contains('failed.') ||
+                    lower.contains('reason:') ||
+                    lower.contains('exception') ||
+                    lower.contains('stepfailedexception') ||
+                    lower.startsWith('caused by:') ||
+                    lower.startsWith('at ') ||
+                    lower.startsWith('com.kms.') ||
+                    lower.startsWith('org.codehaus.') ||
+                    lower.startsWith('java.')) {
+                    errorLines << clean
+                }
+            }
+
+            if (!errorLines.isEmpty()) {
+                parts << errorLines.join('\n')
+            }
+        }
+
+        return parts.findAll { !safe(it).isEmpty() }.join('\n\n').trim()
+    }
+
+    private String extractVisualError(String fullError, String rawLog) {
+        String errorText = safe(fullError)
+
+        if (!errorText.isEmpty()) {
+            List<String> lines = errorText.readLines().findAll { !safe(it).isEmpty() }
+            if (!lines.isEmpty()) {
+                String first = lines[0]
+                int reasonIndex = first.toLowerCase(Locale.ENGLISH).indexOf('reason:')
+                if (reasonIndex >= 0) {
+                    return first.substring(reasonIndex + 'reason:'.length()).trim()
+                }
+                return first
+            }
+        }
+
+        if (!safe(rawLog).isEmpty()) {
+            rawLog.readLines().each { String line ->
+                String clean = stripLinePrefix(removeTimestamp(line))
+                String lower = clean.toLowerCase(Locale.ENGLISH)
+
+                if (lower.contains('failed.') || lower.contains('reason:') || lower.contains('exception')) {
+                    return clean
+                }
+            }
+        }
+
+        return ''
+    }
+
+    // =========================================================================
+    // EVIDENCE
+    // =========================================================================
+
+    private List<Map> collectEvidence(File scenarioDir, File root) {
+        List<File> images = []
+
+        if (scenarioDir != null && scenarioDir.exists()) {
+            scenarioDir.eachFileRecurse(FileType.FILES) { File file ->
+                if (isEvidenceImage(file)) {
+                    images << file
+                }
+            }
+        }
+
+        if (images.isEmpty() && root != null && root.exists()) {
+            root.eachFileRecurse(FileType.FILES) { File file ->
+                if (isEvidenceImage(file) && safe(file.absolutePath).contains(safe(scenarioDir?.name))) {
+                    images << file
+                }
+            }
+        }
+
+        images.sort { a, b -> a.lastModified() <=> b.lastModified() }
+
+        List<Map> result = []
+        images.each { File file ->
+            result << [
+                name  : file.name,
+                href  : file.toURI().toString(),
+                imgSrc: file.toURI().toString(),
+                image : true
+            ]
+        }
+
+        return result
+    }
+
+    private boolean isEvidenceImage(File file) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return false
+        }
+
+        String lower = file.name.toLowerCase(Locale.ENGLISH)
+
+        if (lower.contains('logo') || lower.contains('icon') || lower.contains('favicon')) {
+            return false
+        }
+
+        return lower.endsWith('.png') ||
+               lower.endsWith('.jpg') ||
+               lower.endsWith('.jpeg') ||
+               lower.endsWith('.gif') ||
+               lower.endsWith('.bmp') ||
+               lower.endsWith('.webp')
+    }
+
+    // =========================================================================
+    // FALLBACK
+    // =========================================================================
+
+    private List<Map> buildFallbackScenario(File root) {
+        String rawLog = loadRelevantLogText(root, root)
+        List<Map> steps = extractSteps(rawLog)
+        Map timeInfo = parseTimeInfo(rawLog, root, null, null)
+        List<Map> evidence = collectEvidence(root, root)
+        String fullError = extractFullError(null, null, rawLog)
+        String visualError = extractVisualError(fullError, rawLog)
+        String status = detectScenarioStatus(null, null, fullError, rawLog)
+
+        return [[
+            id            : safe(root.absolutePath).replace('\\', '-').replace('/', '-'),
+            name          : detectSuiteName(root, []),
+            status        : status,
+            summary       : visualError,
+            startShort    : safe(timeInfo.startShort),
+            endShort      : safe(timeInfo.endShort),
+            startLong     : safe(timeInfo.startLong),
+            endLong       : safe(timeInfo.endLong),
+            durationLabel : safe(timeInfo.durationLabel),
+            visualError   : visualError,
+            fullError     : fullError,
+            steps         : steps,
+            evidence      : evidence
+        ]]
+    }
+
+    // =========================================================================
+    // SUITE NAME
+    // =========================================================================
+
+    private String detectSuiteName(File root, List<Map> scenarios) {
+        if (root == null) {
+            return 'Execution'
+        }
+
+        String rootName = safe(root.name)
+        if (!rootName.isEmpty() && !looksLikeTimestamp(rootName)) {
+            return rootName
+        }
+
+        List<File> childDirs = []
+        if (root.exists() && root.isDirectory()) {
+            root.eachFile(FileType.DIRECTORIES) { File dir ->
+                childDirs << dir
+            }
+        }
+
+        childDirs = childDirs.findAll { File dir ->
+            !safe(dir.name).isEmpty() && !looksLikeTimestamp(dir.name)
+        }
+
+        if (!childDirs.isEmpty()) {
+            childDirs.sort { a, b -> b.listFiles()?.size() <=> a.listFiles()?.size() }
+            return childDirs[0].name
+        }
+
+        if (!scenarios.isEmpty()) {
+            return safe(scenarios[0].name)
+        }
+
+        return 'Execution'
+    }
+
+    private boolean looksLikeTimestamp(String value) {
+        String text = safe(value)
+        return text ==~ /\d{8}_\d{6}/ || text ==~ /\d{12,14}/
+    }
+
+    // =========================================================================
+    // UTILS
+    // =========================================================================
+
+    private List<String> readLinesSafely(File file) {
+        try {
+            return file.readLines('UTF-8')
+        } catch (Throwable ignored) {
+            try {
+                return file.readLines()
+            } catch (Throwable ignoredAgain) {
+                return []
+            }
+        }
+    }
+
+    private int toInt(String raw) {
+        String value = safe(raw)
+        if (value.isEmpty()) {
+            return 0
+        }
+
+        try {
+            return Integer.parseInt(value)
+        } catch (Throwable ignored) {
+            return 0
+        }
+    }
+
+    private String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.net.URI
+
+class JiraHtmlTemplateBuilder {
+
+    private static final String APP_NAME = 'EMATCH'
+    private static final String REPORT_TITLE_PREFIX = 'Test report - '
+
+    /*
+     * Troque somente esta variável se quiser mudar o logo.
+     */
+    private static final String LOGO_SRC = 'Image/ematch-logo.png'
+
+    private static final String STATUS_PASS = '#68b84b'
+    private static final String STATUS_FAIL = '#e05b4d'
+    private static final String STATUS_SKIP = '#d7b436'
+    private static final String STATUS_INFO = '#8c35ff'
+
+    JiraHtmlTemplateBuilder() {
+    }
+
+    String build(Map model) {
+        return buildHtml(model)
+    }
+
+    String render(Map model) {
+        return buildHtml(model)
+    }
+
+    String buildHtml(Map model) {
+        Map view = normalizeModel(model)
+
+        StringBuilder html = new StringBuilder()
+
+        html.append('<!DOCTYPE html>\n')
+        html.append('<html lang="en">\n')
+        html.append('<head>\n')
+        html.append('<meta charset="UTF-8">\n')
+        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
+        html.append('<title>')
+        html.append(htmlEscape(view.reportTitle))
+        html.append('</title>\n')
+        html.append(buildStyles())
+        html.append('</head>\n')
+        html.append('<body>\n')
+
+        html.append('<header class="top-banner">\n')
+        html.append('  <div class="top-banner-left">\n')
+        html.append('    <img class="brand-logo" src="')
+        html.append(htmlEscape(resolveLogoHref(view)))
+        html.append('" alt="EMATCH logo">\n')
+        html.append('    <div class="brand-copy">\n')
+        html.append('      <div class="banner-title">')
+        html.append(htmlEscape(view.reportTitle))
+        html.append('</div>\n')
+        html.append('      <div class="banner-subtitle">EMATCH execution overview</div>\n')
+        html.append('    </div>\n')
+        html.append('  </div>\n')
+        html.append('  <div class="top-banner-right">\n')
+        html.append('    <div>')
+        html.append(htmlEscape(view.generatedLabel))
+        html.append('</div>\n')
+        html.append('    <div>Project ')
+        html.append(htmlEscape(APP_NAME))
+        html.append('</div>\n')
+        html.append('  </div>\n')
+        html.append('</header>\n')
+
+        html.append('<div class="page">\n')
+
+        html.append('  <aside class="sidebar">\n')
+        html.append('    <div class="sidebar-tabs">\n')
+        html.append('      <button id="tab-tests" class="sidebar-tab active" type="button" onclick="showTab(\'tests\')">Tests</button>\n')
+        html.append('      <button id="tab-charts" class="sidebar-tab" type="button" onclick="showTab(\'charts\')">Charts</button>\n')
+        html.append('    </div>\n')
+
+        html.append('    <div id="tests-sidebar-block">\n')
+        html.append('      <div class="search-wrap">\n')
+        html.append('        <input id="scenarioSearch" class="search-input" type="text" placeholder="Search test name, path, or status." onkeyup="filterScenarios()">\n')
+        html.append('      </div>\n')
+        html.append('      <div id="scenarioList" class="scenario-list">\n')
+
+        if (view.scenarios.isEmpty()) {
+            html.append('<div class="empty-state">No scenarios were found for this execution.</div>')
+        } else {
+            view.scenarios.eachWithIndex { scenario, index ->
+                html.append(buildScenarioListItem(scenario as Map, index == 0))
+            }
+        }
+
+        html.append('      </div>\n')
+        html.append('    </div>\n')
+
+        html.append('    <div id="charts-sidebar-block" class="hidden">\n')
+        html.append(buildChartsSidebar(view))
+        html.append('    </div>\n')
+        html.append('  </aside>\n')
+
+        html.append('  <main class="content">\n')
+
+        if (view.scenarios.isEmpty()) {
+            html.append('<section class="scenario-panel active">')
+            html.append('<div class="scenario-title">No execution data found</div>')
+            html.append('</section>')
+        } else {
+            view.scenarios.eachWithIndex { scenario, index ->
+                html.append(buildScenarioPanel(scenario as Map, view, index == 0))
+            }
+        }
+
+        html.append(buildChartsPanel(view))
+        html.append('  </main>\n')
+
+        html.append('</div>\n')
+        html.append(buildScripts())
+        html.append('</body>\n')
+        html.append('</html>\n')
+
+        return html.toString()
+    }
+
+    // =========================================================================
+    // NORMALIZATION
+    // =========================================================================
+
+    private Map normalizeModel(Map model) {
+        Map safeModel = model ?: [:]
+
+        String suiteName = pickFirst(
+            safeModel.suiteName,
+            safeModel.testSuiteName,
+            safeModel.suite,
+            safeModel.executionName,
+            safeModel.title,
+            'Execution'
+        )
+
+        List<Map> scenarios = []
+        asList(safeModel.scenarios).eachWithIndex { rawItem, index ->
+            Map item = rawItem instanceof Map ? (rawItem as Map) : [name: safeValue(rawItem)]
+
+            scenarios << [
+                id            : pickFirst(item.id, "scenario-${index + 1}"),
+                name          : pickFirst(item.name, item.scenarioName, item.title, "Scenario ${index + 1}"),
+                summary       : pickFirst(item.summary, item.visualError, item.errorSummary, ''),
+                status        : normalizeStatus(pickFirst(item.status, 'info')),
+                startShort    : pickFirst(item.startShort, ''),
+                endShort      : pickFirst(item.endShort, ''),
+                startLong     : pickFirst(item.startLong, ''),
+                endLong       : pickFirst(item.endLong, ''),
+                durationLabel : pickFirst(item.durationLabel, '00h 00m 00s'),
+                visualError   : pickFirst(item.visualError, item.summary, ''),
+                fullError     : pickFirst(item.fullError, ''),
+                steps         : normalizeSteps(item.steps),
+                evidence      : normalizeEvidence(item.evidence, safeModel)
+            ]
+        }
+
+        int passedCount = scenarios.count { Map it -> it.status == 'passed' }
+        int failedCount = scenarios.count { Map it -> it.status == 'failed' }
+        int skippedCount = scenarios.count { Map it -> it.status == 'skipped' }
+        int totalCount = scenarios.size()
+
+        return [
+            reportTitle   : REPORT_TITLE_PREFIX + suiteName,
+            suiteName     : suiteName,
+            generatedLabel: buildGeneratedLabel(safeModel),
+            reportFolder  : pickFirst(safeModel.reportFolder, safeModel.baseFolder, safeModel.executionFolder),
+            logoSrc       : pickFirst(safeModel.logoSrc, LOGO_SRC),
+            scenarios     : scenarios,
+            passedCount   : passedCount,
+            failedCount   : failedCount,
+            skippedCount  : skippedCount,
+            totalCount    : totalCount
+        ]
+    }
+
+    private List<Map> normalizeSteps(def rawSteps) {
+        List<Map> result = []
+
+        asList(rawSteps).each { raw ->
+            Map row = raw instanceof Map ? (raw as Map) : [detail: safeValue(raw)]
+
+            String detail = pickFirst(row.detail, row.message, row.text, row.title, row.name)
+            if (detail.isEmpty()) {
+                return
+            }
+
+            String status = normalizeStatus(pickFirst(row.status, row.result, row.outcome, 'info'))
+            String timestamp = pickFirst(row.timestamp, row.time, row.label, '')
+
+            result << [
+                status   : status,
+                timestamp: timestamp,
+                detail   : detail,
+                icon     : pickFirst(row.icon, resolveStepIcon(detail, status))
+            ]
+        }
+
+        return result
+    }
+
+    private List<Map> normalizeEvidence(def rawEvidence, Map model) {
+        List<Map> result = []
+
+        asList(rawEvidence).each { raw ->
+            if (raw instanceof Map) {
+                Map item = raw as Map
+                result << [
+                    name  : pickFirst(item.name, item.fileName, 'Evidence'),
+                    href  : pickFirst(item.href, item.url, item.path, ''),
+                    image : Boolean.valueOf(String.valueOf(item.image)),
+                    imgSrc: pickFirst(item.imgSrc, item.imageSrc, item.href, item.url, '')
+                ]
+            } else if (!safeValue(raw).isEmpty()) {
+                String href = safeValue(raw)
+                result << [
+                    name  : new File(href).name,
+                    href  : href,
+                    image : isImageFile(href),
+                    imgSrc: isImageFile(href) ? href : ''
+                ]
+            }
+        }
+
+        return result
+    }
+
+    // =========================================================================
+    // HTML BLOCKS
+    // =========================================================================
+
+    private String buildScenarioListItem(Map scenario, boolean selected) {
+        String borderClass = selected ? 'scenario-list-item selected' : 'scenario-list-item'
+        String shortName = shorten(scenario.name, 55)
+        String shortError = shorten(scenario.summary, 70)
+
+        StringBuilder sb = new StringBuilder()
+        sb.append('<button type="button" class="')
+        sb.append(borderClass)
+        sb.append('" data-sid="')
+        sb.append(htmlEscape(scenario.id))
+        sb.append('" onclick="showScenario(\'')
+        sb.append(jsEscape(scenario.id))
+        sb.append('\')">')
+
+        sb.append('<div class="scenario-list-main">')
+        sb.append('<div class="scenario-list-title">')
+        sb.append(htmlEscape(shortName))
+        sb.append('</div>')
+        sb.append('<div class="scenario-list-summary">')
+        sb.append(htmlEscape(shortError))
+        sb.append('</div>')
+        sb.append('<div class="scenario-list-meta">')
+        sb.append(htmlEscape(pickFirst(scenario.startShort, '')))
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('<div class="scenario-list-side">')
+        sb.append('<span class="status-pill ')
+        sb.append(htmlEscape(scenario.status))
+        sb.append('">')
+        sb.append(htmlEscape(statusLabel(scenario.status)))
+        sb.append('</span>')
+        sb.append('<div class="scenario-list-duration">')
+        sb.append(htmlEscape(pickFirst(scenario.durationLabel, '00h 00m 00s')))
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('</button>')
+        return sb.toString()
+    }
+
+    private String buildScenarioPanel(Map scenario, Map view, boolean selected) {
+        String panelClass = selected ? 'scenario-panel active' : 'scenario-panel'
+
+        String suiteLabel = safeValue(view.suiteName)
+        String scenarioName = safeValue(scenario.name)
+        String scenarioStatus = safeValue(scenario.status)
+
+        String visualError = pickFirst(
+            scenario.visualError,
+            scenario.summary,
+            ''
+        )
+
+        String fullError = pickFirst(
+            scenario.fullError,
+            visualError
+        )
+
+        String startLabel = pickFirst(
+            scenario.startLong,
+            scenario.startShort,
+            '--'
+        )
+
+        String endLabel = pickFirst(
+            scenario.endLong,
+            scenario.endShort,
+            '--'
+        )
+
+        String durationLabel = pickFirst(
+            scenario.durationLabel,
+            '00h 00m 00s'
+        )
+
+        List<Map> evidenceList = scenario.evidence instanceof List ? (scenario.evidence as List<Map>) : []
+        Map firstEvidence = evidenceList.isEmpty() ? null : evidenceList[0]
+
+        StringBuilder sb = new StringBuilder()
+
+        sb.append('<section class="')
+        sb.append(panelClass)
+        sb.append('" id="panel-')
+        sb.append(htmlEscape(safeValue(scenario.id)))
+        sb.append('">')
+
+        sb.append('<div class="scenario-header">')
+        sb.append('<div class="scenario-title">')
+        sb.append(htmlEscape(scenarioName))
+        sb.append('</div>')
+
+        sb.append('<div class="scenario-meta-row">')
+        sb.append(buildMetaChip('Suite', suiteLabel, 'plain'))
+        sb.append(buildMetaChip('Status', statusLabel(scenarioStatus), scenarioStatus))
+        sb.append(buildMetaChip('Start', startLabel, 'gradient'))
+        sb.append(buildMetaChip('End', endLabel, 'gradient'))
+        sb.append(buildMetaChip('Duration', durationLabel, 'gradient'))
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('<div class="section-title">Steps</div>')
+        sb.append('<div class="steps-table">')
+        sb.append('<div class="steps-head">')
+        sb.append('<div class="col-status">STATUS</div>')
+        sb.append('<div class="col-time">TIMESTAMP</div>')
+        sb.append('<div class="col-detail">DETAILS</div>')
+        sb.append('</div>')
+
+        List<Map> steps = scenario.steps instanceof List ? (scenario.steps as List<Map>) : []
+
+        if (steps.isEmpty()) {
+            sb.append('<div class="step-row empty">')
+            sb.append('<div class="col-status"></div>')
+            sb.append('<div class="col-time"></div>')
+            sb.append('<div class="col-detail">No step details available.</div>')
+            sb.append('</div>')
+        } else {
+            steps.each { Map step ->
+                sb.append(buildStepRow(step))
+            }
+        }
+
+        sb.append('</div>')
+
+        if ('failed'.equalsIgnoreCase(scenarioStatus) || !visualError.isEmpty()) {
+            sb.append('<div class="error-block">')
+            sb.append('<div class="error-title">Visual Error Log</div>')
+            sb.append('<div class="error-summary">')
+            sb.append(htmlEscape(visualError))
+            sb.append('</div>')
+
+            if (!safeValue(fullError).isEmpty()) {
+                sb.append('<details class="details-box">')
+                sb.append('<summary>🔎 View full error</summary>')
+                sb.append('<pre>')
+                sb.append(htmlEscape(fullError))
+                sb.append('</pre>')
+                sb.append('</details>')
+            }
+
+            sb.append('</div>')
+        }
+
+        sb.append('<div class="evidence-block">')
+        sb.append('<div class="evidence-title">Evidence</div>')
+
+        if (firstEvidence != null) {
+            sb.append('<details class="evidence-item" open>')
+            sb.append('<summary>🖼 ')
+            sb.append(htmlEscape(pickFirst(firstEvidence.name, 'Open evidence')))
+            sb.append('</summary>')
+
+            if (!pickFirst(firstEvidence.href, '').isEmpty()) {
+                sb.append('<div class="evidence-links">')
+                sb.append('<a href="')
+                sb.append(htmlEscape(firstEvidence.href))
+                sb.append('" target="_blank" rel="noopener noreferrer">🔎 Open evidence</a>')
+                sb.append('</div>')
+            }
+
+            if (Boolean.TRUE.equals(firstEvidence.image) && !pickFirst(firstEvidence.imgSrc, '').isEmpty()) {
+                sb.append('<img class="evidence-image" src="')
+                sb.append(htmlEscape(firstEvidence.imgSrc))
+                sb.append('" alt="Evidence">')
+            }
+
+            sb.append('</details>')
+        } else {
+            sb.append('<div class="evidence-empty">No evidence was found for this scenario.</div>')
+        }
+
+        sb.append('</div>')
+        sb.append('</section>')
+
+        return sb.toString()
+    }
+
+    private String buildStepRow(Map step) {
+        StringBuilder sb = new StringBuilder()
+
+        sb.append('<div class="step-row">')
+        sb.append('<div class="col-status">')
+        sb.append('<span class="status-pill ')
+        sb.append(htmlEscape(step.status))
+        sb.append('">')
+        sb.append(htmlEscape(statusLabel(step.status)))
+        sb.append('</span>')
+        sb.append('</div>')
+
+        sb.append('<div class="col-time">')
+        sb.append(htmlEscape(pickFirst(step.timestamp, '--')))
+        sb.append('</div>')
+
+        sb.append('<div class="col-detail">')
+        sb.append('<span class="step-icon">')
+        sb.append(htmlEscape(pickFirst(step.icon, 'ℹ️')))
+        sb.append('</span> ')
+        sb.append(htmlEscape(pickFirst(step.detail, '')))
+        sb.append('</div>')
+        sb.append('</div>')
+
+        return sb.toString()
+    }
+
+    private String buildMetaChip(String label, String value, String type) {
+        StringBuilder sb = new StringBuilder()
+        sb.append('<div class="meta-chip ')
+        sb.append(htmlEscape(type))
+        sb.append('">')
+        sb.append('<span class="meta-label">')
+        sb.append(htmlEscape(label))
+        sb.append(':</span> ')
+        sb.append('<span class="meta-value">')
+        sb.append(htmlEscape(value))
+        sb.append('</span>')
+        sb.append('</div>')
+        return sb.toString()
+    }
+
+    private String buildChartsSidebar(Map view) {
+        StringBuilder sb = new StringBuilder()
+        sb.append('<div class="chart-side-wrap">')
+        sb.append('<div class="chart-side-title">Execution Status</div>')
+        sb.append('<div class="legend-list">')
+        sb.append(buildLegendLine('Passed', STATUS_PASS, view.passedCount))
+        sb.append(buildLegendLine('Failed', STATUS_FAIL, view.failedCount))
+        sb.append(buildLegendLine('Skipped', STATUS_SKIP, view.skippedCount))
+        sb.append('</div>')
+        sb.append('</div>')
+        return sb.toString()
+    }
+
+    private String buildChartsPanel(Map view) {
+        double failPercent = percent(view.failedCount as int, view.totalCount as int)
+        double passPercent = percent(view.passedCount as int, view.totalCount as int)
+        double skipPercent = percent(view.skippedCount as int, view.totalCount as int)
+
+        String donutStyle = 'background: conic-gradient(' +
+            STATUS_FAIL + ' 0 ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '%,' +
+            STATUS_PASS + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent) + '% ' +
+            String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '%,' +
+            STATUS_SKIP + ' ' + String.format(Locale.ENGLISH, '%.2f', failPercent + passPercent) + '% 100%);'
+
+        StringBuilder sb = new StringBuilder()
+
+        sb.append('<section id="charts-panel" class="charts-panel hidden">')
+        sb.append('<div class="chart-main-title">Global Overview</div>')
+        sb.append('<div class="charts-layout">')
+
+        sb.append('<div>')
+        sb.append('<div class="donut-card">')
+        sb.append('<div class="donut" style="')
+        sb.append(donutStyle)
+        sb.append('">')
+        sb.append('<div class="donut-center">')
+        sb.append('<div class="donut-number">')
+        sb.append(String.valueOf(view.totalCount))
+        sb.append('</div>')
+        sb.append('<div class="donut-label">Tests</div>')
+        sb.append('</div>')
+        sb.append('</div>')
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('<div>')
+        sb.append('<div class="chart-bars">')
+        sb.append(buildBarRow('Passed', view.passedCount as int, view.totalCount as int, STATUS_PASS))
+        sb.append(buildBarRow('Failed', view.failedCount as int, view.totalCount as int, STATUS_FAIL))
+        sb.append(buildBarRow('Skipped', view.skippedCount as int, view.totalCount as int, STATUS_SKIP))
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('</div>')
+        sb.append('</section>')
+
+        return sb.toString()
+    }
+
+    private String buildLegendLine(String label, String color, int value) {
+        StringBuilder sb = new StringBuilder()
+        sb.append('<div class="legend-line">')
+        sb.append('<span class="legend-dot" style="background:')
+        sb.append(color)
+        sb.append('"></span>')
+        sb.append('<span class="legend-text">')
+        sb.append(htmlEscape(label))
+        sb.append('</span>')
+        sb.append('<span class="legend-value">')
+        sb.append(String.valueOf(value))
+        sb.append('</span>')
+        sb.append('</div>')
+        return sb.toString()
+    }
+
+    private String buildBarRow(String label, int value, int total, String color) {
+        double width = percent(value, total)
+
+        StringBuilder sb = new StringBuilder()
+        sb.append('<div class="bar-row">')
+        sb.append('<div class="bar-row-top">')
+        sb.append('<span class="bar-label">')
+        sb.append(htmlEscape(label))
+        sb.append('</span>')
+        sb.append('<span class="bar-value">')
+        sb.append(String.valueOf(value))
+        sb.append('</span>')
+        sb.append('</div>')
+        sb.append('<div class="bar-track">')
+        sb.append('<div class="bar-fill" style="width:')
+        sb.append(String.format(Locale.ENGLISH, '%.2f', width))
+        sb.append('%; background:')
+        sb.append(color)
+        sb.append('"></div>')
+        sb.append('</div>')
+        sb.append('<div class="bar-foot">')
+        sb.append(String.valueOf(total == 0 ? 0 : Math.round(width)))
+        sb.append('% of execution')
+        sb.append('</div>')
+        sb.append('</div>')
+        return sb.toString()
+    }
+
+    // =========================================================================
+    // HELPERS
+    // =========================================================================
+
+    private String buildGeneratedLabel(Map model) {
+        String raw = pickFirst(
+            model.generatedAt,
+            model.generatedLabel,
+            model.createdAt,
+            model.executionDate
+        )
+
+        if (!raw.isEmpty()) {
+            return 'Generated ' + raw
+        }
+
+        return 'Generated ' + new SimpleDateFormat('dd/MM/yyyy HH:mm:ss').format(new Date())
+    }
+
+    private String resolveStepIcon(String detail, String status) {
+        String lower = safeValue(detail).toLowerCase(Locale.ENGLISH)
+
+        if (status == 'failed') {
+            return '❌'
+        }
+        if (status == 'skipped') {
+            return '⏭️'
+        }
+        if (lower.contains('wait')) {
+            return '🔎'
+        }
+        if (lower.contains('click') || lower.contains('select') || lower.contains('fill') || lower.contains('import')) {
+            return '🖱️'
+        }
+        if (lower.contains('open') || lower.contains('navigate')) {
+            return '🌐'
+        }
+        return 'ℹ️'
+    }
+
+    private String normalizeStatus(String raw) {
+        String text = safeValue(raw).toLowerCase(Locale.ENGLISH)
+
+        switch (text) {
+            case 'pass':
+            case 'passed':
+            case 'success':
+                return 'passed'
+            case 'fail':
+            case 'failed':
+            case 'error':
+                return 'failed'
+            case 'skip':
+            case 'skipped':
+                return 'skipped'
+            default:
+                return 'info'
+        }
+    }
+
+    private String statusLabel(String status) {
+        switch (safeValue(status)) {
+            case 'passed':
+                return 'Passed'
+            case 'failed':
+                return 'Failed'
+            case 'skipped':
+                return 'Skipped'
+            default:
+                return 'Info'
+        }
+    }
+
+    private String resolveLogoHref(Map view) {
+        File logoFile = resolveFile(pickFirst(view.logoSrc, LOGO_SRC), pickFirst(view.reportFolder))
+        if (logoFile != null && logoFile.exists()) {
+            return logoFile.toURI().toString()
+        }
+        return pickFirst(view.logoSrc, LOGO_SRC)
+    }
+
+    private File resolveFile(String path, String baseFolder) {
+        String raw = safeValue(path)
+        if (raw.isEmpty()) {
+            return null
+        }
+
+        try {
+            if (raw.toLowerCase(Locale.ENGLISH).startsWith('file:/')) {
+                File uriFile = new File(new URI(raw))
+                if (uriFile.exists()) {
+                    return uriFile
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        File direct = new File(raw)
+        if (direct.exists()) {
+            return direct
+        }
+
+        if (!safeValue(baseFolder).isEmpty()) {
+            File byBase = new File(baseFolder, raw)
+            if (byBase.exists()) {
+                return byBase
+            }
+        }
+
+        return direct
+    }
+
+    private boolean isImageFile(String fileName) {
+        String lower = safeValue(fileName).toLowerCase(Locale.ENGLISH)
+        return lower.endsWith('.png') ||
+               lower.endsWith('.jpg') ||
+               lower.endsWith('.jpeg') ||
+               lower.endsWith('.gif') ||
+               lower.endsWith('.webp') ||
+               lower.endsWith('.bmp')
+    }
+
+    private List asList(def value) {
+        if (value == null) {
+            return []
+        }
+
+        if (value instanceof Collection) {
+            return new ArrayList(value as Collection)
+        }
+
+        if (value.getClass().isArray()) {
+            return (value as Object[]).toList()
+        }
+
+        return [value]
+    }
+
+    private double percent(int value, int total) {
+        if (total <= 0) {
+            return 0d
+        }
+        return ((double) value / (double) total) * 100d
+    }
+
+    private String shorten(String text, int max) {
+        String value = safeValue(text)
+        if (value.length() <= max) {
+            return value
+        }
+        return value.substring(0, Math.max(0, max - 3)) + '...'
+    }
+
+    private String safeValue(def value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+
+    private String pickFirst(Object... values) {
+        if (values == null) {
+            return ''
+        }
+
+        for (Object value : values) {
+            String text = safeValue(value)
+            if (!text.isEmpty()) {
+                return text
+            }
+        }
+
+        return ''
+    }
+
+    private String htmlEscape(def value) {
+        String text = safeValue(value)
+        return text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&#39;')
+    }
+
+    private String jsEscape(def value) {
+        String text = safeValue(value)
+        return text
+            .replace('\\', '\\\\')
+            .replace("'", "\\'")
+            .replace('\r', '')
+            .replace('\n', '\\n')
+    }
+
+    // =========================================================================
+    // CSS / JS
+    // =========================================================================
+
+    private String buildStyles() {
+        return '''
+<style>
+* {
+    box-sizing: border-box;
+}
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    color: #15212b;
+    background: #ffffff;
+}
+.top-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 10px 18px;
+    background: linear-gradient(90deg, #1a2cff 0%, #5b19ff 48%, #d125d4 100%);
+    color: #ffffff;
+}
+.top-banner-left {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+}
+.brand-logo {
+    width: 92px;
+    height: 92px;
+    object-fit: contain;
+    display: block;
+}
+.brand-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.banner-title {
+    font-size: 18px;
+    font-weight: 700;
+    line-height: 1.2;
+}
+.banner-subtitle {
+    font-size: 12px;
+    opacity: 0.92;
+}
+.top-banner-right {
+    font-size: 10px;
+    text-align: right;
+    opacity: 0.94;
+    line-height: 1.5;
+    color: #ffffff !important;
+}
+.page {
+    display: grid;
+    grid-template-columns: 520px 1fr;
+    min-height: calc(100vh - 114px);
+}
+.sidebar {
+    border-right: 1px solid #dfe6ef;
+    background: #ffffff;
+}
+.content {
+    padding: 32px 38px;
+}
+.sidebar-tabs {
+    display: flex;
+    border-bottom: 1px solid #e3e8ef;
+}
+.sidebar-tab {
+    flex: 1;
+    padding: 18px 16px;
+    background: #ffffff;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    font-size: 14px;
+    cursor: pointer;
+    color: #4f5d6d;
+}
+.sidebar-tab.active {
+    color: #5a00d6;
+    border-bottom-color: #7b1fff;
+    font-weight: 700;
+}
+.search-wrap {
+    padding: 18px 18px 12px 18px;
+}
+.search-input {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid #d3dce8;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+}
+.search-input:focus {
+    border-color: #7b1fff;
+    box-shadow: 0 0 0 2px rgba(123,31,255,0.14);
+}
+.scenario-list {
+    padding: 0 12px 18px 12px;
+}
+.scenario-list-item {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 92px;
+    gap: 6px;
+    padding: 14px 12px;
+    border: 0;
+    background: #ffffff;
+    text-align: left;
+    cursor: pointer;
+    position: relative;
+    appearance: none;
+    -webkit-appearance: none;
+    border-radius: 0;
+}
+.scenario-list-item::after {
+    content: "";
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 0;
+    height: 1px;
+    background: #dfe6ef;
+}
+.scenario-list-item:last-child::after {
+    display: none;
+}
+.scenario-list-item:hover {
+    background: #faf2ff;
+}
+.scenario-list-item.selected {
+    border-left: 4px solid #7b1fff;
+    padding-left: 10px;
+    background: #f7edff;
+}
+.scenario-list-main {
+    min-width: 0;
+}
+.scenario-list-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #15212b;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.scenario-list-summary {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #6a7786;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.scenario-list-meta {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #6f7d8d;
+}
+.scenario-list-side {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 4px;
+}
+.scenario-list-duration {
+    font-size: 12px;
+    color: #6f7d8d;
+}
+.status-pill {
+    min-width: 84px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 7px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #ffffff;
+}
+.status-pill.passed {
+    background: #68b84b;
+}
+.status-pill.failed {
+    background: #e05b4d;
+    color: #ffffff;
+}
+.status-pill.skipped {
+    background: #d7b436;
+    color: #ffffff;
+}
+.status-pill.info {
+    background: #8c35ff;
+}
+.scenario-panel {
+    display: none;
+}
+.scenario-panel.active {
+    display: block;
+}
+.scenario-header {
+    margin-bottom: 20px;
+}
+.scenario-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: #15212b;
+    line-height: 1.3;
+    margin-bottom: 16px;
+}
+.scenario-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+.meta-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 36px;
+    padding: 9px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+}
+.meta-chip.plain {
+    background: #eef3f8;
+    color: #1e2a35;
+}
+.meta-chip.gradient {
+    background: linear-gradient(90deg, rgba(61,28,255,0.92) 0%, rgba(209,37,212,0.92) 100%);
+    color: #ffffff;
+}
+.meta-chip.passed {
+    background: #68b84b;
+    color: #ffffff;
+}
+.meta-chip.failed {
+    background: #e05b4d;
+    color: #ffffff;
+}
+.meta-chip.skipped {
+    background: #d7b436;
+    color: #ffffff;
+}
+.meta-chip.info {
+    background: #8c35ff;
+    color: #ffffff;
+}
+.meta-label {
+    opacity: 0.92;
+}
+.section-title {
+    margin-top: 18px;
+    margin-bottom: 10px;
+    font-size: 15px;
+    font-weight: 700;
+    color: #15212b;
+}
+.steps-table {
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #ffffff;
+}
+.steps-head,
+.step-row {
+    display: grid;
+    grid-template-columns: 110px 110px 1fr;
+    gap: 12px;
+    align-items: start;
+    padding: 12px 16px;
+}
+.steps-head {
+    background: #f8fafc;
+    border-bottom: 1px solid #e5e7eb;
+    font-size: 12px;
+    font-weight: 700;
+    color: #5a6776;
+}
+.step-row {
+    position: relative;
+    font-size: 13px;
+    color: #15212b;
+}
+.step-row::after {
+    content: "";
+    position: absolute;
+    left: 16px;
+    right: 16px;
+    bottom: 0;
+    height: 1px;
+    background: #edf2f7;
+}
+.step-row:last-child::after {
+    display: none;
+}
+.step-row.empty {
+    color: #7b8896;
+}
+.col-status {
+    min-width: 0;
+}
+.col-time {
+    min-width: 0;
+    width: 110px;
+    color: #607080;
+    font-size: 12px;
+}
+.col-detail {
+    min-width: 0;
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.45;
+}
+.step-icon {
+    margin-right: 3px;
+}
+.error-block,
+.evidence-block {
+    margin-top: 20px;
+    padding: 14px 16px;
+    border-left: 3px solid #e05b4d;
+    background: #fff8f7;
+    border-radius: 10px;
+    max-width: 980px;
+}
+.evidence-empty,
+.empty-state {
+    padding: 12px 14px;
+    border: 1px dashed #d9e2ec;
+    border-radius: 10px;
+    background: #fafcff;
+    color: #6b7a89;
+    font-size: 13px;
+    margin: 12px;
+}
+.error-title,
+.evidence-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #7e2f29;
+    margin-bottom: 8px;
+}
+.error-summary {
+    font-size: 13px;
+    color: #253341;
+    margin-bottom: 8px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.details-box,
+.evidence-item {
+    margin-top: 10px;
+    border: 1px solid #e3e8ef;
+    border-radius: 10px;
+    overflow: hidden;
+    background: #ffffff;
+}
+.details-box summary,
+.evidence-item summary {
+    cursor: pointer;
+    padding: 12px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #7b1fff;
+    list-style: none;
+}
+.details-box summary::-webkit-details-marker,
+.evidence-item summary::-webkit-details-marker {
+    display: none;
+}
+.details-box pre {
+    margin: 0;
+    padding: 14px;
+    background: #0f1c2b;
+    color: #ffffff;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-x: auto;
+    max-height: 460px;
+}
+.evidence-links {
+    padding: 0 14px 12px 14px;
+    font-size: 13px;
+}
+.evidence-links a {
+    color: #7b1fff;
+    text-decoration: none;
+    font-weight: 700;
+}
+.evidence-image {
+    display: block;
+    width: auto;
+    max-width: calc(100% - 28px);
+    max-height: 520px;
+    margin: 0 14px 14px 14px;
+    border-radius: 10px;
+    border: 1px solid #dde5ef;
+    object-fit: contain;
+    background: #ffffff;
+}
+.chart-side-wrap {
+    padding: 18px;
+}
+.chart-side-title {
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 12px;
+    color: #15212b;
+}
+.donut-card {
+    display: flex;
+    justify-content: center;
+    padding: 12px 0 18px 0;
+}
+.donut {
+    width: 340px;
+    height: 340px;
+    border-radius: 50%;
+    position: relative;
+}
+.donut-center {
+    position: absolute;
+    inset: 34px;
+    border-radius: 50%;
+    background: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+}
+.donut-number {
+    font-size: 42px;
+    font-weight: 700;
+    color: #15212b;
+}
+.donut-label {
+    font-size: 14px;
+    color: #708091;
+}
+.legend-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.legend-line {
+    display: grid;
+    grid-template-columns: 12px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    font-size: 13px;
+    color: #1f2b37;
+}
+.legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+}
+.legend-value {
+    color: #607080;
+}
+.charts-panel {
+    display: block;
+}
+.chart-main-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 18px;
+    color: #15212b;
+}
+.charts-layout {
+    display: grid;
+    grid-template-columns: 420px 1fr;
+    gap: 40px;
+    align-items: start;
+    max-width: 1280px;
+}
+.chart-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    max-width: 760px;
+}
+.bar-row {
+    padding: 16px 18px;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    background: #ffffff;
+}
+.bar-row-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+.bar-label {
+    font-size: 14px;
+    font-weight: 700;
+    color: #15212b;
+}
+.bar-value {
+    font-size: 24px;
+    font-weight: 700;
+    color: #15212b;
+}
+.bar-track {
+    width: 100%;
+    height: 8px;
+    border-radius: 999px;
+    background: #edf2f7;
+    overflow: hidden;
+}
+.bar-fill {
+    height: 100%;
+    border-radius: 999px;
+}
+.bar-foot {
+    margin-top: 8px;
+    font-size: 12px;
+    color: #738394;
+}
+.hidden {
+    display: none !important;
+}
+@media (max-width: 1200px) {
+    .page {
+        grid-template-columns: 1fr;
+    }
+    .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid #dfe6ef;
+    }
+    .content {
+        padding: 20px;
+    }
+    .charts-layout {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+'''
+    }
+
+    private String buildScripts() {
+        return '''
+<script>
+function showTab(tabName) {
+    var tabTests = document.getElementById('tab-tests');
+    var tabCharts = document.getElementById('tab-charts');
+    var testsSidebar = document.getElementById('tests-sidebar-block');
+    var chartsSidebar = document.getElementById('charts-sidebar-block');
+    var chartsPanel = document.getElementById('charts-panel');
+    var scenarioPanels = document.querySelectorAll('.scenario-panel');
+
+    if (tabName === 'charts') {
+        tabTests.classList.remove('active');
+        tabCharts.classList.add('active');
+        testsSidebar.classList.add('hidden');
+        chartsSidebar.classList.remove('hidden');
+        chartsPanel.classList.remove('hidden');
+        scenarioPanels.forEach(function(panel) {
+            panel.classList.add('hidden');
+        });
+    } else {
+        tabCharts.classList.remove('active');
+        tabTests.classList.add('active');
+        chartsSidebar.classList.add('hidden');
+        testsSidebar.classList.remove('hidden');
+        chartsPanel.classList.add('hidden');
+        scenarioPanels.forEach(function(panel) {
+            panel.classList.remove('hidden');
+        });
+    }
+}
+
+function showScenario(id) {
+    var buttons = document.querySelectorAll('.scenario-list-item');
+    var panels = document.querySelectorAll('.scenario-panel');
+
+    buttons.forEach(function(btn) {
+        if (btn.getAttribute('data-sid') === id) {
+            btn.classList.add('selected');
+        } else {
+            btn.classList.remove('selected');
+        }
+    });
+
+    panels.forEach(function(panel) {
+        if (panel.id === 'panel-' + id) {
+            panel.classList.add('active');
+        } else {
+            panel.classList.remove('active');
+        }
+    });
+
+    showTab('tests');
+}
+
+function filterScenarios() {
+    var input = document.getElementById('scenarioSearch');
+    var filter = input.value.toLowerCase();
+    var items = document.querySelectorAll('.scenario-list-item');
+
+    items.forEach(function(item) {
+        var text = item.textContent.toLowerCase();
+        if (text.indexOf(filter) > -1) {
+            item.style.display = '';
+        } else {
+            item.style.display = 'none';
+        }
+    });
+}
+</script>
+'''
+    }
 }
