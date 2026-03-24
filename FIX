@@ -1,280 +1,323 @@
-package jiraIntegration
-
-import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.annotation.*
+import com.kms.katalon.core.context.*
 import com.kms.katalon.core.configuration.RunConfiguration
-import com.kms.katalon.core.context.TestCaseContext
-import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+import org.openqa.selenium.OutputType
 
 import javax.imageio.ImageIO
-import java.awt.GraphicsEnvironment
-import java.awt.Rectangle
+import javax.imageio.ImageWriter
+import javax.imageio.plugins.jpeg.JPEGImageWriteParam
+import javax.imageio.stream.MemoryCacheImageOutputStream
 import java.awt.Robot
+import java.awt.Rectangle
 import java.awt.Toolkit
 import java.awt.image.BufferedImage
-import java.text.SimpleDateFormat
-import java.util.Locale
+import java.util.Base64
 
-class ImagesEvidence {
+class WindowsFailureReportListener {
 
-    private static final SimpleDateFormat FILE_STAMP =
-        new SimpleDateFormat('yyyyMMdd_HHmmss_SSS', Locale.ENGLISH)
+	static List<Map> results = []
+	static Map<String, List<String>> stepsPerTest = [:]
 
-    private static final SimpleDateFormat LOG_STAMP =
-        new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS', Locale.ENGLISH)
+	// === minimal additions for durations ===
+	static Map<String, Long> _caseStartTimes = [:]
+	static long _suiteStartMs = 0L
+	static long _suiteEndMs   = 0L
 
-    private static final ThreadLocal<File> CURRENT_CASE_FOLDER = new ThreadLocal<File>()
-    private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
+	@BeforeTestSuite
+	def beforeSuite(TestSuiteContext suiteCtx) {
+		results.clear()
+		stepsPerTest.clear()
+		_caseStartTimes.clear()
+		_suiteStartMs = System.currentTimeMillis() // added
+	}
 
-    /*
-     * Manual note that will be saved in the evidence log.
-     * Use this when you want the report to show only controlled steps.
-     */
-    @Keyword
-    def note(String message) {
-        appendNoteLine('NOTE', message)
-    }
+	// added: capture per-test start time
+	@BeforeTestCase
+	def beforeCase(TestCaseContext testCaseCtx) {
+		_caseStartTimes[testCaseCtx.getTestCaseId()] = System.currentTimeMillis()
+	}
 
-    /*
-     * Manual controlled checkpoint.
-     * This is useful for validations you want to expose in the custom report.
-     */
-    @Keyword
-    def checkpoint(String message) {
-        appendNoteLine('CHECKPOINT', message)
-    }
+	@AfterTestCase
+	def afterCase(TestCaseContext testCaseCtx) {
 
-    /*
-     * Manual screenshot when you explicitly want one.
-     */
-    @Keyword
-    File captureNow(String label = 'manual') {
-        return captureScreenshot(label)
-    }
+		String name   = testCaseCtx.getTestCaseId()
+		String status = testCaseCtx.getTestCaseStatus()
 
-    /*
-     * Manual note plus screenshot in one command.
-     */
-    @Keyword
-    File noteAndCapture(String message, String label = 'manual') {
-        appendNoteLine('NOTE', message)
-        return captureScreenshot(label)
-    }
+		if (!stepsPerTest.containsKey(name)) stepsPerTest[name] = []
 
-    /*
-     * Global start hook.
-     * This is called automatically from the listener.
-     */
-    static void startCase(TestCaseContext context) {
-        File caseFolder = resolveCaseFolder(context)
-        CURRENT_CASE_FOLDER.set(caseFolder)
-        CURRENT_CASE_ID.set(safe(context?.getTestCaseId()))
-        appendLine(caseFolder, buildLogLine('CASE_START', safe(context?.getTestCaseId())))
-    }
+		String raw = testCaseCtx.getMessage() ?: ""
+		String summary = formatFailureMessage(raw, status)
+		if (!summary?.trim()) summary = "❗ Mandatory failure\n➡️ Unknown error"
 
-    /*
-     * Global end hook.
-     * If the test failed or errored, it captures a screenshot automatically.
-     */
-    static void finishCase(TestCaseContext context) {
-        try {
-            File caseFolder = resolveActiveCaseFolder(context)
-            String status = normalizeStatus(context?.getTestCaseStatus())
+		// --- Extract file + line ---
+		String stack = raw ?: ""
+		String location = extractLocation(stack)
 
-            appendLine(caseFolder, buildLogLine('CASE_END', status))
+		String fullLog = raw.trim()
 
-            if (status == 'FAILED' || status == 'ERROR') {
-                captureScreenshot('auto-failure')
-            }
-        } finally {
-            CURRENT_CASE_FOLDER.remove()
-            CURRENT_CASE_ID.remove()
-        }
-    }
+		// ---------- SCREENSHOT (Desktop-first, then try driver) ----------
+		String screenshotBase64 = null
+		if (status in ["FAILED", "ERROR"]) {
+			screenshotBase64 = captureDesktopScreenshot()   // always works
+			screenshotBase64 = tryDriverScreenshot(screenshotBase64) // override if driver is valid
+		}
 
-    /*
-     * Captures the current desktop screen and stores it in the current test evidence folder.
-     */
-    private static File captureScreenshot(String label) {
-        File caseFolder = resolveActiveCaseFolder(null)
-        String safeLabel = sanitizeFileName(label)
+		// added: per-test duration
+		long started  = _caseStartTimes[name] ?: System.currentTimeMillis()
+		long ended    = System.currentTimeMillis()
+		long duration = Math.max(0L, ended - started)
 
-        if (safeLabel.isEmpty()) {
-            safeLabel = 'manual'
-        }
+		results.add([
+			name            : name,
+			status          : status,
+			summaryMessage  : summary + "\n📍 <b>${location}</b>",
+			fullLog         : fullLog,
+			screenshotBase64: screenshotBase64,
+			durationMs      : duration // added
+		])
+	}
 
-        File target = new File(caseFolder, FILE_STAMP.format(new Date()) + '_' + safeLabel + '.png')
+	@AfterTestSuite
+	def afterSuite(TestSuiteContext suiteCtx) {
 
-        try {
-            if (GraphicsEnvironment.isHeadless()) {
-                appendLine(caseFolder, buildLogLine('SCREENSHOT_ERROR', 'Headless environment. Screenshot was not captured.'))
-                KeywordUtil.logInfo('Evidence screenshot was not captured because the environment is headless.')
-                return null
-            }
+		_suiteEndMs = System.currentTimeMillis() // added
+		long suiteDurationMs = Math.max(0L, _suiteEndMs - _suiteStartMs)
 
-            BufferedImage image = new Robot().createScreenCapture(
-                new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
-            )
+		String reportFolder = RunConfiguration.getReportFolder()
+		File logFile = new File(reportFolder, "execution.log")
+		if (logFile.exists()) parseExecutionLog(logFile)
 
-            ImageIO.write(image, 'png', target)
+		String reportPath = reportFolder + "/eMatchReport.html"
+		File report = new File(reportPath)
 
-            appendLine(caseFolder, buildLogLine('SCREENSHOT', target.absolutePath))
-            KeywordUtil.logInfo('Evidence screenshot saved: ' + target.absolutePath)
+		def failed  = results.findAll { it.status in ["FAILED","ERROR"] }
+		def passed  = results.findAll { it.status == "PASSED" }
+		def skipped = results.findAll { !(it.status in ["PASSED","FAILED","ERROR"]) }
 
-            return target
-        } catch (Throwable t) {
-            appendLine(caseFolder, buildLogLine('SCREENSHOT_ERROR', safe(t?.getMessage())))
-            KeywordUtil.logInfo('Evidence screenshot could not be captured: ' + safe(t?.getMessage()))
-            return null
-        }
-    }
+		// added: totals and average
+		int executed = results.size()
+		long avgMs = executed ? (results.collect { (it.durationMs ?: 0L) }.sum() / executed) : 0L
 
-    /*
-     * Saves controlled notes in a simple log file.
-     * The report builder can later read only this file and ignore noisy execution logs.
-     */
-    private static void appendNoteLine(String type, String message) {
-        File caseFolder = resolveActiveCaseFolder(null)
-        appendLine(caseFolder, buildLogLine(type, message))
-    }
+		report.text = """
+		<html>
+		<head>
+		<title>Windows Test Execution Report — eMatch</title>
+		<meta charset="utf-8"/>
+		<style>
+		body { font-family: Segoe UI, Arial, sans-serif; padding:20px; }
+		.group { margin-top:30px; }
+		.test { margin-bottom:20px; padding:12px; background:#fafafa; border-radius:6px; white-space:pre-line; }
+		.pass  { border-left:5px solid #5cb85c; }
+		.fail  { border-left:5px solid #d9534f; background:#fff3f3; }
+		.skip  { border-left:5px solid #ffcc00; background:#fffaf0; }
+		img.thumb { max-width:350px; border:1px solid #333; cursor:zoom-in; margin-top:6px; border-radius:4px; }
+		#zoomModal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); justify-content:center; align-items:center; z-index:9999; }
+		#zoomModal img { max-width:90%; max-height:90%; border-radius:8px; }
+		details summary { cursor:pointer; font-weight:bold; }
 
-    /*
-     * Returns the active case folder if it already exists in the thread.
-     * Otherwise it resolves it again safely.
-     */
-    private static File resolveActiveCaseFolder(TestCaseContext context) {
-        File active = CURRENT_CASE_FOLDER.get()
+		/* added: compact summary strip */
+		.summary { background:#f6fbff; padding:12px; border-radius:6px; margin-bottom:18px; border-left:5px solid #3388ff; }
+		.kv { display:inline-block; margin-right:18px; margin-bottom:6px; }
+		.kv b { display:block; }
+		</style>
+		</head>
+		<body>
+		
+		<div id="zoomModal" onclick="this.style.display='none'">
+		  <img id="zoomImg">
+		</div>
+		
+		<h2>Windows Test Execution Report — eMatch</h2>
 
-        if (active != null && active.exists()) {
-            return active
-        }
+		<!-- added: summary section with counts and durations -->
+		<div class="summary">
+		  <span class="kv"><b>Suite</b> ${suiteCtx?.getTestSuiteId() ?: "Unknown"}</span>
+		  <span class="kv"><b>Start</b> ${new Date(_suiteStartMs)}</span>
+		  <span class="kv"><b>End</b> ${new Date(_suiteEndMs)}</span>
+		  <span class="kv"><b>Suite Duration</b> ${_fmtMs(suiteDurationMs)}</span>
+		  <span class="kv"><b>Executed</b> ${executed}</span>
+		  <span class="kv"><b>Passed</b> ${passed.size()}</span>
+		  <span class="kv"><b>Failed</b> ${failed.size()}</span>
+		  <span class="kv"><b>Skipped</b> ${skipped.size()}</span>
+		  <span class="kv"><b>Avg/Test</b> ${_fmtMs(avgMs)}</span>
+		</div>
+		"""
 
-        File caseFolder = resolveCaseFolder(context)
-        CURRENT_CASE_FOLDER.set(caseFolder)
+		// FAILED
+		report << "<div class='group'><h3>❌ Failed (${failed.size()})</h3>"
+		failed.each { r ->
+			report << "<div class='test fail'>"
+			report << "<b>${r.name}</b><br>${r.summaryMessage}"
+			// added: per-test duration line
+			report << "<br>⏱ Duration: ${_fmtMs(r.durationMs ?: 0L)}"
+			appendSteps(report, r.name)
 
-        return caseFolder
-    }
+			// ✅ Only ONE collapsed log block
+			if (r.fullLog?.trim()) {
+				report << """
+				<br><details><summary>🔍 See full error log</summary>
+				<pre style="white-space:pre-wrap; font-size:12px;">${escapeHtml(r.fullLog)}</pre>
+				</details>
+				"""
+			}
 
-    /*
-     * Builds a stable folder inside the current Katalon report folder.
-     * Structure:
-     * <current report folder>/Evidences/<sanitized test case id>/
-     */
-    private static File resolveCaseFolder(TestCaseContext context) {
-        String reportFolderPath = ''
+			if (r.screenshotBase64) {
+				report << "<br><img src='data:image/jpeg;base64,${r.screenshotBase64}' class='thumb' " +
+						 "onclick=\"document.getElementById('zoomImg').src=this.src;" +
+						 "document.getElementById('zoomModal').style.display='flex';\">"
+			}
+			report << "</div>"
+		}
+		report << "</div>"
 
-        try {
-            reportFolderPath = safe(RunConfiguration.getReportFolder())
-        } catch (Throwable ignored) {
-        }
+		// PASSED
+		report << "<div class='group'><details><summary>✅ Passed (${passed.size()})</summary>"
+		passed.each { r ->
+			report << "<div class='test pass'><b>${r.name}</b><br>✔ Test Passed"
+			// added: per-test duration line
+			report << "<br>⏱ Duration: ${_fmtMs(r.durationMs ?: 0L)}"
+			appendSteps(report, r.name)
+			report << "</div>"
+		}
+		report << "</details></div>"
 
-        File reportFolder
-        if (!reportFolderPath.isEmpty()) {
-            reportFolder = new File(reportFolderPath)
-        } else {
-            reportFolder = new File(new File(RunConfiguration.getProjectDir(), 'Reports'), '_genericEvidence')
-        }
+		// SKIPPED
+		if (!skipped.isEmpty()) {
+			report << "<div class='group'><h3>⏭ Skipped (${skipped.size()})</h3>"
+			skipped.each { r ->
+				report << "<div class='test skip'><b>${r.name}</b><br>⏭ Test Skipped</div>"
+			}
+			report << "</div>"
+		}
 
-        File evidencesRoot = new File(reportFolder, 'Evidences')
-        if (!evidencesRoot.exists()) {
-            evidencesRoot.mkdirs()
-        }
+		report << "</body></html>"
+		println "✅ eMatch HTML report generated at: ${reportPath}"
+	}
 
-        String caseId = safe(context?.getTestCaseId())
-        if (caseId.isEmpty()) {
-            caseId = safe(CURRENT_CASE_ID.get())
-        }
-        if (caseId.isEmpty()) {
-            caseId = 'general'
-        }
+	// ================== SCREENSHOT HELPERS ==================
 
-        File caseFolder = new File(evidencesRoot, sanitizeFileName(caseId))
-        if (!caseFolder.exists()) {
-            caseFolder.mkdirs()
-        }
+	private static String captureDesktopScreenshot() {
+		try {
+			Robot robot = new Robot()
+			Rectangle rect = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
+			BufferedImage img = robot.createScreenCapture(rect)
 
-        return caseFolder
-    }
+			int maxW = 1600
+			if (img.width > maxW) {
+				float scale = maxW / (float) img.width
+				int newW = (int)(img.width * scale)
+				int newH = (int)(img.height * scale)
+				BufferedImage resized = new BufferedImage(newW, newH, BufferedImage.TYPE_INT_RGB)
+				resized.graphics.drawImage(img, 0, 0, newW, newH, null)
+				img = resized
+			}
 
-    /*
-     * Appends one line into evidence-notes.log.
-     */
-    private static void appendLine(File caseFolder, String line) {
-        if (caseFolder == null) {
-            return
-        }
+			ByteArrayOutputStream baos = new ByteArrayOutputStream()
+			ImageWriter writer = ImageIO.getImageWritersByFormatName("jpeg").next()
+			JPEGImageWriteParam jpegParams = new JPEGImageWriteParam(null)
+			jpegParams.setCompressionMode(JPEGImageWriteParam.MODE_EXPLICIT)
+			jpegParams.setCompressionQuality(0.80f)
+			writer.setOutput(new MemoryCacheImageOutputStream(baos))
+			writer.write(null, new javax.imageio.IIOImage(img, null, null), jpegParams)
+			writer.dispose()
 
-        if (!caseFolder.exists()) {
-            caseFolder.mkdirs()
-        }
+			return Base64.encoder.encodeToString(baos.toByteArray())
+		} catch (Exception e) {
+			println("⚠ Desktop screenshot failed: ${e.message}")
+			return null
+		}
+	}
 
-        File logFile = new File(caseFolder, 'evidence-notes.log')
-        logFile << line + System.lineSeparator()
-    }
+	private static String tryDriverScreenshot(String current) {
+		try {
+			def driver = Windows.getDriver()
+			if (driver != null) {
+				byte[] rawBytes = driver.getScreenshotAs(OutputType.BYTES)
+				if (rawBytes?.length > 0) {
+					return Base64.encoder.encodeToString(rawBytes)
+				}
+			}
+		} catch (ignored) {}
+		return current
+	}
 
-    /*
-     * Standard evidence log format:
-     * 2026-03-24 14:10:52.221|NOTE|Opened menu
-     */
-    private static String buildLogLine(String type, String value) {
-        return LOG_STAMP.format(new Date()) + '|' + safe(type) + '|' + safe(value)
-    }
+	// ================== LOG + STEPS ==================
+	private static void parseExecutionLog(File f) {
+		String current = null
+		
+		f.eachLine { line ->
+			if (line.contains("Start Test Case")) {
+				current = line.replaceAll(/.*Start Test Case\s*:\s*/, "").trim()
+				stepsPerTest[current] = []
+				return
+			}
+			if (line.contains("End Test Case")) { current = null; return }
+			if (!current) return
+			
+			// --- 1) Capture timestamp-formatted user-level steps (original behavior) ---
+	        if (line ==~ /\[\d{2}:\d{2}:\d{2}\].*/) {
+	            String clean = line.replaceFirst(/\[.*?\]\s*/, "").trim()
+	            if (!clean) return
+	            if (clean.startsWith("FAILED") || clean.startsWith("ERROR") || clean.contains("Exception")) return
+	            if (clean ==~ /(Start|End) Test (Suite|Case).*/) return
+	            stepsPerTest[current] << clean
+	            return
+	        }
+	
+	        // --- 2) Capture your test's logInfo / markWarning messages ---
+	        if (line.contains("INFO") || line.contains("WARN")) {
+	            String clean = line.replaceFirst(/^\[.*?\]\s*/, "").trim()
+	
+	            // Exclude engine noise (WinAppDriver + Selenium + Java stack)
+	            if (clean.contains("Exception") || clean.contains("Caused by") || clean.matches(/at .+:\d+/)) return
+	            if (clean.contains("org.openqa") || clean.contains("io.appium") || clean.contains("sun.reflect")) return
+	
+	            stepsPerTest[current] << clean
+	        }
+		}
+	}
 
-    private static String normalizeStatus(String status) {
-        return safe(status).toUpperCase(Locale.ENGLISH)
-    }
+	private static void appendSteps(File report, String testName) {
+		def steps = stepsPerTest[testName]
+		if (steps?.size() > 0) {
+			report << "<br><details><summary>▶ Steps Executed</summary><div style='margin-top:6px;'>"
+			steps.eachWithIndex { s, i -> report << "${i+1}. ${s}<br>" }
+			report << "</div></details>"
+		}
+	}
 
-    private static String sanitizeFileName(String value) {
-        return safe(value)
-            .replace('\\', '_')
-            .replace('/', '_')
-            .replace(':', '_')
-            .replace('*', '_')
-            .replace('?', '_')
-            .replace('"', '_')
-            .replace('<', '_')
-            .replace('>', '_')
-            .replace('|', '_')
-            .replaceAll(/\s+/, '_')
-    }
+	// ================== MESSAGE + LOCATION ==================
+	private static String extractLocation(String stack) {
+		def tc = stack =~ /at\s+(.+?)\.run\((.+?):(\d+)\)/
+		if (tc.find()) return "${tc.group(2).replaceAll(/^.*[\\\/]/, '')} : line ${tc.group(3)}"
+		def pg = stack =~ /(.*\.groovy):(\d+)/
+		if (pg.find()) return pg.group(1).replaceAll(/^.*[\\\/]/, "") + " : line " + pg.group(2)
+		return "Line unavailable"
+	}
 
-    private static String safe(Object value) {
-        return value == null ? '' : String.valueOf(value).trim()
-    }
+	private static String formatFailureMessage(String raw, String status) {
+		if (!(status in ["FAILED","ERROR"])) return "✔ Test Passed"
+		String cleaned = raw ?: ""
+		def m = cleaned =~ /Reason:\s*(?:\r?\n)?([^\r\n]+)/
+		if (m.find()) return "❗ Mandatory failure\n➡️ ${m.group(1).trim()}"
+		return "❗ Mandatory failure\n➡️ Unknown error"
+	}
+
+	private static String escapeHtml(String s) {
+		s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+	}
+
+	private String _fmtMs(Object ms) {
+	    if (ms == null) return "0ms"
+	
+	    // Convert to double for mod and division operations
+	    double totalMs = ((Number) ms).doubleValue()
+	
+	    long minutes = (long) (totalMs / 60000)
+	    long seconds = (long) ((totalMs % 60000) / 1000)
+	    long millis = (long) (totalMs % 1000)
+	
+	    return String.format("%dm %02ds %03dms", minutes, seconds, millis)
+	}
 }
-
-
-
-
-
-
-
-
-import com.kms.katalon.core.annotation.AfterTestCase
-import com.kms.katalon.core.annotation.BeforeTestCase
-import com.kms.katalon.core.context.TestCaseContext
-
-import jiraIntegration.ImagesEvidence
-
-class GlobalEvidenceListener {
-
-    @BeforeTestCase
-    def beforeTestCase(TestCaseContext testCaseContext) {
-        ImagesEvidence.startCase(testCaseContext)
-    }
-
-    @AfterTestCase
-    def afterTestCase(TestCaseContext testCaseContext) {
-        ImagesEvidence.finishCase(testCaseContext)
-    }
-}
-
-
-
-
-
-
-
-CustomKeywords.'jiraIntegration.ImagesEvidence.note'('Opened login page')
-CustomKeywords.'jiraIntegration.ImagesEvidence.checkpoint'('Validated current date')
-CustomKeywords.'jiraIntegration.ImagesEvidence.captureNow'('before-save')
-CustomKeywords.'jiraIntegration.ImagesEvidence.noteAndCapture'('Before clicking Save', 'before-save')
