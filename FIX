@@ -1,1 +1,1951 @@
+package jiraIntegration
 
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import org.openqa.selenium.OutputType
+
+import javax.imageio.ImageIO
+
+import java.awt.GraphicsEnvironment
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.image.BufferedImage
+import java.text.SimpleDateFormat
+import java.util.Locale
+
+class JiraImagesEvidence {
+
+    private static final SimpleDateFormat TRACE_STAMP =
+        new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS', Locale.ENGLISH)
+
+    private static final SimpleDateFormat FILE_STAMP =
+        new SimpleDateFormat('yyyyMMdd_HHmmss_SSS', Locale.ENGLISH)
+
+    private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
+    private static final ThreadLocal<File> CURRENT_CASE_FOLDER = new ThreadLocal<File>()
+
+    @Keyword
+    def startCase(String caseId) {
+        String resolvedCaseId = safe(caseId)
+        if (resolvedCaseId.isEmpty()) {
+            return
+        }
+
+        File caseFolder = ensureCaseFolder(resolvedCaseId)
+
+        CURRENT_CASE_ID.set(resolvedCaseId)
+        CURRENT_CASE_FOLDER.set(caseFolder)
+
+        writeTrace(caseFolder, 'CASE_START', nowStamp(), resolvedCaseId)
+    }
+
+    @Keyword
+    def finishCase(String status = '', String rawFailureMessage = '') {
+        String caseId = safe(CURRENT_CASE_ID.get())
+        File caseFolder = resolveCurrentCaseFolder()
+
+        if (caseFolder == null) {
+            return
+        }
+
+        String normalizedStatus = normalizeStatus(status)
+
+        if (!normalizedStatus.isEmpty()) {
+            writeTrace(caseFolder, 'STATUS', nowStamp(), normalizedStatus)
+        }
+
+        String failureText = safe(rawFailureMessage)
+        if (!failureText.isEmpty()) {
+            File failureFile = new File(caseFolder, 'failure.txt')
+            failureFile.write(failureText, 'UTF-8')
+            writeTrace(caseFolder, 'FAILURE_FILE', nowStamp(), failureFile.absolutePath)
+        }
+
+        writeTrace(caseFolder, 'CASE_END', nowStamp(), caseId)
+
+        CURRENT_CASE_ID.remove()
+        CURRENT_CASE_FOLDER.remove()
+    }
+
+    @Keyword
+    def note(String message) {
+        writeStep(message)
+    }
+
+    @Keyword
+    def checkpoint(String message) {
+        writeStep(message)
+    }
+
+    @Keyword
+    String captureNow(String label = 'manual') {
+        File file = captureEvidence(firstNonBlank(label, 'manual'))
+        return file != null ? file.absolutePath : ''
+    }
+
+    @Keyword
+    def noteAndCapture(String message, String label = 'manual') {
+        writeStep(message)
+        captureNow(label)
+    }
+
+    @Keyword
+    String autoFailure(String caseId = '') {
+        if (resolveCurrentCaseFolder() == null && !safe(caseId).isEmpty()) {
+            startCase(caseId)
+        }
+
+        File file = captureEvidence('auto-failure')
+        return file != null ? file.absolutePath : ''
+    }
+
+    private void writeStep(String message) {
+        File caseFolder = resolveCurrentCaseFolder()
+        if (caseFolder == null) {
+            return
+        }
+
+        String detail = safe(message)
+        if (detail.isEmpty()) {
+            return
+        }
+
+        writeTrace(caseFolder, 'STEP', nowStamp(), detail)
+    }
+
+    private File captureEvidence(String label) {
+        File caseFolder = resolveCurrentCaseFolder()
+        if (caseFolder == null) {
+            return null
+        }
+
+        String fileName = FILE_STAMP.format(new Date()) + '_' + sanitizeFragment(label) + '.png'
+        File output = new File(caseFolder, fileName)
+
+        boolean saved = tryDriverScreenshot(output)
+        if (!saved) {
+            saved = captureDesktopScreenshot(output)
+        }
+
+        if (!saved || !output.exists()) {
+            return null
+        }
+
+        writeTrace(caseFolder, 'SCREENSHOT', nowStamp(), output.absolutePath)
+        KeywordUtil.logInfo('Evidence screenshot saved: ' + output.absolutePath)
+
+        return output
+    }
+
+    private boolean tryDriverScreenshot(File output) {
+        try {
+            def driver = Windows.getDriver()
+            if (driver == null) {
+                return false
+            }
+
+            byte[] bytes = driver.getScreenshotAs(OutputType.BYTES)
+            if (bytes == null || bytes.length == 0) {
+                return false
+            }
+
+            output.bytes = bytes
+            return true
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private boolean captureDesktopScreenshot(File output) {
+        try {
+            if (GraphicsEnvironment.isHeadless()) {
+                return false
+            }
+
+            Rectangle screenRect = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
+            BufferedImage image = new Robot().createScreenCapture(screenRect)
+            ImageIO.write(image, 'png', output)
+
+            return output.exists()
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private File resolveCurrentCaseFolder() {
+        File existing = CURRENT_CASE_FOLDER.get()
+        if (existing != null) {
+            return existing
+        }
+
+        String caseId = safe(CURRENT_CASE_ID.get())
+        if (caseId.isEmpty()) {
+            return null
+        }
+
+        File folder = ensureCaseFolder(caseId)
+        CURRENT_CASE_FOLDER.set(folder)
+        return folder
+    }
+
+    private File ensureCaseFolder(String caseId) {
+        File reportFolder = new File(RunConfiguration.getReportFolder())
+        File evidencesRoot = new File(reportFolder, 'Evidences')
+
+        if (!evidencesRoot.exists()) {
+            evidencesRoot.mkdirs()
+        }
+
+        File caseFolder = new File(evidencesRoot, sanitizeCaseId(caseId))
+        if (!caseFolder.exists()) {
+            caseFolder.mkdirs()
+        }
+
+        return caseFolder
+    }
+
+    private void writeTrace(File caseFolder, String type, String timestamp, String payload) {
+        File traceFile = new File(caseFolder, 'trace.log')
+        String cleanPayload = safe(payload)
+            .replace('\r', ' ')
+            .replace('\n', ' ')
+            .trim()
+
+        traceFile << safe(type) + '|' + safe(timestamp) + '|' + cleanPayload + System.lineSeparator()
+    }
+
+    private String normalizeStatus(String status) {
+        String upper = safe(status).toUpperCase(Locale.ENGLISH)
+
+        if (upper == 'PASSED' || upper == 'PASS' || upper == 'SUCCESS') {
+            return 'passed'
+        }
+        if (upper == 'FAILED' || upper == 'FAIL' || upper == 'ERROR') {
+            return 'failed'
+        }
+        if (upper == 'SKIPPED' || upper == 'SKIP' || upper == 'BLOCKED') {
+            return 'blocked'
+        }
+
+        return upper.isEmpty() ? '' : upper.toLowerCase(Locale.ENGLISH)
+    }
+
+    private String sanitizeCaseId(String value) {
+        return safe(value)
+            .replace('\\', '_')
+            .replace('/', '_')
+            .replace(':', '_')
+            .replace('*', '_')
+            .replace('?', '_')
+            .replace('"', '_')
+            .replace('<', '_')
+            .replace('>', '_')
+            .replace('|', '_')
+            .replaceAll('[^A-Za-z0-9._-]+', '_')
+            .replaceAll('_+', '_')
+            .replaceAll('^_+|_+$', '')
+    }
+
+    private String sanitizeFragment(String value) {
+        String sanitized = safe(value)
+            .replaceAll('[^A-Za-z0-9._-]+', '-')
+            .replaceAll('-+', '-')
+            .replaceAll('^-+|-+$', '')
+
+        return sanitized.isEmpty() ? 'capture' : sanitized
+    }
+
+    private String nowStamp() {
+        return TRACE_STAMP.format(new Date())
+    }
+
+    private String firstNonBlank(Object... values) {
+        if (values == null) {
+            return ''
+        }
+
+        for (Object value : values) {
+            String text = safe(value)
+            if (!text.isEmpty()) {
+                return text
+            }
+        }
+
+        return ''
+    }
+
+    private String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+import com.kms.katalon.core.annotation.AfterTestCase
+import com.kms.katalon.core.annotation.BeforeTestCase
+import com.kms.katalon.core.context.TestCaseContext
+import com.kms.katalon.core.util.KeywordUtil
+
+class ematchReport {
+
+    @BeforeTestCase
+    def beforeCase(TestCaseContext testCaseContext) {
+        try {
+            String caseId = safe(testCaseContext != null ? testCaseContext.getTestCaseId() : '')
+            if (caseId.isEmpty()) {
+                return
+            }
+
+            CustomKeywords.'jiraIntegration.JiraImagesEvidence.startCase'(caseId)
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('Report listener beforeCase failed: ' + safe(t.message))
+        }
+    }
+
+    @AfterTestCase
+    def afterCase(TestCaseContext testCaseContext) {
+        try {
+            String caseId = safe(testCaseContext != null ? testCaseContext.getTestCaseId() : '')
+            String status = normalizeStatus(testCaseContext != null ? testCaseContext.getTestCaseStatus() : '')
+            String rawMessage = safe(testCaseContext != null ? testCaseContext.getMessage() : '')
+
+            if ('failed'.equalsIgnoreCase(status) || 'blocked'.equalsIgnoreCase(status)) {
+                try {
+                    CustomKeywords.'jiraIntegration.JiraImagesEvidence.autoFailure'(caseId)
+                } catch (Throwable ignored) {
+                }
+            }
+
+            CustomKeywords.'jiraIntegration.JiraImagesEvidence.finishCase'(status, rawMessage)
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('Report listener afterCase failed: ' + safe(t.message))
+        }
+    }
+
+    private String normalizeStatus(String rawStatus) {
+        String upper = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+        if (upper == 'PASSED' || upper == 'PASS' || upper == 'SUCCESS') {
+            return 'passed'
+        }
+        if (upper == 'FAILED' || upper == 'FAIL' || upper == 'ERROR') {
+            return 'failed'
+        }
+        if (upper == 'SKIPPED' || upper == 'SKIP' || upper == 'BLOCKED') {
+            return 'blocked'
+        }
+
+        return upper.isEmpty() ? 'blocked' : upper.toLowerCase(Locale.ENGLISH)
+    }
+
+    private String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import java.io.BufferedReader
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStreamReader
+import java.math.BigDecimal
+import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+
+import javax.xml.XMLConstants
+import javax.xml.parsers.DocumentBuilderFactory
+
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+import org.w3c.dom.Node
+import org.w3c.dom.NodeList
+
+class JiraReportBuilder {
+
+    private static final String APP_NAME = 'EMATCH'
+    private static final String LOGO_SRC = 'Images/General/logo.png'
+
+    private static final SimpleDateFormat OUTPUT_DATE_TIME =
+        new SimpleDateFormat('dd/MM/yyyy HH:mm:ss', Locale.ENGLISH)
+
+    private static final SimpleDateFormat OUTPUT_STAMP =
+        new SimpleDateFormat('yyyy-MM-dd HH.mm.ss', Locale.ENGLISH)
+
+    private static final List<String> DATE_PATTERNS = [
+        'yyyy-MM-dd HH:mm:ss.SSS',
+        'yyyy-MM-dd HH:mm:ss',
+        'dd/MM/yyyy HH:mm:ss'
+    ]
+
+    private static final Pattern LOG_TS_PATTERN =
+        Pattern.compile('(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?)')
+
+    File buildReport(String reportFolderPath) {
+        return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), '', '')
+    }
+
+    File buildReport(String reportFolderPath, String suiteName, String executionTitle) {
+        return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), suiteName, executionTitle)
+    }
+
+    File buildReport(File reportFolder) {
+        return buildReport(reportFolder, '', '')
+    }
+
+    File buildReport(File reportFolder, String suiteName, String executionTitle) {
+        Map model = buildModel(reportFolder, suiteName, executionTitle)
+        String html = new JiraHtmlTemplateBuilder().build(model)
+
+        File output = new File(reportFolder, 'eMatchReport.html')
+        output.write(html, 'UTF-8')
+        return output
+    }
+
+    Map buildModel(File reportFolder) {
+        return buildModel(reportFolder, '', '')
+    }
+
+    Map buildModel(File reportFolder, String suiteName, String executionTitle) {
+        File root = reportFolder ?: new File('.')
+
+        if (!root.exists()) {
+            return emptyModel(root)
+        }
+
+        List<File> junitFiles = collectJUnitFiles(root)
+        List<Map> scenarios = []
+
+        junitFiles.each { File junitFile ->
+            scenarios.addAll(buildScenariosFromJUnit(junitFile, root))
+        }
+
+        if (scenarios.isEmpty()) {
+            scenarios = buildFallbackScenarios(root)
+        }
+
+        String resolvedSuiteName = firstNonBlank(
+            suiteName,
+            detectSuiteName(root, scenarios),
+            'Execution'
+        )
+
+        String resolvedExecutionName = firstNonBlank(
+            executionTitle,
+            resolvedSuiteName + ' ' + OUTPUT_STAMP.format(new Date())
+        )
+
+        return [
+            appName       : APP_NAME,
+            suiteName     : resolvedSuiteName,
+            executionName : resolvedExecutionName,
+            title         : resolvedExecutionName,
+            generatedAt   : OUTPUT_DATE_TIME.format(new Date()),
+            reportFolder  : root.absolutePath,
+            logoSrc       : LOGO_SRC,
+            scenarios     : scenarios
+        ]
+    }
+
+    private Map emptyModel(File root) {
+        return [
+            appName       : APP_NAME,
+            suiteName     : 'Execution',
+            executionName : 'Execution',
+            title         : 'Execution',
+            generatedAt   : OUTPUT_DATE_TIME.format(new Date()),
+            reportFolder  : root != null ? root.absolutePath : new File('.').absolutePath,
+            logoSrc       : LOGO_SRC,
+            scenarios     : []
+        ]
+    }
+
+    private List<Map> buildScenariosFromJUnit(File junitFile, File reportRoot) {
+        List<Map> scenarios = []
+        Document document = parseXml(junitFile)
+
+        if (document == null) {
+            return scenarios
+        }
+
+        NodeList testcaseNodes = document.getElementsByTagName('testcase')
+
+        for (int i = 0; i < testcaseNodes.length; i++) {
+            Element testcaseNode = (Element) testcaseNodes.item(i)
+
+            String rawName = firstNonBlank(
+                testcaseNode.getAttribute('name'),
+                "Scenario ${i + 1}"
+            )
+
+            String className = safe(testcaseNode.getAttribute('classname'))
+            String displayName = buildDisplayName(className, rawName)
+
+            Element failureNode = firstDirectChild(testcaseNode, 'failure')
+            Element errorNode = firstDirectChild(testcaseNode, 'error')
+            Element skippedNode = firstDirectChild(testcaseNode, 'skipped')
+
+            String status = 'passed'
+            Element resultNode = null
+
+            if (failureNode != null) {
+                status = 'failed'
+                resultNode = failureNode
+            } else if (errorNode != null) {
+                status = 'failed'
+                resultNode = errorNode
+            } else if (skippedNode != null) {
+                status = 'blocked'
+                resultNode = skippedNode
+            }
+
+            String junitError = safe(resultNode != null ? resultNode.getTextContent() : '')
+            List<String> caseIds = candidateCaseIds(displayName, rawName, className)
+
+            Map traceData = readTraceData(reportRoot, caseIds)
+            long durationMs = resolveDurationMs(
+                traceData,
+                toDurationMillis(testcaseNode.getAttribute('time'))
+            )
+
+            String fullError = firstNonBlank(junitError, safe(traceData.failureText))
+            String shortError = buildShortError(fullError, displayName)
+
+            scenarios << [
+                id           : buildScenarioId(displayName, i + 1),
+                name         : displayName,
+                scenarioName : displayName,
+                status       : status,
+                result       : status,
+                durationMs   : durationMs,
+                durationLabel: formatDuration(durationMs),
+                startTime    : formatDateTime(traceData.startMs as long),
+                endTime      : formatDateTime(traceData.endMs as long),
+                startLabel   : formatDateTime(traceData.startMs as long),
+                endLabel     : formatDateTime(traceData.endMs as long),
+                visualError  : shortError,
+                errorSummary : shortError,
+                fullError    : fullError,
+                reportFolder : reportRoot.absolutePath,
+                steps        : collectScenarioSteps(reportRoot, caseIds, traceData),
+                evidence     : traceData.evidence ?: []
+            ]
+        }
+
+        return scenarios
+    }
+
+    private List<Map> buildFallbackScenarios(File reportRoot) {
+        List<Map> scenarios = []
+        List<String> caseIds = collectCaseIdsFromTrace(reportRoot)
+
+        caseIds.eachWithIndex { String caseId, int index ->
+            Map traceData = readTraceData(reportRoot, [caseId])
+            String status = normalizeStatus(traceData.status)
+
+            scenarios << [
+                id           : buildScenarioId(caseId, index + 1),
+                name         : caseId,
+                scenarioName : caseId,
+                status       : status,
+                result       : status,
+                durationMs   : resolveDurationMs(traceData, 0L),
+                durationLabel: formatDuration(resolveDurationMs(traceData, 0L)),
+                startTime    : formatDateTime(traceData.startMs as long),
+                endTime      : formatDateTime(traceData.endMs as long),
+                startLabel   : formatDateTime(traceData.startMs as long),
+                endLabel     : formatDateTime(traceData.endMs as long),
+                visualError  : buildShortError(safe(traceData.failureText), caseId),
+                errorSummary : buildShortError(safe(traceData.failureText), caseId),
+                fullError    : safe(traceData.failureText),
+                reportFolder : reportRoot.absolutePath,
+                steps        : collectScenarioSteps(reportRoot, [caseId], traceData),
+                evidence     : traceData.evidence ?: []
+            ]
+        }
+
+        return scenarios
+    }
+
+    private Map readTraceData(File reportRoot, List<String> caseIds) {
+        Map result = [
+            startMs    : 0L,
+            endMs      : 0L,
+            durationMs : 0L,
+            status     : '',
+            failureText: '',
+            steps      : [],
+            evidence   : []
+        ]
+
+        File caseFolder = findEvidenceCaseFolder(reportRoot, caseIds)
+        if (caseFolder == null || !caseFolder.exists()) {
+            return result
+        }
+
+        File traceFile = new File(caseFolder, 'trace.log')
+        if (!traceFile.exists()) {
+            collectEvidenceFiles(caseFolder).each { Map row ->
+                result.evidence << row
+            }
+            return result
+        }
+
+        eachLine(traceFile) { String line ->
+            String[] parts = safe(line).split(Pattern.quote('|'), 3)
+            if (parts == null || parts.length < 3) {
+                return
+            }
+
+            String type = safe(parts[0])
+            String stamp = safe(parts[1])
+            String payload = safe(parts[2])
+
+            if ('CASE_START'.equalsIgnoreCase(type)) {
+                result.startMs = parseDateMillis(stamp)
+                return
+            }
+
+            if ('CASE_END'.equalsIgnoreCase(type)) {
+                result.endMs = parseDateMillis(stamp)
+                return
+            }
+
+            if ('STATUS'.equalsIgnoreCase(type)) {
+                result.status = normalizeStatus(payload)
+                return
+            }
+
+            if ('STEP'.equalsIgnoreCase(type)) {
+                if (!payload.isEmpty()) {
+                    result.steps << [detail: payload]
+                }
+                return
+            }
+
+            if ('SCREENSHOT'.equalsIgnoreCase(type)) {
+                File imageFile = new File(payload)
+                if (imageFile.exists()) {
+                    result.evidence << [
+                        name  : imageFile.name,
+                        href  : imageFile.toURI().toString(),
+                        image : true,
+                        imgSrc: imageFile.toURI().toString()
+                    ]
+                }
+                return
+            }
+
+            if ('FAILURE_FILE'.equalsIgnoreCase(type)) {
+                File failureFile = new File(payload)
+                if (failureFile.exists()) {
+                    result.failureText = failureFile.getText('UTF-8')
+                }
+            }
+        }
+
+        if ((result.evidence as List).isEmpty()) {
+            collectEvidenceFiles(caseFolder).each { Map row ->
+                result.evidence << row
+            }
+        }
+
+        if ((result.startMs as long) > 0L && (result.endMs as long) >= (result.startMs as long)) {
+            result.durationMs = (result.endMs as long) - (result.startMs as long)
+        }
+
+        return result
+    }
+
+    private List<Map> collectScenarioSteps(File reportRoot, List<String> caseIds, Map traceData) {
+        List<Map> steps = []
+
+        if (traceData != null && traceData.steps instanceof List) {
+            steps.addAll(traceData.steps as List<Map>)
+        }
+
+        if (steps.isEmpty()) {
+            steps.addAll(readReportStepsFromLogs(reportRoot, caseIds))
+        }
+
+        steps = steps
+            .findAll { Map row ->
+                row != null && !safe(row.detail).isEmpty()
+            }
+            .unique { Map row ->
+                safe(row.detail)
+            }
+
+        return steps
+    }
+
+    private List<Map> readReportStepsFromLogs(File reportRoot, List<String> caseIds) {
+        List<Map> steps = []
+        List<File> logs = collectLogFiles(reportRoot)
+
+        logs.each { File logFile ->
+            String currentCase = ''
+
+            eachLine(logFile) { String line ->
+                String cleanLine = safe(line)
+                if (cleanLine.isEmpty()) {
+                    return
+                }
+
+                String startedCase = extractStartedCase(cleanLine)
+                if (!startedCase.isEmpty()) {
+                    currentCase = startedCase
+                    return
+                }
+
+                String endedCase = extractEndedCase(cleanLine)
+                if (!endedCase.isEmpty()) {
+                    if (matchesCase(endedCase, caseIds)) {
+                        currentCase = ''
+                    } else if (normalizeCaseId(currentCase) == normalizeCaseId(endedCase)) {
+                        currentCase = ''
+                    }
+                    return
+                }
+
+                if (!matchesCase(currentCase, caseIds)) {
+                    return
+                }
+
+                int markerIndex = cleanLine.indexOf('[REPORT_STEP]')
+                if (markerIndex >= 0) {
+                    String detail = safe(cleanLine.substring(markerIndex + '[REPORT_STEP]'.length()))
+                    if (!detail.isEmpty()) {
+                        steps << [detail: detail]
+                    }
+                }
+            }
+        }
+
+        return steps
+    }
+
+    private List<String> collectCaseIdsFromTrace(File reportRoot) {
+        List<String> ids = []
+        File evidencesRoot = new File(reportRoot, 'Evidences')
+
+        if (!evidencesRoot.exists()) {
+            return ids
+        }
+
+        evidencesRoot.eachDir { File dir ->
+            File trace = new File(dir, 'trace.log')
+            if (!trace.exists()) {
+                return
+            }
+
+            eachLine(trace) { String line ->
+                String[] parts = safe(line).split(Pattern.quote('|'), 3)
+                if (parts != null && parts.length >= 3 && 'CASE_START'.equalsIgnoreCase(safe(parts[0]))) {
+                    ids << safe(parts[2])
+                }
+            }
+        }
+
+        return ids.unique()
+    }
+
+    private List<File> collectJUnitFiles(File root) {
+        List<File> files = []
+
+        root.eachFileRecurse { File file ->
+            if (!file.isFile()) {
+                return
+            }
+
+            String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+            if (lower == 'junit_report.xml' || lower == 'junitreport.xml' || lower == 'junit.xml') {
+                files << file
+            }
+        }
+
+        return files
+            .findAll { File file -> file.exists() }
+            .unique { File file -> file.absolutePath }
+            .sort { File a, File b -> a.absolutePath <=> b.absolutePath }
+    }
+
+    private List<File> collectLogFiles(File root) {
+        List<File> files = []
+
+        root.eachFileRecurse { File file ->
+            if (!file.isFile()) {
+                return
+            }
+
+            String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+            if (lower.endsWith('.log') || lower.endsWith('.txt')) {
+                files << file
+            }
+        }
+
+        return files
+            .findAll { File file -> file.exists() && file.length() > 0L }
+            .sort { File a, File b -> priorityOfLog(a) <=> priorityOfLog(b) }
+    }
+
+    private int priorityOfLog(File file) {
+        String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+
+        if (lower == 'execution0.log') {
+            return 0
+        }
+        if (lower.contains('execution')) {
+            return 1
+        }
+        return 5
+    }
+
+    private File findEvidenceCaseFolder(File reportRoot, List<String> caseIds) {
+        File evidencesRoot = new File(reportRoot, 'Evidences')
+        if (!evidencesRoot.exists()) {
+            return null
+        }
+
+        List<String> folderNames = caseIds.collect { String caseId ->
+            sanitizeCaseId(caseId)
+        }.findAll { String value ->
+            !value.isEmpty()
+        }
+
+        for (String folderName : folderNames) {
+            File candidate = new File(evidencesRoot, folderName)
+            if (candidate.exists() && candidate.isDirectory()) {
+                return candidate
+            }
+        }
+
+        return null
+    }
+
+    private List<Map> collectEvidenceFiles(File caseFolder) {
+        List<Map> evidence = []
+
+        caseFolder.eachFile { File file ->
+            if (!file.isFile()) {
+                return
+            }
+
+            String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+            boolean isImage = lower.endsWith('.png') ||
+                lower.endsWith('.jpg') ||
+                lower.endsWith('.jpeg') ||
+                lower.endsWith('.gif') ||
+                lower.endsWith('.bmp') ||
+                lower.endsWith('.webp')
+
+            if (!isImage) {
+                return
+            }
+
+            evidence << [
+                name  : file.name,
+                href  : file.toURI().toString(),
+                image : true,
+                imgSrc: file.toURI().toString()
+            ]
+        }
+
+        return evidence.sort { Map a, Map b ->
+            safe(b.name) <=> safe(a.name)
+        }
+    }
+
+    private Document parseXml(File file) {
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance()
+
+            try {
+                factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                factory.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                factory.setFeature('http://xml.org/sax/features/external-general-entities', false)
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                factory.setFeature('http://xml.org/sax/features/external-parameter-entities', false)
+            } catch (Throwable ignored) {
+            }
+
+            factory.setNamespaceAware(false)
+            factory.setExpandEntityReferences(false)
+            factory.setXIncludeAware(false)
+
+            return factory.newDocumentBuilder().parse(file)
+        } catch (Throwable ignored) {
+            return null
+        }
+    }
+
+    private Element firstDirectChild(Element parent, String tagName) {
+        if (parent == null) {
+            return null
+        }
+
+        NodeList children = parent.getChildNodes()
+
+        for (int i = 0; i < children.length; i++) {
+            Node child = children.item(i)
+            if (child instanceof Element && tagName.equalsIgnoreCase(child.getNodeName())) {
+                return (Element) child
+            }
+        }
+
+        return null
+    }
+
+    private void eachLine(File file, Closure consumer) {
+        BufferedReader reader = null
+
+        try {
+            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))
+            String line
+            while ((line = reader.readLine()) != null) {
+                consumer.call(line)
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                reader?.close()
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private String extractStartedCase(String line) {
+        int idx = safe(line).indexOf('START Test Cases/')
+        if (idx < 0) {
+            return ''
+        }
+
+        return safe(line.substring(idx + 'START '.length()))
+    }
+
+    private String extractEndedCase(String line) {
+        int idx = safe(line).indexOf('END Test Cases/')
+        if (idx < 0) {
+            return ''
+        }
+
+        return safe(line.substring(idx + 'END '.length()))
+    }
+
+    private long extractLogTimestampMs(String line) {
+        Matcher matcher = LOG_TS_PATTERN.matcher(safe(line))
+        if (matcher.find()) {
+            return parseDateMillis(matcher.group(1))
+        }
+        return 0L
+    }
+
+    private long parseDateMillis(String value) {
+        String text = safe(value)
+
+        if (text.isEmpty()) {
+            return 0L
+        }
+
+        for (String pattern : DATE_PATTERNS) {
+            try {
+                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(text).time
+            } catch (Throwable ignored) {
+            }
+        }
+
+        return 0L
+    }
+
+    private String detectSuiteName(File root, List<Map> scenarios) {
+        String parentName = safe(root != null && root.parentFile != null ? root.parentFile.name : '')
+        if (!parentName.isEmpty() && !parentName.matches('\\d{8}_\\d{6}')) {
+            return parentName
+        }
+
+        if (scenarios != null && !scenarios.isEmpty()) {
+            return safe(scenarios[0].name)
+        }
+
+        return 'Execution'
+    }
+
+    private String buildDisplayName(String className, String rawName) {
+        String cls = safe(className)
+        String name = safe(rawName)
+
+        if (!cls.isEmpty()) {
+            if (cls.startsWith('Test Cases/')) {
+                return cls
+            }
+
+            if (cls.contains('/')) {
+                return cls
+            }
+        }
+
+        return name
+    }
+
+    private List<String> candidateCaseIds(String displayName, String rawName, String className) {
+        return [
+            safe(displayName),
+            safe(rawName),
+            safe(className)
+        ].findAll { String value ->
+            !value.isEmpty()
+        }.unique()
+    }
+
+    private boolean matchesCase(String value, List<String> candidates) {
+        String left = normalizeCaseId(value)
+        if (left.isEmpty()) {
+            return false
+        }
+
+        return candidates.any { String candidate ->
+            normalizeCaseId(candidate) == left
+        }
+    }
+
+    private String normalizeCaseId(String value) {
+        return safe(value)
+            .replace('\\', '/')
+            .replaceAll('\\s+', ' ')
+            .trim()
+    }
+
+    private String buildScenarioId(String value, int index) {
+        String text = safe(value)
+            .replace('\\', '/')
+            .replaceAll('[^A-Za-z0-9/_-]+', '-')
+            .replaceAll('-+', '-')
+            .replaceAll('^[-/]+|[-/]+$', '')
+
+        return text.isEmpty() ? "scenario-${index}" : text
+    }
+
+    private String buildShortError(String fullError, String displayName) {
+        String text = safe(fullError)
+        if (text.isEmpty()) {
+            return ''
+        }
+
+        int reasonIndex = text.indexOf('Reason:')
+        if (reasonIndex >= 0) {
+            String reasonTail = text.substring(reasonIndex + 'Reason:'.length()).trim()
+            List<String> lines = reasonTail.readLines().findAll { String line ->
+                String clean = safe(line)
+                !clean.isEmpty() && !clean.startsWith('at ')
+            }
+
+            if (!lines.isEmpty()) {
+                return lines[0]
+            }
+        }
+
+        List<String> allLines = text.readLines().findAll { String line ->
+            String clean = safe(line)
+            !clean.isEmpty() && !clean.startsWith('at ')
+        }
+
+        if (!allLines.isEmpty()) {
+            return allLines[0]
+        }
+
+        return safe(displayName) + ' FAILED.'
+    }
+
+    private long resolveDurationMs(Map traceData, long junitDurationMs) {
+        long traceDuration = traceData != null ? asLong(traceData.durationMs) : 0L
+        if (traceDuration > 0L) {
+            return traceDuration
+        }
+        return junitDurationMs
+    }
+
+    private long toDurationMillis(String secondsValue) {
+        String value = safe(secondsValue)
+
+        if (value.isEmpty()) {
+            return 0L
+        }
+
+        try {
+            BigDecimal seconds = new BigDecimal(value.replace(',', '.'))
+            return seconds.multiply(new BigDecimal('1000')).longValue()
+        } catch (Throwable ignored) {
+            return 0L
+        }
+    }
+
+    private String normalizeStatus(String value) {
+        String lower = safe(value).toLowerCase(Locale.ENGLISH)
+
+        if (lower == 'passed' || lower == 'pass' || lower == 'success') {
+            return 'passed'
+        }
+        if (lower == 'failed' || lower == 'fail' || lower == 'error') {
+            return 'failed'
+        }
+
+        return 'blocked'
+    }
+
+    private String formatDateTime(long millis) {
+        if (millis <= 0L) {
+            return '--'
+        }
+
+        return OUTPUT_DATE_TIME.format(new Date(millis))
+    }
+
+    private String formatDuration(long durationMs) {
+        long totalSeconds = Math.round(Math.max(0L, durationMs) / 1000d)
+        long hours = (long) (totalSeconds / 3600L)
+        long minutes = (long) ((totalSeconds % 3600L) / 60L)
+        long seconds = (long) (totalSeconds % 60L)
+
+        return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+    }
+
+    private long asLong(Object value) {
+        try {
+            return Long.parseLong(String.valueOf(value))
+        } catch (Throwable ignored) {
+            return 0L
+        }
+    }
+
+    private String sanitizeCaseId(String value) {
+        return safe(value)
+            .replace('\\', '_')
+            .replace('/', '_')
+            .replace(':', '_')
+            .replace('*', '_')
+            .replace('?', '_')
+            .replace('"', '_')
+            .replace('<', '_')
+            .replace('>', '_')
+            .replace('|', '_')
+            .replaceAll('[^A-Za-z0-9._-]+', '_')
+            .replaceAll('_+', '_')
+            .replaceAll('^_+|_+$', '')
+    }
+
+    private String firstNonBlank(Object... values) {
+        if (values == null) {
+            return ''
+        }
+
+        for (Object value : values) {
+            String text = safe(value)
+            if (!text.isEmpty()) {
+                return text
+            }
+        }
+
+        return ''
+    }
+
+    private String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import java.io.File
+import java.net.URI
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class JiraHtmlTemplateBuilder {
+
+    private static final String APP_NAME = 'EMATCH'
+    private static final String REPORT_TITLE_PREFIX = 'Test report - '
+    private static final String LOGO_SRC = 'Images/General/logo.png'
+
+    String build(Map model) {
+        return buildHtml(model)
+    }
+
+    String render(Map model) {
+        return buildHtml(model)
+    }
+
+    String buildHtml(Map model) {
+        Map view = normalizeModel(model)
+
+        StringBuilder html = new StringBuilder()
+
+        html.append('<!DOCTYPE html>\n')
+        html.append('<html lang="en">\n')
+        html.append('<head>\n')
+        html.append('<meta charset="UTF-8">\n')
+        html.append('<meta name="viewport" content="width=device-width, initial-scale=1.0">\n')
+        html.append('<title>')
+        html.append(htmlEscape(view.reportTitle))
+        html.append('</title>\n')
+        html.append(buildStyles())
+        html.append('</head>\n')
+        html.append('<body>\n')
+
+        html.append('<header class="top-banner">\n')
+        html.append('<div class="top-banner-left">\n')
+        html.append('<img class="brand-logo" src="')
+        html.append(htmlEscape(resolveLogoHref(view)))
+        html.append('" alt="EMATCH logo">\n')
+        html.append('<div class="brand-copy">\n')
+        html.append('<div class="banner-title">')
+        html.append(htmlEscape(view.reportTitle))
+        html.append('</div>\n')
+        html.append('<div class="banner-subtitle">EMATCH execution overview</div>\n')
+        html.append('</div>\n')
+        html.append('</div>\n')
+        html.append('</header>\n')
+
+        html.append('<div class="page">\n')
+
+        html.append('<aside class="sidebar">\n')
+        html.append('<div class="sidebar-tabs">\n')
+        html.append('<button class="sidebar-tab active" type="button">Tests</button>\n')
+        html.append('</div>\n')
+        html.append('<div class="search-wrap">\n')
+        html.append('<input id="scenarioSearch" class="search-input" type="text" placeholder="Search test name, path, or status." onkeyup="filterScenarios()">\n')
+        html.append('</div>\n')
+        html.append('<div id="scenarioList" class="scenario-list">\n')
+
+        if ((view.scenarios as List).isEmpty()) {
+            html.append('<div class="empty-state">No scenarios were found for this execution.</div>')
+        } else {
+            (view.scenarios as List<Map>).eachWithIndex { Map scenario, int index ->
+                html.append(buildScenarioListItem(scenario, index == 0))
+            }
+        }
+
+        html.append('</div>\n')
+        html.append('</aside>\n')
+
+        html.append('<main class="content">\n')
+
+        if ((view.scenarios as List).isEmpty()) {
+            html.append('<section class="scenario-panel active"><div class="scenario-title">No execution data found</div></section>')
+        } else {
+            (view.scenarios as List<Map>).eachWithIndex { Map scenario, int index ->
+                html.append(buildScenarioPanel(scenario, view, index == 0))
+            }
+        }
+
+        html.append('</main>\n')
+        html.append('</div>\n')
+        html.append(buildScripts())
+        html.append('</body>\n')
+        html.append('</html>\n')
+
+        return html.toString()
+    }
+
+    private Map normalizeModel(Map model) {
+        Map safeModel = model ?: [:]
+
+        String suiteName = pickFirst(
+            safeModel.suiteName,
+            safeModel.executionName,
+            safeModel.title,
+            'Execution'
+        )
+
+        List<Map> scenarios = []
+
+        asList(safeModel.scenarios).eachWithIndex { def rawItem, int index ->
+            Map item = rawItem instanceof Map ? (rawItem as Map) : [:]
+            String status = normalizeStatus(pickFirst(item.status, 'blocked'))
+
+            List<Map> normalizedSteps = []
+            asList(item.steps).each { def rawStep ->
+                Map step = rawStep instanceof Map ? (rawStep as Map) : [:]
+                String detail = pickFirst(step.detail, step.message, step.text)
+                if (!detail.isEmpty()) {
+                    normalizedSteps << [detail: detail]
+                }
+            }
+
+            List<Map> normalizedEvidence = []
+            asList(item.evidence).each { def rawEvidence ->
+                Map ev = rawEvidence instanceof Map ? (rawEvidence as Map) : [:]
+                String href = pickFirst(ev.href, ev.url, ev.path)
+                String imgSrc = pickFirst(ev.imgSrc, ev.imageSrc, href)
+                boolean image = Boolean.valueOf(String.valueOf(ev.image))
+
+                if (!href.isEmpty() || !imgSrc.isEmpty()) {
+                    normalizedEvidence << [
+                        name  : pickFirst(ev.name, 'Evidence'),
+                        href  : href,
+                        image : image,
+                        imgSrc: imgSrc
+                    ]
+                }
+            }
+
+            scenarios << [
+                id            : pickFirst(item.id, "scenario-${index + 1}"),
+                name          : pickFirst(item.name, item.scenarioName, "Scenario ${index + 1}"),
+                status        : status,
+                durationLabel : pickFirst(item.durationLabel, '00h 00m 00s'),
+                startLabel    : pickFirst(item.startLabel, '--'),
+                endLabel      : pickFirst(item.endLabel, '--'),
+                visualError   : pickFirst(item.visualError, ''),
+                fullError     : pickFirst(item.fullError, ''),
+                steps         : normalizedSteps,
+                evidence      : normalizedEvidence
+            ]
+        }
+
+        return [
+            reportTitle: REPORT_TITLE_PREFIX + suiteName,
+            suiteName  : suiteName,
+            reportFolder: pickFirst(safeModel.reportFolder),
+            logoSrc    : pickFirst(safeModel.logoSrc, LOGO_SRC),
+            scenarios  : scenarios
+        ]
+    }
+
+    private String buildScenarioListItem(Map scenario, boolean selected) {
+        StringBuilder sb = new StringBuilder()
+
+        sb.append('<button type="button" class="scenario-list-item')
+        if (selected) {
+            sb.append(' selected')
+        }
+        sb.append('" data-sid="')
+        sb.append(htmlEscape(pickFirst(scenario.id)))
+        sb.append('" onclick="showScenario(\'')
+        sb.append(jsEscape(pickFirst(scenario.id)))
+        sb.append('\')">')
+
+        sb.append('<div class="scenario-list-main">')
+        sb.append('<div class="scenario-list-title">')
+        sb.append(htmlEscape(shorten(pickFirst(scenario.name), 60)))
+        sb.append('</div>')
+        sb.append('<div class="scenario-list-summary">')
+        if ('failed'.equalsIgnoreCase(pickFirst(scenario.status))) {
+            sb.append(htmlEscape(shorten(pickFirst(scenario.visualError), 70)))
+        } else {
+            sb.append('-')
+        }
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('<div class="scenario-list-side">')
+        sb.append('<span class="status-pill ')
+        sb.append(htmlEscape(pickFirst(scenario.status)))
+        sb.append('">')
+        sb.append(htmlEscape(statusLabel(pickFirst(scenario.status))))
+        sb.append('</span>')
+        sb.append('<div class="scenario-list-duration">')
+        sb.append(htmlEscape(pickFirst(scenario.durationLabel)))
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('</button>')
+        return sb.toString()
+    }
+
+    private String buildScenarioPanel(Map scenario, Map view, boolean selected) {
+        StringBuilder sb = new StringBuilder()
+        String status = pickFirst(scenario.status)
+        boolean isFailedLike = 'failed'.equalsIgnoreCase(status) || 'blocked'.equalsIgnoreCase(status)
+        List<Map> steps = scenario.steps instanceof List ? (scenario.steps as List<Map>) : []
+        List<Map> evidence = scenario.evidence instanceof List ? (scenario.evidence as List<Map>) : []
+
+        sb.append('<section class="scenario-panel')
+        if (selected) {
+            sb.append(' active')
+        }
+        sb.append('" id="panel-')
+        sb.append(htmlEscape(pickFirst(scenario.id)))
+        sb.append('">')
+
+        sb.append('<div class="scenario-header">')
+        sb.append('<div class="scenario-title">')
+        sb.append(htmlEscape(pickFirst(scenario.name)))
+        sb.append('</div>')
+
+        sb.append('<div class="scenario-meta-row">')
+        sb.append(buildMetaChip('Suite', pickFirst(view.suiteName), 'plain'))
+        sb.append(buildMetaChip('Status', statusLabel(status), status))
+        sb.append(buildMetaChip('Start', pickFirst(scenario.startLabel, '--'), 'purple'))
+        sb.append(buildMetaChip('End', pickFirst(scenario.endLabel, '--'), 'purple'))
+        sb.append(buildMetaChip('Duration', pickFirst(scenario.durationLabel, '00h 00m 00s'), 'purple'))
+        sb.append('</div>')
+        sb.append('</div>')
+
+        sb.append('<div class="section-title">Steps</div>')
+        sb.append('<div class="steps-box">')
+
+        if (steps.isEmpty()) {
+            sb.append('<div class="empty-inline">No step details available.</div>')
+        } else {
+            sb.append('<ul class="steps-list">')
+            steps.each { Map step ->
+                sb.append('<li>')
+                sb.append(htmlEscape(pickFirst(step.detail)))
+                sb.append('</li>')
+            }
+            sb.append('</ul>')
+        }
+
+        sb.append('</div>')
+
+        if (isFailedLike) {
+            sb.append('<div class="error-block">')
+            sb.append('<div class="error-title">Visual Error Log</div>')
+            sb.append('<div class="error-summary">')
+            sb.append(htmlEscape(pickFirst(scenario.visualError)))
+            sb.append('</div>')
+
+            if (!pickFirst(scenario.fullError).isEmpty()) {
+                sb.append('<details class="details-box">')
+                sb.append('<summary>🔎 View full error</summary>')
+                sb.append('<pre>')
+                sb.append(htmlEscape(pickFirst(scenario.fullError)))
+                sb.append('</pre>')
+                sb.append('</details>')
+            }
+
+            sb.append('</div>')
+
+            sb.append('<div class="evidence-block">')
+            sb.append('<div class="evidence-title">Evidence</div>')
+
+            if (evidence.isEmpty()) {
+                sb.append('<div class="empty-inline">No evidence was found for this scenario.</div>')
+            } else {
+                evidence.eachWithIndex { Map ev, int index ->
+                    sb.append('<div class="evidence-item">')
+                    sb.append('<div class="evidence-name">')
+                    sb.append(htmlEscape(pickFirst(ev.name, 'Evidence')))
+                    sb.append('</div>')
+
+                    if (!pickFirst(ev.href).isEmpty()) {
+                        sb.append('<div class="evidence-links"><a href="')
+                        sb.append(htmlEscape(pickFirst(ev.href)))
+                        sb.append('" target="_blank" rel="noopener noreferrer">🔎 Open evidence</a></div>')
+                    }
+
+                    if (Boolean.TRUE.equals(ev.image) && !pickFirst(ev.imgSrc).isEmpty()) {
+                        sb.append('<img class="evidence-image" src="')
+                        sb.append(htmlEscape(pickFirst(ev.imgSrc)))
+                        sb.append('" alt="Evidence ')
+                        sb.append(String.valueOf(index + 1))
+                        sb.append('">')
+                    }
+
+                    sb.append('</div>')
+                }
+            }
+
+            sb.append('</div>')
+        }
+
+        sb.append('</section>')
+        return sb.toString()
+    }
+
+    private String buildMetaChip(String label, String value, String type) {
+        StringBuilder sb = new StringBuilder()
+        sb.append('<div class="meta-chip ')
+        sb.append(htmlEscape(type))
+        sb.append('">')
+        sb.append('<span class="meta-label">')
+        sb.append(htmlEscape(label))
+        sb.append(':</span> ')
+        sb.append('<span class="meta-value">')
+        sb.append(htmlEscape(value))
+        sb.append('</span></div>')
+        return sb.toString()
+    }
+
+    private String resolveLogoHref(Map view) {
+        File logoFile = resolveFile(pickFirst(view.logoSrc, LOGO_SRC), pickFirst(view.reportFolder))
+        if (logoFile != null && logoFile.exists()) {
+            return logoFile.toURI().toString()
+        }
+        return pickFirst(view.logoSrc, LOGO_SRC)
+    }
+
+    private File resolveFile(String path, String baseFolder) {
+        String raw = pickFirst(path)
+        if (raw.isEmpty()) {
+            return null
+        }
+
+        try {
+            if (raw.toLowerCase(Locale.ENGLISH).startsWith('file:/')) {
+                return new File(new URI(raw))
+            }
+        } catch (Throwable ignored) {
+        }
+
+        File direct = new File(raw)
+        if (direct.exists()) {
+            return direct
+        }
+
+        if (!pickFirst(baseFolder).isEmpty()) {
+            File byBase = new File(baseFolder, raw)
+            if (byBase.exists()) {
+                return byBase
+            }
+        }
+
+        return direct
+    }
+
+    private List asList(def value) {
+        if (value == null) {
+            return []
+        }
+        if (value instanceof Collection) {
+            return new ArrayList(value as Collection)
+        }
+        if (value.getClass().isArray()) {
+            return (value as Object[]).toList()
+        }
+        return [value]
+    }
+
+    private String normalizeStatus(String raw) {
+        String lower = pickFirst(raw).toLowerCase(Locale.ENGLISH)
+
+        if (lower == 'passed' || lower == 'pass' || lower == 'success') {
+            return 'passed'
+        }
+        if (lower == 'failed' || lower == 'fail' || lower == 'error') {
+            return 'failed'
+        }
+        return 'blocked'
+    }
+
+    private String statusLabel(String status) {
+        String lower = pickFirst(status).toLowerCase(Locale.ENGLISH)
+
+        if (lower == 'passed') {
+            return 'Passed'
+        }
+        if (lower == 'failed') {
+            return 'Failed'
+        }
+        return 'Blocked'
+    }
+
+    private String shorten(String text, int max) {
+        String value = pickFirst(text)
+        if (value.length() <= max) {
+            return value
+        }
+        return value.substring(0, Math.max(0, max - 3)) + '...'
+    }
+
+    private String pickFirst(Object... values) {
+        if (values == null) {
+            return ''
+        }
+
+        for (Object value : values) {
+            String text = value == null ? '' : String.valueOf(value).trim()
+            if (!text.isEmpty()) {
+                return text
+            }
+        }
+
+        return ''
+    }
+
+    private String htmlEscape(def value) {
+        String text = pickFirst(value)
+        return text
+            .replace('&', '&amp;')
+            .replace('<', '&lt;')
+            .replace('>', '&gt;')
+            .replace('"', '&quot;')
+            .replace("'", '&#39;')
+    }
+
+    private String jsEscape(def value) {
+        String text = pickFirst(value)
+        return text
+            .replace('\\', '\\\\')
+            .replace("'", "\\'")
+            .replace('\r', '')
+            .replace('\n', '\\n')
+    }
+
+    private String buildStyles() {
+        return '''
+<style>
+* { box-sizing:border-box; }
+body {
+    margin:0;
+    font-family:Arial, Helvetica, sans-serif;
+    background:#ffffff;
+    color:#1d2630;
+}
+.top-banner {
+    background:#5b1fcf;
+    color:#ffffff;
+    padding:14px 18px;
+    display:flex;
+    align-items:center;
+}
+.top-banner-left {
+    display:flex;
+    align-items:center;
+    gap:14px;
+}
+.brand-logo {
+    width:44px;
+    height:44px;
+    object-fit:contain;
+    background:#ffffff;
+    border-radius:6px;
+}
+.banner-title {
+    font-size:16px;
+    font-weight:700;
+}
+.banner-subtitle {
+    font-size:12px;
+    opacity:0.92;
+    margin-top:2px;
+}
+.page {
+    display:grid;
+    grid-template-columns:280px 1fr;
+    min-height:calc(100vh - 72px);
+}
+.sidebar {
+    border-right:1px solid #e4e8ef;
+    background:#fafbfd;
+}
+.sidebar-tabs {
+    display:flex;
+    border-bottom:1px solid #e4e8ef;
+}
+.sidebar-tab {
+    flex:1;
+    background:#fafbfd;
+    border:0;
+    padding:14px 10px;
+    font-size:13px;
+    font-weight:700;
+    color:#4a5565;
+}
+.search-wrap {
+    padding:14px;
+}
+.search-input {
+    width:100%;
+    padding:10px 12px;
+    border:1px solid #d8e0ea;
+    border-radius:8px;
+    font-size:12px;
+}
+.scenario-list {
+    padding:0 10px 14px 10px;
+}
+.scenario-list-item {
+    width:100%;
+    border:1px solid transparent;
+    background:#ffffff;
+    padding:12px 10px;
+    margin-bottom:8px;
+    border-radius:10px;
+    text-align:left;
+    cursor:pointer;
+    display:grid;
+    grid-template-columns:1fr auto;
+    gap:10px;
+}
+.scenario-list-item.selected {
+    border-color:#cfc3ff;
+    background:#f7f3ff;
+}
+.scenario-list-title {
+    font-size:12px;
+    font-weight:700;
+    color:#1c2733;
+    line-height:1.35;
+}
+.scenario-list-summary {
+    font-size:11px;
+    color:#707b88;
+    margin-top:5px;
+    line-height:1.35;
+}
+.scenario-list-side {
+    display:flex;
+    flex-direction:column;
+    align-items:flex-end;
+    gap:8px;
+}
+.scenario-list-duration {
+    font-size:11px;
+    color:#6e7782;
+}
+.content {
+    padding:18px 20px 30px 20px;
+}
+.scenario-panel {
+    display:none;
+}
+.scenario-panel.active {
+    display:block;
+}
+.scenario-title {
+    font-size:16px;
+    font-weight:700;
+    margin-bottom:14px;
+}
+.scenario-meta-row {
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px;
+    margin-bottom:18px;
+}
+.meta-chip {
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    min-height:34px;
+    padding:8px 12px;
+    border-radius:999px;
+    font-size:12px;
+    font-weight:700;
+}
+.meta-chip.plain {
+    background:#f0f3f7;
+    color:#2a3440;
+}
+.meta-chip.purple {
+    background:#4b1bb4;
+    color:#ffffff;
+}
+.meta-chip.passed {
+    background:#67b94f;
+    color:#ffffff;
+}
+.meta-chip.failed {
+    background:#d85d4c;
+    color:#ffffff;
+}
+.meta-chip.blocked {
+    background:#a0a7b4;
+    color:#ffffff;
+}
+.status-pill {
+    min-width:76px;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    padding:7px 10px;
+    border-radius:999px;
+    font-size:11px;
+    font-weight:700;
+    color:#ffffff;
+}
+.status-pill.passed { background:#67b94f; }
+.status-pill.failed { background:#d85d4c; }
+.status-pill.blocked { background:#a0a7b4; }
+.section-title {
+    font-size:14px;
+    font-weight:700;
+    margin:8px 0 8px 0;
+}
+.steps-box,
+.error-block,
+.evidence-block {
+    border:1px solid #e3e8ef;
+    border-radius:10px;
+    background:#ffffff;
+    padding:12px 14px;
+    margin-bottom:16px;
+}
+.steps-list {
+    margin:0;
+    padding-left:18px;
+}
+.steps-list li {
+    margin:0 0 8px 0;
+    line-height:1.45;
+    font-size:13px;
+}
+.error-title,
+.evidence-title {
+    font-size:14px;
+    font-weight:700;
+    margin-bottom:8px;
+}
+.error-summary {
+    font-size:13px;
+    line-height:1.45;
+    margin-bottom:8px;
+}
+.details-box summary {
+    cursor:pointer;
+    font-weight:700;
+    color:#4b1bb4;
+}
+.details-box pre {
+    margin-top:10px;
+    background:#101722;
+    color:#ffffff;
+    padding:12px;
+    border-radius:8px;
+    white-space:pre-wrap;
+    word-break:break-word;
+    font-size:12px;
+    line-height:1.45;
+    max-height:460px;
+    overflow:auto;
+}
+.evidence-item {
+    margin-bottom:14px;
+}
+.evidence-name {
+    font-size:12px;
+    font-weight:700;
+    margin-bottom:6px;
+}
+.evidence-links {
+    margin-bottom:8px;
+}
+.evidence-links a {
+    color:#4b1bb4;
+    font-size:13px;
+    font-weight:700;
+    text-decoration:none;
+}
+.evidence-image {
+    display:block;
+    max-width:100%;
+    max-height:520px;
+    border:1px solid #dce4ee;
+    border-radius:8px;
+    object-fit:contain;
+    background:#ffffff;
+}
+.empty-inline,
+.empty-state {
+    color:#75808d;
+    font-size:13px;
+}
+@media (max-width: 1100px) {
+    .page {
+        grid-template-columns:1fr;
+    }
+    .sidebar {
+        border-right:0;
+        border-bottom:1px solid #e4e8ef;
+    }
+}
+</style>
+'''
+    }
+
+    private String buildScripts() {
+        return '''
+<script>
+function showScenario(id) {
+    var buttons = document.querySelectorAll('.scenario-list-item');
+    var panels = document.querySelectorAll('.scenario-panel');
+
+    buttons.forEach(function(btn) {
+        if (btn.getAttribute('data-sid') === id) {
+            btn.classList.add('selected');
+        } else {
+            btn.classList.remove('selected');
+        }
+    });
+
+    panels.forEach(function(panel) {
+        if (panel.id === 'panel-' + id) {
+            panel.classList.add('active');
+        } else {
+            panel.classList.remove('active');
+        }
+    });
+}
+
+function filterScenarios() {
+    var input = document.getElementById('scenarioSearch');
+    var filter = input.value.toLowerCase();
+    var items = document.querySelectorAll('.scenario-list-item');
+
+    items.forEach(function(item) {
+        var text = item.textContent.toLowerCase();
+        if (text.indexOf(filter) > -1) {
+            item.style.display = '';
+        } else {
+            item.style.display = 'none';
+        }
+    });
+}
+</script>
+'''
+    }
+}
