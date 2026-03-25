@@ -5,343 +5,160 @@ import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.configuration.RunConfiguration
 
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
 import java.util.concurrent.ConcurrentHashMap
 import java.util.regex.Pattern
 
 class ematchReport {
 
-    private static final Map<String, Long> CASE_START_MS = new ConcurrentHashMap<>()
-    private static final ThreadLocal<Boolean> AFTER_CASE_RUNNING = ThreadLocal.withInitial({ false })
+    private static final Map<String, Long> CASE_START = new ConcurrentHashMap<>()
 
-    private static final int MAX_LOG_FILES = 8
-    private static final int MAX_LINES_PER_FILE = 12000
-    private static final int MAX_STEPS_PER_CASE = 300
+    private static final Pattern START_PATTERN = Pattern.compile('\\[START\\].*Test Cases/(.+)')
+    private static final Pattern END_PATTERN   = Pattern.compile('\\[END\\].*Test Cases/(.+)')
 
-    private static final Pattern START_CASE_PATTERN = Pattern.compile('/START \\(Test Cases/(.+?)\\)')
-    private static final Pattern END_CASE_PATTERN   = Pattern.compile('/END \\(Test Cases/(.+?)\\)')
+    private static final SimpleDateFormat FORMAT = new SimpleDateFormat("HH:mm:ss.SSS")
 
     @BeforeTestCase
-    def beforeCase(TestCaseContext testCaseContext) {
-        try {
-            String caseId = safe(testCaseContext?.getTestCaseId())
-            CASE_START_MS.put(caseId, System.currentTimeMillis())
-        } catch (Throwable t) {
-            KeywordUtil.logInfo('Report listener beforeCase failed: ' + safe(t.message))
-        }
+    def beforeCase(TestCaseContext ctx) {
+        String caseId = safe(ctx.getTestCaseId())
+        long now = System.currentTimeMillis()
+
+        CASE_START.put(caseId, now)
+
+        append("CASE_START", caseId, now, "")
     }
 
     @AfterTestCase
-    def afterCase(TestCaseContext testCaseContext) {
-        if (Boolean.TRUE == AFTER_CASE_RUNNING.get()) {
-            return
+    def afterCase(TestCaseContext ctx) {
+        String caseId = safe(ctx.getTestCaseId())
+        String status = normalize(ctx.getTestCaseStatus())
+
+        long end = System.currentTimeMillis()
+        long start = CASE_START.containsKey(caseId) ? CASE_START.get(caseId) : end
+        long duration = end - start
+
+        List<Map> steps = extractSteps(caseId)
+
+        steps.each { s ->
+            append("STEP", caseId, s.time, s.detail)
         }
 
-        AFTER_CASE_RUNNING.set(true)
+        append("CASE_END", caseId, end, "")
+        append("STATUS", caseId, end, status)
+        append("DURATION", caseId, end, String.valueOf(duration))
+
+        if (status == "FAILED") {
+            try {
+                CustomKeywords.'jiraIntegration.JiraImagesEvidence.autoFailure'(caseId)
+            } catch (Throwable ignored) {}
+        }
 
         try {
-            String caseId = safe(testCaseContext?.getTestCaseId())
-            String rawStatus = safe(testCaseContext?.getTestCaseStatus())
-            String reportStatus = normalizeStatus(rawStatus)
+            CustomKeywords.'jiraIntegration.JiraImagesEvidence.finishCase'()
+        } catch (Throwable ignored) {}
 
-            long endMs = System.currentTimeMillis()
-            long startMs = CASE_START_MS.containsKey(caseId) ? asLong(CASE_START_MS[caseId]) : endMs
-            long durationMs = Math.max(0L, endMs - startMs)
-
-            List<Map> steps = []
-            try {
-                steps = extractReportSteps(caseId)
-            } catch (Throwable stepError) {
-                KeywordUtil.logInfo('Step extraction skipped for case [' + caseId + ']: ' + safe(stepError.message))
-                steps = []
-            }
-
-            steps.each { Map row ->
-                try {
-                    appendTrace(
-                        'REPORT_STEP',
-                        caseId,
-                        formatTime(asLong(row.timeMs)),
-                        safe(row.detail)
-                    )
-                } catch (Throwable ignored) {
-                }
-            }
-
-            appendTrace('REPORT_CASE_END', caseId, formatTime(endMs))
-            appendTrace('REPORT_STATUS', caseId, reportStatus)
-            appendTrace('REPORT_DURATION', caseId, String.valueOf(durationMs))
-
-            String failure = buildFailureSummary(safe(testCaseContext?.getMessage()))
-            if (!failure.isEmpty()) {
-                appendTrace('REPORT_FAILURE', caseId, failure)
-            }
-
-            if (reportStatus == 'FAILED') {
-                try {
-                    CustomKeywords.'jiraIntegration.JiraImagesEvidence.autoFailure'(caseId)
-                } catch (Throwable ignored) {
-                }
-            }
-
-            try {
-                CustomKeywords.'jiraIntegration.JiraImagesEvidence.finishCase'()
-            } catch (Throwable ignored) {
-            }
-
-        } catch (Throwable t) {
-            KeywordUtil.logInfo('Report listener afterCase failed: ' + safe(t.message))
-        } finally {
-            try {
-                String caseId = safe(testCaseContext?.getTestCaseId())
-                CASE_START_MS.remove(caseId)
-            } catch (Throwable ignored) {
-            }
-            AFTER_CASE_RUNNING.set(false)
-        }
+        CASE_START.remove(caseId)
     }
 
-    private List<Map> extractReportSteps(String caseId) {
-        List<Map> result = []
-        List<File> logFiles = collectExecutionLogs()
+    // =========================
+    // STEP EXTRACTION
+    // =========================
 
-        if (logFiles == null || logFiles.isEmpty()) {
-            return result
+    private List<Map> extractSteps(String caseId) {
+
+        List<Map> result = []
+        File root = new File(RunConfiguration.getReportFolder())
+
+        if (!root.exists()) return result
+
+        List<File> logs = []
+
+        root.eachFileRecurse { f ->
+            if (f.isFile() && f.name.toLowerCase().contains("execution")) {
+                logs << f
+            }
         }
 
-        logFiles.each { File logFile ->
-            if (result.size() >= MAX_STEPS_PER_CASE) {
-                return
-            }
+        logs.sort { a, b -> b.lastModified() <=> a.lastModified() }
 
-            boolean insideCase = false
-            int readCount = 0
+        logs.take(3).each { file ->
 
-            eachLineSafely(logFile) { String rawLine ->
-                if (readCount >= MAX_LINES_PER_FILE || result.size() >= MAX_STEPS_PER_CASE) {
-                    return
-                }
-                readCount++
+            boolean inside = false
 
-                String line = safe(rawLine)
-                if (line.isEmpty()) {
-                    return
-                }
+            file.eachLine(StandardCharsets.UTF_8.name()) { line ->
 
-                if (shouldIgnoreLogLine(line)) {
+                String l = safe(line)
+                if (l.isEmpty()) return
+
+                // START
+                def sm = START_PATTERN.matcher(l)
+                if (sm.find()) {
+                    inside = safe(sm.group(1)) == caseId
                     return
                 }
 
-                def startMatcher = START_CASE_PATTERN.matcher(line)
-                if (startMatcher.find()) {
-                    insideCase = safe(startMatcher.group(1)) == safe(caseId)
+                // END
+                def em = END_PATTERN.matcher(l)
+                if (em.find()) {
+                    inside = false
                     return
                 }
 
-                def endMatcher = END_CASE_PATTERN.matcher(line)
-                if (endMatcher.find()) {
-                    if (safe(endMatcher.group(1)) == safe(caseId)) {
-                        insideCase = false
-                    }
-                    return
-                }
+                if (!inside) return
 
-                if (!insideCase) {
-                    return
-                }
-
-                int markerIndex = line.indexOf('[REPORT_STEP]')
-                if (markerIndex >= 0) {
-                    String detail = safe(line.substring(markerIndex + '[REPORT_STEP]'.length()))
-                    if (!detail.isEmpty()) {
-                        long timeMs = parseExecutionLogMillis(line)
-                        result << [
-                            timeMs: timeMs,
-                            detail: detail
-                        ]
-                    }
-                    return
-                }
-
-                String inferredStep = inferStepFromExecutionLine(line)
-                if (!inferredStep.isEmpty()) {
-                    long timeMs = parseExecutionLogMillis(line)
+                // 🔥 SOMENTE LOGINFO COM STEP
+                if (l.contains("[REPORT_STEP]")) {
                     result << [
-                        timeMs: timeMs,
-                        detail: inferredStep
+                        time: extractTime(l),
+                        detail: l.substring(l.indexOf("[REPORT_STEP]") + 13).trim()
                     ]
                 }
             }
         }
 
-        result = result
-            .findAll { it != null && !safe(it.detail).isEmpty() }
-            .unique { Map row -> String.valueOf(asLong(row.timeMs)) + '|' + safe(row.detail) }
-            .sort { Map a, Map b -> asLong(a.timeMs) <=> asLong(b.timeMs) }
+        result.sort { a, b -> a.time <=> b.time }
 
-        return result.take(MAX_STEPS_PER_CASE)
+        return result
     }
 
-    private List<File> collectExecutionLogs() {
-        File root = new File(RunConfiguration.getReportFolder())
-        if (!root.exists()) {
-            return []
-        }
+    // =========================
+    // TIME PARSER
+    // =========================
 
-        List<File> files = []
-        root.eachFileRecurse { File file ->
-            if (file == null || !file.isFile()) {
-                return
-            }
-
-            String name = safe(file.name).toLowerCase(Locale.ENGLISH)
-
-            if (!(name.endsWith('.log') || name == 'execution0.log')) {
-                return
-            }
-
-            if (name.contains('ktr') || name.contains('temp') || name.contains('debug')) {
-                return
-            }
-
-            files << file
-        }
-
-        files = files
-            .findAll { it.exists() && it.isFile() && it.length() > 0L }
-            .sort { File a, File b -> b.lastModified() <=> a.lastModified() }
-            .take(MAX_LOG_FILES)
-
-        return files
-    }
-
-    private void eachLineSafely(File file, Closure consumer) {
-        if (file == null || !file.exists() || !file.isFile()) {
-            return
-        }
-
-        BufferedReader reader = null
+    private long extractTime(String line) {
         try {
-            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))
-            String line
-            while ((line = reader.readLine()) != null) {
-                consumer.call(line)
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            try {
-                reader?.close()
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    private boolean shouldIgnoreLogLine(String line) {
-        String lower = safe(line).toLowerCase(Locale.ENGLISH)
-
-        return lower.contains('report listener aftercase failed')
-            || lower.contains('collectexecutionlogs')
-            || lower.contains('extractreportsteps')
-            || lower.contains('buildfailuresummary')
-            || lower.contains('return (value == null)')
-            || lower.contains('java.lang.string.valueof(value).trim()')
-            || lower.contains('root.eachfilerecurse')
-            || lower.contains('files = files.unique')
-            || lower.contains('files.sort')
-            || lower.contains('logfiles.each')
-            || lower.contains('safe(rawstatus)')
-            || lower.contains('normalizestatus(rawstatus)')
-            || lower.contains('jiraimagesevidence.finishcase')
-            || lower.contains('jiraimagesevidence.autofailure')
-    }
-
-    private String inferStepFromExecutionLine(String line) {
-        String cleaned = safe(line)
-
-        if (cleaned.isEmpty()) {
-            return ''
-        }
-
-        if (cleaned.contains('[REPORT_STEP]')) {
-            return ''
-        }
-
-        String lower = cleaned.toLowerCase(Locale.ENGLISH)
-
-        if (lower.contains('click(') || lower.contains('.click(')) {
-            return cleaned
-        }
-        if (lower.contains('settext(') || lower.contains('sendkeys(') || lower.contains('setencryptedtext(')) {
-            return cleaned
-        }
-        if (lower.contains('verify') || lower.contains('waitforelement') || lower.contains('findtestobject')) {
-            return cleaned
-        }
-        if (lower.contains('navigate') || lower.contains('openbrowser') || lower.contains('closebrowser')) {
-            return cleaned
-        }
-        if (lower.contains('windowsimagekeywords.clickimage')) {
-            return cleaned
-        }
-        if (lower.contains('delay(') || lower.contains('comment(') || lower.contains('loginfo(')) {
-            return cleaned
-        }
-
-        return ''
-    }
-
-    private long parseExecutionLogMillis(String line) {
-        try {
+            // exemplo log: 2026-03-25 09:58:20.123
+            String ts = line.substring(0, 23)
+            return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS").parse(ts).time
+        } catch (Throwable e) {
             return System.currentTimeMillis()
-        } catch (Throwable ignored) {
-            return 0L
         }
     }
 
-    private long asLong(def value) {
-        try {
-            return Long.parseLong(String.valueOf(value))
-        } catch (Throwable ignored) {
-            return 0L
-        }
+    // =========================
+    // HELPERS
+    // =========================
+
+    private void append(String type, String caseId, long time, String value) {
+        KeywordUtil.logInfo(
+            "[" + type + "] " +
+            caseId + " | " +
+            FORMAT.format(new Date(time)) + " | " +
+            safe(value)
+        )
     }
 
-    private String safe(def value) {
-        return value == null ? '' : String.valueOf(value).trim()
+    private String normalize(String s) {
+        String v = safe(s).toUpperCase()
+
+        if (v.contains("PASS")) return "PASSED"
+        if (v.contains("FAIL") || v.contains("ERROR")) return "FAILED"
+        if (v.contains("SKIP")) return "SKIPPED"
+
+        return "UNKNOWN"
     }
 
-    private String normalizeStatus(String rawStatus) {
-        String lower = safe(rawStatus).toUpperCase(Locale.ENGLISH)
-        if (lower == 'PASSED' || lower == 'PASS' || lower == 'SUCCESS') {
-            return 'PASSED'
-        }
-        if (lower == 'FAILED' || lower == 'FAIL' || lower == 'ERROR') {
-            return 'FAILED'
-        }
-        if (lower == 'SKIPPED' || lower == 'SKIP') {
-            return 'SKIPPED'
-        }
-        return lower.isEmpty() ? 'UNKNOWN' : lower
-    }
-
-    private String formatTime(long millis) {
-        return String.valueOf(millis)
-    }
-
-    private String buildFailureSummary(String message) {
-        return safe(message)
-    }
-
-    private void appendTrace(String type, String caseId, String value1) {
-        try {
-            KeywordUtil.logInfo('[' + safe(type) + '] ' + safe(caseId) + ' | ' + safe(value1))
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void appendTrace(String type, String caseId, String value1, String value2) {
-        try {
-            KeywordUtil.logInfo('[' + safe(type) + '] ' + safe(caseId) + ' | ' + safe(value1) + ' | ' + safe(value2))
-        } catch (Throwable ignored) {
-        }
+    private String safe(def v) {
+        return v == null ? "" : String.valueOf(v).trim()
     }
 }
