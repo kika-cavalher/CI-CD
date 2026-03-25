@@ -1,1 +1,400 @@
+import com.kms.katalon.core.annotation.AfterTestCase
+import com.kms.katalon.core.annotation.BeforeTestCase
+import com.kms.katalon.core.context.TestCaseContext
 
+import jiraIntegration.JiraImagesEvidence
+
+import java.util.concurrent.ConcurrentHashMap
+import java.util.Locale
+
+class ematchReport {
+
+    private static final Map<String, Long> CASE_START_MS = new ConcurrentHashMap<String, Long>()
+
+    @BeforeTestCase
+    def beforeCase(TestCaseContext testCaseContext) {
+        String caseId = safe(testCaseContext?.getTestCaseId())
+        long startMs = System.currentTimeMillis()
+
+        CASE_START_MS.put(caseId, startMs)
+
+        JiraImagesEvidence.startCaseInternal(caseId)
+        JiraImagesEvidence.appendTraceInternal(
+            'REPORT_CASE_START',
+            caseId,
+            String.valueOf(startMs),
+            ''
+        )
+    }
+
+    @AfterTestCase
+    def afterCase(TestCaseContext testCaseContext) {
+        String caseId = safe(testCaseContext?.getTestCaseId())
+        String reportStatus = normalizeStatus(safe(testCaseContext?.getTestCaseStatus()))
+
+        long endMs = System.currentTimeMillis()
+        long startMs = CASE_START_MS.containsKey(caseId) ? CASE_START_MS.get(caseId) : endMs
+        long durationMs = Math.max(0L, endMs - startMs)
+
+        JiraImagesEvidence.appendTraceInternal(
+            'REPORT_CASE_END',
+            caseId,
+            String.valueOf(endMs),
+            ''
+        )
+
+        JiraImagesEvidence.appendTraceInternal(
+            'REPORT_STATUS',
+            caseId,
+            reportStatus,
+            ''
+        )
+
+        JiraImagesEvidence.appendTraceInternal(
+            'REPORT_DURATION',
+            caseId,
+            String.valueOf(durationMs),
+            ''
+        )
+
+        String failure = buildFailureSummary(safe(testCaseContext?.getMessage()))
+        if (!failure.isEmpty()) {
+            JiraImagesEvidence.appendTraceInternal(
+                'REPORT_FAILURE',
+                caseId,
+                failure,
+                ''
+            )
+        }
+
+        if ('FAILED'.equals(reportStatus)) {
+            JiraImagesEvidence.autoFailureInternal(caseId)
+        }
+
+        JiraImagesEvidence.finishCaseInternal()
+        CASE_START_MS.remove(caseId)
+    }
+
+    private String normalizeStatus(String rawStatus) {
+        String upper = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+        if (upper == 'PASSED' || upper == 'PASS' || upper == 'SUCCESS') {
+            return 'PASSED'
+        }
+
+        if (upper == 'FAILED' || upper == 'FAIL' || upper == 'ERROR') {
+            return 'FAILED'
+        }
+
+        if (upper == 'SKIPPED' || upper == 'SKIP' || upper == 'NOT_RUN' || upper == 'NOT RUN' || upper == 'BLOCKED') {
+            return 'BLOCKED'
+        }
+
+        return upper.isEmpty() ? 'BLOCKED' : upper
+    }
+
+    private String buildFailureSummary(String message) {
+        String raw = safe(message)
+        if (raw.isEmpty()) {
+            return ''
+        }
+
+        List<String> meaningful = []
+
+        raw.readLines().each { String line ->
+            String clean = safe(line)
+            if (clean.isEmpty()) {
+                return
+            }
+            if (clean.startsWith('at ')) {
+                return
+            }
+            if (clean.startsWith('Caused by:')) {
+                return
+            }
+            meaningful << clean
+        }
+
+        if (meaningful.isEmpty()) {
+            return ''
+        }
+
+        if (meaningful.size() == 1) {
+            return meaningful[0]
+        }
+
+        return meaningful[0] + ' | ' + meaningful[1]
+    }
+
+    private String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import org.openqa.selenium.OutputType
+
+import java.awt.GraphicsEnvironment
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.image.BufferedImage
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
+import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+import javax.imageio.ImageIO
+
+class JiraImagesEvidence {
+
+    private static final String TRACE_FILE_NAME = 'custom_report_trace.txt'
+
+    private static final SimpleDateFormat FILE_STAMP =
+        new SimpleDateFormat('yyyyMMdd_HHmmss_SSS', Locale.ENGLISH)
+
+    private static final Object TRACE_LOCK = new Object()
+
+    private static final ThreadLocal<File> CURRENT_CASE_FOLDER = new ThreadLocal<File>()
+    private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
+
+    @Keyword
+    def startCase(String caseId) {
+        startCaseInternal(caseId)
+    }
+
+    @Keyword
+    def finishCase() {
+        finishCaseInternal()
+    }
+
+    @Keyword
+    def note(String message) {
+        String caseId = safe(CURRENT_CASE_ID.get())
+        if (caseId.isEmpty()) {
+            return
+        }
+
+        appendTraceInternal(
+            'REPORT_STEP',
+            caseId,
+            String.valueOf(System.currentTimeMillis()),
+            safe(message)
+        )
+    }
+
+    @Keyword
+    def checkpoint(String message) {
+        note(message)
+    }
+
+    @Keyword
+    String captureNow(String label = 'manual') {
+        File screenshot = captureScreenshotToCurrentCase(safe(label))
+        return screenshot != null && screenshot.exists() ? screenshot.absolutePath : ''
+    }
+
+    @Keyword
+    String noteAndCapture(String message, String label = 'manual') {
+        note(message)
+        return captureNow(label)
+    }
+
+    @Keyword
+    String autoFailure(String caseId = '') {
+        return autoFailureInternal(caseId)
+    }
+
+    static void startCaseInternal(String caseId) {
+        String cleanCaseId = safe(caseId)
+        if (cleanCaseId.isEmpty()) {
+            return
+        }
+
+        File caseFolder = resolveCaseFolder(cleanCaseId)
+        CURRENT_CASE_ID.set(cleanCaseId)
+        CURRENT_CASE_FOLDER.set(caseFolder)
+    }
+
+    static void finishCaseInternal() {
+        CURRENT_CASE_ID.remove()
+        CURRENT_CASE_FOLDER.remove()
+    }
+
+    static String autoFailureInternal(String caseId = '') {
+        String effectiveCaseId = safe(caseId)
+
+        if (!effectiveCaseId.isEmpty()) {
+            startCaseInternal(effectiveCaseId)
+        }
+
+        File screenshot = captureScreenshotToCurrentCase('auto-failure')
+        return screenshot != null && screenshot.exists() ? screenshot.absolutePath : ''
+    }
+
+    static void appendTraceInternal(String type, String caseId, String value1, String value2) {
+        File traceFile = new File(RunConfiguration.getReportFolder(), TRACE_FILE_NAME)
+        traceFile.parentFile?.mkdirs()
+
+        synchronized (TRACE_LOCK) {
+            BufferedWriter writer = null
+            try {
+                writer = new BufferedWriter(
+                    new OutputStreamWriter(
+                        new FileOutputStream(traceFile, true),
+                        StandardCharsets.UTF_8
+                    )
+                )
+
+                writer.write(cleanTrace(type))
+                writer.write('\t')
+                writer.write(cleanTrace(caseId))
+                writer.write('\t')
+                writer.write(cleanTrace(value1))
+                writer.write('\t')
+                writer.write(cleanTrace(value2))
+                writer.newLine()
+            } finally {
+                try {
+                    writer?.close()
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    private static File captureScreenshotToCurrentCase(String label) {
+        File caseFolder = CURRENT_CASE_FOLDER.get()
+
+        if (caseFolder == null) {
+            String caseId = safe(CURRENT_CASE_ID.get())
+            if (caseId.isEmpty()) {
+                caseId = 'unknown-case'
+            }
+            caseFolder = resolveCaseFolder(caseId)
+            CURRENT_CASE_FOLDER.set(caseFolder)
+        }
+
+        if (!caseFolder.exists()) {
+            caseFolder.mkdirs()
+        }
+
+        String safeLabel = sanitizeName(label)
+        if (safeLabel.isEmpty()) {
+            safeLabel = 'manual'
+        }
+
+        File targetFile = new File(caseFolder, FILE_STAMP.format(new Date()) + '_' + safeLabel + '.png')
+
+        if (captureDesktopScreenshot(targetFile)) {
+            return targetFile
+        }
+
+        if (captureDriverScreenshot(targetFile)) {
+            return targetFile
+        }
+
+        return null
+    }
+
+    private static boolean captureDesktopScreenshot(File targetFile) {
+        try {
+            if (GraphicsEnvironment.isHeadless()) {
+                return false
+            }
+
+            Robot robot = new Robot()
+            Rectangle rectangle = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
+            BufferedImage image = robot.createScreenCapture(rectangle)
+
+            targetFile.parentFile?.mkdirs()
+            ImageIO.write(image, 'png', targetFile)
+
+            return targetFile.exists() && targetFile.length() > 0L
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private static boolean captureDriverScreenshot(File targetFile) {
+        try {
+            def driver = Windows.getDriver()
+            if (driver == null) {
+                return false
+            }
+
+            byte[] bytes = driver.getScreenshotAs(OutputType.BYTES)
+            if (bytes == null || bytes.length == 0) {
+                return false
+            }
+
+            targetFile.parentFile?.mkdirs()
+            targetFile.bytes = bytes
+
+            return targetFile.exists() && targetFile.length() > 0L
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private static File resolveCaseFolder(String caseId) {
+        File reportFolder = new File(RunConfiguration.getReportFolder())
+        File evidencesRoot = new File(reportFolder, 'Evidences')
+        File caseFolder = new File(evidencesRoot, sanitizeName(caseId))
+        caseFolder.mkdirs()
+        return caseFolder
+    }
+
+    private static String cleanTrace(Object value) {
+        return safe(value)
+            .replace('\r', ' ')
+            .replace('\n', ' ')
+            .replace('\t', ' ')
+    }
+
+    private static String sanitizeName(Object value) {
+        return safe(value)
+            .replace('\\', '_')
+            .replace('/', '_')
+            .replace(':', '_')
+            .replace('*', '_')
+            .replace('?', '_')
+            .replace('"', '_')
+            .replace('<', '_')
+            .replace('>', '_')
+            .replace('|', '_')
+            .replaceAll(/[^A-Za-z0-9._-]+/, '_')
+            .replaceAll(/_+/, '_')
+            .trim()
+    }
+
+    private static String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
