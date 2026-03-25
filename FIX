@@ -1,384 +1,968 @@
-import com.kms.katalon.core.annotation.AfterTestCase
-import com.kms.katalon.core.annotation.BeforeTestCase
-import com.kms.katalon.core.context.TestCaseContext
-
-import jiraIntegration.JiraImagesEvidence
-
-import java.util.concurrent.ConcurrentHashMap
-import java.util.Locale
-
-class ematchReport {
-
-    private static final Map<String, Long> CASE_START_MS = new ConcurrentHashMap<String, Long>()
-
-    @BeforeTestCase
-    def beforeCase(TestCaseContext testCaseContext) {
-        String caseId = safe(testCaseContext?.getTestCaseId())
-        long startMs = System.currentTimeMillis()
-
-        CASE_START_MS.put(caseId, startMs)
-
-        JiraImagesEvidence.startCaseInternal(caseId)
-        JiraImagesEvidence.appendTraceInternal(
-            'REPORT_CASE_START',
-            caseId,
-            String.valueOf(startMs),
-            ''
-        )
-    }
-
-    @AfterTestCase
-    def afterCase(TestCaseContext testCaseContext) {
-        String caseId = safe(testCaseContext?.getTestCaseId())
-        String reportStatus = normalizeStatus(safe(testCaseContext?.getTestCaseStatus()))
-
-        long endMs = System.currentTimeMillis()
-        long startMs = CASE_START_MS.containsKey(caseId) ? CASE_START_MS.get(caseId) : endMs
-        long durationMs = Math.max(0L, endMs - startMs)
-
-        JiraImagesEvidence.appendTraceInternal(
-            'REPORT_CASE_END',
-            caseId,
-            String.valueOf(endMs),
-            ''
-        )
-
-        JiraImagesEvidence.appendTraceInternal(
-            'REPORT_STATUS',
-            caseId,
-            reportStatus,
-            ''
-        )
-
-        JiraImagesEvidence.appendTraceInternal(
-            'REPORT_DURATION',
-            caseId,
-            String.valueOf(durationMs),
-            ''
-        )
-
-        String failure = buildFailureSummary(safe(testCaseContext?.getMessage()))
-        if (!failure.isEmpty()) {
-            JiraImagesEvidence.appendTraceInternal(
-                'REPORT_FAILURE',
-                caseId,
-                failure,
-                ''
-            )
-        }
-
-        if ('FAILED'.equals(reportStatus)) {
-            JiraImagesEvidence.autoFailureInternal(caseId)
-        }
-
-        JiraImagesEvidence.finishCaseInternal()
-        CASE_START_MS.remove(caseId)
-    }
-
-    private String normalizeStatus(String rawStatus) {
-        String upper = safe(rawStatus).toUpperCase(Locale.ENGLISH)
-
-        if (upper == 'PASSED' || upper == 'PASS' || upper == 'SUCCESS') {
-            return 'PASSED'
-        }
-
-        if (upper == 'FAILED' || upper == 'FAIL' || upper == 'ERROR') {
-            return 'FAILED'
-        }
-
-        if (upper == 'SKIPPED' || upper == 'SKIP' || upper == 'NOT_RUN' || upper == 'NOT RUN' || upper == 'BLOCKED') {
-            return 'BLOCKED'
-        }
-
-        return upper.isEmpty() ? 'BLOCKED' : upper
-    }
-
-    private String buildFailureSummary(String message) {
-        String raw = safe(message)
-        if (raw.isEmpty()) {
-            return ''
-        }
-
-        List<String> meaningful = []
-
-        raw.readLines().each { String line ->
-            String clean = safe(line)
-            if (clean.isEmpty()) {
-                return
-            }
-            if (clean.startsWith('at ')) {
-                return
-            }
-            if (clean.startsWith('Caused by:')) {
-                return
-            }
-            meaningful << clean
-        }
-
-        if (meaningful.isEmpty()) {
-            return ''
-        }
-
-        if (meaningful.size() == 1) {
-            return meaningful[0]
-        }
-
-        return meaningful[0] + ' | ' + meaningful[1]
-    }
-
-    private String safe(Object value) {
-        return value == null ? '' : String.valueOf(value).trim()
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 package jiraIntegration
 
-import com.kms.katalon.core.annotation.Keyword
-import com.kms.katalon.core.configuration.RunConfiguration
-import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+import org.w3c.dom.NodeList
 
-import org.openqa.selenium.OutputType
+import javax.xml.XMLConstants
+import javax.xml.parsers.DocumentBuilderFactory
 
-import java.awt.GraphicsEnvironment
-import java.awt.Rectangle
-import java.awt.Robot
-import java.awt.Toolkit
-import java.awt.image.BufferedImage
+import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.math.BigDecimal
+import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.LinkedHashMap
+import java.util.LinkedHashSet
 import java.util.Locale
 
-import javax.imageio.ImageIO
+class JiraReportBuilder {
 
-class JiraImagesEvidence {
-
+    private static final String APP_NAME = 'EMATCH'
+    private static final String LOGO_SRC = 'Image/ematch-logo.png'
     private static final String TRACE_FILE_NAME = 'custom_report_trace.txt'
 
-    private static final SimpleDateFormat FILE_STAMP =
-        new SimpleDateFormat('yyyyMMdd_HHmmss_SSS', Locale.ENGLISH)
+    private static final SimpleDateFormat OUTPUT_DATE_TIME =
+        new SimpleDateFormat('dd/MM/yyyy HH:mm:ss', Locale.ENGLISH)
 
-    private static final Object TRACE_LOCK = new Object()
+    private static final SimpleDateFormat OUTPUT_CLOCK =
+        new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH)
 
-    private static final ThreadLocal<File> CURRENT_CASE_FOLDER = new ThreadLocal<File>()
-    private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
+    private static final List<String> DATE_PATTERNS = [
+        'yyyy-MM-dd HH:mm:ss.SSS',
+        'yyyy-MM-dd HH:mm:ss',
+        "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+        "yyyy-MM-dd'T'HH:mm:ss.SSS",
+        "yyyy-MM-dd'T'HH:mm:ss",
+        'dd/MM/yyyy HH:mm:ss',
+        'dd.MM.yyyy HH:mm:ss',
+        'MM-dd-yyyy HH:mm:ss',
+        'MM/dd/yyyy HH:mm:ss',
+        'HH:mm:ss'
+    ]
 
-    @Keyword
-    def startCase(String caseId) {
-        startCaseInternal(caseId)
+    File buildReport(String reportFolderPath) {
+        return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), '', '')
     }
 
-    @Keyword
-    def finishCase() {
-        finishCaseInternal()
-    }
-
-    @Keyword
-    def note(String message) {
-        String caseId = safe(CURRENT_CASE_ID.get())
-        if (caseId.isEmpty()) {
-            return
-        }
-
-        appendTraceInternal(
-            'REPORT_STEP',
-            caseId,
-            String.valueOf(System.currentTimeMillis()),
-            safe(message)
+    File buildReport(String reportFolderPath, String suiteName, String executionTitle) {
+        return buildReport(
+            new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath),
+            suiteName,
+            executionTitle
         )
     }
 
-    @Keyword
-    def checkpoint(String message) {
-        note(message)
+    File buildReport(File reportFolder) {
+        return buildReport(reportFolder, '', '')
     }
 
-    @Keyword
-    String captureNow(String label = 'manual') {
-        File screenshot = captureScreenshotToCurrentCase(safe(label))
-        return screenshot != null && screenshot.exists() ? screenshot.absolutePath : ''
+    File buildReport(File reportFolder, String suiteName, String executionTitle) {
+        File root = reportFolder ?: new File('.')
+        Map model = buildModel(root, suiteName, executionTitle)
+
+        JiraHtmlTemplateBuilder htmlTemplateBuilder = new JiraHtmlTemplateBuilder()
+        String html = htmlTemplateBuilder.build(model)
+
+        File output = new File(root, 'eMatchReport.html')
+        writeUtf8(output, html)
+
+        return output
     }
 
-    @Keyword
-    String noteAndCapture(String message, String label = 'manual') {
-        note(message)
-        return captureNow(label)
-    }
+    private Map buildModel(File reportRoot, String requestedSuiteName, String executionTitle) {
+        LinkedHashMap<String, Map> junitByCaseId = new LinkedHashMap<String, Map>()
+        List<File> junitFiles = collectJUnitFiles(reportRoot)
 
-    @Keyword
-    String autoFailure(String caseId = '') {
-        return autoFailureInternal(caseId)
-    }
-
-    static void startCaseInternal(String caseId) {
-        String cleanCaseId = safe(caseId)
-        if (cleanCaseId.isEmpty()) {
-            return
-        }
-
-        File caseFolder = resolveCaseFolder(cleanCaseId)
-        CURRENT_CASE_ID.set(cleanCaseId)
-        CURRENT_CASE_FOLDER.set(caseFolder)
-    }
-
-    static void finishCaseInternal() {
-        CURRENT_CASE_ID.remove()
-        CURRENT_CASE_FOLDER.remove()
-    }
-
-    static String autoFailureInternal(String caseId = '') {
-        String effectiveCaseId = safe(caseId)
-
-        if (!effectiveCaseId.isEmpty()) {
-            startCaseInternal(effectiveCaseId)
-        }
-
-        File screenshot = captureScreenshotToCurrentCase('auto-failure')
-        return screenshot != null && screenshot.exists() ? screenshot.absolutePath : ''
-    }
-
-    static void appendTraceInternal(String type, String caseId, String value1, String value2) {
-        File traceFile = new File(RunConfiguration.getReportFolder(), TRACE_FILE_NAME)
-        traceFile.parentFile?.mkdirs()
-
-        synchronized (TRACE_LOCK) {
-            BufferedWriter writer = null
-            try {
-                writer = new BufferedWriter(
-                    new OutputStreamWriter(
-                        new FileOutputStream(traceFile, true),
-                        StandardCharsets.UTF_8
-                    )
-                )
-
-                writer.write(cleanTrace(type))
-                writer.write('\t')
-                writer.write(cleanTrace(caseId))
-                writer.write('\t')
-                writer.write(cleanTrace(value1))
-                writer.write('\t')
-                writer.write(cleanTrace(value2))
-                writer.newLine()
-            } finally {
-                try {
-                    writer?.close()
-                } catch (Throwable ignored) {
+        for (File junitFile : junitFiles) {
+            List<Map> rows = parseJUnitFile(junitFile)
+            for (Map row : rows) {
+                String caseId = safe(row.caseId)
+                if (!caseId.isEmpty()) {
+                    junitByCaseId.put(caseId, row)
                 }
             }
         }
+
+        Map<String, Map> traceByCaseId = parseTraceFile(new File(reportRoot, TRACE_FILE_NAME))
+        Map<String, Map> logByCaseId = parseExecutionLogs(reportRoot)
+
+        LinkedHashSet<String> allCaseIds = new LinkedHashSet<String>()
+        allCaseIds.addAll(junitByCaseId.keySet())
+        allCaseIds.addAll(traceByCaseId.keySet())
+        allCaseIds.addAll(logByCaseId.keySet())
+
+        List<Map> scenarios = []
+        int index = 1
+
+        for (String caseId : allCaseIds) {
+            Map junitRow = junitByCaseId.containsKey(caseId) ? junitByCaseId.get(caseId) : [:]
+            Map traceRow = traceByCaseId.containsKey(caseId) ? traceByCaseId.get(caseId) : [:]
+            Map logRow = logByCaseId.containsKey(caseId) ? logByCaseId.get(caseId) : [:]
+
+            long startMs = firstPositive(
+                asLong(traceRow.startMs),
+                asLong(logRow.startMs)
+            )
+
+            long endMs = firstPositive(
+                asLong(traceRow.endMs),
+                asLong(logRow.endMs)
+            )
+
+            long durationMs = firstPositive(
+                asLong(traceRow.durationMs),
+                (startMs > 0L && endMs >= startMs) ? (endMs - startMs) : 0L,
+                asLong(junitRow.durationMs)
+            )
+
+            String status = normalizeScenarioStatus(
+                firstNonBlank(
+                    traceRow.status,
+                    junitRow.status
+                )
+            )
+
+            String fullError = firstNonBlank(
+                traceRow.failure,
+                junitRow.fullError,
+                junitRow.errorDetail
+            )
+
+            List<Map> manualSteps = logRow.steps instanceof List ? (List<Map>) logRow.steps : []
+            List<Map> steps = buildScenarioSteps(manualSteps, status, fullError, endMs)
+
+            List<Map> evidence = findEvidence(reportRoot, caseId)
+
+            String displayName = firstNonBlank(
+                junitRow.name,
+                caseId
+            )
+
+            String shortError = buildShortError(fullError)
+
+            scenarios << [
+                id           : buildScenarioId(displayName, index),
+                caseId       : caseId,
+                name         : displayName,
+                scenarioName : displayName,
+                status       : status,
+                result       : status,
+                durationMs   : durationMs,
+                durationLabel: formatDuration(durationMs),
+                startTime    : formatDateTime(startMs),
+                endTime      : formatDateTime(endMs),
+                startLabel   : formatDateTime(startMs),
+                endLabel     : formatDateTime(endMs),
+                startShort   : formatClock(startMs),
+                endShort     : formatClock(endMs),
+                startLong    : formatDateTime(startMs),
+                endLong      : formatDateTime(endMs),
+                visualError  : shortError,
+                errorSummary : shortError,
+                fullError    : fullError,
+                errorDetail  : fullError,
+                reportFolder : reportRoot.absolutePath,
+                steps        : steps,
+                evidence     : evidence
+            ]
+
+            index++
+        }
+
+        if (scenarios.isEmpty()) {
+            scenarios << [
+                id           : 'scenario-1',
+                caseId       : 'scenario-1',
+                name         : 'Execution',
+                scenarioName : 'Execution',
+                status       : 'blocked',
+                result       : 'blocked',
+                durationMs   : 0L,
+                durationLabel: formatDuration(0L),
+                startTime    : '',
+                endTime      : '',
+                startLabel   : '--',
+                endLabel     : '--',
+                startShort   : '--',
+                endShort     : '--',
+                startLong    : '--',
+                endLong      : '--',
+                visualError  : '',
+                errorSummary : '',
+                fullError    : '',
+                errorDetail  : '',
+                reportFolder : reportRoot.absolutePath,
+                steps        : [],
+                evidence     : []
+            ]
+        }
+
+        String resolvedSuiteName = resolveSuiteName(reportRoot, requestedSuiteName)
+        String resolvedExecutionTitle = !safe(executionTitle).isEmpty()
+            ? safe(executionTitle)
+            : resolvedSuiteName
+
+        return [
+            appName         : APP_NAME,
+            suiteName       : resolvedSuiteName,
+            executionName   : resolvedExecutionTitle,
+            title           : resolvedExecutionTitle,
+            generatedAt     : OUTPUT_DATE_TIME.format(new Date()),
+            reportFolder    : reportRoot.absolutePath,
+            baseFolder      : reportRoot.absolutePath,
+            executionFolder : reportRoot.absolutePath,
+            logoSrc         : LOGO_SRC,
+            scenarios       : scenarios
+        ]
     }
 
-    private static File captureScreenshotToCurrentCase(String label) {
-        File caseFolder = CURRENT_CASE_FOLDER.get()
+    private String resolveSuiteName(File reportRoot, String requestedSuiteName) {
+        String explicit = safe(requestedSuiteName)
 
-        if (caseFolder == null) {
-            String caseId = safe(CURRENT_CASE_ID.get())
-            if (caseId.isEmpty()) {
-                caseId = 'unknown-case'
+        if (!explicit.isEmpty() && !looksLikeTimestampFolder(explicit)) {
+            return explicit
+        }
+
+        if (reportRoot != null && reportRoot.parentFile != null) {
+            String parentName = safe(reportRoot.parentFile.name)
+            if (!parentName.isEmpty() && !looksLikeTimestampFolder(parentName)) {
+                return parentName
             }
-            caseFolder = resolveCaseFolder(caseId)
-            CURRENT_CASE_FOLDER.set(caseFolder)
         }
 
-        if (!caseFolder.exists()) {
-            caseFolder.mkdirs()
+        if (reportRoot != null && !safe(reportRoot.name).isEmpty() && !looksLikeTimestampFolder(reportRoot.name)) {
+            return safe(reportRoot.name)
         }
 
-        String safeLabel = sanitizeName(label)
-        if (safeLabel.isEmpty()) {
-            safeLabel = 'manual'
+        return 'Execution'
+    }
+
+    private boolean looksLikeTimestampFolder(String value) {
+        String text = safe(value)
+        return text ==~ /\d{8}_\d{6}/
+    }
+
+    private List<Map> parseJUnitFile(File junitFile) {
+        List<Map> result = []
+
+        Document document = parseXml(junitFile)
+        if (document == null) {
+            return result
         }
 
-        File targetFile = new File(caseFolder, FILE_STAMP.format(new Date()) + '_' + safeLabel + '.png')
+        NodeList testCases = document.getElementsByTagName('testcase')
 
-        if (captureDesktopScreenshot(targetFile)) {
-            return targetFile
+        for (int i = 0; i < testCases.getLength(); i++) {
+            Element testcase = (Element) testCases.item(i)
+
+            String className = attr(testcase, 'classname')
+            String rawName = attr(testcase, 'name')
+            String caseId = buildDisplayName(className, rawName)
+
+            Element failureElement = firstDirectChild(testcase, 'failure')
+            Element errorElement = firstDirectChild(testcase, 'error')
+            Element skippedElement = firstDirectChild(testcase, 'skipped')
+
+            String status = 'passed'
+            Element resultElement = null
+
+            if (failureElement != null) {
+                status = 'failed'
+                resultElement = failureElement
+            } else if (errorElement != null) {
+                status = 'failed'
+                resultElement = errorElement
+            } else if (skippedElement != null) {
+                status = 'blocked'
+                resultElement = skippedElement
+            }
+
+            String fullError = ''
+            if (resultElement != null) {
+                fullError = firstNonBlank(
+                    attr(resultElement, 'message'),
+                    safe(resultElement.getTextContent())
+                )
+            }
+
+            long durationMs = toDurationMillis(attr(testcase, 'time'))
+
+            result << [
+                caseId     : caseId,
+                name       : caseId,
+                status     : status,
+                durationMs : durationMs,
+                fullError  : fullError,
+                errorDetail: fullError
+            ]
         }
 
-        if (captureDriverScreenshot(targetFile)) {
-            return targetFile
+        return result
+    }
+
+    private Document parseXml(File xmlFile) {
+        if (xmlFile == null || !xmlFile.exists()) {
+            return null
+        }
+
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance()
+            factory.setNamespaceAware(false)
+            factory.setXIncludeAware(false)
+            factory.setExpandEntityReferences(false)
+
+            try {
+                factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                factory.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                factory.setFeature('http://xml.org/sax/features/external-general-entities', false)
+            } catch (Throwable ignored) {
+            }
+
+            try {
+                factory.setFeature('http://xml.org/sax/features/external-parameter-entities', false)
+            } catch (Throwable ignored) {
+            }
+
+            return factory.newDocumentBuilder().parse(xmlFile)
+        } catch (Throwable ignored) {
+            return null
+        }
+    }
+
+    private Element firstDirectChild(Element parent, String name) {
+        if (parent == null) {
+            return null
+        }
+
+        for (int i = 0; i < parent.getChildNodes().getLength(); i++) {
+            def node = parent.getChildNodes().item(i)
+            if (node instanceof Element && safe(node.getNodeName()) == safe(name)) {
+                return (Element) node
+            }
         }
 
         return null
     }
 
-    private static boolean captureDesktopScreenshot(File targetFile) {
-        try {
-            if (GraphicsEnvironment.isHeadless()) {
+    private Map<String, Map> parseTraceFile(File traceFile) {
+        LinkedHashMap<String, Map> result = new LinkedHashMap<String, Map>()
+
+        if (traceFile == null || !traceFile.exists() || !traceFile.isFile()) {
+            return result
+        }
+
+        eachLine(traceFile) { String line ->
+            if (safe(line).isEmpty()) {
+                return
+            }
+
+            String[] parts = line.split('\t', 4)
+
+            String type = parts.length > 0 ? safe(parts[0]) : ''
+            String caseId = parts.length > 1 ? safe(parts[1]) : ''
+            String value1 = parts.length > 2 ? safe(parts[2]) : ''
+            String value2 = parts.length > 3 ? safe(parts[3]) : ''
+
+            if (type.isEmpty() || caseId.isEmpty()) {
+                return
+            }
+
+            if (!result.containsKey(caseId)) {
+                result.put(caseId, [:])
+            }
+
+            Map row = result.get(caseId)
+
+            if ('REPORT_CASE_START'.equals(type)) {
+                row.startMs = asLong(value1)
+                return
+            }
+
+            if ('REPORT_CASE_END'.equals(type)) {
+                row.endMs = asLong(value1)
+                return
+            }
+
+            if ('REPORT_STATUS'.equals(type)) {
+                row.status = normalizeScenarioStatus(value1)
+                return
+            }
+
+            if ('REPORT_DURATION'.equals(type)) {
+                row.durationMs = asLong(value1)
+                return
+            }
+
+            if ('REPORT_FAILURE'.equals(type)) {
+                row.failure = firstNonBlank(row.failure, value1, value2)
+            }
+        }
+
+        return result
+    }
+
+    private Map<String, Map> parseExecutionLogs(File reportRoot) {
+        LinkedHashMap<String, Map> result = new LinkedHashMap<String, Map>()
+        List<File> logFiles = collectExecutionLogs(reportRoot)
+
+        for (File logFile : logFiles) {
+            String currentCaseId = ''
+
+            eachLine(logFile) { String rawLine ->
+                String line = safe(rawLine)
+                if (line.isEmpty()) {
+                    return
+                }
+
+                String startedCase = extractStartedCaseId(line)
+                if (!startedCase.isEmpty()) {
+                    currentCaseId = startedCase
+
+                    if (!result.containsKey(currentCaseId)) {
+                        result.put(currentCaseId, [steps: []])
+                    }
+
+                    Map row = result.get(currentCaseId)
+                    long timestamp = parseLogTimestampMillis(line)
+                    if (timestamp > 0L && asLong(row.startMs) <= 0L) {
+                        row.startMs = timestamp
+                    }
+                    return
+                }
+
+                String endedCase = extractEndedCaseId(line)
+                if (!endedCase.isEmpty()) {
+                    if (!result.containsKey(endedCase)) {
+                        result.put(endedCase, [steps: []])
+                    }
+
+                    Map row = result.get(endedCase)
+                    long timestamp = parseLogTimestampMillis(line)
+                    if (timestamp > 0L) {
+                        row.endMs = timestamp
+                    }
+
+                    if (safe(currentCaseId) == endedCase) {
+                        currentCaseId = ''
+                    }
+                    return
+                }
+
+                if (currentCaseId.isEmpty()) {
+                    return
+                }
+
+                String detail = extractReportStepDetail(line)
+                if (detail.isEmpty()) {
+                    return
+                }
+
+                if (!result.containsKey(currentCaseId)) {
+                    result.put(currentCaseId, [steps: []])
+                }
+
+                Map row = result.get(currentCaseId)
+                if (!(row.steps instanceof List)) {
+                    row.steps = []
+                }
+
+                row.steps << [
+                    timeMs: parseLogTimestampMillis(line),
+                    detail: detail
+                ]
+            }
+        }
+
+        for (Map row : result.values()) {
+            List<Map> steps = row.steps instanceof List ? (List<Map>) row.steps : []
+            row.steps = steps
+                .findAll { it != null && !safe(it.detail).isEmpty() }
+                .unique { Map step -> safe(step.detail) + '|' + String.valueOf(asLong(step.timeMs)) }
+                .sort { Map a, Map b -> asLong(a.timeMs) <=> asLong(b.timeMs) }
+        }
+
+        return result
+    }
+
+    private List<File> collectExecutionLogs(File reportRoot) {
+        List<File> result = []
+        if (reportRoot == null || !reportRoot.exists()) {
+            return result
+        }
+
+        collectFilesRecursively(reportRoot, result)
+
+        result = result.findAll { File file ->
+            if (file == null || !file.isFile()) {
                 return false
             }
 
-            Robot robot = new Robot()
-            Rectangle rectangle = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
-            BufferedImage image = robot.createScreenCapture(rectangle)
+            String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
 
-            targetFile.parentFile?.mkdirs()
-            ImageIO.write(image, 'png', targetFile)
+            if (lower == TRACE_FILE_NAME.toLowerCase(Locale.ENGLISH)) {
+                return false
+            }
 
-            return targetFile.exists() && targetFile.length() > 0L
-        } catch (Throwable ignored) {
-            return false
+            return lower.endsWith('.log') || lower.endsWith('.txt')
+        }
+
+        result.sort { File a, File b ->
+            int pa = logPriority(a)
+            int pb = logPriority(b)
+            if (pa != pb) {
+                return pa <=> pb
+            }
+            return a.lastModified() <=> b.lastModified()
+        }
+
+        return result
+    }
+
+    private int logPriority(File file) {
+        String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+
+        if (lower == 'execution0.log') {
+            return 0
+        }
+        if (lower.startsWith('execution') && lower.endsWith('.log')) {
+            return 1
+        }
+        if (lower == 'execution.log') {
+            return 2
+        }
+        return 10
+    }
+
+    private void collectFilesRecursively(File folder, List<File> output) {
+        if (folder == null || !folder.exists()) {
+            return
+        }
+
+        File[] children = folder.listFiles()
+        if (children == null) {
+            return
+        }
+
+        for (File child : children) {
+            if (child.isDirectory()) {
+                collectFilesRecursively(child, output)
+            } else {
+                output << child
+            }
         }
     }
 
-    private static boolean captureDriverScreenshot(File targetFile) {
-        try {
-            def driver = Windows.getDriver()
-            if (driver == null) {
-                return false
+    private String extractStartedCaseId(String line) {
+        String value = safe(line)
+
+        int direct = value.indexOf('START Test Cases/')
+        if (direct >= 0) {
+            return safe(value.substring(direct + 'START '.length()))
+        }
+
+        def matcher = value =~ /START\s+\((Test Cases\/.+?)\)/
+        if (matcher.find()) {
+            return safe(matcher.group(1))
+        }
+
+        return ''
+    }
+
+    private String extractEndedCaseId(String line) {
+        String value = safe(line)
+
+        int direct = value.indexOf('END Test Cases/')
+        if (direct >= 0) {
+            return safe(value.substring(direct + 'END '.length()))
+        }
+
+        def matcher = value =~ /END\s+\((Test Cases\/.+?)\)/
+        if (matcher.find()) {
+            return safe(matcher.group(1))
+        }
+
+        return ''
+    }
+
+    private String extractReportStepDetail(String line) {
+        String value = safe(line)
+        if (value.isEmpty()) {
+            return ''
+        }
+
+        int markerIndex = value.indexOf('[REPORT_STEP]')
+        if (markerIndex < 0) {
+            return ''
+        }
+
+        String detail = value.substring(markerIndex + '[REPORT_STEP]'.length()).trim()
+
+        detail = detail
+            .replaceAll(/^[\s'"]+/, '')
+            .replaceAll(/['"]+\)?$/, '')
+            .trim()
+
+        return detail
+    }
+
+    private List<Map> buildScenarioSteps(List<Map> manualSteps, String scenarioStatus, String fullError, long endMs) {
+        List<Map> result = []
+
+        for (Map row : manualSteps) {
+            String detail = safe(row.detail)
+            if (detail.isEmpty()) {
+                continue
             }
 
-            byte[] bytes = driver.getScreenshotAs(OutputType.BYTES)
-            if (bytes == null || bytes.length == 0) {
-                return false
+            long timeMs = asLong(row.timeMs)
+
+            result << [
+                status    : 'passed',
+                timestamp : formatClock(timeMs),
+                detail    : detail,
+                icon      : '✅'
+            ]
+        }
+
+        if ('failed'.equalsIgnoreCase(scenarioStatus)) {
+            String failureDetail = buildShortError(fullError)
+            if (!failureDetail.isEmpty()) {
+                result << [
+                    status    : 'failed',
+                    timestamp : formatClock(endMs),
+                    detail    : failureDetail,
+                    icon      : '❌'
+                ]
             }
+        }
 
-            targetFile.parentFile?.mkdirs()
-            targetFile.bytes = bytes
+        return result
+    }
 
-            return targetFile.exists() && targetFile.length() > 0L
-        } catch (Throwable ignored) {
-            return false
+    private List<Map> findEvidence(File reportRoot, String caseId) {
+        List<Map> result = []
+        File evidencesRoot = new File(reportRoot, 'Evidences')
+
+        if (!evidencesRoot.exists()) {
+            return result
+        }
+
+        String folderName = sanitizeFolderName(caseId)
+        File exactFolder = new File(evidencesRoot, folderName)
+
+        List<File> images = []
+        if (exactFolder.exists()) {
+            collectImagesRecursively(exactFolder, images)
+        } else {
+            List<File> allImages = []
+            collectImagesRecursively(evidencesRoot, allImages)
+
+            String normalizedCaseId = normalizeKey(caseId)
+
+            allImages = allImages
+                .findAll { File image ->
+                    String normalizedPath = normalizeKey(image.absolutePath)
+                    return !normalizedCaseId.isEmpty() && normalizedPath.contains(normalizedCaseId)
+                }
+                .sort { File a, File b -> b.lastModified() <=> a.lastModified() }
+
+            images.addAll(allImages)
+        }
+
+        images = images.sort { File a, File b -> b.lastModified() <=> a.lastModified() }
+
+        for (File image : images.take(5)) {
+            String href = image.toURI().toString()
+            result << [
+                name  : image.name,
+                href  : href,
+                image : true,
+                imgSrc: href
+            ]
+        }
+
+        return result
+    }
+
+    private void collectImagesRecursively(File folder, List<File> output) {
+        if (folder == null || !folder.exists()) {
+            return
+        }
+
+        File[] children = folder.listFiles()
+        if (children == null) {
+            return
+        }
+
+        for (File child : children) {
+            if (child.isDirectory()) {
+                collectImagesRecursively(child, output)
+            } else if (isImageFile(child)) {
+                output << child
+            }
         }
     }
 
-    private static File resolveCaseFolder(String caseId) {
-        File reportFolder = new File(RunConfiguration.getReportFolder())
-        File evidencesRoot = new File(reportFolder, 'Evidences')
-        File caseFolder = new File(evidencesRoot, sanitizeName(caseId))
-        caseFolder.mkdirs()
-        return caseFolder
+    private boolean isImageFile(File file) {
+        String lower = safe(file?.name).toLowerCase(Locale.ENGLISH)
+        return lower.endsWith('.png') ||
+               lower.endsWith('.jpg') ||
+               lower.endsWith('.jpeg') ||
+               lower.endsWith('.gif') ||
+               lower.endsWith('.bmp') ||
+               lower.endsWith('.webp')
     }
 
-    private static String cleanTrace(Object value) {
-        return safe(value)
-            .replace('\r', ' ')
-            .replace('\n', ' ')
-            .replace('\t', ' ')
+    private List<File> collectJUnitFiles(File reportRoot) {
+        List<File> result = []
+        if (reportRoot == null || !reportRoot.exists()) {
+            return result
+        }
+
+        List<File> allFiles = []
+        collectFilesRecursively(reportRoot, allFiles)
+
+        for (File file : allFiles) {
+            String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+            if (lower == 'junit_report.xml' || lower == 'junitreport.xml' || lower == 'junit.xml') {
+                result << file
+            }
+        }
+
+        result.sort { File a, File b -> a.absolutePath <=> b.absolutePath }
+        return result
     }
 
-    private static String sanitizeName(Object value) {
+    private String buildDisplayName(String className, String rawName) {
+        String cleanClass = safe(className)
+        String cleanName = safe(rawName)
+
+        if (!cleanClass.isEmpty()) {
+            if (cleanClass.startsWith('Test Cases/')) {
+                if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+                    return cleanClass + '/' + cleanName
+                }
+                return cleanClass
+            }
+
+            if (cleanClass.contains('/')) {
+                if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+                    return cleanClass + '/' + cleanName
+                }
+                return cleanClass
+            }
+        }
+
+        return cleanName
+    }
+
+    private String buildScenarioId(String value, int index) {
+        String normalized = safe(value)
+            .replace('\\', '/')
+            .replaceAll(/[^A-Za-z0-9\/_-]+/, '-')
+            .replaceAll(/-+/, '-')
+            .replaceAll(/^[-\/]+|[-\/]+$/, '')
+
+        if (normalized.isEmpty()) {
+            normalized = 'scenario-' + index
+        }
+
+        return normalized
+    }
+
+    private String normalizeScenarioStatus(String raw) {
+        String lower = safe(raw).toLowerCase(Locale.ENGLISH)
+
+        if (lower == 'passed' || lower == 'pass' || lower == 'success') {
+            return 'passed'
+        }
+
+        if (lower == 'failed' || lower == 'fail' || lower == 'error') {
+            return 'failed'
+        }
+
+        if (lower == 'blocked' || lower == 'skipped' || lower == 'skip' || lower == 'not_run' || lower == 'not run') {
+            return 'blocked'
+        }
+
+        return lower.isEmpty() ? 'blocked' : lower
+    }
+
+    private String buildShortError(String fullError) {
+        String raw = safe(fullError)
+        if (raw.isEmpty()) {
+            return ''
+        }
+
+        List<String> lines = []
+        for (String line : raw.readLines()) {
+            String clean = safe(line)
+            if (clean.isEmpty()) {
+                continue
+            }
+            if (clean.startsWith('at ')) {
+                continue
+            }
+            if (clean.startsWith('Caused by:')) {
+                continue
+            }
+            lines << clean
+            if (lines.size() >= 2) {
+                break
+            }
+        }
+
+        if (lines.isEmpty()) {
+            return ''
+        }
+
+        return lines.join(' | ')
+    }
+
+    private long parseLogTimestampMillis(String line) {
+        String raw = extractTimestampText(line)
+        if (raw.isEmpty()) {
+            return 0L
+        }
+
+        for (String pattern : DATE_PATTERNS) {
+            try {
+                return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(raw).time
+            } catch (Throwable ignored) {
+            }
+        }
+
+        return 0L
+    }
+
+    private String extractTimestampText(String line) {
+        String value = safe(line)
+        if (value.isEmpty()) {
+            return ''
+        }
+
+        List<String> patterns = [
+            /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}/,
+            /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
+            /\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}/,
+            /\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}/
+        ]
+
+        for (def pattern : patterns) {
+            def matcher = value =~ pattern
+            if (matcher.find()) {
+                return safe(matcher.group(0))
+            }
+        }
+
+        return ''
+    }
+
+    private long toDurationMillis(String secondsValue) {
+        String value = safe(secondsValue)
+        if (value.isEmpty()) {
+            return 0L
+        }
+
+        try {
+            BigDecimal seconds = new BigDecimal(value.replace(',', '.'))
+            return seconds.multiply(new BigDecimal('1000')).longValue()
+        } catch (Throwable ignored) {
+            return 0L
+        }
+    }
+
+    private String formatDateTime(long millis) {
+        if (millis <= 0L) {
+            return '--'
+        }
+        return OUTPUT_DATE_TIME.format(new Date(millis))
+    }
+
+    private String formatClock(long millis) {
+        if (millis <= 0L) {
+            return '--'
+        }
+        return OUTPUT_CLOCK.format(new Date(millis))
+    }
+
+    private String formatDuration(long durationMs) {
+        long safeDuration = durationMs < 0L ? 0L : durationMs
+
+        long totalSeconds = Math.round(safeDuration / 1000d)
+        long hours = (long) (totalSeconds / 3600L)
+        long minutes = (long) ((totalSeconds % 3600L) / 60L)
+        long seconds = (long) (totalSeconds % 60L)
+
+        return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+    }
+
+    private long firstPositive(long... values) {
+        if (values == null) {
+            return 0L
+        }
+
+        for (long value : values) {
+            if (value > 0L) {
+                return value
+            }
+        }
+
+        return 0L
+    }
+
+    private String firstNonBlank(Object... values) {
+        if (values == null) {
+            return ''
+        }
+
+        for (Object value : values) {
+            String text = safe(value)
+            if (!text.isEmpty()) {
+                return text
+            }
+        }
+
+        return ''
+    }
+
+    private long asLong(Object value) {
+        try {
+            return Long.parseLong(String.valueOf(value))
+        } catch (Throwable ignored) {
+            return 0L
+        }
+    }
+
+    private String attr(Element element, String attributeName) {
+        if (element == null) {
+            return ''
+        }
+
+        try {
+            return safe(element.getAttribute(attributeName))
+        } catch (Throwable ignored) {
+            return ''
+        }
+    }
+
+    private String sanitizeFolderName(String value) {
         return safe(value)
             .replace('\\', '_')
             .replace('/', '_')
@@ -394,7 +978,60 @@ class JiraImagesEvidence {
             .trim()
     }
 
-    private static String safe(Object value) {
+    private String normalizeKey(String value) {
+        return safe(value)
+            .toLowerCase(Locale.ENGLISH)
+            .replaceAll(/[^a-z0-9]+/, '')
+    }
+
+    private void eachLine(File file, Closure consumer) {
+        if (file == null || !file.exists() || !file.isFile()) {
+            return
+        }
+
+        BufferedReader reader = null
+        try {
+            reader = new BufferedReader(
+                new InputStreamReader(
+                    new FileInputStream(file),
+                    StandardCharsets.UTF_8
+                )
+            )
+
+            String line
+            while ((line = reader.readLine()) != null) {
+                consumer.call(line)
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            try {
+                reader?.close()
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void writeUtf8(File file, String content) {
+        file.parentFile?.mkdirs()
+
+        BufferedWriter writer = null
+        try {
+            writer = new BufferedWriter(
+                new OutputStreamWriter(
+                    new FileOutputStream(file),
+                    StandardCharsets.UTF_8
+                )
+            )
+            writer.write(content ?: '')
+        } finally {
+            try {
+                writer?.close()
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private String safe(Object value) {
         return value == null ? '' : String.valueOf(value).trim()
     }
 }
