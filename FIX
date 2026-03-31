@@ -1,1 +1,269 @@
+/*
+ * Responsibility:
+ * Generic application lifecycle helper for Jenkins.
+ * This file only starts and stops the application under test.
+ */
 
+def start(script, Map cfg) {
+	def taskName = (cfg.taskName ?: '').toString().trim()
+	def waitSeconds = (cfg.waitSeconds ?: 40).toString()
+	def healthUrl = (cfg.healthUrl ?: '').toString().trim()
+
+	def startupPorts = []
+	(cfg.startupPorts ?: []).each { port ->
+		if (port != null && port.toString().trim()) {
+			startupPorts << port.toString().trim()
+		}
+	}
+
+	script.withEnv([
+		"TASK_NAME=${taskName}",
+		"WAIT_SECONDS=${waitSeconds}",
+		"HEALTH_URL=${healthUrl}",
+		"STARTUP_PORTS=${startupPorts.join(',')}"
+	]) {
+		script.powershell '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Test-ListeningPort {
+    param([int]$Port)
+
+    try {
+        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        return ($null -ne $listener)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Wait-ListeningPort {
+    param(
+        [int]$Port,
+        [datetime]$Deadline
+    )
+
+    while ((Get-Date) -lt $Deadline) {
+        if (Test-ListeningPort -Port $Port) {
+            Write-Host ("✅ Port $Port is listening")
+            return
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw ("Port $Port was not ready before timeout")
+}
+
+function Wait-HttpReady {
+    param(
+        [string]$Url,
+        [datetime]$Deadline
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return
+    }
+
+    while ((Get-Date) -lt $Deadline) {
+        try {
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                Write-Host ("✅ Application responded at $Url with HTTP $($response.StatusCode)")
+                return
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw ("Health URL was not ready before timeout: $Url")
+}
+
+Write-Host '============================================================'
+Write-Host '🚀 STARTING APPLICATION THROUGH SCHEDULED TASK'
+Write-Host ("🕒 Wait seconds: $($env:WAIT_SECONDS)")
+Write-Host '============================================================'
+
+if ([string]::IsNullOrWhiteSpace($env:TASK_NAME)) {
+    throw 'TASK_NAME was not provided'
+}
+
+schtasks /run /tn $env:TASK_NAME | Out-Host
+
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($env:STARTUP_PORTS)) {
+    $ports = $env:STARTUP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+if ($ports.Count -eq 0 -and [string]::IsNullOrWhiteSpace($env:HEALTH_URL)) {
+    Start-Sleep -Seconds ([int]$env:WAIT_SECONDS)
+    Write-Host '✅ Scheduled task triggered'
+    Write-Host '============================================================'
+    return
+}
+
+$deadline = (Get-Date).AddSeconds([int]$env:WAIT_SECONDS)
+
+Start-Sleep -Seconds 3
+
+foreach ($port in $ports) {
+    Wait-ListeningPort -Port ([int]$port) -Deadline $deadline
+}
+
+Wait-HttpReady -Url $env:HEALTH_URL -Deadline $deadline
+
+Write-Host '✅ Application scheduled task triggered and application is ready'
+Write-Host '============================================================'
+'''
+	}
+}
+
+def stop(script, Map cfg) {
+	def stopPorts = []
+	(cfg.stopPorts ?: []).each { port ->
+		if (port != null && port.toString().trim()) {
+			stopPorts << port.toString().trim()
+		}
+	}
+
+	def processPatterns = []
+	(cfg.processPatterns ?: []).each { pattern ->
+		if (pattern != null && pattern.toString().trim()) {
+			processPatterns << pattern.toString().trim()
+		}
+	}
+
+	script.withEnv([
+		"STOP_PORTS=${stopPorts.join(',')}",
+		"PROCESS_PATTERNS=${processPatterns.join('||')}"
+	]) {
+		script.powershell(
+			returnStatus: true,
+			script: '''
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+
+function Stop-ProcessTreeSafe {
+    param([int]$ProcessId)
+
+    if (-not $ProcessId) {
+        return
+    }
+
+    try {
+        taskkill /PID $ProcessId /T /F 1>$null 2>$null
+    }
+    catch {
+    }
+
+    Start-Sleep -Milliseconds 300
+
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+}
+
+function Stop-ProcessListeningOnPort {
+    param([int]$Port)
+
+    try {
+        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique
+
+        foreach ($ownerPid in $owners) {
+            if ($ownerPid) {
+                Write-Host ("🧹 Stopping process on port $Port | PID=$ownerPid")
+                Stop-ProcessTreeSafe -ProcessId $ownerPid
+            }
+        }
+    }
+    catch {
+    }
+}
+
+function Get-SafeTargetProcesses {
+    param([string[]]$Patterns)
+
+    if ($null -eq $Patterns -or $Patterns.Count -eq 0) {
+        return @()
+    }
+
+    $all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+
+    return @(
+        $all | Where-Object {
+            $cmd = [string]$_.CommandLine
+            $name = [string]$_.Name
+
+            if ([string]::IsNullOrWhiteSpace($cmd) -and [string]::IsNullOrWhiteSpace($name)) {
+                return $false
+            }
+
+            foreach ($pattern in $Patterns) {
+                if ([string]::IsNullOrWhiteSpace($pattern)) {
+                    continue
+                }
+
+                if (($cmd -match $pattern) -or ($name -match $pattern)) {
+                    return $true
+                }
+            }
+
+            return $false
+        }
+    )
+}
+
+Write-Host '============================================================'
+Write-Host '🧹 STOPPING APPLICATION PROCESSES'
+Write-Host '============================================================'
+
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($env:STOP_PORTS)) {
+    $ports = $env:STOP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+foreach ($port in $ports) {
+    Stop-ProcessListeningOnPort -Port ([int]$port)
+}
+
+$rawPatterns = @()
+if (-not [string]::IsNullOrWhiteSpace($env:PROCESS_PATTERNS)) {
+    $rawPatterns = $env:PROCESS_PATTERNS.Split('||') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+$targets = Get-SafeTargetProcesses -Patterns $rawPatterns
+
+foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
+    try {
+        Write-Host ("🧹 Stopping matched process | PID=$($proc.ProcessId) | Name=$($proc.Name)")
+        Stop-ProcessTreeSafe -ProcessId $proc.ProcessId
+    }
+    catch {
+    }
+}
+
+Start-Sleep -Seconds 2
+
+foreach ($port in $ports) {
+    Stop-ProcessListeningOnPort -Port ([int]$port)
+}
+
+Write-Host '✅ Application stop command finished'
+Write-Host '============================================================'
+
+exit 0
+'''
+		)
+	}
+}
+
+return this
