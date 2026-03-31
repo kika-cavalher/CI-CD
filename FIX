@@ -1,1338 +1,47 @@
-📁 Suggested structure
-jenkinsIntegration/
-  JenkinsAppManager.groovy
-  JenkinsConsoleView.groovy
-  JenkinsLiveLogger.groovy
-  JenkinsPaths.groovy
-  JenkinsResultStore.groovy
-
-jenkinsPipelines/
-  Jenkinsfile_Correction_Add_Correction.groovy
-  Jenkinsfile_Other_Suite.groovy
-1) jenkinsIntegration/JenkinsAppManager.groovy
 /*
  * Responsibility:
- * Generic application lifecycle manager for Jenkins.
- * This file only starts and stops the application under test.
- * It is generic and does not contain project-specific naming.
+ * Pipeline focused on executing only one Katalon test suite.
+ * The next Jenkins job is triggered as a separate build in post-success.
  */
 
-def start(script, Map cfg) {
-	def taskName = (cfg.taskName ?: '').toString().trim()
-	def waitSeconds = (cfg.waitSeconds ?: 40).toString()
-	def healthUrl = (cfg.healthUrl ?: '').toString().trim()
-
-	def startupPorts = []
-	(cfg.startupPorts ?: []).each { port ->
-		if (port != null && port.toString().trim()) {
-			startupPorts << port.toString().trim()
-		}
-	}
-
-	script.withEnv([
-		"TASK_NAME=${taskName}",
-		"WAIT_SECONDS=${waitSeconds}",
-		"HEALTH_URL=${healthUrl}",
-		"STARTUP_PORTS=${startupPorts.join(',')}"
-	]) {
-		script.powershell '''
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-
-function Test-ListeningPort {
-    param([int]$Port)
-
-    try {
-        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        return ($null -ne $listener)
-    }
-    catch {
-        return $false
-    }
-}
-
-function Wait-ListeningPort {
-    param(
-        [int]$Port,
-        [datetime]$Deadline
-    )
-
-    while ((Get-Date) -lt $Deadline) {
-        if (Test-ListeningPort -Port $Port) {
-            Write-Host ("✅ Port $Port is listening")
-            return
-        }
-
-        Start-Sleep -Seconds 2
-    }
-
-    throw ("Port $Port was not ready before timeout")
-}
-
-function Wait-HttpReady {
-    param(
-        [string]$Url,
-        [datetime]$Deadline
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Url)) {
-        return
-    }
-
-    while ((Get-Date) -lt $Deadline) {
-        try {
-            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-
-            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
-                Write-Host ("✅ Application responded at $Url with HTTP $($response.StatusCode)")
-                return
-            }
-        }
-        catch {
-        }
-
-        Start-Sleep -Seconds 2
-    }
-
-    throw ("Health URL was not ready before timeout: $Url")
-}
-
-Write-Host '============================================================'
-Write-Host '🚀 STARTING APPLICATION THROUGH SCHEDULED TASK'
-Write-Host ("🕒 Wait seconds: $($env:WAIT_SECONDS)")
-Write-Host '============================================================'
-
-if ([string]::IsNullOrWhiteSpace($env:TASK_NAME)) {
-    throw 'TASK_NAME was not provided'
-}
-
-schtasks /run /tn $env:TASK_NAME | Out-Host
-
-$ports = @()
-if (-not [string]::IsNullOrWhiteSpace($env:STARTUP_PORTS)) {
-    $ports = $env:STARTUP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-}
-
-if ($ports.Count -eq 0 -and [string]::IsNullOrWhiteSpace($env:HEALTH_URL)) {
-    Start-Sleep -Seconds ([int]$env:WAIT_SECONDS)
-    Write-Host '✅ Scheduled task triggered'
-    Write-Host '============================================================'
-    return
-}
-
-$deadline = (Get-Date).AddSeconds([int]$env:WAIT_SECONDS)
-
-Start-Sleep -Seconds 3
-
-foreach ($port in $ports) {
-    Wait-ListeningPort -Port ([int]$port) -Deadline $deadline
-}
-
-Wait-HttpReady -Url $env:HEALTH_URL -Deadline $deadline
-
-Write-Host '✅ Application scheduled task triggered and application is ready'
-Write-Host '============================================================'
-'''
-	}
-}
-
-def stop(script, Map cfg) {
-	def stopPorts = []
-	(cfg.stopPorts ?: []).each { port ->
-		if (port != null && port.toString().trim()) {
-			stopPorts << port.toString().trim()
-		}
-	}
-
-	def processPatterns = []
-	(cfg.processPatterns ?: []).each { pattern ->
-		if (pattern != null && pattern.toString().trim()) {
-			processPatterns << pattern.toString().trim()
-		}
-	}
-
-	script.withEnv([
-		"STOP_PORTS=${stopPorts.join(',')}",
-		"PROCESS_PATTERNS=${processPatterns.join('||')}"
-	]) {
-		script.powershell '''
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
-
-function Stop-ProcessTree {
-    param([int]$ProcessId)
-
-    if (-not $ProcessId) {
-        return
-    }
-
-    try {
-        taskkill /PID $ProcessId /T /F | Out-Null
-    }
-    catch {
-        try {
-            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-        }
-        catch {
-        }
-    }
-}
-
-function Stop-ProcessListeningOnPort {
-    param([int]$Port)
-
-    try {
-        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty OwningProcess -Unique
-
-        foreach ($ownerPid in $owners) {
-            if ($ownerPid) {
-                Stop-ProcessTree -ProcessId $ownerPid
-            }
-        }
-    }
-    catch {
-    }
-}
-
-Write-Host '============================================================'
-Write-Host '🧹 STOPPING APPLICATION PROCESSES'
-Write-Host '============================================================'
-
-$ports = @()
-if (-not [string]::IsNullOrWhiteSpace($env:STOP_PORTS)) {
-    $ports = $env:STOP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-}
-
-foreach ($port in $ports) {
-    Stop-ProcessListeningOnPort -Port ([int]$port)
-}
-
-$rawPatterns = @()
-if (-not [string]::IsNullOrWhiteSpace($env:PROCESS_PATTERNS)) {
-    $rawPatterns = $env:PROCESS_PATTERNS.Split('||') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-}
-
-if ($rawPatterns.Count -gt 0) {
-    $targets = Get-CimInstance Win32_Process | Where-Object {
-        $cmd = [string]$_.CommandLine
-        $name = [string]$_.Name
-        $matched = $false
-
-        foreach ($pattern in $rawPatterns) {
-            if ($cmd -match $pattern -or $name -match $pattern) {
-                $matched = $true
-                break
-            }
-        }
-
-        $matched
-    }
-
-    foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
-        try {
-            Stop-ProcessTree -ProcessId $proc.ProcessId
-        }
-        catch {
-        }
-    }
-}
-
-Start-Sleep -Seconds 2
-
-foreach ($port in $ports) {
-    Stop-ProcessListeningOnPort -Port ([int]$port)
-}
-
-Write-Host '✅ Application stop command finished'
-Write-Host '============================================================'
-'''
-	}
-}
-
-return this
-2) jenkinsIntegration/JenkinsConsoleView.groovy
-/*
- * Responsibility:
- * Clean Jenkins console output for suite execution.
- */
-
-def cleanText(String value) {
-    return (value ?: '').replaceAll(/\s+/, ' ').trim()
-}
-
-def formatDurationSeconds(def rawValue) {
-    long total = 0L
-
-    try {
-        total = (rawValue ?: '0').toString().toLong()
-    }
-    catch (ignored) {
-        total = 0L
-    }
-
-    long hours = (long) (total / 3600)
-    long minutes = (long) ((total % 3600) / 60)
-    long seconds = (long) (total % 60)
-
-    return String.format('%02d:%02d:%02d', hours, minutes, seconds)
-}
-
-def sumDurationSeconds(List results) {
-    long total = 0L
-
-    results.each { item ->
-        try {
-            total += (item.durationSeconds ?: '0').toString().toLong()
-        }
-        catch (ignored) {
-        }
-    }
-
-    return total
-}
-
-def printSuiteHeader(script, String suiteName, String suitePath, String timeoutMinutes) {
-    script.echo '------------------------------------------------------------'
-    script.echo '🚀 [START SUITE]'
-    script.echo "📛 Name    : ${suiteName}"
-    script.echo "📁 Path    : ${suitePath}"
-    script.echo "⏱️ Timeout : ${timeoutMinutes} min"
-    script.echo '------------------------------------------------------------'
-}
-
-def printSuiteResult(script, Map result) {
-    script.echo '------------------------------------------------------------'
-    script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
-    script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
-    script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
-
-    if (result.reason) {
-        script.echo "🧾 Reason  : ${cleanText(result.reason)}"
-    }
-
-    if (result.primaryArtifactRel) {
-        script.echo "🖼️ Image   : Reports/${result.primaryArtifactRel}"
-    }
-
-    if (result.logRel) {
-        script.echo "📄 Log     : Reports/${result.logRel}"
-    }
-
-    (result.caseSummary ?: []).take(3).each { line ->
-        script.echo "🧪 Case    : ${cleanText(line.toString())}"
-    }
-
-    (result.stepSummary ?: []).take(3).each { line ->
-        script.echo "➡️ Step    : ${cleanText(line.toString())}"
-    }
-
-    script.echo '------------------------------------------------------------'
-}
-
-def printRunningSummary(script, List results) {
-    def passed = results.count { it.status == 'PASSED' }
-    def failed = results.count { it.status == 'FAILED' }
-    def timeout = results.count { it.status == 'TIMEOUT' }
-    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
-
-    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
-
-    script.echo '------------------------------------------------------------'
-    script.echo "📌 RUNNING SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
-    script.echo '------------------------------------------------------------'
-}
-
-def printFinalSummary(script, List results, String currentResult) {
-    def passed = results.count { it.status == 'PASSED' }
-    def failed = results.count { it.status == 'FAILED' }
-    def timeout = results.count { it.status == 'TIMEOUT' }
-    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
-    def total = results.size()
-
-    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
-
-    script.echo '============================================================'
-
-    if (total == 0) {
-        script.echo '⚠️ PIPELINE STOPPED BEFORE ANY SUITE WAS EXECUTED'
-    }
-    else if (currentResult == 'ABORTED') {
-        script.echo '🛑 PIPELINE ABORTED'
-    }
-    else if (failed > 0 || timeout > 0) {
-        script.echo '❌ PIPELINE FINISHED WITH ERRORS'
-    }
-    else {
-        script.echo '✅ PIPELINE FINISHED SUCCESSFULLY'
-    }
-
-    script.echo "📌 FINAL SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
-    script.echo '============================================================'
-
-    results.each { result ->
-        script.echo '------------------------------------------------------------'
-        script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
-        script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
-        script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
-
-        if (result.reason) {
-            script.echo "🧾 Reason  : ${cleanText(result.reason)}"
-        }
-
-        if (result.primaryArtifactRel) {
-            script.echo "🖼️ Image   : Reports/${result.primaryArtifactRel}"
-        }
-
-        script.echo '------------------------------------------------------------'
-    }
-}
-
-return this
-3) jenkinsIntegration/JenkinsLiveLogger.groovy
-/*
- * Responsibility:
- * 1) Run one Katalon suite
- * 2) Stream useful live output to Jenkins console
- * 3) Write suite metadata
- * 4) Create synthetic JUnit when needed
- */
-
-def safeFileName(String value) {
-    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
-}
-
-def runSuite(script, Map cfg, Map suite) {
-    def suiteKey = safeFileName(suite.name)
-
-    return script.withEnv([
-        "KATALON_EXE=${cfg.katalonExe}",
-        "PROJECT_PATH=${cfg.projectPath}",
-        "REPORTS_ROOT=${cfg.reportsRoot}",
-        "SUITE_NAME=${suite.name}",
-        "SUITE_PATH=${suite.path}",
-        "SUITE_KEY=${suiteKey}",
-        "BROWSER=${cfg.browser}",
-        "SUITE_TIMEOUT_MINUTES=${cfg.suiteTimeoutMinutes.toString()}"
-    ]) {
-        script.powershell(
-            returnStatus: true,
-            script: '''
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-
-$script:LastProgressLine = ''
-$script:CurrentScenario = ''
-$script:LastStepLine = ''
-$script:RecentStepLines = New-Object System.Collections.ArrayList
-$script:ExecutionRecordBuffer = New-Object System.Collections.ArrayList
-$script:IsInsideRecord = $false
-
-function Clean-Text {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return ''
-    }
-
-    $text = $Value -replace '[\\r\\n]+', ' '
-    $text = $text -replace '\\s+', ' '
-    return $text.Trim()
-}
-
-function Short-Text {
-    param(
-        [string]$Value,
-        [int]$Max = 180
-    )
-
-    $text = Clean-Text $Value
-
-    if ($text.Length -gt $Max) {
-        return $text.Substring(0, $Max - 3) + '...'
-    }
-
-    return $text
-}
-
-function To-RelativePath {
-    param(
-        [string]$Root,
-        [string]$FullPath
-    )
-
-    if ([string]::IsNullOrWhiteSpace($FullPath)) {
-        return ''
-    }
-
-    if (-not $FullPath.StartsWith($Root)) {
-        return ''
-    }
-
-    $rel = $FullPath.Substring($Root.Length)
-
-    if ($rel.StartsWith('\\')) {
-        $rel = $rel.Substring(1)
-    }
-
-    return $rel.Replace('\\', '/')
-}
-
-function Add-RecentStepLine {
-    param([string]$Text)
-
-    if ([string]::IsNullOrWhiteSpace($Text)) {
-        return
-    }
-
-    [void]$script:RecentStepLines.Add($Text)
-
-    while ($script:RecentStepLines.Count -gt 10) {
-        $script:RecentStepLines.RemoveAt(0)
-    }
-}
-
-function Stop-ProcessTree {
-    param([int]$ProcessId)
-
-    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
-    foreach ($child in $children) {
-        Stop-ProcessTree -ProcessId $child.ProcessId
-    }
-
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-}
-
-function Read-NewContent {
-    param(
-        [string]$Path,
-        [ref]$Offset
-    )
-
-    if (-not (Test-Path $Path)) {
-        return @()
-    }
-
-    $fs = $null
-    $sr = $null
-
-    try {
-        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
-        $sr = New-Object System.IO.StreamReader($fs)
-        $content = $sr.ReadToEnd()
-        $Offset.Value = $fs.Position
-
-        if ([string]::IsNullOrWhiteSpace($content)) {
-            return @()
-        }
-
-        return @($content -split "`r?`n")
-    }
-    catch {
-        return @()
-    }
-    finally {
-        if ($sr) { $sr.Close() }
-        if ($fs) { $fs.Close() }
-    }
-}
-
-function Should-SkipKatalonLine {
-    param([string]$Text)
-
-    $noise = @(
-        'CPU load',
-        'Total memory',
-        'Free memory',
-        'Start getting machine ID',
-        'Start appending additional signatures',
-        'Search for valid offline licenses',
-        'Start checking license',
-        'Invalid package binding for default import',
-        'ENTRY org.eclipse.jdt.core',
-        'MESSAGE Invalid package binding',
-        'The number of Runtime Engine running sessions',
-        'Cleaning up workspace'
-    )
-
-    foreach ($item in $noise) {
-        if ($Text -like "*$item*") {
-            return $true
-        }
-    }
-
-    return $false
-}
-
-function Emit-KatalonConsoleLine {
-    param(
-        [string]$Line,
-        [string]$Prefix
-    )
-
-    $text = Clean-Text $Line
-
-    if ([string]::IsNullOrWhiteSpace($text)) {
-        return
-    }
-
-    if (Should-SkipKatalonLine -Text $text) {
-        return
-    }
-
-    if ($text -match 'Test Suites/.+\\.\\.\\.[0-9]+/[0-9]+\\([0-9]+%\\)') {
-        if ($script:LastProgressLine -ne $text) {
-            Write-Host ($Prefix + $text)
-            $script:LastProgressLine = $text
-        }
-        return
-    }
-
-    if (
-        $text -match 'START Test Suites' -or
-        $text -match 'START Test Cases' -or
-        $text -match 'START SCENARIO' -or
-        $text -match 'ChromeDriver' -or
-        $text -match 'chromedriver' -or
-        $text -match 'sessionId' -or
-        $text -match 'Navigate' -or
-        $text -match 'Click' -or
-        $text -match 'Import' -or
-        $text -match 'Save' -or
-        $text -match 'not found' -or
-        $text -match 'selector is null' -or
-        $text -match 'FAILED' -or
-        $text -match 'ERROR' -or
-        $text -match 'Exception' -or
-        $text -match 'Warning'
-    ) {
-        Write-Host ($Prefix + $text)
-    }
-}
-
-function Get-XmlTagValue {
-    param(
-        [string]$Text,
-        [string]$Tag
-    )
-
-    $options = [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    $pattern = '<' + [regex]::Escape($Tag) + '>(.*?)</' + [regex]::Escape($Tag) + '>'
-    $match = [regex]::Match($Text, $pattern, $options)
-
-    if ($match.Success) {
-        return $match.Groups[1].Value
-    }
-
-    return ''
-}
-
-function Get-XmlPropertyValue {
-    param(
-        [string]$Text,
-        [string]$Name
-    )
-
-    $options = [System.Text.RegularExpressions.RegexOptions]::Singleline -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    $pattern = '<property name="' + [regex]::Escape($Name) + '">(.*?)</property>'
-    $match = [regex]::Match($Text, $pattern, $options)
-
-    if ($match.Success) {
-        return $match.Groups[1].Value
-    }
-
-    return ''
-}
-
-function Emit-HumanExecutionRecord {
-    param([string]$RecordText)
-
-    $level = (Get-XmlTagValue -Text $RecordText -Tag 'level').ToUpperInvariant()
-    $message = Get-XmlTagValue -Text $RecordText -Tag 'message'
-    $stepIndex = Get-XmlPropertyValue -Text $RecordText -Name 'stepIndex'
-
-    if ([string]::IsNullOrWhiteSpace($message)) {
-        return
-    }
-
-    $message = [System.Net.WebUtility]::HtmlDecode($message)
-    $message = $message -replace '<[^>]+>', ''
-    $message = Short-Text $message 180
-
-    if ([string]::IsNullOrWhiteSpace($message)) {
-        return
-    }
-
-    if ($message -match '^Start scenario\\s*:\\s*(.+)$') {
-        $script:CurrentScenario = Short-Text $Matches[1] 150
-        Write-Host ("[STEP] 🎬 SCENARIO | " + $script:CurrentScenario)
-        Add-RecentStepLine ("🎬 " + $script:CurrentScenario)
-        return
-    }
-
-    if ($message -match '^End action\\s*:') {
-        return
-    }
-
-    if ($message -match '^extract report to folder') {
-        return
-    }
-
-    $interesting = $false
-
-    if (-not [string]::IsNullOrWhiteSpace($stepIndex)) {
-        $interesting = $true
-    }
-
-    if (
-        $message -match 'Navigate to' -or
-        $message -match 'Click' -or
-        $message -match 'Import' -or
-        $message -match 'Save' -or
-        $message -match 'selector is null' -or
-        $message -match 'not found' -or
-        $message -match 'Unable to' -or
-        $message -match 'successfully'
-    ) {
-        $interesting = $true
-    }
-
-    if (-not $interesting) {
-        return
-    }
-
-    $icon = '➡️'
-
-    if ($level -eq 'PASSED') {
-        $icon = '✅'
-    }
-    elseif ($level -eq 'FAILED' -or $level -eq 'ERROR') {
-        $icon = '❌'
-    }
-    elseif ($level -eq 'WARNING') {
-        $icon = '⚠️'
-    }
-
-    $line = ''
-
-    if ([string]::IsNullOrWhiteSpace($stepIndex)) {
-        $line = $icon + ' ' + $message
-    }
-    else {
-        $line = $icon + ' STEP ' + $stepIndex + ' | ' + $message
-    }
-
-    if ($line -ne $script:LastStepLine) {
-        Write-Host ('[STEP] ' + $line)
-        Add-RecentStepLine $line
-        $script:LastStepLine = $line
-    }
-}
-
-function Emit-ExecutionLines {
-    param([string[]]$Lines)
-
-    foreach ($line in $Lines) {
-        if ($line -match '<record>') {
-            $script:IsInsideRecord = $true
-            $script:ExecutionRecordBuffer.Clear()
-        }
-
-        if ($script:IsInsideRecord) {
-            [void]$script:ExecutionRecordBuffer.Add($line)
-        }
-
-        if ($line -match '</record>' -and $script:IsInsideRecord) {
-            $recordText = ($script:ExecutionRecordBuffer -join "`n")
-            Emit-HumanExecutionRecord -RecordText $recordText
-            $script:IsInsideRecord = $false
-            $script:ExecutionRecordBuffer.Clear()
-        }
-    }
-}
-
-function Find-ExecutionLog {
-    param([string]$Root)
-
-    $candidate = Get-ChildItem -Path $Root -Filter 'execution0.log' -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object {
-            $full = $_.FullName.Replace('\\', '/')
-            ($full -notmatch '/logs/') -and
-            ($full -notmatch '/Self-healing/')
-        } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($candidate) {
-        return $candidate.FullName
-    }
-
-    return ''
-}
-
-function Find-SuiteOutputDir {
-    param(
-        [string]$Root,
-        [datetime]$StartedAt
-    )
-
-    $candidate = Get-ChildItem -Path $Root -Directory -Recurse -ErrorAction SilentlyContinue |
-        Where-Object {
-            $full = $_.FullName.Replace('\\', '/')
-            ($full -notmatch '/logs($|/)') -and
-            ($full -notmatch '/Self-healing($|/)') -and
-            ($_.LastWriteTime -ge $StartedAt.AddMinutes(-1))
-        } |
-        Where-Object {
-            (Test-Path (Join-Path $_.FullName 'JUnit_Report.xml')) -or
-            (Test-Path (Join-Path $_.FullName 'execution0.log')) -or
-            (Get-ChildItem -Path $_.FullName -Filter '*.png' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
-        } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($candidate) {
-        return $candidate.FullName
-    }
-
-    return ''
-}
-
-function Find-BestScreenshot {
-    param([string]$SuiteOutputDir)
-
-    if ([string]::IsNullOrWhiteSpace($SuiteOutputDir) -or -not (Test-Path $SuiteOutputDir)) {
-        return ''
-    }
-
-    $allPngs = @(Get-ChildItem -Path $SuiteOutputDir -Filter '*.png' -File -Recurse -ErrorAction SilentlyContinue)
-
-    if ($allPngs.Count -eq 0) {
-        return ''
-    }
-
-    $preferredErrorPngs = @(
-        $allPngs |
-        Where-Object {
-            $_.Name -match '^[0-9]+\\.png$' -and $_.Length -gt 10KB
-        } |
-        Sort-Object @{Expression='Length';Descending=$true}, @{Expression='LastWriteTime';Descending=$true}
-    )
-
-    if ($preferredErrorPngs.Count -gt 0) {
-        return $preferredErrorPngs[0].FullName
-    }
-
-    $largeFallbackPngs = @(
-        $allPngs |
-        Where-Object {
-            $_.Length -gt 10KB
-        } |
-        Sort-Object @{Expression='Length';Descending=$true}, @{Expression='LastWriteTime';Descending=$true}
-    )
-
-    if ($largeFallbackPngs.Count -gt 0) {
-        return $largeFallbackPngs[0].FullName
-    }
-
-    $finalFallback = $allPngs | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    if ($finalFallback) {
-        return $finalFallback.FullName
-    }
-
-    return ''
-}
-
-function Get-JUnitSummary {
-    param([string]$JunitFile)
-
-    $result = [ordered]@{
-        Executed = 0
-        Passed   = 0
-        Failed   = 0
-        Skipped  = 0
-        Reason   = ''
-        Cases    = @()
-    }
-
-    if ([string]::IsNullOrWhiteSpace($JunitFile) -or -not (Test-Path $JunitFile)) {
-        return $result
-    }
-
-    try {
-        [xml]$xml = Get-Content $JunitFile
-
-        $testcases = @()
-
-        if ($xml.testsuite) {
-            $testcases = @($xml.testsuite.testcase)
-        }
-        elseif ($xml.testsuites) {
-            foreach ($ts in @($xml.testsuites.testsuite)) {
-                $testcases += @($ts.testcase)
-            }
-        }
-
-        $testcases = @($testcases | Where-Object { $_ })
-        $result.Executed = $testcases.Count
-
-        $failedNodes = @($testcases | Where-Object { $_.failure -or $_.error })
-        $skippedNodes = @($testcases | Where-Object { $_.skipped })
-
-        $result.Failed = $failedNodes.Count
-        $result.Skipped = $skippedNodes.Count
-        $result.Passed = $result.Executed - $result.Failed - $result.Skipped
-
-        foreach ($tc in ($testcases | Select-Object -First 5)) {
-            $caseName = Short-Text $tc.name 90
-
-            if ($tc.failure -or $tc.error) {
-                $msg = ''
-                if ($tc.failure) {
-                    $msg = Short-Text (($tc.failure.message + ' ' + $tc.failure.InnerText)) 90
-                }
-                elseif ($tc.error) {
-                    $msg = Short-Text (($tc.error.message + ' ' + $tc.error.InnerText)) 90
-                }
-
-                $result.Cases += ('❌ ' + $caseName + ' | ' + $msg)
-            }
-            elseif ($tc.skipped) {
-                $result.Cases += ('⏭️ ' + $caseName + ' | skipped')
-            }
-            else {
-                $result.Cases += ('✅ ' + $caseName + ' | passed')
-            }
-        }
-
-        if ($failedNodes.Count -gt 0) {
-            $firstBad = $failedNodes[0]
-
-            if ($firstBad.failure) {
-                $result.Reason = Short-Text (($firstBad.failure.message + ' ' + $firstBad.failure.InnerText)) 150
-            }
-            elseif ($firstBad.error) {
-                $result.Reason = Short-Text (($firstBad.error.message + ' ' + $firstBad.error.InnerText)) 150
-            }
-        }
-    }
-    catch {
-        $result.Reason = Short-Text $_.Exception.Message 150
-    }
-
-    return $result
-}
-
-function Write-SyntheticJunit {
-    param(
-        [string]$FilePath,
-        [string]$SuiteName,
-        [string]$Reason
-    )
-
-    $escapedReason = [System.Security.SecurityElement]::Escape($Reason)
-    if ([string]::IsNullOrWhiteSpace($escapedReason)) {
-        $escapedReason = 'Suite failed without JUnit report'
-    }
-
-    $xml = @"
-<?xml version="1.0" encoding="UTF-8"?>
-<testsuite name="$SuiteName" tests="1" failures="1" errors="0" skipped="0">
-  <testcase classname="$SuiteName" name="$SuiteName">
-    <failure message="$escapedReason">$escapedReason</failure>
-  </testcase>
-</testsuite>
-"@
-
-    Set-Content -Path $FilePath -Value $xml -Encoding UTF8
-}
-
-$SuiteStartedAt = Get-Date
-$LogsDir = Join-Path $env:REPORTS_ROOT 'logs'
-$StdoutLog = Join-Path $LogsDir ($env:SUITE_KEY + '.log')
-$StderrLog = Join-Path $LogsDir ($env:SUITE_KEY + '.err.log')
-$MetaFile = Join-Path $LogsDir ($env:SUITE_KEY + '.meta.properties')
-$SyntheticJunit = Join-Path $LogsDir ($env:SUITE_KEY + '.junit.xml')
-
-if (-not (Test-Path $LogsDir)) {
-    New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
-}
-
-Remove-Item $StdoutLog -Force -ErrorAction SilentlyContinue
-Remove-Item $StderrLog -Force -ErrorAction SilentlyContinue
-Remove-Item $MetaFile -Force -ErrorAction SilentlyContinue
-Remove-Item $SyntheticJunit -Force -ErrorAction SilentlyContinue
-
-$args = @(
-    '-noSplash',
-    '-runMode=console',
-    '-consoleLog',
-    ('-projectPath="' + $env:PROJECT_PATH + '"'),
-    '-retry=0',
-    ('-testSuitePath="' + $env:SUITE_PATH + '"'),
-    ('-browserType="' + $env:BROWSER + '"'),
-    ('-reportFolder="' + $env:REPORTS_ROOT + '"')
-)
-
-Write-Host '------------------------------------------------------------'
-Write-Host ('🚀 SUITE START | ' + $env:SUITE_NAME)
-Write-Host ('📁 Project     | ' + $env:PROJECT_PATH)
-Write-Host ('🧪 Suite       | ' + $env:SUITE_PATH)
-Write-Host ('🌐 Browser     | ' + $env:BROWSER)
-Write-Host ('📂 Reports     | ' + $env:REPORTS_ROOT)
-Write-Host '------------------------------------------------------------'
-
-$process = Start-Process `
-    -FilePath $env:KATALON_EXE `
-    -ArgumentList $args `
-    -PassThru `
-    -NoNewWindow `
-    -RedirectStandardOutput $StdoutLog `
-    -RedirectStandardError $StderrLog
-
-$stdoutOffset = 0L
-$stderrOffset = 0L
-$executionOffset = 0L
-$executionFile = ''
-$timeoutAt = (Get-Date).AddMinutes([int]$env:SUITE_TIMEOUT_MINUTES)
-$exitCode = 0
-
-while (-not $process.HasExited) {
-    $stdoutLines = Read-NewContent -Path $StdoutLog -Offset ([ref]$stdoutOffset)
-    foreach ($line in $stdoutLines) {
-        Emit-KatalonConsoleLine -Line $line -Prefix '[KATALON] '
-    }
-
-    $stderrLines = Read-NewContent -Path $StderrLog -Offset ([ref]$stderrOffset)
-    foreach ($line in $stderrLines) {
-        Emit-KatalonConsoleLine -Line $line -Prefix '[STDERR ] '
-    }
-
-    if (-not $executionFile) {
-        $executionFile = Find-ExecutionLog -Root $env:REPORTS_ROOT
-        if ($executionFile) {
-            Write-Host ('[INFO] execution0 detected: ' + $executionFile)
-        }
-    }
-
-    if ($executionFile) {
-        $executionLines = Read-NewContent -Path $executionFile -Offset ([ref]$executionOffset)
-        Emit-ExecutionLines -Lines $executionLines
-    }
-
-    if ((Get-Date) -ge $timeoutAt) {
-        Write-Host ('[TIMEOUT] Suite exceeded ' + $env:SUITE_TIMEOUT_MINUTES + ' minutes')
-        Stop-ProcessTree -ProcessId $process.Id
-        $exitCode = 124
-        break
-    }
-
-    Start-Sleep -Seconds 2
-    try { $process.Refresh() } catch {}
-}
-
-if ($exitCode -eq 0) {
-    try { $process.Refresh() } catch {}
-    $exitCode = $process.ExitCode
-}
-
-$stdoutLines = Read-NewContent -Path $StdoutLog -Offset ([ref]$stdoutOffset)
-foreach ($line in $stdoutLines) {
-    Emit-KatalonConsoleLine -Line $line -Prefix '[KATALON] '
-}
-
-$stderrLines = Read-NewContent -Path $StderrLog -Offset ([ref]$stderrOffset)
-foreach ($line in $stderrLines) {
-    Emit-KatalonConsoleLine -Line $line -Prefix '[STDERR ] '
-}
-
-if ($executionFile) {
-    $executionLines = Read-NewContent -Path $executionFile -Offset ([ref]$executionOffset)
-    Emit-ExecutionLines -Lines $executionLines
-}
-
-$SuiteOutputDir = Find-SuiteOutputDir -Root $env:REPORTS_ROOT -StartedAt $SuiteStartedAt
-
-$junitFile = ''
-$firstScreenshot = ''
-$logRel = To-RelativePath -Root $env:REPORTS_ROOT -FullPath $StdoutLog
-
-if (-not [string]::IsNullOrWhiteSpace($SuiteOutputDir)) {
-    $junitCandidate = Get-ChildItem -Path $SuiteOutputDir -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-
-    if ($junitCandidate) {
-        $junitFile = $junitCandidate.FullName
-    }
-
-    $firstScreenshot = Find-BestScreenshot -SuiteOutputDir $SuiteOutputDir
-}
-
-$junitSummary = Get-JUnitSummary -JunitFile $junitFile
-
-$status = 'PASSED'
-$icon = '✅'
-
-if ($exitCode -eq 124) {
-    $status = 'TIMEOUT'
-    $icon = '⏰'
-}
-elseif ($junitSummary.Failed -gt 0 -or $exitCode -ne 0) {
-    $status = 'FAILED'
-    $icon = '❌'
-}
-
-$reason = $junitSummary.Reason
-
-if ($status -ne 'PASSED' -and [string]::IsNullOrWhiteSpace($reason)) {
-    $reasonHints = @()
-
-    if (Test-Path $StdoutLog) {
-        $reasonHints += Get-Content $StdoutLog -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_ -match 'FAILED|ERROR|Exception|selector is null|not found|InvalidConsoleArgumentException|Timeout|timed out'
-            } |
-            Select-Object -Last 5
-    }
-
-    if (Test-Path $StderrLog) {
-        $reasonHints += Get-Content $StderrLog -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_ -match 'FAILED|ERROR|Exception|selector is null|not found|Timeout|timed out'
-            } |
-            Select-Object -Last 5
-    }
-
-    if ($reasonHints.Count -gt 0) {
-        $reason = Short-Text (($reasonHints -join ' ')) 150
-    }
-}
-
-if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'TIMEOUT') {
-    $reason = 'Suite execution exceeded timeout'
-}
-
-if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'FAILED') {
-    $reason = 'Suite failed without explicit reason in JUnit'
-}
-
-if (([string]::IsNullOrWhiteSpace($junitFile) -or -not (Test-Path $junitFile)) -and $status -ne 'PASSED') {
-    Write-SyntheticJunit -FilePath $SyntheticJunit -SuiteName $env:SUITE_NAME -Reason $reason
-}
-
-$screenshotRel = To-RelativePath -Root $env:REPORTS_ROOT -FullPath $firstScreenshot
-$durationSeconds = [math]::Max(0, [int]((Get-Date) - $SuiteStartedAt).TotalSeconds)
-
-$metaLines = @()
-$metaLines += ('SUITE_NAME=' + $env:SUITE_NAME)
-$metaLines += ('STATUS=' + $status)
-$metaLines += ('ICON=' + $icon)
-$metaLines += ('EXIT_CODE=' + $exitCode)
-$metaLines += ('DURATION_SECONDS=' + $durationSeconds)
-$metaLines += ('EXECUTED=' + $junitSummary.Executed)
-$metaLines += ('PASSED=' + $junitSummary.Passed)
-$metaLines += ('FAILED=' + $junitSummary.Failed)
-$metaLines += ('SKIPPED=' + $junitSummary.Skipped)
-$metaLines += ('REASON=' + (Short-Text $reason 150))
-$metaLines += ('SCREENSHOT_REL=' + $screenshotRel)
-$metaLines += ('LOG_REL=' + $logRel)
-$metaLines += ('CASE_SUMMARY=' + (($junitSummary.Cases -join ' || ')))
-$metaLines += ('STEP_SUMMARY=' + (($script:RecentStepLines -join ' || ')))
-
-Set-Content -Path $MetaFile -Value $metaLines -Encoding UTF8
-
-Write-Host '------------------------------------------------------------'
-Write-Host ('🏁 SUITE END   | ' + $env:SUITE_NAME)
-Write-Host ('📌 STATUS      | ' + $status)
-Write-Host ('⏱️ DURATION    | ' + $durationSeconds + ' seconds')
-Write-Host ('📊 EXECUTED    | ' + $junitSummary.Executed)
-Write-Host ('✅ PASSED      | ' + $junitSummary.Passed)
-Write-Host ('❌ FAILED      | ' + $junitSummary.Failed)
-Write-Host ('⏭️ SKIPPED     | ' + $junitSummary.Skipped)
-if (-not [string]::IsNullOrWhiteSpace($reason)) {
-    Write-Host ('🧾 REASON      | ' + $reason)
-}
-if (-not [string]::IsNullOrWhiteSpace($screenshotRel)) {
-    Write-Host ('🖼️ SCREENSHOT  | Reports/' + $screenshotRel)
-}
-Write-Host ('📄 LOG         | Reports/' + $logRel)
-Write-Host '------------------------------------------------------------'
-
-exit $exitCode
-'''
-        )
-    }
-}
-
-return this
-4) jenkinsIntegration/JenkinsPaths.groovy
-/*
- * Responsibility:
- * Centralize path calculations used by Jenkins integration files.
- */
-
-def workspace(script) {
-	return script.pwd()
-}
-
-def projectPath(script, String projectFileName) {
-	return "${workspace(script)}\\${projectFileName}"
-}
-
-def reportsRoot(script) {
-	return "${workspace(script)}\\Reports"
-}
-
-def logsRoot(script) {
-	return "${reportsRoot(script)}\\logs"
-}
-
-def artifactsRoot(script) {
-	return "${reportsRoot(script)}\\suite-artifacts"
-}
-
-return this
-5) jenkinsIntegration/JenkinsResultStore.groovy
-/*
- * Responsibility:
- * Store and read suite execution metadata.
- */
-
-def safeFileName(String value) {
-	return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
-}
-
-def parsePropertiesText(String text) {
-	def map = [:]
-
-	if (!text?.trim()) {
-		return map
-	}
-
-	text.readLines().each { line ->
-		int idx = line.indexOf('=')
-		if (idx > 0) {
-			def key = line.substring(0, idx).trim()
-			def value = line.substring(idx + 1).trim()
-			map[key] = value
-		}
-	}
-
-	return map
-}
-
-def splitSummary(String value) {
-	if (!value?.trim()) {
-		return []
-	}
-
-	return value.split('\\|\\|').collect { it.trim() }.findAll { it }
-}
-
-def readSuiteMeta(script, String reportsRoot, String suiteName) {
-	def metaPath = "${reportsRoot}\\logs\\${safeFileName(suiteName)}.meta.properties"
-
-	if (!script.fileExists(metaPath)) {
-		return [:]
-	}
-
-	return parsePropertiesText(script.readFile(file: metaPath, encoding: 'UTF-8'))
-}
-
-def saveSuiteResults(script, String reportsRoot, List results) {
-	def json = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(results))
-
-	script.writeFile(
-		file: "${reportsRoot}\\suite-results.json",
-		text: json,
-		encoding: 'UTF-8'
-	)
-}
-
-def loadSuiteResults(script, String reportsRoot) {
-	def filePath = "${reportsRoot}\\suite-results.json"
-
-	if (!script.fileExists(filePath)) {
-		return []
-	}
-
-	def text = script.readFile(file: filePath, encoding: 'UTF-8')
-	if (!text?.trim()) {
-		return []
-	}
-
-	return new groovy.json.JsonSlurperClassic().parseText(text)
-}
-
-return this
-6) jenkinsPipelines/Jenkinsfile_Correction_Add_Correction.groovy
-✨ This is the important part
-
-Now this file is focused mostly on:
-
-project file
-execution plan
-startup task
-execution order
-
-To change suite order later, you only edit getExecutionPlan().
-
-/*
- * Responsibility:
- * Main Jenkins pipeline for one execution flow.
- * This file should stay focused on suite order and pipeline-level configuration.
- */
-
-def safeFileName(String value) {
-    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
-}
-
-def getPipelineConfig() {
-    return [
-        projectFileName : 'portal.prj',
-
-        application: [
-            startTask      : 'AppBackFrontSetup',
-            startupWaitSecs: 40,
-            startupPorts   : ['8020', '4200'],
-            stopPorts      : ['8020', '4200'],
-            healthUrl      : 'http://localhost:4200',
-            processPatterns: [
-                'start-back\\.bat',
-                'start-front\\.bat',
-                'start\\.bat',
-                'web_portal_back',
-                'web_portal',
-                'APP_BACK_CMD',
-                'APP_FRONT_CMD',
-                'cmd\\.exe',
-                'java\\.exe',
-                'node\\.exe'
-            ]
-        ],
-
-        execution: [
-            browser            : 'Chrome',
-            suiteTimeoutMinutes: 10
+def PIPELINE_CONFIG = [
+    projectFileName      : 'gaia-portal.prj',
+
+    suiteName            : 'Correction- Add Correction',
+    suitePath            : 'Test Suites/Correction- Add Correction',
+
+    triggerNextJob       : false,
+    nextJobName          : '',   // Example: 'GI5/eMatch/Correction_Edit_Correction'
+    nextJobOnlyIfSuccess : true,
+
+    application: [
+        startTask       : 'GaiaBackFrontSetup',
+        startupWaitSecs : 40,
+        startupPorts    : ['8020', '4200'],
+        stopPorts       : ['8020', '4200'],
+        healthUrl       : 'http://localhost:4200',
+        processPatterns : [
+            'gaia-start-back\\.bat',
+            'gaia-start-front\\.bat',
+            'gaia-start\\.bat',
+            'web_portal_back',
+            'web_portal',
+            'GAIA_BACK_CMD',
+            'GAIA_FRONT_CMD',
+            'cmd\\.exe',
+            'java\\.exe',
+            'node\\.exe'
         ]
-    ]
-}
+    ],
 
-def getExecutionPlan() {
-    return [
-        [name: 'Correction - Add Correction', path: 'Test Suites/Correction- Add Correction'],
-
-        /*
-         * Add next suites here, in the order you want.
-         * Example:
-         *
-         * [name: 'Correction - Validate Correction', path: 'Test Suites/Correction- Validate Correction'],
-         * [name: 'Correction - Remove Correction', path: 'Test Suites/Correction- Remove Correction']
-         */
+    execution: [
+        browser             : 'Chrome',
+        suiteTimeoutMinutes : 10
     ]
+]
+
+def safeFileName(String value) {
+    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
 }
 
 def bootstrapSupportFiles(script) {
@@ -1600,7 +309,7 @@ pipeline {
     agent {
         node {
             label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Portal\\Correction_Add_Correction'
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
         }
     }
 
@@ -1615,7 +324,7 @@ pipeline {
 
     parameters {
         string(name: 'STARTUP_WAIT_SECONDS', defaultValue: '40', description: 'Seconds to wait after application startup')
-        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for each suite')
+        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for the suite')
         string(name: 'BROWSER', defaultValue: 'Chrome', description: 'Katalon browser type')
     }
 
@@ -1643,8 +352,6 @@ pipeline {
         stage('Validate Tools') {
             steps {
                 script {
-                    def cfg = getPipelineConfig()
-
                     bat """
 @echo off
 echo ------------------------------------------------------------
@@ -1682,15 +389,8 @@ if not exist "${pwd()}\\jenkinsIntegration\\JenkinsResultStore.groovy" (
     exit /b 1
 )
 
-if not exist "${pwd()}\\${cfg.projectFileName}" (
-    echo [ERROR] Katalon project file not found
-    echo ${pwd()}\\${cfg.projectFileName}
-    exit /b 1
-)
-
 echo [OK] Katalon executable found
 echo [OK] Jenkins support files found
-echo [OK] Project file found
 echo ------------------------------------------------------------
 """
                 }
@@ -1700,14 +400,13 @@ echo ------------------------------------------------------------
         stage('Start Application') {
             steps {
                 script {
-                    def cfg = getPipelineConfig()
                     def appManager = loadAppManager(this)
 
                     appManager.start(this, [
-                        taskName   : cfg.application.startTask,
-                        waitSeconds: params.STARTUP_WAIT_SECONDS.toInteger(),
-                        startupPorts: cfg.application.startupPorts,
-                        healthUrl  : cfg.application.healthUrl
+                        taskName    : PIPELINE_CONFIG.application.startTask,
+                        waitSeconds : params.STARTUP_WAIT_SECONDS.toInteger(),
+                        startupPorts: PIPELINE_CONFIG.application.startupPorts,
+                        healthUrl   : PIPELINE_CONFIG.application.healthUrl
                     ])
                 }
             }
@@ -1734,7 +433,7 @@ echo ------------------------------------------------------------
             }
         }
 
-        stage('Prepare Useful Artifacts') {
+        stage('Prepare Artifacts') {
             steps {
                 script {
                     def paths = loadPaths(this)
@@ -1753,71 +452,60 @@ mkdir "${paths.artifactsRoot(this)}"
             }
         }
 
-        stage('Execute Suites') {
+        stage('Execute Suite') {
             steps {
                 script {
-                    def cfg = getPipelineConfig()
                     def paths = loadPaths(this)
                     def consoleView = loadConsoleView(this)
                     def resultStore = loadResultStore(this)
                     def liveLogger = loadLiveLogger(this)
 
-                    def suiteResults = []
-                    def suites = getExecutionPlan()
-                    def defaultTimeout = params.SUITE_TIMEOUT_MINUTES.toInteger()
-                    def projectPath = paths.projectPath(this, cfg.projectFileName)
+                    def suite = [
+                        name: PIPELINE_CONFIG.suiteName,
+                        path: PIPELINE_CONFIG.suitePath
+                    ]
 
-                    suites.each { suite ->
-                        stage("Suite - ${suite.name}") {
-                            consoleView.printSuiteHeader(this, suite.name, suite.path, defaultTimeout.toString())
+                    def projectPath = paths.projectPath(this, PIPELINE_CONFIG.projectFileName)
 
-                            int exitCode = liveLogger.runSuite(this, [
-                                katalonExe         : env.KATALON_EXE,
-                                projectPath        : projectPath,
-                                reportsRoot        : paths.reportsRoot(this),
-                                browser            : params.BROWSER,
-                                suiteTimeoutMinutes: defaultTimeout
-                            ], suite)
+                    consoleView.printSuiteHeader(this, suite.name, suite.path, params.SUITE_TIMEOUT_MINUTES)
 
-                            def meta = resultStore.readSuiteMeta(this, paths.reportsRoot(this), suite.name)
+                    int exitCode = liveLogger.runSuite(this, [
+                        katalonExe         : env.KATALON_EXE,
+                        projectPath        : projectPath,
+                        reportsRoot        : paths.reportsRoot(this),
+                        browser            : params.BROWSER,
+                        suiteTimeoutMinutes: params.SUITE_TIMEOUT_MINUTES.toInteger()
+                    ], suite)
 
-                            def result = [
-                                name              : suite.name,
-                                path              : suite.path,
-                                status            : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
-                                icon              : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
-                                exitCode          : meta['EXIT_CODE'] ?: "${exitCode}",
-                                executed          : meta['EXECUTED'] ?: '0',
-                                passed            : meta['PASSED'] ?: '0',
-                                failed            : meta['FAILED'] ?: '0',
-                                skipped           : meta['SKIPPED'] ?: '0',
-                                durationSeconds   : meta['DURATION_SECONDS'] ?: '0',
-                                reason            : meta['REASON'] ?: '',
-                                screenshotRel     : meta['SCREENSHOT_REL'] ?: '',
-                                primaryArtifactRel: '',
-                                logRel            : meta['LOG_REL'] ?: '',
-                                caseSummary       : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
-                                stepSummary       : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
-                            ]
+                    def meta = resultStore.readSuiteMeta(this, paths.reportsRoot(this), suite.name)
 
-                            publishPrimaryArtifact(this, paths.reportsRoot(this), result)
+                    def result = [
+                        name              : suite.name,
+                        path              : suite.path,
+                        status            : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
+                        icon              : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
+                        exitCode          : meta['EXIT_CODE'] ?: "${exitCode}",
+                        executed          : meta['EXECUTED'] ?: '0',
+                        passed            : meta['PASSED'] ?: '0',
+                        failed            : meta['FAILED'] ?: '0',
+                        skipped           : meta['SKIPPED'] ?: '0',
+                        durationSeconds   : meta['DURATION_SECONDS'] ?: '0',
+                        reason            : meta['REASON'] ?: '',
+                        screenshotRel     : meta['SCREENSHOT_REL'] ?: '',
+                        primaryArtifactRel: '',
+                        logRel            : meta['LOG_REL'] ?: '',
+                        caseSummary       : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
+                        stepSummary       : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
+                    ]
 
-                            suiteResults << result
-                            resultStore.saveSuiteResults(this, paths.reportsRoot(this), suiteResults)
+                    publishPrimaryArtifact(this, paths.reportsRoot(this), result)
+                    resultStore.saveSuiteResults(this, paths.reportsRoot(this), [result])
 
-                            consoleView.printSuiteResult(this, result)
-                            consoleView.printRunningSummary(this, suiteResults)
+                    consoleView.printSuiteResult(this, result)
 
-                            if (result.status != 'PASSED') {
-                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                    error("${result.name} finished with status ${result.status}")
-                                }
-                            }
-                        }
-                    }
-
-                    if (suiteResults.any { it.status != 'PASSED' }) {
+                    if (result.status != 'PASSED') {
                         currentBuild.result = 'FAILURE'
+                        error("${result.name} finished with status ${result.status}")
                     }
                 }
             }
@@ -1827,7 +515,6 @@ mkdir "${paths.artifactsRoot(this)}"
     post {
         always {
             script {
-                def cfg = getPipelineConfig()
                 def suiteResults = []
                 def reportsRoot = "${pwd()}\\Reports"
 
@@ -1844,22 +531,6 @@ mkdir "${paths.artifactsRoot(this)}"
                 }
 
                 try {
-                    if (fileExists('jenkinsIntegration/JenkinsAppManager.groovy')) {
-                        def appManager = loadAppManager(this)
-                        appManager.stop(this, [
-                            stopPorts      : cfg.application.stopPorts,
-                            processPatterns: cfg.application.processPatterns
-                        ])
-                    }
-                    else {
-                        emergencyStopApplication(this, cfg.application.stopPorts)
-                    }
-                }
-                catch (Throwable ignored) {
-                    emergencyStopApplication(this, cfg.application.stopPorts)
-                }
-
-                try {
                     if (fileExists('jenkinsIntegration/JenkinsConsoleView.groovy')) {
                         def consoleView = loadConsoleView(this)
                         consoleView.printFinalSummary(this, suiteResults, currentBuild.currentResult)
@@ -1867,8 +538,24 @@ mkdir "${paths.artifactsRoot(this)}"
                 }
                 catch (Throwable ignored) {
                     echo '============================================================'
-                    echo 'PIPELINE FINISHED WITH ERRORS'
+                    echo 'PIPELINE FINISHED'
                     echo '============================================================'
+                }
+
+                try {
+                    if (fileExists('jenkinsIntegration/JenkinsAppManager.groovy')) {
+                        def appManager = loadAppManager(this)
+                        appManager.stop(this, [
+                            stopPorts      : PIPELINE_CONFIG.application.stopPorts,
+                            processPatterns: PIPELINE_CONFIG.application.processPatterns
+                        ])
+                    }
+                    else {
+                        emergencyStopApplication(this, PIPELINE_CONFIG.application.stopPorts)
+                    }
+                }
+                catch (Throwable ignored) {
+                    emergencyStopApplication(this, PIPELINE_CONFIG.application.stopPorts)
                 }
             }
 
@@ -1885,7 +572,20 @@ mkdir "${paths.artifactsRoot(this)}"
         }
 
         success {
-            echo '[OK] PIPELINE FINISHED SUCCESSFULLY'
+            script {
+                if (PIPELINE_CONFIG.triggerNextJob && (PIPELINE_CONFIG.nextJobName ?: '').trim()) {
+                    echo "Triggering next Jenkins job as a separate build: ${PIPELINE_CONFIG.nextJobName}"
+
+                    build job: PIPELINE_CONFIG.nextJobName,
+                          wait: false,
+                          propagate: false
+
+                    echo "Next Jenkins job triggered successfully: ${PIPELINE_CONFIG.nextJobName}"
+                }
+                else {
+                    echo 'No next Jenkins job configured.'
+                }
+            }
         }
 
         failure {
@@ -1897,4 +597,3 @@ mkdir "${paths.artifactsRoot(this)}"
         }
     }
 }
-🔥
