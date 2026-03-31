@@ -1,25 +1,334 @@
+1) jenkinsIntegration/JenkinsAppManager.groovy
 /*
  * Responsibility:
- * Pipeline focused on executing only one Katalon test suite.
- * The next Jenkins job is triggered as a separate build in post-success.
+ * Generic application lifecycle helper for Jenkins.
+ * This file must only start and stop the application.
+ */
+
+def start(script, Map cfg) {
+	def taskName = (cfg.taskName ?: '').toString().trim()
+	def waitSeconds = (cfg.waitSeconds ?: 40).toString()
+	def healthUrl = (cfg.healthUrl ?: '').toString().trim()
+
+	def startupPorts = []
+	(cfg.startupPorts ?: []).each { port ->
+		if (port != null && port.toString().trim()) {
+			startupPorts << port.toString().trim()
+		}
+	}
+
+	script.withEnv([
+		"TASK_NAME=${taskName}",
+		"WAIT_SECONDS=${waitSeconds}",
+		"HEALTH_URL=${healthUrl}",
+		"STARTUP_PORTS=${startupPorts.join(',')}"
+	]) {
+		script.powershell '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Test-ListeningPort {
+    param([int]$Port)
+
+    try {
+        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+        return ($null -ne $listener)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Wait-ListeningPort {
+    param(
+        [int]$Port,
+        [datetime]$Deadline
+    )
+
+    while ((Get-Date) -lt $Deadline) {
+        if (Test-ListeningPort -Port $Port) {
+            Write-Host ("✅ Port $Port is listening")
+            return
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw ("Port $Port was not ready before timeout")
+}
+
+function Wait-HttpReady {
+    param(
+        [string]$Url,
+        [datetime]$Deadline
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return
+    }
+
+    while ((Get-Date) -lt $Deadline) {
+        try {
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                Write-Host ("✅ Application responded at $Url with HTTP $($response.StatusCode)")
+                return
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw ("Health URL was not ready before timeout: $Url")
+}
+
+Write-Host '============================================================'
+Write-Host '🚀 STARTING APPLICATION THROUGH SCHEDULED TASK'
+Write-Host ("🕒 Wait seconds: $($env:WAIT_SECONDS)")
+Write-Host '============================================================'
+
+if ([string]::IsNullOrWhiteSpace($env:TASK_NAME)) {
+    throw 'TASK_NAME was not provided'
+}
+
+schtasks /run /tn $env:TASK_NAME | Out-Host
+
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($env:STARTUP_PORTS)) {
+    $ports = $env:STARTUP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+if ($ports.Count -eq 0 -and [string]::IsNullOrWhiteSpace($env:HEALTH_URL)) {
+    Start-Sleep -Seconds ([int]$env:WAIT_SECONDS)
+
+    Write-Host '✅ Scheduled task triggered'
+    Write-Host '============================================================'
+    return
+}
+
+$deadline = (Get-Date).AddSeconds([int]$env:WAIT_SECONDS)
+
+Start-Sleep -Seconds 3
+
+foreach ($port in $ports) {
+    Wait-ListeningPort -Port ([int]$port) -Deadline $deadline
+}
+
+Wait-HttpReady -Url $env:HEALTH_URL -Deadline $deadline
+
+Write-Host '✅ Application scheduled task triggered and application is ready'
+Write-Host '============================================================'
+'''
+	}
+}
+
+def stop(script, Map cfg) {
+	def stopPorts = []
+	(cfg.stopPorts ?: []).each { port ->
+		if (port != null && port.toString().trim()) {
+			stopPorts << port.toString().trim()
+		}
+	}
+
+	def processPatterns = []
+	(cfg.processPatterns ?: []).each { pattern ->
+		if (pattern != null && pattern.toString().trim()) {
+			processPatterns << pattern.toString().trim()
+		}
+	}
+
+	script.withEnv([
+		"STOP_PORTS=${stopPorts.join(',')}",
+		"PROCESS_PATTERNS=${processPatterns.join('||')}"
+	]) {
+		script.powershell(
+			returnStatus: true,
+			script: '''
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+
+function Test-ProcessExists {
+    param([int]$ProcessId)
+
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        return ($null -ne $proc)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+
+    if (-not $ProcessId) {
+        return
+    }
+
+    if (-not (Test-ProcessExists -ProcessId $ProcessId)) {
+        return
+    }
+
+    try {
+        taskkill /PID $ProcessId /T /F 1>$null 2>$null
+    }
+    catch {
+    }
+
+    Start-Sleep -Milliseconds 300
+
+    try {
+        if (Test-ProcessExists -ProcessId $ProcessId) {
+            Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+    }
+}
+
+function Stop-ProcessListeningOnPort {
+    param([int]$Port)
+
+    try {
+        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique
+
+        foreach ($ownerPid in $owners) {
+            if ($ownerPid) {
+                Stop-ProcessTree -ProcessId $ownerPid
+            }
+        }
+    }
+    catch {
+    }
+}
+
+Write-Host '============================================================'
+Write-Host '🧹 STOPPING APPLICATION PROCESSES'
+Write-Host '============================================================'
+
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($env:STOP_PORTS)) {
+    $ports = $env:STOP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+foreach ($port in $ports) {
+    Stop-ProcessListeningOnPort -Port ([int]$port)
+}
+
+$rawPatterns = @()
+if (-not [string]::IsNullOrWhiteSpace($env:PROCESS_PATTERNS)) {
+    $rawPatterns = $env:PROCESS_PATTERNS.Split('||') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+if ($rawPatterns.Count -gt 0) {
+    $targets = Get-CimInstance Win32_Process | Where-Object {
+        $cmd = [string]$_.CommandLine
+        $name = [string]$_.Name
+        $matched = $false
+
+        foreach ($pattern in $rawPatterns) {
+            if ($cmd -match $pattern -or $name -match $pattern) {
+                $matched = $true
+                break
+            }
+        }
+
+        $matched
+    }
+
+    foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
+        try {
+            Stop-ProcessTree -ProcessId $proc.ProcessId
+        }
+        catch {
+        }
+    }
+}
+
+Start-Sleep -Seconds 2
+
+foreach ($port in $ports) {
+    Stop-ProcessListeningOnPort -Port ([int]$port)
+}
+
+Write-Host '✅ Application stop command finished'
+Write-Host '============================================================'
+
+exit 0
+'''
+		)
+	}
+}
+
+return this
+2) jenkinsIntegration/JenkinsPaths.groovy
+/*
+ * Responsibility:
+ * Centralize path calculations used by Jenkins integration files.
+ */
+
+def workspace(script) {
+	return script.pwd()
+}
+
+def projectPath(script, String projectFileName) {
+	return "${workspace(script)}\\${projectFileName}"
+}
+
+def reportsRoot(script) {
+	return "${workspace(script)}\\Reports"
+}
+
+def logsRoot(script) {
+	return "${reportsRoot(script)}\\logs"
+}
+
+def artifactsRoot(script) {
+	return "${reportsRoot(script)}\\suite-artifacts"
+}
+
+return this
+3) jenkinsPipelines/Jenkinsfile_Correction.groovy
+/*
+ * Responsibility:
+ * Pipeline for all Correction suites in one single build.
+ * Next job trigger stays disabled for now.
  */
 
 def PIPELINE_CONFIG = [
-    projectFileName      : 'gaia-portal.prj',
+    projectFileName : 'gaia-portal.prj',
 
-    suiteName            : 'Correction- Add Correction',
-    suitePath            : 'Test Suites/Correction- Add Correction',
+    suites : [
+        [name: 'Correction- Add Correction',              path: 'Test Suites/Correction- Add Correction'],
+        [name: 'Correction- Computation Selection',       path: 'Test Suites/Correction- Computation Selection'],
+        [name: 'Correction- Corrected Duplication',       path: 'Test Suites/Correction- Corrected Duplication'],
+        [name: 'Correction- Correction Details',          path: 'Test Suites/Correction- Correction Details'],
+        [name: 'Correction- Download Invalid Records',    path: 'Test Suites/Correction- Download Invalid Records']
+    ],
 
-    triggerNextJob       : false,
-    nextJobName          : '',   // Example: 'GI5/eMatch/Correction_Edit_Correction'
-    nextJobOnlyIfSuccess : true,
+    triggerNextJob : false,
+    nextJobName    : '',
 
-    application: [
+    application : [
         startTask       : 'GaiaBackFrontSetup',
         startupWaitSecs : 40,
-        startupPorts    : ['8020', '4200'],
+
+        /*
+         * Keep startupPorts and healthUrl empty for now.
+         * This avoids blocking the build in startup validation.
+         * The scheduled task is triggered and the pipeline waits fixed seconds.
+         */
+        startupPorts    : [],
+        healthUrl       : '',
+
         stopPorts       : ['8020', '4200'],
-        healthUrl       : 'http://localhost:4200',
         processPatterns : [
             'gaia-start-back\\.bat',
             'gaia-start-front\\.bat',
@@ -34,7 +343,7 @@ def PIPELINE_CONFIG = [
         ]
     ],
 
-    execution: [
+    execution : [
         browser             : 'Chrome',
         suiteTimeoutMinutes : 10
     ]
@@ -318,13 +627,13 @@ pipeline {
         ansiColor('xterm')
         disableConcurrentBuilds()
         skipDefaultCheckout(true)
-        timeout(time: 120, unit: 'MINUTES')
+        timeout(time: 180, unit: 'MINUTES')
         buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '20'))
     }
 
     parameters {
         string(name: 'STARTUP_WAIT_SECONDS', defaultValue: '40', description: 'Seconds to wait after application startup')
-        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for the suite')
+        string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '15', description: 'Timeout in minutes for each suite')
         string(name: 'BROWSER', defaultValue: 'Chrome', description: 'Katalon browser type')
     }
 
@@ -349,7 +658,7 @@ pipeline {
             }
         }
 
-        stage('Validate Tools') {
+        stage('Validate Support Files') {
             steps {
                 script {
                     bat """
@@ -403,10 +712,10 @@ echo ------------------------------------------------------------
                     def appManager = loadAppManager(this)
 
                     appManager.start(this, [
-                        taskName    : PIPELINE_CONFIG.application.startTask,
-                        waitSeconds : params.STARTUP_WAIT_SECONDS.toInteger(),
-                        startupPorts: PIPELINE_CONFIG.application.startupPorts,
-                        healthUrl   : PIPELINE_CONFIG.application.healthUrl
+                        taskName     : PIPELINE_CONFIG.application.startTask,
+                        waitSeconds  : params.STARTUP_WAIT_SECONDS.toInteger(),
+                        startupPorts : PIPELINE_CONFIG.application.startupPorts,
+                        healthUrl    : PIPELINE_CONFIG.application.healthUrl
                     ])
                 }
             }
@@ -421,6 +730,30 @@ echo ------------------------------------------------------------
                     echo '[OK] FULL CHECKOUT COMPLETED'
                     echo "Workspace: ${pwd()}"
                     echo '------------------------------------------------------------'
+                }
+            }
+        }
+
+        stage('Validate Project File') {
+            steps {
+                script {
+                    def projectFilePath = "${pwd()}\\${PIPELINE_CONFIG.projectFileName}"
+
+                    bat """
+@echo off
+echo ------------------------------------------------------------
+echo VALIDATING PROJECT FILE
+echo ------------------------------------------------------------
+
+if not exist "${projectFilePath}" (
+    echo [ERROR] Project file not found
+    echo ${projectFilePath}
+    exit /b 1
+)
+
+echo [OK] Project file found
+echo ------------------------------------------------------------
+"""
                 }
             }
         }
@@ -452,7 +785,7 @@ mkdir "${paths.artifactsRoot(this)}"
             }
         }
 
-        stage('Execute Suite') {
+        stage('Execute Correction Suites') {
             steps {
                 script {
                     def paths = loadPaths(this)
@@ -460,52 +793,61 @@ mkdir "${paths.artifactsRoot(this)}"
                     def resultStore = loadResultStore(this)
                     def liveLogger = loadLiveLogger(this)
 
-                    def suite = [
-                        name: PIPELINE_CONFIG.suiteName,
-                        path: PIPELINE_CONFIG.suitePath
-                    ]
-
+                    def suiteResults = []
                     def projectPath = paths.projectPath(this, PIPELINE_CONFIG.projectFileName)
+                    def defaultTimeout = params.SUITE_TIMEOUT_MINUTES.toInteger()
 
-                    consoleView.printSuiteHeader(this, suite.name, suite.path, params.SUITE_TIMEOUT_MINUTES)
+                    PIPELINE_CONFIG.suites.each { suite ->
+                        stage("Suite - ${suite.name}") {
+                            consoleView.printSuiteHeader(this, suite.name, suite.path, defaultTimeout.toString())
 
-                    int exitCode = liveLogger.runSuite(this, [
-                        katalonExe         : env.KATALON_EXE,
-                        projectPath        : projectPath,
-                        reportsRoot        : paths.reportsRoot(this),
-                        browser            : params.BROWSER,
-                        suiteTimeoutMinutes: params.SUITE_TIMEOUT_MINUTES.toInteger()
-                    ], suite)
+                            int exitCode = liveLogger.runSuite(this, [
+                                katalonExe         : env.KATALON_EXE,
+                                projectPath        : projectPath,
+                                reportsRoot        : paths.reportsRoot(this),
+                                browser            : params.BROWSER,
+                                suiteTimeoutMinutes: defaultTimeout
+                            ], suite)
 
-                    def meta = resultStore.readSuiteMeta(this, paths.reportsRoot(this), suite.name)
+                            def meta = resultStore.readSuiteMeta(this, paths.reportsRoot(this), suite.name)
 
-                    def result = [
-                        name              : suite.name,
-                        path              : suite.path,
-                        status            : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
-                        icon              : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
-                        exitCode          : meta['EXIT_CODE'] ?: "${exitCode}",
-                        executed          : meta['EXECUTED'] ?: '0',
-                        passed            : meta['PASSED'] ?: '0',
-                        failed            : meta['FAILED'] ?: '0',
-                        skipped           : meta['SKIPPED'] ?: '0',
-                        durationSeconds   : meta['DURATION_SECONDS'] ?: '0',
-                        reason            : meta['REASON'] ?: '',
-                        screenshotRel     : meta['SCREENSHOT_REL'] ?: '',
-                        primaryArtifactRel: '',
-                        logRel            : meta['LOG_REL'] ?: '',
-                        caseSummary       : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
-                        stepSummary       : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
-                    ]
+                            def result = [
+                                name              : suite.name,
+                                path              : suite.path,
+                                status            : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
+                                icon              : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
+                                exitCode          : meta['EXIT_CODE'] ?: "${exitCode}",
+                                executed          : meta['EXECUTED'] ?: '0',
+                                passed            : meta['PASSED'] ?: '0',
+                                failed            : meta['FAILED'] ?: '0',
+                                skipped           : meta['SKIPPED'] ?: '0',
+                                durationSeconds   : meta['DURATION_SECONDS'] ?: '0',
+                                reason            : meta['REASON'] ?: '',
+                                screenshotRel     : meta['SCREENSHOT_REL'] ?: '',
+                                primaryArtifactRel: '',
+                                logRel            : meta['LOG_REL'] ?: '',
+                                caseSummary       : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
+                                stepSummary       : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
+                            ]
 
-                    publishPrimaryArtifact(this, paths.reportsRoot(this), result)
-                    resultStore.saveSuiteResults(this, paths.reportsRoot(this), [result])
+                            publishPrimaryArtifact(this, paths.reportsRoot(this), result)
 
-                    consoleView.printSuiteResult(this, result)
+                            suiteResults << result
+                            resultStore.saveSuiteResults(this, paths.reportsRoot(this), suiteResults)
 
-                    if (result.status != 'PASSED') {
+                            consoleView.printSuiteResult(this, result)
+                            consoleView.printRunningSummary(this, suiteResults)
+
+                            if (result.status != 'PASSED') {
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                    error("${result.name} finished with status ${result.status}")
+                                }
+                            }
+                        }
+                    }
+
+                    if (suiteResults.any { it.status != 'PASSED' }) {
                         currentBuild.result = 'FAILURE'
-                        error("${result.name} finished with status ${result.status}")
                     }
                 }
             }
@@ -546,8 +888,8 @@ mkdir "${paths.artifactsRoot(this)}"
                     if (fileExists('jenkinsIntegration/JenkinsAppManager.groovy')) {
                         def appManager = loadAppManager(this)
                         appManager.stop(this, [
-                            stopPorts      : PIPELINE_CONFIG.application.stopPorts,
-                            processPatterns: PIPELINE_CONFIG.application.processPatterns
+                            stopPorts       : PIPELINE_CONFIG.application.stopPorts,
+                            processPatterns : PIPELINE_CONFIG.application.processPatterns
                         ])
                     }
                     else {
