@@ -1,269 +1,866 @@
-/*
- * Responsibility:
- * Generic application lifecycle helper for Jenkins.
- * This file only starts and stops the application under test.
- */
+🔧 Jenkins Pipeline Integration Documentation
 
-def start(script, Map cfg) {
-	def taskName = (cfg.taskName ?: '').toString().trim()
-	def waitSeconds = (cfg.waitSeconds ?: 40).toString()
-	def healthUrl = (cfg.healthUrl ?: '').toString().trim()
+This documentation explains how the Jenkins pipeline is structured for the automation project, what each file is responsible for, and how the execution flows from application startup to suite execution, result collection, artifact handling, and application shutdown.
 
-	def startupPorts = []
-	(cfg.startupPorts ?: []).each { port ->
-		if (port != null && port.toString().trim()) {
-			startupPorts << port.toString().trim()
-		}
-	}
+The objective is to make the Jenkins integration easier to understand, maintain, troubleshoot, and evolve.
 
-	script.withEnv([
-		"TASK_NAME=${taskName}",
-		"WAIT_SECONDS=${waitSeconds}",
-		"HEALTH_URL=${healthUrl}",
-		"STARTUP_PORTS=${startupPorts.join(',')}"
-	]) {
-		script.powershell '''
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
+✅ With this documentation, any maintainer should be able to:
+Understand the end to end Jenkins execution flow
+Identify which file is responsible for each part of the process
+Know where to change suite configuration and execution order
+Know where startup and shutdown logic is handled
+Understand how suite logs, screenshots, and metadata are collected
+Troubleshoot failures more quickly when the pipeline stops before, during, or after execution
+📚 What this documentation covers
+Jenkins Pipeline Architecture and File Responsibilities
 
-function Test-ListeningPort {
-    param([int]$Port)
+This section explains the Jenkins integration structure behind the pipeline execution.
 
-    try {
-        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        return ($null -ne $listener)
-    }
-    catch {
-        return $false
-    }
-}
+Main files currently used
+jenkinsPipelines/Jenkinsfile_Correction.groovy
+jenkinsIntegration/JenkinsAppManager.groovy
+jenkinsIntegration/JenkinsConsoleView.groovy
+jenkinsIntegration/JenkinsLiveLogger.groovy
+jenkinsIntegration/JenkinsPaths.groovy
+jenkinsIntegration/JenkinsResultStore.groovy
+🧩 Integration Architecture and File Responsibilities
+Jenkinsfile_Correction.groovy
 
-function Wait-ListeningPort {
-    param(
-        [int]$Port,
-        [datetime]$Deadline
-    )
+This is the main pipeline entry point for the Correction execution flow.
 
-    while ((Get-Date) -lt $Deadline) {
-        if (Test-ListeningPort -Port $Port) {
-            Write-Host ("✅ Port $Port is listening")
-            return
-        }
+It is the file Jenkins calls directly when the job starts.
 
-        Start-Sleep -Seconds 2
-    }
+Main responsibilities
+Define the Katalon project file to execute
+Define which Correction suites belong to this build
+Configure startup behavior
+Configure browser and suite timeout
+Load all helper files
+Orchestrate the full flow from startup to shutdown
+Optionally trigger the next Jenkins job later, if needed
+What should be changed here
 
-    throw ("Port $Port was not ready before timeout")
-}
+This is the main file to update when you want to:
 
-function Wait-HttpReady {
-    param(
-        [string]$Url,
-        [datetime]$Deadline
-    )
+Add or remove suites from the Correction build
+Change the execution order of suites
+Change the Katalon .prj file name
+Change the browser type
+Change suite timeout
+Change startup task name
+Enable or disable next job trigger
+Important note
 
-    if ([string]::IsNullOrWhiteSpace($Url)) {
-        return
-    }
+This file should stay focused on configuration and orchestration, not detailed technical logic.
 
-    while ((Get-Date) -lt $Deadline) {
-        try {
-            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+JenkinsAppManager.groovy
 
-            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
-                Write-Host ("✅ Application responded at $Url with HTTP $($response.StatusCode)")
-                return
-            }
-        }
-        catch {
-        }
+This file is responsible for the application lifecycle used by Jenkins.
 
-        Start-Sleep -Seconds 2
-    }
+Main responsibilities
+Start the application through the scheduled task
+Wait the configured amount of time before execution continues
+Optionally validate startup readiness by ports or health URL
+Stop the application after execution finishes
+Kill only the intended application processes
+Avoid stopping unrelated Jenkins or system processes
+Why this file exists
 
-    throw ("Health URL was not ready before timeout: $Url")
-}
+Without this separation, application startup and shutdown logic would make the main pipeline file too large and hard to maintain.
 
-Write-Host '============================================================'
-Write-Host '🚀 STARTING APPLICATION THROUGH SCHEDULED TASK'
-Write-Host ("🕒 Wait seconds: $($env:WAIT_SECONDS)")
-Write-Host '============================================================'
+When to change this file
 
-if ([string]::IsNullOrWhiteSpace($env:TASK_NAME)) {
-    throw 'TASK_NAME was not provided'
-}
+Update this file when you need to:
 
-schtasks /run /tn $env:TASK_NAME | Out-Host
+Change how the application is started
+Change how startup validation works
+Change how ports are checked
+Improve shutdown safety
+Fix issues where application processes remain open after build completion
+Important note
 
-$ports = @()
-if (-not [string]::IsNullOrWhiteSpace($env:STARTUP_PORTS)) {
-    $ports = $env:STARTUP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-}
+This file must contain only start and stop logic.
+It must not contain pipeline configuration such as suite lists or job settings.
 
-if ($ports.Count -eq 0 -and [string]::IsNullOrWhiteSpace($env:HEALTH_URL)) {
-    Start-Sleep -Seconds ([int]$env:WAIT_SECONDS)
-    Write-Host '✅ Scheduled task triggered'
-    Write-Host '============================================================'
-    return
-}
+JenkinsConsoleView.groovy
 
-$deadline = (Get-Date).AddSeconds([int]$env:WAIT_SECONDS)
+This file is responsible for the human readable console output shown in Jenkins.
 
-Start-Sleep -Seconds 3
+Main responsibilities
+Print suite start blocks
+Print suite result summaries
+Print running summary after each suite
+Print final pipeline summary
+Format durations
+Format short and clean output for easier reading
+Why this file exists
 
-foreach ($port in $ports) {
-    Wait-ListeningPort -Port ([int]$port) -Deadline $deadline
-}
+Jenkins logs can become very noisy and difficult to read.
+This helper centralizes the visual output so the console remains cleaner and more structured.
 
-Wait-HttpReady -Url $env:HEALTH_URL -Deadline $deadline
+When to change this file
 
-Write-Host '✅ Application scheduled task triggered and application is ready'
-Write-Host '============================================================'
-'''
-	}
-}
+Update this file when you want to:
 
-def stop(script, Map cfg) {
-	def stopPorts = []
-	(cfg.stopPorts ?: []).each { port ->
-		if (port != null && port.toString().trim()) {
-			stopPorts << port.toString().trim()
-		}
-	}
+Improve console readability
+Add or remove summary fields
+Change icons or visual formatting
+Show more or fewer case and step details
+JenkinsLiveLogger.groovy
 
-	def processPatterns = []
-	(cfg.processPatterns ?: []).each { pattern ->
-		if (pattern != null && pattern.toString().trim()) {
-			processPatterns << pattern.toString().trim()
-		}
-	}
+This is the file responsible for running each suite and collecting live execution information.
 
-	script.withEnv([
-		"STOP_PORTS=${stopPorts.join(',')}",
-		"PROCESS_PATTERNS=${processPatterns.join('||')}"
-	]) {
-		script.powershell(
-			returnStatus: true,
-			script: '''
-$ErrorActionPreference = 'Continue'
-$ProgressPreference = 'SilentlyContinue'
+Main responsibilities
+Execute one Katalon suite
+Launch Katalon with the correct parameters
+Stream useful live output into Jenkins console
+Read execution0.log during execution
+Extract meaningful scenario and step messages
+Detect timeout
+Find the best JUnit file
+Find the best screenshot
+Create metadata for the suite
+Generate synthetic JUnit if the suite fails without generating one
+Why this file exists
 
-function Stop-ProcessTreeSafe {
-    param([int]$ProcessId)
+This is the technical core of suite execution.
+It isolates the heavy logic related to Katalon runtime, logs, metadata, and evidence discovery.
 
-    if (-not $ProcessId) {
-        return
-    }
+What kind of data it produces
 
-    try {
-        taskkill /PID $ProcessId /T /F 1>$null 2>$null
-    }
-    catch {
-    }
+For each suite it produces or resolves:
 
-    Start-Sleep -Milliseconds 300
+Suite status
+Exit code
+Duration
+Executed / Passed / Failed / Skipped counts
+Failure reason
+Screenshot path
+Log path
+Case summary
+Step summary
+When to change this file
 
-    try {
-        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    catch {
-    }
-}
+Update this file when you need to:
 
-function Stop-ProcessListeningOnPort {
-    param([int]$Port)
+Improve live Jenkins console visibility
+Change how execution0.log is parsed
+Change how screenshots are selected
+Improve failure reason extraction
+Change timeout behavior
+Adjust metadata creation
+JenkinsPaths.groovy
 
-    try {
-        $owners = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty OwningProcess -Unique
+This file centralizes path calculation used across the Jenkins integration.
 
-        foreach ($ownerPid in $owners) {
-            if ($ownerPid) {
-                Write-Host ("🧹 Stopping process on port $Port | PID=$ownerPid")
-                Stop-ProcessTreeSafe -ProcessId $ownerPid
-            }
-        }
-    }
-    catch {
-    }
-}
+Main responsibilities
+Resolve current workspace
+Build the project file path
+Build the Reports root path
+Build the logs folder path
+Build the suite artifacts path
+Why this file exists
 
-function Get-SafeTargetProcesses {
-    param([string[]]$Patterns)
+It avoids repeating hardcoded path logic across multiple files.
 
-    if ($null -eq $Patterns -or $Patterns.Count -eq 0) {
-        return @()
-    }
+When to change this file
 
-    $all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+Update this file when:
 
-    return @(
-        $all | Where-Object {
-            $cmd = [string]$_.CommandLine
-            $name = [string]$_.Name
+Folder structure changes
+Reports location changes
+Artifact location changes
+Project path resolution needs to be adjusted
+JenkinsResultStore.groovy
 
-            if ([string]::IsNullOrWhiteSpace($cmd) -and [string]::IsNullOrWhiteSpace($name)) {
-                return $false
-            }
+This file is responsible for persisting and reading suite execution metadata.
 
-            foreach ($pattern in $Patterns) {
-                if ([string]::IsNullOrWhiteSpace($pattern)) {
-                    continue
-                }
+Main responsibilities
+Read suite .meta.properties files
+Parse stored metadata
+Split case and step summaries
+Save the full suite result list as JSON
+Reload suite results later in the pipeline
+Why this file exists
 
-                if (($cmd -match $pattern) -or ($name -match $pattern)) {
-                    return $true
-                }
-            }
+The pipeline needs a stable way to carry suite result data across stages and into post actions.
 
-            return $false
-        }
-    )
-}
+When to change this file
 
-Write-Host '============================================================'
-Write-Host '🧹 STOPPING APPLICATION PROCESSES'
-Write-Host '============================================================'
+Update this file when you need to:
 
-$ports = @()
-if (-not [string]::IsNullOrWhiteSpace($env:STOP_PORTS)) {
-    $ports = $env:STOP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-}
+Add new stored metadata fields
+Change metadata parsing rules
+Change the JSON structure used to persist results
+🔄 End to End Execution Flow
 
-foreach ($port in $ports) {
-    Stop-ProcessListeningOnPort -Port ([int]$port)
-}
+This section explains how the Jenkins pipeline behaves during execution, from bootstrap to final shutdown.
 
-$rawPatterns = @()
-if (-not [string]::IsNullOrWhiteSpace($env:PROCESS_PATTERNS)) {
-    $rawPatterns = $env:PROCESS_PATTERNS.Split('||') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-}
+1. Bootstrap support files
 
-$targets = Get-SafeTargetProcesses -Patterns $rawPatterns
+The pipeline begins by doing a lightweight checkout containing the Jenkins support files.
 
-foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
-    try {
-        Write-Host ("🧹 Stopping matched process | PID=$($proc.ProcessId) | Name=$($proc.Name)")
-        Stop-ProcessTreeSafe -ProcessId $proc.ProcessId
-    }
-    catch {
-    }
-}
+Purpose
+Ensure helper files are available before the full repository checkout
+Allow validation of the integration files early in the build
+2. Validate support files
 
-Start-Sleep -Seconds 2
+The pipeline validates the presence of the required Jenkins helper files and the Katalon executable.
 
-foreach ($port in $ports) {
-    Stop-ProcessListeningOnPort -Port ([int]$port)
-}
+Purpose
+Fail fast if the environment is broken
+Avoid reaching suite execution with missing support files
+3. Start application
 
-Write-Host '✅ Application stop command finished'
-Write-Host '============================================================'
+The pipeline calls JenkinsAppManager.groovy to start the application through the configured scheduled task.
 
-exit 0
-'''
-		)
-	}
-}
+Purpose
+Bring backend and frontend up before the test execution starts
+Important behavior
 
-return this
+Depending on configuration, startup can be:
+
+Fixed wait only
+Port validation
+Health URL validation
+Combined validation
+4. Full checkout repository
+
+After startup, the pipeline performs the full checkout of the repository.
+
+Purpose
+Retrieve the full automation project
+Retrieve test suites, objects, keywords, settings, and reports structure
+5. Validate project file
+
+The pipeline checks if the configured Katalon project file exists.
+
+Example
+gaia-portal.prj
+Purpose
+Fail early if the wrong .prj file name is configured
+6. Normalize runtime settings
+
+The pipeline updates runtime related files before suite execution.
+
+Purpose
+Disable unstable rerun behaviors
+Disable self healing related flags when needed
+Keep execution more deterministic in Jenkins
+7. Prepare artifacts
+
+The pipeline prepares the Reports structure and initializes result persistence.
+
+Purpose
+Ensure reports and logs folders are clean
+Ensure suite results can be saved progressively
+8. Execute suites
+
+The pipeline loops through all configured Correction suites.
+
+For each suite:
+
+Print suite header
+Run the suite through JenkinsLiveLogger.groovy
+Read suite metadata
+Resolve screenshot and log
+Save suite results
+Print suite result
+Print running summary
+Important behavior
+
+If one suite fails:
+
+Its stage is marked as failure
+The pipeline still keeps the result information
+Final summary can still be generated
+9. Final summary
+
+In post execution, the pipeline loads all saved suite results and prints the final summary.
+
+Purpose
+Provide one final consolidated view of the execution outcome
+10. Stop application
+
+The pipeline then calls JenkinsAppManager.groovy again to stop the application.
+
+Purpose
+Free the environment for the next build
+Avoid keeping backend or frontend processes open
+Important note
+
+This is one of the most sensitive parts of the pipeline.
+If stop logic is too broad, it can accidentally kill Jenkins related processes instead of only the application.
+
+11. Publish artifacts and JUnit
+
+The pipeline archives screenshots and publishes JUnit results.
+
+Purpose
+Make failures visible in Jenkins
+Keep evidence accessible after execution
+Preserve JUnit compatibility for reporting
+12. Optional next job trigger
+
+If enabled in the future, the pipeline can trigger another Jenkins job as a separate build.
+
+Current status
+
+For now, this remains disabled with:
+
+triggerNextJob : false
+nextJobName : ''
+🗂️ Current Correction Build Scope
+
+The current Correction build is designed to execute the following suites in one single Jenkins build:
+
+Correction- Add Correction
+Correction- Computation Selection
+Correction- Corrected Duplication
+Correction- Correction Details
+Correction- Download Invalid Records
+
+These suites are configured inside Jenkinsfile_Correction.groovy.
+
+⚙️ Main Configuration Area
+
+The most important editable section is the PIPELINE_CONFIG block inside Jenkinsfile_Correction.groovy.
+
+This block currently centralizes:
+
+Project file name
+List of suites
+Next job trigger configuration
+Application startup task
+Startup wait
+Startup validation settings
+Stop ports
+Process patterns
+Browser
+Suite timeout
+
+This means most day to day maintenance can be done from one single place.
+
+🛠️ Troubleshooting Guide
+Pipeline stops before any suite starts
+
+Possible causes:
+
+Missing Jenkins helper file
+Katalon executable path invalid
+Project .prj file name incorrect
+Startup task failed
+Port or health validation too strict
+First places to check
+Validate Support Files
+Validate Project File
+Start Application
+Application starts but suites do not run
+
+Possible causes:
+
+Katalon project file not found
+Broken test suite path
+Runtime normalization issue
+Build failed before reaching execution stage
+First places to check
+Jenkinsfile_Correction.groovy
+JenkinsPaths.groovy
+JenkinsLiveLogger.groovy
+Suite runs but console is hard to understand
+
+Possible causes:
+
+Noisy raw Katalon output
+Missing step extraction
+Insufficient summary formatting
+First places to check
+JenkinsConsoleView.groovy
+JenkinsLiveLogger.groovy
+Pipeline finishes but app processes remain open
+
+Possible causes:
+
+Stop logic too weak
+Process patterns not matching the application
+Ports not being targeted correctly
+First place to check
+JenkinsAppManager.groovy
+Pipeline loses Jenkins node connection while stopping application
+
+Possible causes:
+
+Stop logic too broad
+Killing generic cmd.exe, java.exe, or node.exe
+Accidentally killing Jenkins remoting related process
+First place to check
+JenkinsAppManager.groovy
+Screenshot exists but is blank or white
+
+Possible causes:
+
+Screenshot captured after browser became blank
+Screenshot captured too late
+Failure listener capturing after state loss
+First place to check
+
+This is usually not Jenkins first.
+It is more likely in the Katalon evidence capture timing.
+
+🧠 Recommended Maintenance Rules
+Keep Jenkinsfile_Correction.groovy focused on orchestration
+
+Do not place heavy technical execution logic there.
+
+Keep JenkinsAppManager.groovy focused only on startup and shutdown
+
+Do not place suite configuration or pipeline settings there.
+
+Keep process matching specific
+
+Avoid generic patterns that can affect Jenkins infrastructure.
+
+Keep path logic centralized
+
+Do not duplicate path calculations in multiple files.
+
+Keep result persistence stable
+
+Metadata and result storage should remain predictable so post actions can safely load them.
+
+📌 Suggested Mental Model
+
+You can think of the Jenkins integration like this:
+
+Jenkinsfile_Correction.groovy
+= the orchestrator
+JenkinsAppManager.groovy
+= the environment controller
+JenkinsLiveLogger.groovy
+= the suite executor and live collector
+JenkinsConsoleView.groovy
+= the console presenter
+JenkinsPaths.groovy
+= the path resolver
+JenkinsResultStore.groovy
+= the execution memory
+✅ Final objective of this structure
+
+This Jenkins structure is designed to make the automation execution:
+
+easier to configure
+easier to read
+easier to troubleshoot
+safer to evolve
+more reusable for future pipeline files
+
+
+
+📁 Suggested page tree
+🗂️ Parent page
+
+Jenkins Pipeline Integration
+
+📄 Child page
+
+Jenkins File Responsibilities
+
+📄 Child pages for each file
+Jenkinsfile_Correction.groovy
+JenkinsAppManager.groovy
+JenkinsLiveLogger.groovy
+JenkinsConsoleView.groovy
+JenkinsPaths.groovy
+JenkinsResultStore.groovy
+✅ How this should look in Confluence
+1. Parent page
+Jenkins Pipeline Integration
+
+Use this as the main entry page.
+
+Intro text
+
+This documentation explains how the Jenkins pipeline is structured for the automation project, what each file is responsible for, and how the execution flows from application startup to suite execution, result collection, artifact handling, and application shutdown.
+
+The objective is to make the Jenkins integration easier to understand, maintain, troubleshoot, and evolve.
+
+This documentation should help maintainers:
+Understand the end to end Jenkins execution flow
+Identify which file is responsible for each part of the process
+Know where to change suite configuration and execution order
+Know where startup and shutdown logic are handled
+Understand how logs, screenshots, metadata, and final summaries are generated
+Child pages
+Full page: Jenkins File Responsibilities
+Full page: Jenkinsfile_Correction.groovy
+Full page: JenkinsAppManager.groovy
+Full page: JenkinsLiveLogger.groovy
+Full page: JenkinsConsoleView.groovy
+Full page: JenkinsPaths.groovy
+Full page: JenkinsResultStore.groovy
+2. Child page
+📄 Jenkins File Responsibilities
+
+This section explains the actual project structure behind the Jenkins pipeline integration.
+
+Main files
+Jenkinsfile_Correction.groovy
+Orchestrates the full Jenkins execution flow for the Correction suites.
+JenkinsAppManager.groovy
+Starts and stops the application used by the Jenkins pipeline.
+JenkinsLiveLogger.groovy
+Executes suites, streams live output, resolves logs, screenshots, and metadata.
+JenkinsConsoleView.groovy
+Prints structured and readable output in the Jenkins console.
+JenkinsPaths.groovy
+Centralizes all workspace, report, and artifact path calculations.
+JenkinsResultStore.groovy
+Stores and reloads suite execution metadata and final suite result collections.
+Execution flow summary
+Start the flow in Jenkinsfile_Correction.groovy
+Bootstrap and validate support files
+Start the application through JenkinsAppManager.groovy
+Normalize runtime settings
+Prepare artifacts and result storage
+Execute each suite through JenkinsLiveLogger.groovy
+Print suite and final summaries through JenkinsConsoleView.groovy
+Persist and reload results through JenkinsResultStore.groovy
+Stop the application through JenkinsAppManager.groovy
+Full pages
+Full page: Jenkinsfile_Correction.groovy
+Full page: JenkinsAppManager.groovy
+Full page: JenkinsLiveLogger.groovy
+Full page: JenkinsConsoleView.groovy
+Full page: JenkinsPaths.groovy
+Full page: JenkinsResultStore.groovy
+3. Child page
+📄 Jenkinsfile_Correction.groovy
+
+Jenkinsfile_Correction.groovy is the main orchestration file for the Correction pipeline. It is the file Jenkins calls directly when the job starts.
+
+This file handles:
+Defining the Katalon project file
+Defining the list of Correction suites to run
+Defining browser and suite timeout
+Defining startup and shutdown configuration
+Loading support files
+Driving the full execution flow
+Optionally triggering a next Jenkins job in the future
+📍 Position in the architecture
+
+This file sits at the top of the Jenkins execution flow and controls all other helper files.
+
+📥 Reads
+PIPELINE_CONFIG
+Suite list
+Katalon executable path
+Git repository settings
+Jenkins support files
+📤 Produces
+Full pipeline orchestration
+Stage execution order
+Final build status
+Optional next job trigger
+🔧 Common changes maintainers may need
+Add or remove suites from the build
+Change suite execution order
+Change gaia-portal.prj
+Change browser type
+Change timeout
+Change startup task name
+Enable or disable next job trigger
+🔍 Main sections to validate
+PIPELINE_CONFIG
+Bootstrap Support Files
+Start Application
+Execute Correction Suites
+post { always { ... } }
+♻️ How to reuse in another pipeline
+
+Review:
+
+Project file name
+Suite list
+Custom workspace
+Startup task
+Stop ports
+Browser and timeout values
+⚠️ Change this file when
+The build scope changes
+The suite sequence changes
+Another pipeline is created for a different test area
+4. Child page
+📄 JenkinsAppManager.groovy
+
+JenkinsAppManager.groovy is responsible for application lifecycle management inside the Jenkins pipeline.
+
+This file handles:
+Starting the application through a scheduled task
+Waiting for startup completion
+Optional readiness validation
+Stopping the application after execution
+Killing only intended application processes
+📍 Position in the architecture
+
+This file is the environment controller used by the main pipeline.
+
+📥 Reads
+Task name
+Startup wait time
+Startup ports
+Health URL
+Stop ports
+Process match patterns
+📤 Produces
+Application startup
+Application shutdown
+Controlled cleanup after build completion
+🔧 Common changes maintainers may need
+Change scheduled task name
+Change startup timing
+Add or remove readiness validation
+Adjust stop process rules
+Improve stop safety to avoid killing Jenkins related processes
+🔍 Main methods to validate
+start(...)
+stop(...)
+Port validation logic
+Process matching logic
+♻️ How to reuse in another project
+
+Review:
+
+Scheduled task name
+Port numbers
+Health URL
+Process patterns
+Application specific command line identifiers
+⚠️ Change this file when
+Startup behavior changes
+Shutdown becomes unstable
+Application processes remain open after execution
+Jenkins agent is being interrupted during stop
+5. Child page
+📄 JenkinsLiveLogger.groovy
+
+JenkinsLiveLogger.groovy is responsible for executing each Katalon suite and collecting live execution information.
+
+This file handles:
+Launching one suite in Katalon
+Streaming useful live output to Jenkins
+Reading execution0.log
+Extracting scenario and step information
+Resolving failure reason
+Locating screenshots
+Locating JUnit files
+Writing suite metadata
+Creating synthetic JUnit if needed
+📍 Position in the architecture
+
+This file is the execution engine for each suite.
+
+📥 Reads
+Katalon executable
+Project path
+Reports root
+Browser type
+Suite name
+Suite path
+Timeout
+📤 Writes
+Log files
+Metadata properties
+Synthetic JUnit when necessary
+Step summaries
+Case summaries
+🔧 Common changes maintainers may need
+Improve live console readability
+Adjust failure reason extraction
+Change screenshot selection rules
+Improve execution0.log parsing
+Adjust timeout handling
+Improve synthetic JUnit generation
+🔍 Main methods to validate
+runSuite(...)
+JUnit summary extraction
+Screenshot selection logic
+Execution log parsing
+Meta file generation
+♻️ How to reuse in another project
+
+Review:
+
+Katalon command arguments
+Expected report file names
+Screenshot naming assumptions
+Log parsing assumptions
+Timeout thresholds
+⚠️ Change this file when
+Logs are not clear enough
+Evidence is not being found correctly
+Failure reason is weak or empty
+JUnit is missing in failed executions
+6. Child page
+📄 JenkinsConsoleView.groovy
+
+JenkinsConsoleView.groovy is responsible for making the Jenkins console easier to read.
+
+This file handles:
+Printing suite start blocks
+Printing suite result blocks
+Printing running summary
+Printing final summary
+Formatting duration
+Cleaning noisy text before display
+📍 Position in the architecture
+
+This file is the presentation layer for console output.
+
+📥 Reads
+Suite result maps
+Current pipeline result
+Duration values
+Case summary and step summary data
+📤 Produces
+Cleaner Jenkins console
+Human readable execution summary
+Better debugging visibility during execution
+🔧 Common changes maintainers may need
+Change icons
+Change summary format
+Add more suite information
+Add more failure details
+Reduce or increase console verbosity
+🔍 Main methods to validate
+printSuiteHeader(...)
+printSuiteResult(...)
+printRunningSummary(...)
+printFinalSummary(...)
+♻️ How to reuse in another project
+
+Review:
+
+Desired summary fields
+Preferred formatting style
+Build description format
+Number of step lines to show
+⚠️ Change this file when
+The console becomes too noisy
+Summaries are missing useful information
+You want to improve readability for support or QA teams
+7. Child page
+📄 JenkinsPaths.groovy
+
+JenkinsPaths.groovy centralizes all path calculations used by the Jenkins integration.
+
+This file handles:
+Resolving workspace path
+Building project file path
+Resolving reports root
+Resolving logs folder
+Resolving artifact folder
+📍 Position in the architecture
+
+This file is the shared path resolver used by the pipeline and support files.
+
+📥 Reads
+Jenkins current workspace
+Project file name
+📤 Produces
+Stable path strings reused across the integration
+🔧 Common changes maintainers may need
+Change reports folder structure
+Add new artifact directories
+Change project path resolution rules
+Adjust path behavior for another repository structure
+🔍 Main methods to validate
+workspace(...)
+projectPath(...)
+reportsRoot(...)
+logsRoot(...)
+artifactsRoot(...)
+♻️ How to reuse in another project
+
+Review:
+
+Folder structure
+Report folder naming
+Artifact storage conventions
+⚠️ Change this file when
+The repository structure changes
+Reports move to a different folder
+New shared path rules are needed
+8. Child page
+📄 JenkinsResultStore.groovy
+
+JenkinsResultStore.groovy stores and reloads suite execution metadata used across the pipeline.
+
+This file handles:
+Reading .meta.properties
+Parsing stored metadata
+Splitting stored summaries
+Saving suite result list as JSON
+Loading suite result list later for final summary and post actions
+📍 Position in the architecture
+
+This file is the persistence layer for suite result data.
+
+📥 Reads
+Meta property files
+Saved suite result JSON
+Stored case summary
+Stored step summary
+📤 Writes
+suite-results.json
+Parsed metadata maps
+Structured suite result lists
+🔧 Common changes maintainers may need
+Add more result fields
+Change parsing logic
+Change JSON structure
+Adjust summary split format
+🔍 Main methods to validate
+readSuiteMeta(...)
+saveSuiteResults(...)
+loadSuiteResults(...)
+splitSummary(...)
+♻️ How to reuse in another project
+
+Review:
+
+Metadata fields produced by the live logger
+JSON structure expected by final summary
+Summary separators and conventions
+⚠️ Change this file when
+New suite metadata needs to be persisted
+Final summary requires new fields
+Meta parsing becomes inconsistent
+✨ Suggested extra parent page
+
+If you want it even closer to the model in your screenshots, create one more page under the main page:
+
+📁 Jenkins Files
+
+And under it place:
+
+Jenkins File Responsibilities
+Jenkinsfile_Correction.groovy
+JenkinsAppManager.groovy
+JenkinsLiveLogger.groovy
+JenkinsConsoleView.groovy
+JenkinsPaths.groovy
+JenkinsResultStore.groovy
+
+So the final tree becomes:
+
+Jenkins Pipeline Integration
+└── Jenkins Files
+    ├── Jenkins File Responsibilities
+    ├── Jenkinsfile_Correction.groovy
+    ├── JenkinsAppManager.groovy
+    ├── JenkinsLiveLogger.groovy
+    ├── JenkinsConsoleView.groovy
+    ├── JenkinsPaths.groovy
+    └── JenkinsResultStore.groovy
+
+That is the closest structure to the page model you showed.
