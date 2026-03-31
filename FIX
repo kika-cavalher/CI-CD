@@ -1,38 +1,39 @@
-JenkinsBatManager.groovy
+📁 Suggested structure
+jenkinsIntegration/
+  JenkinsAppManager.groovy
+  JenkinsConsoleView.groovy
+  JenkinsLiveLogger.groovy
+  JenkinsPaths.groovy
+  JenkinsResultStore.groovy
+
+jenkinsPipelines/
+  Jenkinsfile_Correction_Add_Correction.groovy
+  Jenkinsfile_Other_Suite.groovy
+1) jenkinsIntegration/JenkinsAppManager.groovy
 /*
  * Responsibility:
- * This file is responsible only for starting and stopping Gaia.
- * It preserves the scheduled task approach that already works in your machine.
- * Default behavior is legacy and backward compatible.
+ * Generic application lifecycle manager for Jenkins.
+ * This file only starts and stops the application under test.
+ * It is generic and does not contain project-specific naming.
  */
 
 def start(script, Map cfg) {
-	/*
-	 * Responsibility:
-	 * Trigger the scheduled task that starts Gaia.
-	 * By default, keep legacy behavior:
-	 * 1) run the task
-	 * 2) wait fixed seconds
-	 * 3) continue
-	 *
-	 * Optional readiness validation is only used if all values are explicitly provided.
-	 */
-
-	def taskName = cfg.taskName ?: ''
+	def taskName = (cfg.taskName ?: '').toString().trim()
 	def waitSeconds = (cfg.waitSeconds ?: 40).toString()
-	def backPort = (cfg.containsKey('backPort') && cfg.backPort != null) ? cfg.backPort.toString().trim() : ''
-	def frontPort = (cfg.containsKey('frontPort') && cfg.frontPort != null) ? cfg.frontPort.toString().trim() : ''
-	def frontUrl = (cfg.containsKey('frontUrl') && cfg.frontUrl != null) ? cfg.frontUrl.toString().trim() : ''
+	def healthUrl = (cfg.healthUrl ?: '').toString().trim()
 
-	def useReadiness = (backPort && frontPort && frontUrl) ? 'true' : 'false'
+	def startupPorts = []
+	(cfg.startupPorts ?: []).each { port ->
+		if (port != null && port.toString().trim()) {
+			startupPorts << port.toString().trim()
+		}
+	}
 
 	script.withEnv([
 		"TASK_NAME=${taskName}",
 		"WAIT_SECONDS=${waitSeconds}",
-		"BACK_PORT=${backPort}",
-		"FRONT_PORT=${frontPort}",
-		"FRONT_URL=${frontUrl}",
-		"USE_READINESS=${useReadiness}"
+		"HEALTH_URL=${healthUrl}",
+		"STARTUP_PORTS=${startupPorts.join(',')}"
 	]) {
 		script.powershell '''
 $ErrorActionPreference = 'Stop'
@@ -44,7 +45,6 @@ function Test-ListeningPort {
     try {
         $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
             Select-Object -First 1
-
         return ($null -ne $listener)
     }
     catch {
@@ -55,20 +55,19 @@ function Test-ListeningPort {
 function Wait-ListeningPort {
     param(
         [int]$Port,
-        [string]$Label,
         [datetime]$Deadline
     )
 
     while ((Get-Date) -lt $Deadline) {
         if (Test-ListeningPort -Port $Port) {
-            Write-Host ('✅ ' + $Label + ' is listening on port ' + $Port)
+            Write-Host ("✅ Port $Port is listening")
             return
         }
 
         Start-Sleep -Seconds 2
     }
 
-    throw ($Label + ' did not start listening on port ' + $Port + ' before timeout')
+    throw ("Port $Port was not ready before timeout")
 }
 
 function Wait-HttpReady {
@@ -77,12 +76,16 @@ function Wait-HttpReady {
         [datetime]$Deadline
     )
 
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return
+    }
+
     while ((Get-Date) -lt $Deadline) {
         try {
             $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
 
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
-                Write-Host ('✅ Frontend responded at ' + $Url + ' with HTTP ' + $response.StatusCode)
+                Write-Host ("✅ Application responded at $Url with HTTP $($response.StatusCode)")
                 return
             }
         }
@@ -92,53 +95,66 @@ function Wait-HttpReady {
         Start-Sleep -Seconds 2
     }
 
-    throw ('Frontend URL was not ready before timeout: ' + $Url)
+    throw ("Health URL was not ready before timeout: $Url")
 }
 
 Write-Host '============================================================'
-Write-Host '🚀 STARTING GAIA THROUGH SCHEDULED TASK'
-Write-Host ('🕒 Wait seconds: ' + $env:WAIT_SECONDS)
+Write-Host '🚀 STARTING APPLICATION THROUGH SCHEDULED TASK'
+Write-Host ("🕒 Wait seconds: $($env:WAIT_SECONDS)")
 Write-Host '============================================================'
+
+if ([string]::IsNullOrWhiteSpace($env:TASK_NAME)) {
+    throw 'TASK_NAME was not provided'
+}
 
 schtasks /run /tn $env:TASK_NAME | Out-Host
 
-if ($env:USE_READINESS -ne 'true') {
-    Start-Sleep -Seconds ([int]$env:WAIT_SECONDS)
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($env:STARTUP_PORTS)) {
+    $ports = $env:STARTUP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
 
-    Write-Host '✅ Gaia scheduled task triggered'
+if ($ports.Count -eq 0 -and [string]::IsNullOrWhiteSpace($env:HEALTH_URL)) {
+    Start-Sleep -Seconds ([int]$env:WAIT_SECONDS)
+    Write-Host '✅ Scheduled task triggered'
     Write-Host '============================================================'
     return
 }
-
-Write-Host ('🔌 Back port: ' + $env:BACK_PORT)
-Write-Host ('🌐 Front port: ' + $env:FRONT_PORT)
-Write-Host ('🔗 Front URL : ' + $env:FRONT_URL)
 
 $deadline = (Get-Date).AddSeconds([int]$env:WAIT_SECONDS)
 
 Start-Sleep -Seconds 3
 
-Wait-ListeningPort -Port ([int]$env:BACK_PORT) -Label 'Gaia backend' -Deadline $deadline
-Wait-ListeningPort -Port ([int]$env:FRONT_PORT) -Label 'Gaia frontend' -Deadline $deadline
-Wait-HttpReady -Url $env:FRONT_URL -Deadline $deadline
+foreach ($port in $ports) {
+    Wait-ListeningPort -Port ([int]$port) -Deadline $deadline
+}
 
-Write-Host '✅ Gaia scheduled task triggered and application is ready'
+Wait-HttpReady -Url $env:HEALTH_URL -Deadline $deadline
+
+Write-Host '✅ Application scheduled task triggered and application is ready'
 Write-Host '============================================================'
 '''
 	}
 }
 
 def stop(script, Map cfg) {
-	/*
-	 * Responsibility:
-	 * Stop Gaia by:
-	 * 1) killing process trees listening on known ports
-	 * 2) killing remaining Gaia-related cmd/java/node processes
-	 */
+	def stopPorts = []
+	(cfg.stopPorts ?: []).each { port ->
+		if (port != null && port.toString().trim()) {
+			stopPorts << port.toString().trim()
+		}
+	}
+
+	def processPatterns = []
+	(cfg.processPatterns ?: []).each { pattern ->
+		if (pattern != null && pattern.toString().trim()) {
+			processPatterns << pattern.toString().trim()
+		}
+	}
 
 	script.withEnv([
-		"BACK_PORT=${cfg.backPort.toString()}",
-		"FRONT_PORT=${cfg.frontPort.toString()}"
+		"STOP_PORTS=${stopPorts.join(',')}",
+		"PROCESS_PATTERNS=${processPatterns.join('||')}"
 	]) {
 		script.powershell '''
 $ErrorActionPreference = 'SilentlyContinue'
@@ -181,77 +197,65 @@ function Stop-ProcessListeningOnPort {
 }
 
 Write-Host '============================================================'
-Write-Host '🧹 STOPPING GAIA PROCESSES'
+Write-Host '🧹 STOPPING APPLICATION PROCESSES'
 Write-Host '============================================================'
 
-Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
-Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
-
-$targets = Get-CimInstance Win32_Process | Where-Object {
-    $cmd = [string]$_.CommandLine
-    $name = [string]$_.Name
-
-    ($cmd -match 'gaia-start-back\\.bat') -or
-    ($cmd -match 'gaia-start-front\\.bat') -or
-    ($cmd -match 'gaia-start\\.bat') -or
-    ($cmd -match 'web_portal_back') -or
-    ($cmd -match 'web_portal') -or
-    ($cmd -match 'GAIA_BACK_CMD') -or
-    ($cmd -match 'GAIA_FRONT_CMD') -or
-    (($name -match 'cmd\\.exe|java\\.exe|node\\.exe') -and ($cmd -match 'gaia|web_portal'))
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($env:STOP_PORTS)) {
+    $ports = $env:STOP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 }
 
-foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
-    try {
-        Stop-ProcessTree -ProcessId $proc.ProcessId
+foreach ($port in $ports) {
+    Stop-ProcessListeningOnPort -Port ([int]$port)
+}
+
+$rawPatterns = @()
+if (-not [string]::IsNullOrWhiteSpace($env:PROCESS_PATTERNS)) {
+    $rawPatterns = $env:PROCESS_PATTERNS.Split('||') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+if ($rawPatterns.Count -gt 0) {
+    $targets = Get-CimInstance Win32_Process | Where-Object {
+        $cmd = [string]$_.CommandLine
+        $name = [string]$_.Name
+        $matched = $false
+
+        foreach ($pattern in $rawPatterns) {
+            if ($cmd -match $pattern -or $name -match $pattern) {
+                $matched = $true
+                break
+            }
+        }
+
+        $matched
     }
-    catch {
+
+    foreach ($proc in ($targets | Sort-Object ProcessId -Descending)) {
+        try {
+            Stop-ProcessTree -ProcessId $proc.ProcessId
+        }
+        catch {
+        }
     }
 }
 
 Start-Sleep -Seconds 2
 
-Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
-Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
+foreach ($port in $ports) {
+    Stop-ProcessListeningOnPort -Port ([int]$port)
+}
 
-Write-Host '✅ Gaia stop command finished'
+Write-Host '✅ Application stop command finished'
 Write-Host '============================================================'
 '''
 	}
 }
 
 return this
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-JenkinsConsoleView.groovy
+2) jenkinsIntegration/JenkinsConsoleView.groovy
 /*
  * Responsibility:
- * This file prints a clean and readable view in the Jenkins console.
+ * Clean Jenkins console output for suite execution.
  */
 
 def cleanText(String value) {
@@ -386,39 +390,13 @@ def printFinalSummary(script, List results, String currentResult) {
 }
 
 return this
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-JenkinsLiveLogger.groovy
+3) jenkinsIntegration/JenkinsLiveLogger.groovy
 /*
  * Responsibility:
- * This file is responsible for:
- * 1) Running one Katalon suite
- * 2) Streaming useful live output to the Jenkins console
- * 3) Writing a clean metadata file for the suite
- * 4) Creating a synthetic JUnit when Katalon fails without generating one
+ * 1) Run one Katalon suite
+ * 2) Stream useful live output to Jenkins console
+ * 3) Write suite metadata
+ * 4) Create synthetic JUnit when needed
  */
 
 def safeFileName(String value) {
@@ -426,11 +404,6 @@ def safeFileName(String value) {
 }
 
 def runSuite(script, Map cfg, Map suite) {
-    /*
-     * Responsibility:
-     * Execute one suite and return the process exit code.
-     */
-
     def suiteKey = safeFileName(suite.name)
 
     return script.withEnv([
@@ -852,18 +825,6 @@ function Find-BestScreenshot {
         return $preferredErrorPngs[0].FullName
     }
 
-    $preferredNamedPngs = @(
-        $allPngs |
-        Where-Object {
-            $_.Name -ieq 'gaia_homepage.png' -and $_.Length -gt 10KB
-        } |
-        Sort-Object LastWriteTime -Descending
-    )
-
-    if ($preferredNamedPngs.Count -gt 0) {
-        return $preferredNamedPngs[0].FullName
-    }
-
     $largeFallbackPngs = @(
         $allPngs |
         Where-Object {
@@ -1207,235 +1168,170 @@ exit $exitCode
 }
 
 return this
+4) jenkinsIntegration/JenkinsPaths.groovy
+/*
+ * Responsibility:
+ * Centralize path calculations used by Jenkins integration files.
+ */
 
+def workspace(script) {
+	return script.pwd()
+}
 
+def projectPath(script, String projectFileName) {
+	return "${workspace(script)}\\${projectFileName}"
+}
 
+def reportsRoot(script) {
+	return "${workspace(script)}\\Reports"
+}
 
+def logsRoot(script) {
+	return "${reportsRoot(script)}\\logs"
+}
 
+def artifactsRoot(script) {
+	return "${reportsRoot(script)}\\suite-artifacts"
+}
 
+return this
+5) jenkinsIntegration/JenkinsResultStore.groovy
+/*
+ * Responsibility:
+ * Store and read suite execution metadata.
+ */
 
+def safeFileName(String value) {
+	return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
+}
 
+def parsePropertiesText(String text) {
+	def map = [:]
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-JenkinsPaths.groovy
-	/*
-	 * Responsibility:
-	 * This file centralizes all path calculations used by Jenkins integration files.
-	 */
-
-	def workspace(script) {
-		/*
-		 * Responsibility:
-		 * Return the real workspace for the current build,
-		 * including Jenkins generated suffixes such as @2.
-		 */
-		return script.pwd()
-	}
-
-	def projectPath(script) {
-		/*
-		 * Responsibility:
-		 * Return the Katalon project path based on the real workspace.
-		 */
-		return "${workspace(script)}\\gaia-portal.prj"
-	}
-
-	def reportsRoot(script) {
-		/*
-		 * Responsibility:
-		 * Return the Reports root based on the real workspace.
-		 */
-		return "${workspace(script)}\\Reports"
-	}
-
-	def logsRoot(script) {
-		/*
-		 * Responsibility:
-		 * Return the logs folder under Reports.
-		 */
-		return "${reportsRoot(script)}\\logs"
-	}
-
-	return this
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-JenkinsResultStore.groovy
-	/*
-	 * Responsibility:
-	 * This file handles storing and reading suite execution metadata.
-	 */
-
-	def safeFileName(String value) {
-		/*
-		 * Responsibility:
-		 * Convert a suite name into a filesystem safe file name.
-		 */
-
-		return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
-	}
-
-	def parsePropertiesText(String text) {
-		/*
-		 * Responsibility:
-		 * Parse a simple key=value text block into a map.
-		 */
-
-		def map = [:]
-
-		if (!text?.trim()) {
-			return map
-		}
-
-		text.readLines().each { line ->
-			int idx = line.indexOf('=')
-			if (idx > 0) {
-				def key = line.substring(0, idx).trim()
-				def value = line.substring(idx + 1).trim()
-				map[key] = value
-			}
-		}
-
+	if (!text?.trim()) {
 		return map
 	}
 
-	def splitSummary(String value) {
-		/*
-		 * Responsibility:
-		 * Split a summary string stored with || separator.
-		 */
-
-		if (!value?.trim()) {
-			return []
+	text.readLines().each { line ->
+		int idx = line.indexOf('=')
+		if (idx > 0) {
+			def key = line.substring(0, idx).trim()
+			def value = line.substring(idx + 1).trim()
+			map[key] = value
 		}
-
-		return value.split('\\|\\|').collect { it.trim() }.findAll { it }
 	}
 
-	def readSuiteMeta(script, String reportsRoot, String suiteName) {
-		/*
-		 * Responsibility:
-		 * Read the meta file generated by the live runner for one suite.
-		 */
+	return map
+}
 
-		def metaPath = "${reportsRoot}\\logs\\${safeFileName(suiteName)}.meta.properties"
-
-		if (!script.fileExists(metaPath)) {
-			return [:]
-		}
-
-		return parsePropertiesText(script.readFile(file: metaPath, encoding: 'UTF-8'))
+def splitSummary(String value) {
+	if (!value?.trim()) {
+		return []
 	}
 
-	def saveSuiteResults(script, String reportsRoot, List results) {
-		/*
-		 * Responsibility:
-		 * Save the full suite results list as JSON.
-		 */
+	return value.split('\\|\\|').collect { it.trim() }.findAll { it }
+}
 
-		def json = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(results))
+def readSuiteMeta(script, String reportsRoot, String suiteName) {
+	def metaPath = "${reportsRoot}\\logs\\${safeFileName(suiteName)}.meta.properties"
 
-		script.writeFile(
-				file: "${reportsRoot}\\suite-results.json",
-				text: json,
-				encoding: 'UTF-8'
-				)
+	if (!script.fileExists(metaPath)) {
+		return [:]
 	}
 
-	def loadSuiteResults(script, String reportsRoot) {
-		/*
-		 * Responsibility:
-		 * Load the persisted suite results JSON.
-		 */
+	return parsePropertiesText(script.readFile(file: metaPath, encoding: 'UTF-8'))
+}
 
-		def filePath = "${reportsRoot}\\suite-results.json"
+def saveSuiteResults(script, String reportsRoot, List results) {
+	def json = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(results))
 
-		if (!script.fileExists(filePath)) {
-			return []
-		}
+	script.writeFile(
+		file: "${reportsRoot}\\suite-results.json",
+		text: json,
+		encoding: 'UTF-8'
+	)
+}
 
-		def text = script.readFile(file: filePath, encoding: 'UTF-8')
-		if (!text?.trim()) {
-			return []
-		}
+def loadSuiteResults(script, String reportsRoot) {
+	def filePath = "${reportsRoot}\\suite-results.json"
 
-		return new groovy.json.JsonSlurperClassic().parseText(text)
+	if (!script.fileExists(filePath)) {
+		return []
 	}
 
-	return this
+	def text = script.readFile(file: filePath, encoding: 'UTF-8')
+	if (!text?.trim()) {
+		return []
+	}
 
+	return new groovy.json.JsonSlurperClassic().parseText(text)
+}
 
+return this
+6) jenkinsPipelines/Jenkinsfile_Correction_Add_Correction.groovy
+✨ This is the important part
 
+Now this file is focused mostly on:
 
+project file
+execution plan
+startup task
+execution order
 
+To change suite order later, you only edit getExecutionPlan().
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-JenkinsfileGaiaCorrections.groovy
 /*
  * Responsibility:
- * Main Jenkins pipeline for Gaia Corrections.
- * This file must remain a plain Groovy script.
+ * Main Jenkins pipeline for one execution flow.
+ * This file should stay focused on suite order and pipeline-level configuration.
  */
 
 def safeFileName(String value) {
     return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
 }
 
-def getSuites() {
+def getPipelineConfig() {
     return [
-        [name: 'Correction- Add Correction', path: 'Test Suites/Correction- Add Correction']
+        projectFileName : 'portal.prj',
+
+        application: [
+            startTask      : 'AppBackFrontSetup',
+            startupWaitSecs: 40,
+            startupPorts   : ['8020', '4200'],
+            stopPorts      : ['8020', '4200'],
+            healthUrl      : 'http://localhost:4200',
+            processPatterns: [
+                'start-back\\.bat',
+                'start-front\\.bat',
+                'start\\.bat',
+                'web_portal_back',
+                'web_portal',
+                'APP_BACK_CMD',
+                'APP_FRONT_CMD',
+                'cmd\\.exe',
+                'java\\.exe',
+                'node\\.exe'
+            ]
+        ],
+
+        execution: [
+            browser            : 'Chrome',
+            suiteTimeoutMinutes: 10
+        ]
+    ]
+}
+
+def getExecutionPlan() {
+    return [
+        [name: 'Correction - Add Correction', path: 'Test Suites/Correction- Add Correction'],
+
+        /*
+         * Add next suites here, in the order you want.
+         * Example:
+         *
+         * [name: 'Correction - Validate Correction', path: 'Test Suites/Correction- Validate Correction'],
+         * [name: 'Correction - Remove Correction', path: 'Test Suites/Correction- Remove Correction']
+         */
     ]
 }
 
@@ -1473,8 +1369,8 @@ def loadPaths(script) {
     return script.load('jenkinsIntegration/JenkinsPaths.groovy')
 }
 
-def loadBatManager(script) {
-    return script.load('jenkinsIntegration/JenkinsBatManager.groovy')
+def loadAppManager(script) {
+    return script.load('jenkinsIntegration/JenkinsAppManager.groovy')
 }
 
 def loadLiveLogger(script) {
@@ -1658,10 +1554,9 @@ Write-Host '------------------------------------------------------------'
     }
 }
 
-def emergencyStopGaia(script) {
+def emergencyStopApplication(script, List stopPorts) {
     script.withEnv([
-        "BACK_PORT=${script.env.BACK_PORT}",
-        "FRONT_PORT=${script.env.FRONT_PORT}"
+        "STOP_PORTS=${stopPorts.join(',')}"
     ]) {
         script.powershell(
             returnStatus: true,
@@ -1686,8 +1581,14 @@ function Stop-ProcessListeningOnPort {
     }
 }
 
-Stop-ProcessListeningOnPort -Port ([int]$env:BACK_PORT)
-Stop-ProcessListeningOnPort -Port ([int]$env:FRONT_PORT)
+$ports = @()
+if (-not [string]::IsNullOrWhiteSpace($env:STOP_PORTS)) {
+    $ports = $env:STOP_PORTS.Split(',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+
+foreach ($port in $ports) {
+    Stop-ProcessListeningOnPort -Port ([int]$port)
+}
 
 exit 0
 '''
@@ -1699,7 +1600,7 @@ pipeline {
     agent {
         node {
             label 'GI5_SWDCFRNXGI55817'
-            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Gaia\\Gaia_Corrections'
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\Portal\\Correction_Add_Correction'
         }
     }
 
@@ -1713,7 +1614,7 @@ pipeline {
     }
 
     parameters {
-        string(name: 'STARTUP_WAIT_SECONDS', defaultValue: '40', description: 'Seconds to wait after Gaia startup')
+        string(name: 'STARTUP_WAIT_SECONDS', defaultValue: '40', description: 'Seconds to wait after application startup')
         string(name: 'SUITE_TIMEOUT_MINUTES', defaultValue: '10', description: 'Timeout in minutes for each suite')
         string(name: 'BROWSER', defaultValue: 'Chrome', description: 'Katalon browser type')
     }
@@ -1723,9 +1624,6 @@ pipeline {
         GIT_URL     = 'https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/gaia-portal.git'
         GIT_BRANCH  = '*/master'
         GIT_CRED    = '965eceec-b3a3-4ec5-8820-a857c87dd80f'
-        START_TASK  = 'GaiaBackFrontSetup'
-        BACK_PORT   = '8020'
-        FRONT_PORT  = '4200'
     }
 
     stages {
@@ -1745,6 +1643,8 @@ pipeline {
         stage('Validate Tools') {
             steps {
                 script {
+                    def cfg = getPipelineConfig()
+
                     bat """
 @echo off
 echo ------------------------------------------------------------
@@ -1757,8 +1657,8 @@ if not exist "${env.KATALON_EXE}" (
     exit /b 1
 )
 
-if not exist "${pwd()}\\jenkinsIntegration\\JenkinsBatManager.groovy" (
-    echo [ERROR] JenkinsBatManager.groovy not found
+if not exist "${pwd()}\\jenkinsIntegration\\JenkinsAppManager.groovy" (
+    echo [ERROR] JenkinsAppManager.groovy not found
     exit /b 1
 )
 
@@ -1782,22 +1682,32 @@ if not exist "${pwd()}\\jenkinsIntegration\\JenkinsResultStore.groovy" (
     exit /b 1
 )
 
+if not exist "${pwd()}\\${cfg.projectFileName}" (
+    echo [ERROR] Katalon project file not found
+    echo ${pwd()}\\${cfg.projectFileName}
+    exit /b 1
+)
+
 echo [OK] Katalon executable found
 echo [OK] Jenkins support files found
+echo [OK] Project file found
 echo ------------------------------------------------------------
 """
                 }
             }
         }
 
-        stage('Start Gaia') {
+        stage('Start Application') {
             steps {
                 script {
-                    def batManager = loadBatManager(this)
+                    def cfg = getPipelineConfig()
+                    def appManager = loadAppManager(this)
 
-                    batManager.start(this, [
-                        taskName   : env.START_TASK,
-                        waitSeconds: params.STARTUP_WAIT_SECONDS.toInteger()
+                    appManager.start(this, [
+                        taskName   : cfg.application.startTask,
+                        waitSeconds: params.STARTUP_WAIT_SECONDS.toInteger(),
+                        startupPorts: cfg.application.startupPorts,
+                        healthUrl  : cfg.application.healthUrl
                     ])
                 }
             }
@@ -1835,7 +1745,7 @@ echo ------------------------------------------------------------
 if exist "${paths.reportsRoot(this)}" rmdir /s /q "${paths.reportsRoot(this)}"
 mkdir "${paths.reportsRoot(this)}"
 mkdir "${paths.logsRoot(this)}"
-mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
+mkdir "${paths.artifactsRoot(this)}"
 """
 
                     resultStore.saveSuiteResults(this, paths.reportsRoot(this), [])
@@ -1846,14 +1756,16 @@ mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
         stage('Execute Suites') {
             steps {
                 script {
+                    def cfg = getPipelineConfig()
                     def paths = loadPaths(this)
                     def consoleView = loadConsoleView(this)
                     def resultStore = loadResultStore(this)
                     def liveLogger = loadLiveLogger(this)
 
                     def suiteResults = []
-                    def suites = getSuites()
+                    def suites = getExecutionPlan()
                     def defaultTimeout = params.SUITE_TIMEOUT_MINUTES.toInteger()
+                    def projectPath = paths.projectPath(this, cfg.projectFileName)
 
                     suites.each { suite ->
                         stage("Suite - ${suite.name}") {
@@ -1861,7 +1773,7 @@ mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
 
                             int exitCode = liveLogger.runSuite(this, [
                                 katalonExe         : env.KATALON_EXE,
-                                projectPath        : paths.projectPath(this),
+                                projectPath        : projectPath,
                                 reportsRoot        : paths.reportsRoot(this),
                                 browser            : params.BROWSER,
                                 suiteTimeoutMinutes: defaultTimeout
@@ -1873,7 +1785,7 @@ mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
                                 name              : suite.name,
                                 path              : suite.path,
                                 status            : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
-                                icon              : meta['ICON'] ?: (exitCode == 0 ? '[OK]' : (exitCode == 124 ? '[TO]' : '[X]')),
+                                icon              : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
                                 exitCode          : meta['EXIT_CODE'] ?: "${exitCode}",
                                 executed          : meta['EXECUTED'] ?: '0',
                                 passed            : meta['PASSED'] ?: '0',
@@ -1915,6 +1827,7 @@ mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
     post {
         always {
             script {
+                def cfg = getPipelineConfig()
                 def suiteResults = []
                 def reportsRoot = "${pwd()}\\Reports"
 
@@ -1931,19 +1844,19 @@ mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
                 }
 
                 try {
-                    if (fileExists('jenkinsIntegration/JenkinsBatManager.groovy')) {
-                        def batManager = loadBatManager(this)
-                        batManager.stop(this, [
-                            backPort : env.BACK_PORT.toInteger(),
-                            frontPort: env.FRONT_PORT.toInteger()
+                    if (fileExists('jenkinsIntegration/JenkinsAppManager.groovy')) {
+                        def appManager = loadAppManager(this)
+                        appManager.stop(this, [
+                            stopPorts      : cfg.application.stopPorts,
+                            processPatterns: cfg.application.processPatterns
                         ])
                     }
                     else {
-                        emergencyStopGaia(this)
+                        emergencyStopApplication(this, cfg.application.stopPorts)
                     }
                 }
                 catch (Throwable ignored) {
-                    emergencyStopGaia(this)
+                    emergencyStopApplication(this, cfg.application.stopPorts)
                 }
 
                 try {
@@ -1984,21 +1897,4 @@ mkdir "${paths.reportsRoot(this)}\\suite-artifacts"
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+🔥
