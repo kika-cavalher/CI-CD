@@ -1,1 +1,378 @@
-jenkinsPipelines/Jenkinsfile_ArchiveMode.groovy
+/*
+ * Responsibility:
+ * Shared runner for eMatch desktop Jenkins pipelines.
+ * Each Jenkinsfile provides its own PIPELINE_CONFIG and delegates execution here.
+ */
+
+def safeFileName(String value) {
+    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
+}
+
+def bootstrapSupportFiles(script, Map cfg) {
+    script.deleteDir()
+
+    script.checkout([
+        $class: 'GitSCM',
+        branches: [[name: cfg.git.branch]],
+        userRemoteConfigs: [[url: cfg.git.url, credentialsId: cfg.git.credentialsId]],
+        extensions: [
+            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30],
+            [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [
+                [path: 'jenkinsPipelines'],
+                [path: 'jenkinsIntegration']
+            ]]
+        ]
+    ])
+}
+
+def fullCheckout(script, Map cfg) {
+    script.deleteDir()
+
+    script.checkout([
+        $class: 'GitSCM',
+        branches: [[name: cfg.git.branch]],
+        userRemoteConfigs: [[url: cfg.git.url, credentialsId: cfg.git.credentialsId]],
+        extensions: [
+            [$class: 'CloneOption', shallow: false, noTags: false, timeout: 30]
+        ]
+    ])
+}
+
+def loadPaths(script) {
+    return script.load('jenkinsIntegration/JenkinsPaths.groovy')
+}
+
+def loadConsoleView(script) {
+    return script.load('jenkinsIntegration/JenkinsConsoleView.groovy')
+}
+
+def loadResultStore(script) {
+    return script.load('jenkinsIntegration/JenkinsResultStore.groovy')
+}
+
+def loadDesktopTaskLogger(script) {
+    return script.load('jenkinsIntegration/JenkinsDesktopTaskLogger.groovy')
+}
+
+def publishPrimaryArtifact(script, String reportsRoot, Map result) {
+    if (!(result?.screenshotRel ?: '').trim()) {
+        return
+    }
+
+    def parts = result.screenshotRel.tokenize('/')
+    if (!parts) {
+        return
+    }
+
+    def suiteKey = safeFileName(result.name)
+    def timestampPart = (parts.size() >= 2) ? parts[parts.size() - 2] : new Date().format('yyyyMMdd_HHmmss')
+    def fileName = parts[parts.size() - 1]
+    def srcFile = "${reportsRoot}\\${result.screenshotRel.replace('/', '\\')}"
+    def destRel = "suite-artifacts/${suiteKey}/${timestampPart}/${fileName}"
+    def destDir = "${reportsRoot}\\suite-artifacts\\${suiteKey}\\${timestampPart}"
+    def destFile = "${reportsRoot}\\${destRel.replace('/', '\\')}"
+
+    script.withEnv([
+        "SRC_FILE=${srcFile}",
+        "DEST_DIR=${destDir}",
+        "DEST_FILE=${destFile}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+if (-not [string]::IsNullOrWhiteSpace($env:SRC_FILE) -and (Test-Path -LiteralPath $env:SRC_FILE)) {
+    New-Item -ItemType Directory -Path $env:DEST_DIR -Force | Out-Null
+    Copy-Item -LiteralPath $env:SRC_FILE -Destination $env:DEST_FILE -Force
+}
+'''
+        )
+    }
+
+    result.primaryArtifactRel = destRel
+}
+
+def emergencyStopWinDriver(script, String winDriverTask) {
+    if (!(winDriverTask ?: '').trim()) {
+        return
+    }
+
+    script.withEnv([
+        "WIN_DRIVER_TASK=${winDriverTask}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+
+try {
+    schtasks /end /tn $env:WIN_DRIVER_TASK 1>$null 2>$null
+}
+catch {
+}
+
+exit 0
+'''
+        )
+    }
+}
+
+def validateSupportFiles(script, Map cfg) {
+    script.bat """
+@echo off
+echo ------------------------------------------------------------
+echo VALIDATING TOOLS AND SUPPORT FILES
+echo ------------------------------------------------------------
+
+if not exist "${cfg.execution.katalonExe}" (
+    echo [ERROR] Katalon executable not found
+    echo ${cfg.execution.katalonExe}
+    exit /b 1
+)
+
+if not exist "${script.pwd()}\\jenkinsIntegration\\JenkinsConsoleView.groovy" (
+    echo [ERROR] JenkinsConsoleView.groovy not found
+    exit /b 1
+)
+
+if not exist "${script.pwd()}\\jenkinsIntegration\\JenkinsPaths.groovy" (
+    echo [ERROR] JenkinsPaths.groovy not found
+    exit /b 1
+)
+
+if not exist "${script.pwd()}\\jenkinsIntegration\\JenkinsResultStore.groovy" (
+    echo [ERROR] JenkinsResultStore.groovy not found
+    exit /b 1
+)
+
+if not exist "${script.pwd()}\\jenkinsIntegration\\JenkinsDesktopTaskLogger.groovy" (
+    echo [ERROR] JenkinsDesktopTaskLogger.groovy not found
+    exit /b 1
+)
+
+if not exist "${script.pwd()}\\jenkinsIntegration\\JenkinsDesktopPipelineRunner.groovy" (
+    echo [ERROR] JenkinsDesktopPipelineRunner.groovy not found
+    exit /b 1
+)
+
+echo [OK] Katalon executable found
+echo [OK] Jenkins support files found
+echo ------------------------------------------------------------
+"""
+}
+
+def prepareArtifacts(script, def paths, def resultStore) {
+    script.bat """
+@echo off
+if exist "${paths.reportsRoot(script)}" rmdir /s /q "${paths.reportsRoot(script)}"
+mkdir "${paths.reportsRoot(script)}"
+mkdir "${paths.logsRoot(script)}"
+mkdir "${paths.artifactsRoot(script)}"
+"""
+
+    resultStore.saveSuiteResults(script, paths.reportsRoot(script), [])
+}
+
+def buildResultFromMeta(def resultStore, script, String reportsRoot, Map suite, int exitCode) {
+    def meta = resultStore.readSuiteMeta(script, reportsRoot, suite.name)
+
+    return [
+        name              : suite.name,
+        type              : meta['SUITE_TYPE'] ?: (suite.type ?: 'SUITE'),
+        path              : meta['SUITE_PATH'] ?: (suite.path ?: ''),
+        status            : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
+        icon              : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
+        exitCode          : meta['EXIT_CODE'] ?: "${exitCode}",
+        executed          : meta['EXECUTED'] ?: '0',
+        passed            : meta['PASSED'] ?: '0',
+        failed            : meta['FAILED'] ?: '0',
+        skipped           : meta['SKIPPED'] ?: '0',
+        durationSeconds   : meta['DURATION_SECONDS'] ?: '0',
+        reason            : meta['REASON'] ?: '',
+        screenshotRel     : meta['SCREENSHOT_REL'] ?: '',
+        primaryArtifactRel: '',
+        logRel            : meta['LOG_REL'] ?: '',
+        caseSummary       : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: ''),
+        stepSummary       : resultStore.splitSummary(meta['STEP_SUMMARY'] ?: '')
+    ]
+}
+
+def run(script, Map cfg) {
+    script.node(cfg.agent.label) {
+        script.timestamps {
+            script.ansiColor('xterm') {
+                script.timeout(time: cfg.pipelineTimeoutMinutes as int, unit: 'MINUTES') {
+                    def suiteResults = []
+                    def consoleView = null
+                    def paths = null
+                    def resultStore = null
+
+                    try {
+                        script.stage('Bootstrap Support Files') {
+                            bootstrapSupportFiles(script, cfg)
+
+                            script.echo '------------------------------------------------------------'
+                            script.echo '[OK] BOOTSTRAP CHECKOUT COMPLETED'
+                            script.echo "Workspace: ${script.pwd()}"
+                            script.echo '------------------------------------------------------------'
+                        }
+
+                        script.stage('Validate Support Files') {
+                            validateSupportFiles(script, cfg)
+                        }
+
+                        script.stage('Full Checkout Repository') {
+                            fullCheckout(script, cfg)
+
+                            script.echo '------------------------------------------------------------'
+                            script.echo '[OK] FULL CHECKOUT COMPLETED'
+                            script.echo "Workspace: ${script.pwd()}"
+                            script.echo '------------------------------------------------------------'
+                        }
+
+                        script.stage('Validate Project File') {
+                            def pathsTmp = loadPaths(script)
+                            def projectFilePath = pathsTmp.projectPath(script, cfg.execution.projectFileName)
+
+                            script.bat """
+@echo off
+echo ------------------------------------------------------------
+echo VALIDATING PROJECT FILE
+echo ------------------------------------------------------------
+
+if not exist "${projectFilePath}" (
+    echo [ERROR] Project file not found
+    echo ${projectFilePath}
+    exit /b 1
+)
+
+echo [OK] Project file found
+echo ------------------------------------------------------------
+"""
+                        }
+
+                        script.stage('Prepare Artifacts') {
+                            paths = loadPaths(script)
+                            resultStore = loadResultStore(script)
+
+                            prepareArtifacts(script, paths, resultStore)
+                        }
+
+                        script.stage(cfg.executionStageName ?: 'Execute Desktop Suites') {
+                            consoleView = loadConsoleView(script)
+                            paths = paths ?: loadPaths(script)
+                            resultStore = resultStore ?: loadResultStore(script)
+                            def desktopTaskLogger = loadDesktopTaskLogger(script)
+
+                            cfg.suites.each { suite ->
+                                script.stage("Suite - ${suite.name}") {
+                                    def suiteTimeout = (suite.timeoutMinutes ?: cfg.defaultSuiteTimeoutMinutes).toString()
+                                    consoleView.printSuiteHeader(script, suite, suiteTimeout)
+
+                                    int exitCode = desktopTaskLogger.runSuite(script, [
+                                        katalonExe         : cfg.execution.katalonExe,
+                                        projectPath        : paths.projectPath(script, cfg.execution.projectFileName),
+                                        reportsRoot        : paths.reportsRoot(script),
+                                        browser            : cfg.execution.browser,
+                                        winDriverTask      : cfg.desktop.winDriverTask,
+                                        suiteTimeoutMinutes: cfg.defaultSuiteTimeoutMinutes,
+                                        pollSeconds        : cfg.desktop.pollSeconds
+                                    ], suite)
+
+                                    def result = buildResultFromMeta(resultStore, script, paths.reportsRoot(script), suite, exitCode)
+
+                                    publishPrimaryArtifact(script, paths.reportsRoot(script), result)
+
+                                    suiteResults << result
+                                    resultStore.saveSuiteResults(script, paths.reportsRoot(script), suiteResults)
+
+                                    consoleView.printSuiteResult(script, result)
+                                    consoleView.printRunningSummary(script, suiteResults)
+
+                                    if (result.status != 'PASSED') {
+                                        script.catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                            script.error("${result.name} finished with status ${result.status}")
+                                        }
+
+                                        if (suite.stopPipelineOnFailure == true) {
+                                            script.currentBuild.result = 'FAILURE'
+                                            script.error("Stopping pipeline because suite ${result.name} failed and stopPipelineOnFailure=true")
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (suiteResults.any { it.status != 'PASSED' }) {
+                                script.currentBuild.result = 'FAILURE'
+                            }
+                        }
+                    }
+                    finally {
+                        try {
+                            if (!paths) {
+                                paths = loadPaths(script)
+                            }
+                            if (!resultStore) {
+                                resultStore = loadResultStore(script)
+                            }
+
+                            suiteResults = resultStore.loadSuiteResults(script, paths.reportsRoot(script))
+                        }
+                        catch (Throwable ignored) {
+                        }
+
+                        try {
+                            if (!consoleView) {
+                                consoleView = loadConsoleView(script)
+                            }
+
+                            consoleView.printFinalSummary(script, suiteResults, script.currentBuild.currentResult)
+                        }
+                        catch (Throwable ignored) {
+                            script.echo '============================================================'
+                            script.echo 'PIPELINE FINISHED'
+                            script.echo '============================================================'
+                        }
+
+                        try {
+                            emergencyStopWinDriver(script, cfg.desktop.winDriverTask)
+                        }
+                        catch (Throwable ignored) {
+                        }
+
+                        script.catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            script.archiveArtifacts(
+                                artifacts: 'Reports/suite-artifacts/**/*.png,Reports/**/*.log,Reports/**/*.txt',
+                                allowEmptyArchive: true
+                            )
+                        }
+
+                        script.catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                            script.junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml,Reports/logs/*.junit.xml'
+                        }
+
+                        if (script.currentBuild.currentResult == 'SUCCESS') {
+                            if (cfg.triggerNextJob && (cfg.nextJobName ?: '').trim()) {
+                                script.echo "Triggering next Jenkins job as a separate build: ${cfg.nextJobName}"
+
+                                script.build job: cfg.nextJobName,
+                                             wait: false,
+                                             propagate: false
+
+                                script.echo "Next Jenkins job triggered successfully: ${cfg.nextJobName}"
+                            }
+                            else {
+                                script.echo 'No next Jenkins job configured.'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+return this
