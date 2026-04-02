@@ -1,18 +1,1141 @@
+1) jenkinsIntegration/JenkinsPaths.groovy
+/*
+ * Responsibility:
+ * Centralize path calculations used by Jenkins desktop pipeline files.
+ */
+
+def workspace(script) {
+    return script.pwd()
+}
+
+def projectPath(script, String projectFileName) {
+    return "${workspace(script)}\\${projectFileName}"
+}
+
+def reportsRoot(script) {
+    return "${workspace(script)}\\Reports"
+}
+
+def logsRoot(script) {
+    return "${reportsRoot(script)}\\logs"
+}
+
+def artifactsRoot(script) {
+    return "${reportsRoot(script)}\\suite-artifacts"
+}
+
+return this
+2) jenkinsIntegration/JenkinsResultStore.groovy
+/*
+ * Responsibility:
+ * Store and read desktop suite execution metadata.
+ */
+
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def safeFileName(String value) {
+    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
+}
+
+def parsePropertiesText(String text) {
+    def map = [:]
+
+    if (!text?.trim()) {
+        return map
+    }
+
+    text.readLines().each { line ->
+        int idx = line.indexOf('=')
+        if (idx > 0) {
+            def key = line.substring(0, idx).trim()
+            def value = line.substring(idx + 1).trim()
+            map[key] = value
+        }
+    }
+
+    return map
+}
+
+def splitSummary(String value) {
+    if (!value?.trim()) {
+        return []
+    }
+
+    return value.split('\\|\\|').collect { it.trim() }.findAll { it }
+}
+
+def readAssetMeta(script, String reportsRoot, String assetName) {
+    def metaPath = "${reportsRoot}\\logs\\${safeFileName(assetName)}.meta.properties"
+
+    if (!script.fileExists(metaPath)) {
+        return [:]
+    }
+
+    return parsePropertiesText(script.readFile(file: metaPath, encoding: 'UTF-8'))
+}
+
+def saveResults(script, String reportsRoot, List results) {
+    def json = JsonOutput.prettyPrint(JsonOutput.toJson(results))
+
+    script.writeFile(
+        file: "${reportsRoot}\\suite-results.json",
+        text: json,
+        encoding: 'UTF-8'
+    )
+}
+
+def loadResults(script, String reportsRoot) {
+    def filePath = "${reportsRoot}\\suite-results.json"
+
+    if (!script.fileExists(filePath)) {
+        return []
+    }
+
+    def text = script.readFile(file: filePath, encoding: 'UTF-8')
+    if (!text?.trim()) {
+        return []
+    }
+
+    return new JsonSlurperClassic().parseText(text)
+}
+
+return this
+3) jenkinsIntegration/JenkinsConsoleView.groovy
+/*
+ * Responsibility:
+ * Clean Jenkins console output for desktop asset execution.
+ */
+
+def cleanText(String value) {
+    return (value ?: '').replaceAll(/\s+/, ' ').trim()
+}
+
+def formatDurationSeconds(def rawValue) {
+    long total = 0L
+
+    try {
+        total = (rawValue ?: '0').toString().toLong()
+    }
+    catch (ignored) {
+        total = 0L
+    }
+
+    long hours = (long) (total / 3600)
+    long minutes = (long) ((total % 3600) / 60)
+    long seconds = (long) (total % 60)
+
+    return String.format('%02d:%02d:%02d', hours, minutes, seconds)
+}
+
+def sumDurationSeconds(List results) {
+    long total = 0L
+
+    results.each { item ->
+        try {
+            total += (item.durationSeconds ?: '0').toString().toLong()
+        }
+        catch (ignored) {
+        }
+    }
+
+    return total
+}
+
+def printAssetHeader(script, Map asset, String timeoutMinutes) {
+    script.echo '------------------------------------------------------------'
+    script.echo '🚀 [START ASSET]'
+    script.echo "📛 Name    : ${asset.name}"
+    script.echo "🧪 Type    : ${asset.type}"
+    script.echo "📁 Path    : ${asset.path}"
+    script.echo "⏱️ Timeout : ${timeoutMinutes} min"
+    script.echo '------------------------------------------------------------'
+}
+
+def printAssetResult(script, Map result) {
+    script.echo '------------------------------------------------------------'
+    script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
+    script.echo "🧪 Type    : ${result.type ?: ''}"
+    script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
+    script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
+
+    if (result.reason) {
+        script.echo "🧾 Reason  : ${cleanText(result.reason)}"
+    }
+
+    if (result.logRel) {
+        script.echo "📄 Log     : Reports/${result.logRel}"
+    }
+
+    (result.caseSummary ?: []).take(3).each { line ->
+        script.echo "🧪 Case    : ${cleanText(line.toString())}"
+    }
+
+    script.echo '------------------------------------------------------------'
+}
+
+def printRunningSummary(script, List results) {
+    def passed = results.count { it.status == 'PASSED' }
+    def failed = results.count { it.status == 'FAILED' }
+    def timeout = results.count { it.status == 'TIMEOUT' }
+    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
+
+    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
+
+    script.echo '------------------------------------------------------------'
+    script.echo "📌 RUNNING SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
+    script.echo '------------------------------------------------------------'
+}
+
+def printFinalSummary(script, List results, String currentResult) {
+    def passed = results.count { it.status == 'PASSED' }
+    def failed = results.count { it.status == 'FAILED' }
+    def timeout = results.count { it.status == 'TIMEOUT' }
+    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
+    def total = results.size()
+
+    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
+
+    script.echo '============================================================'
+
+    if (total == 0) {
+        script.echo '⚠️ PIPELINE STOPPED BEFORE ANY ASSET WAS EXECUTED'
+    }
+    else if (currentResult == 'ABORTED') {
+        script.echo '🛑 PIPELINE ABORTED'
+    }
+    else if (failed > 0 || timeout > 0) {
+        script.echo '❌ PIPELINE FINISHED WITH ERRORS'
+    }
+    else {
+        script.echo '✅ PIPELINE FINISHED SUCCESSFULLY'
+    }
+
+    script.echo "📌 FINAL SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
+    script.echo '============================================================'
+
+    results.each { result ->
+        script.echo '------------------------------------------------------------'
+        script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
+        script.echo "🧪 Type    : ${result.type ?: ''}"
+        script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
+        script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
+
+        if (result.reason) {
+            script.echo "🧾 Reason  : ${cleanText(result.reason)}"
+        }
+
+        script.echo '------------------------------------------------------------'
+    }
+}
+
+return this
+4) jenkinsIntegration/JenkinsDesktopTaskLogger.groovy
+/*
+ * Responsibility:
+ * 1) Run one Katalon desktop suite or collection
+ * 2) Start and stop shared WinDriver task
+ * 3) Capture stdout/stderr logs
+ * 4) Create one metadata file per executed asset
+ *
+ * Important:
+ * Jenkins does NOT open REC/PRD anymore.
+ * Katalon keeps the internal logic to open/close REC or PRD as needed.
+ */
+
+def safeFileName(String value) {
+    return (value ?: '').replaceAll(/[^A-Za-z0-9._ -]/, '').replace(' ', '_')
+}
+
+def runAsset(script, Map cfg, Map asset) {
+    def assetKey = safeFileName(asset.name)
+
+    return script.withEnv([
+        "KATALON_EXE=${cfg.katalonExe}",
+        "PROJECT_PATH=${cfg.projectPath}",
+        "REPORTS_ROOT=${cfg.reportsRoot}",
+        "ASSET_NAME=${asset.name}",
+        "ASSET_TYPE=${asset.type}",
+        "ASSET_PATH=${asset.path}",
+        "ASSET_KEY=${assetKey}",
+        "ASSET_TIMEOUT_MINUTES=${(asset.timeoutMinutes ?: cfg.defaultTimeoutMinutes).toString()}",
+        "WIN_DRIVER_TASK=${cfg.winDriverTask ?: ''}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Clean-Text {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    $text = $Value -replace '[\\r\\n]+', ' '
+    $text = $text -replace '\\s+', ' '
+    return $text.Trim()
+}
+
+function Short-Text {
+    param(
+        [string]$Value,
+        [int]$Max = 180
+    )
+
+    $text = Clean-Text $Value
+
+    if ($text.Length -gt $Max) {
+        return $text.Substring(0, $Max - 3) + '...'
+    }
+
+    return $text
+}
+
+function To-RelativePath {
+    param(
+        [string]$Root,
+        [string]$FullPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($FullPath)) {
+        return ''
+    }
+
+    if (-not $FullPath.StartsWith($Root)) {
+        return ''
+    }
+
+    $rel = $FullPath.Substring($Root.Length)
+
+    if ($rel.StartsWith('\\')) {
+        $rel = $rel.Substring(1)
+    }
+
+    return $rel.Replace('\\', '/')
+}
+
+function Stop-ProcessTree {
+    param([int]$ProcessId)
+
+    try {
+        $children = Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue
+        foreach ($child in $children) {
+            Stop-ProcessTree -ProcessId $child.ProcessId
+        }
+    }
+    catch {
+    }
+
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+}
+
+function Read-NewContent {
+    param(
+        [string]$Path,
+        [ref]$Offset
+    )
+
+    if (-not (Test-Path $Path)) {
+        return @()
+    }
+
+    $fs = $null
+    $sr = $null
+
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
+        $sr = New-Object System.IO.StreamReader($fs)
+        $content = $sr.ReadToEnd()
+        $Offset.Value = $fs.Position
+
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            return @()
+        }
+
+        return @($content -split "`r?`n")
+    }
+    catch {
+        return @()
+    }
+    finally {
+        if ($sr) { $sr.Close() }
+        if ($fs) { $fs.Close() }
+    }
+}
+
+function Should-SkipKatalonLine {
+    param([string]$Text)
+
+    $noise = @(
+        'CPU load',
+        'Total memory',
+        'Free memory',
+        'Start getting machine ID',
+        'Start appending additional signatures',
+        'Search for valid offline licenses',
+        'Start checking license',
+        'Invalid package binding for default import',
+        'ENTRY org.eclipse.jdt.core',
+        'MESSAGE Invalid package binding'
+    )
+
+    foreach ($item in $noise) {
+        if ($Text -like "*$item*") {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Emit-KatalonConsoleLine {
+    param(
+        [string]$Line,
+        [string]$Prefix
+    )
+
+    $text = Clean-Text $Line
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return
+    }
+
+    if (Should-SkipKatalonLine -Text $text) {
+        return
+    }
+
+    if (
+        $text -match 'START Test Suites' -or
+        $text -match 'START Test Cases' -or
+        $text -match 'START SCENARIO' -or
+        $text -match 'FAILED' -or
+        $text -match 'ERROR' -or
+        $text -match 'Exception' -or
+        $text -match 'Warning' -or
+        $text -match 'Test suite' -or
+        $text -match 'Test suite collection' -or
+        $text -match 'report folder'
+    ) {
+        Write-Host ($Prefix + $text)
+    }
+}
+
+function Start-WinDriverTask {
+    param([string]$TaskName)
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+
+    Write-Host ("[INFO] Starting WinDriver task: " + $TaskName)
+    schtasks /run /tn $TaskName | Out-Host
+    Start-Sleep -Seconds 3
+}
+
+function Stop-WinDriverTask {
+    param([string]$TaskName)
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+
+    try {
+        Write-Host ("[INFO] Stopping WinDriver task: " + $TaskName)
+        schtasks /end /tn $TaskName 1>$null 2>$null
+    }
+    catch {
+    }
+}
+
+function Find-AssetOutputDir {
+    param(
+        [string]$Root,
+        [datetime]$StartedAt
+    )
+
+    $candidate = Get-ChildItem -Path $Root -Directory -Recurse -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.LastWriteTime -ge $StartedAt.AddMinutes(-1)
+        } |
+        Where-Object {
+            (Test-Path (Join-Path $_.FullName 'JUnit_Report.xml'))
+        } |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if ($candidate) {
+        return $candidate.FullName
+    }
+
+    return ''
+}
+
+function Get-JUnitSummary {
+    param([string]$JunitFile)
+
+    $result = [ordered]@{
+        Executed = 0
+        Passed   = 0
+        Failed   = 0
+        Skipped  = 0
+        Reason   = ''
+        Cases    = @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($JunitFile) -or -not (Test-Path $JunitFile)) {
+        return $result
+    }
+
+    try {
+        [xml]$xml = Get-Content $JunitFile
+
+        $testcases = @()
+
+        if ($xml.testsuite) {
+            $testcases = @($xml.testsuite.testcase)
+        }
+        elseif ($xml.testsuites) {
+            foreach ($ts in @($xml.testsuites.testsuite)) {
+                $testcases += @($ts.testcase)
+            }
+        }
+
+        $testcases = @($testcases | Where-Object { $_ })
+        $result.Executed = $testcases.Count
+
+        $failedNodes = @($testcases | Where-Object { $_.failure -or $_.error })
+        $skippedNodes = @($testcases | Where-Object { $_.skipped })
+
+        $result.Failed = $failedNodes.Count
+        $result.Skipped = $skippedNodes.Count
+        $result.Passed = $result.Executed - $result.Failed - $result.Skipped
+
+        foreach ($tc in ($testcases | Select-Object -First 5)) {
+            $caseName = Short-Text $tc.name 90
+
+            if ($tc.failure -or $tc.error) {
+                $msg = ''
+                if ($tc.failure) {
+                    $msg = Short-Text (($tc.failure.message + ' ' + $tc.failure.InnerText)) 90
+                }
+                elseif ($tc.error) {
+                    $msg = Short-Text (($tc.error.message + ' ' + $tc.error.InnerText)) 90
+                }
+
+                $result.Cases += ('❌ ' + $caseName + ' | ' + $msg)
+            }
+            elseif ($tc.skipped) {
+                $result.Cases += ('⏭️ ' + $caseName + ' | skipped')
+            }
+            else {
+                $result.Cases += ('✅ ' + $caseName + ' | passed')
+            }
+        }
+
+        if ($failedNodes.Count -gt 0) {
+            $firstBad = $failedNodes[0]
+
+            if ($firstBad.failure) {
+                $result.Reason = Short-Text (($firstBad.failure.message + ' ' + $firstBad.failure.InnerText)) 150
+            }
+            elseif ($firstBad.error) {
+                $result.Reason = Short-Text (($firstBad.error.message + ' ' + $firstBad.error.InnerText)) 150
+            }
+        }
+    }
+    catch {
+        $result.Reason = Short-Text $_.Exception.Message 150
+    }
+
+    return $result
+}
+
+function Write-SyntheticJunit {
+    param(
+        [string]$FilePath,
+        [string]$AssetName,
+        [string]$Reason
+    )
+
+    $escapedReason = [System.Security.SecurityElement]::Escape($Reason)
+    if ([string]::IsNullOrWhiteSpace($escapedReason)) {
+        $escapedReason = 'Desktop asset failed without JUnit report'
+    }
+
+    $xml = @"
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="$AssetName" tests="1" failures="1" errors="0" skipped="0">
+  <testcase classname="$AssetName" name="$AssetName">
+    <failure message="$escapedReason">$escapedReason</failure>
+  </testcase>
+</testsuite>
+"@
+
+    Set-Content -Path $FilePath -Value $xml -Encoding UTF8
+}
+
+$StartedAt = Get-Date
+$LogsDir = Join-Path $env:REPORTS_ROOT 'logs'
+$StdoutLog = Join-Path $LogsDir ($env:ASSET_KEY + '.log')
+$StderrLog = Join-Path $LogsDir ($env:ASSET_KEY + '.err.log')
+$MetaFile = Join-Path $LogsDir ($env:ASSET_KEY + '.meta.properties')
+$SyntheticJunit = Join-Path $LogsDir ($env:ASSET_KEY + '.junit.xml')
+
+if (-not (Test-Path $LogsDir)) {
+    New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
+}
+
+Remove-Item $StdoutLog -Force -ErrorAction SilentlyContinue
+Remove-Item $StderrLog -Force -ErrorAction SilentlyContinue
+Remove-Item $MetaFile -Force -ErrorAction SilentlyContinue
+Remove-Item $SyntheticJunit -Force -ErrorAction SilentlyContinue
+
+$args = @(
+    '-noSplash',
+    '-runMode=console',
+    '-consoleLog',
+    ('-projectPath="' + $env:PROJECT_PATH + '"'),
+    '-retry=0',
+    ('-browserType="Windows"'),
+    ('-reportFolder="' + $env:REPORTS_ROOT + '"')
+)
+
+if ($env:ASSET_TYPE -eq 'COLLECTION') {
+    $args += ('-testSuiteCollectionPath="' + $env:ASSET_PATH + '"')
+}
+else {
+    $args += ('-testSuitePath="' + $env:ASSET_PATH + '"')
+}
+
+Write-Host '------------------------------------------------------------'
+Write-Host ('🚀 ASSET START | ' + $env:ASSET_NAME)
+Write-Host ('🧪 TYPE       | ' + $env:ASSET_TYPE)
+Write-Host ('📁 PATH       | ' + $env:ASSET_PATH)
+Write-Host ('📂 REPORTS    | ' + $env:REPORTS_ROOT)
+Write-Host '------------------------------------------------------------'
+
+Start-WinDriverTask -TaskName $env:WIN_DRIVER_TASK
+
+$process = $null
+$stdoutOffset = 0L
+$stderrOffset = 0L
+$timeoutAt = (Get-Date).AddMinutes([int]$env:ASSET_TIMEOUT_MINUTES)
+$exitCode = 0
+
+try {
+    $process = Start-Process `
+        -FilePath $env:KATALON_EXE `
+        -ArgumentList $args `
+        -PassThru `
+        -NoNewWindow `
+        -RedirectStandardOutput $StdoutLog `
+        -RedirectStandardError $StderrLog
+
+    while (-not $process.HasExited) {
+        $stdoutLines = Read-NewContent -Path $StdoutLog -Offset ([ref]$stdoutOffset)
+        foreach ($line in $stdoutLines) {
+            Emit-KatalonConsoleLine -Line $line -Prefix '[KATALON] '
+        }
+
+        $stderrLines = Read-NewContent -Path $StderrLog -Offset ([ref]$stderrOffset)
+        foreach ($line in $stderrLines) {
+            Emit-KatalonConsoleLine -Line $line -Prefix '[STDERR ] '
+        }
+
+        if ((Get-Date) -ge $timeoutAt) {
+            Write-Host ('[TIMEOUT] Asset exceeded ' + $env:ASSET_TIMEOUT_MINUTES + ' minutes')
+            Stop-ProcessTree -ProcessId $process.Id
+            $exitCode = 124
+            break
+        }
+
+        Start-Sleep -Seconds 2
+        try { $process.Refresh() } catch {}
+    }
+
+    if ($exitCode -eq 0) {
+        try { $process.Refresh() } catch {}
+        $exitCode = $process.ExitCode
+    }
+}
+finally {
+    Stop-WinDriverTask -TaskName $env:WIN_DRIVER_TASK
+}
+
+$stdoutLines = Read-NewContent -Path $StdoutLog -Offset ([ref]$stdoutOffset)
+foreach ($line in $stdoutLines) {
+    Emit-KatalonConsoleLine -Line $line -Prefix '[KATALON] '
+}
+
+$stderrLines = Read-NewContent -Path $StderrLog -Offset ([ref]$stderrOffset)
+foreach ($line in $stderrLines) {
+    Emit-KatalonConsoleLine -Line $line -Prefix '[STDERR ] '
+}
+
+$AssetOutputDir = Find-AssetOutputDir -Root $env:REPORTS_ROOT -StartedAt $StartedAt
+
+$junitFile = ''
+$logRel = To-RelativePath -Root $env:REPORTS_ROOT -FullPath $StdoutLog
+
+if (-not [string]::IsNullOrWhiteSpace($AssetOutputDir)) {
+    $junitCandidate = Get-ChildItem -Path $AssetOutputDir -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if ($junitCandidate) {
+        $junitFile = $junitCandidate.FullName
+    }
+}
+
+$junitSummary = Get-JUnitSummary -JunitFile $junitFile
+
+$status = 'PASSED'
+$icon = '✅'
+
+if ($exitCode -eq 124) {
+    $status = 'TIMEOUT'
+    $icon = '⏰'
+}
+elseif ($junitSummary.Failed -gt 0 -or $exitCode -ne 0) {
+    $status = 'FAILED'
+    $icon = '❌'
+}
+
+$reason = $junitSummary.Reason
+
+if ($status -ne 'PASSED' -and [string]::IsNullOrWhiteSpace($reason)) {
+    $reasonHints = @()
+
+    if (Test-Path $StdoutLog) {
+        $reasonHints += Get-Content $StdoutLog -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_ -match 'FAILED|ERROR|Exception|not found|Timeout|timed out'
+            } |
+            Select-Object -Last 5
+    }
+
+    if (Test-Path $StderrLog) {
+        $reasonHints += Get-Content $StderrLog -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_ -match 'FAILED|ERROR|Exception|not found|Timeout|timed out'
+            } |
+            Select-Object -Last 5
+    }
+
+    if ($reasonHints.Count -gt 0) {
+        $reason = Short-Text (($reasonHints -join ' ')) 150
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'TIMEOUT') {
+    $reason = 'Desktop asset execution exceeded timeout'
+}
+
+if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'FAILED') {
+    $reason = 'Desktop asset failed without explicit reason in JUnit'
+}
+
+if (([string]::IsNullOrWhiteSpace($junitFile) -or -not (Test-Path $junitFile)) -and $status -ne 'PASSED') {
+    Write-SyntheticJunit -FilePath $SyntheticJunit -AssetName $env:ASSET_NAME -Reason $reason
+}
+
+$durationSeconds = [math]::Max(0, [int]((Get-Date) - $StartedAt).TotalSeconds)
+
+$metaLines = @()
+$metaLines += ('ASSET_NAME=' + $env:ASSET_NAME)
+$metaLines += ('ASSET_TYPE=' + $env:ASSET_TYPE)
+$metaLines += ('ASSET_PATH=' + $env:ASSET_PATH)
+$metaLines += ('STATUS=' + $status)
+$metaLines += ('ICON=' + $icon)
+$metaLines += ('EXIT_CODE=' + $exitCode)
+$metaLines += ('DURATION_SECONDS=' + $durationSeconds)
+$metaLines += ('EXECUTED=' + $junitSummary.Executed)
+$metaLines += ('PASSED=' + $junitSummary.Passed)
+$metaLines += ('FAILED=' + $junitSummary.Failed)
+$metaLines += ('SKIPPED=' + $junitSummary.Skipped)
+$metaLines += ('REASON=' + (Short-Text $reason 150))
+$metaLines += ('LOG_REL=' + $logRel)
+$metaLines += ('CASE_SUMMARY=' + (($junitSummary.Cases -join ' || ')))
+
+Set-Content -Path $MetaFile -Value $metaLines -Encoding UTF8
+
+Write-Host '------------------------------------------------------------'
+Write-Host ('🏁 ASSET END   | ' + $env:ASSET_NAME)
+Write-Host ('📌 STATUS      | ' + $status)
+Write-Host ('⏱️ DURATION    | ' + $durationSeconds + ' seconds')
+Write-Host ('📊 EXECUTED    | ' + $junitSummary.Executed)
+Write-Host ('✅ PASSED      | ' + $junitSummary.Passed)
+Write-Host ('❌ FAILED      | ' + $junitSummary.Failed)
+Write-Host ('⏭️ SKIPPED     | ' + $junitSummary.Skipped)
+if (-not [string]::IsNullOrWhiteSpace($reason)) {
+    Write-Host ('🧾 REASON      | ' + $reason)
+}
+Write-Host ('📄 LOG         | Reports/' + $logRel)
+Write-Host '------------------------------------------------------------'
+
+exit $exitCode
+'''
+        )
+    }
+}
+
+return this
+5) jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy
+/*
+ * Responsibility:
+ * Shared runner for desktop Jenkins pipelines.
+ *
+ * Jenkins controls only:
+ * - validate environment
+ * - prepare reports folder
+ * - execute suite/collection list
+ * - archive reports
+ * - trigger next Jenkins job when configured
+ *
+ * Katalon keeps the REC/PRD opening and closing logic internally.
+ */
+
+def loadPaths(script) {
+    return script.load('jenkinsIntegration/JenkinsPaths.groovy')
+}
+
+def loadConsoleView(script) {
+    return script.load('jenkinsIntegration/JenkinsConsoleView.groovy')
+}
+
+def loadResultStore(script) {
+    return script.load('jenkinsIntegration/JenkinsResultStore.groovy')
+}
+
+def loadDesktopTaskLogger(script) {
+    return script.load('jenkinsIntegration/JenkinsDesktopTaskLogger.groovy')
+}
+
+def validateEnvironment(script, Map cfg, def paths) {
+    script.bat """
 @echo off
-setlocal
+echo ------------------------------------------------------------
+echo VALIDATING ENVIRONMENT
+echo ------------------------------------------------------------
 
-taskkill /F /IM IXS.Ematch.IHM.exe >nul 2>&1
-
-set "APP_EXE=D:\PUT\THE\REAL\PATH\IXS.Ematch.IHM.exe"
-
-if not exist "%APP_EXE%" (
-    echo [ERROR] App executable not found: %APP_EXE%
+if not exist "${cfg.execution.katalonExe}" (
+    echo [ERROR] Katalon executable not found
+    echo ${cfg.execution.katalonExe}
     exit /b 1
 )
 
-start "" "%APP_EXE%"
-timeout /t 8 /nobreak >nul
-exit /b 0
+if not exist "${paths.projectPath(script, cfg.execution.projectFileName)}" (
+    echo [ERROR] Project file not found
+    echo ${paths.projectPath(script, cfg.execution.projectFileName)}
+    exit /b 1
+)
+
+echo [OK] Environment validated
+echo ------------------------------------------------------------
+"""
+}
+
+def prepareArtifacts(script, def paths, def resultStore) {
+    script.bat """
+@echo off
+if exist "${paths.reportsRoot(script)}" rmdir /s /q "${paths.reportsRoot(script)}"
+mkdir "${paths.reportsRoot(script)}"
+mkdir "${paths.logsRoot(script)}"
+mkdir "${paths.artifactsRoot(script)}"
+"""
+
+    resultStore.saveResults(script, paths.reportsRoot(script), [])
+}
+
+def buildResultFromMeta(def resultStore, script, String reportsRoot, Map asset, int exitCode) {
+    def meta = resultStore.readAssetMeta(script, reportsRoot, asset.name)
+
+    return [
+        name            : asset.name,
+        type            : meta['ASSET_TYPE'] ?: asset.type,
+        path            : meta['ASSET_PATH'] ?: asset.path,
+        status          : meta['STATUS'] ?: (exitCode == 0 ? 'PASSED' : (exitCode == 124 ? 'TIMEOUT' : 'FAILED')),
+        icon            : meta['ICON'] ?: (exitCode == 0 ? '✅' : (exitCode == 124 ? '⏰' : '❌')),
+        exitCode        : meta['EXIT_CODE'] ?: "${exitCode}",
+        executed        : meta['EXECUTED'] ?: '0',
+        passed          : meta['PASSED'] ?: '0',
+        failed          : meta['FAILED'] ?: '0',
+        skipped         : meta['SKIPPED'] ?: '0',
+        durationSeconds : meta['DURATION_SECONDS'] ?: '0',
+        reason          : meta['REASON'] ?: '',
+        logRel          : meta['LOG_REL'] ?: '',
+        caseSummary     : resultStore.splitSummary(meta['CASE_SUMMARY'] ?: '')
+    ]
+}
+
+def run(script, Map cfg) {
+    def paths = loadPaths(script)
+    def consoleView = loadConsoleView(script)
+    def resultStore = loadResultStore(script)
+    def taskLogger = loadDesktopTaskLogger(script)
+
+    def results = []
+
+    script.stage('Validate Environment') {
+        validateEnvironment(script, cfg, paths)
+    }
+
+    script.stage('Prepare Artifacts') {
+        prepareArtifacts(script, paths, resultStore)
+    }
+
+    script.stage(cfg.execution.stageName ?: 'Run Test Assets') {
+        cfg.assets.each { asset ->
+            script.stage("Run - ${asset.name}") {
+                def timeoutMinutes = (asset.timeoutMinutes ?: cfg.execution.defaultTimeoutMinutes).toString()
+
+                consoleView.printAssetHeader(script, asset, timeoutMinutes)
+
+                int exitCode = taskLogger.runAsset(script, [
+                    katalonExe            : cfg.execution.katalonExe,
+                    projectPath           : paths.projectPath(script, cfg.execution.projectFileName),
+                    reportsRoot           : paths.reportsRoot(script),
+                    defaultTimeoutMinutes : cfg.execution.defaultTimeoutMinutes,
+                    winDriverTask         : cfg.execution.winDriverTask
+                ], asset)
+
+                def result = buildResultFromMeta(resultStore, script, paths.reportsRoot(script), asset, exitCode)
+
+                results << result
+                resultStore.saveResults(script, paths.reportsRoot(script), results)
+
+                consoleView.printAssetResult(script, result)
+                consoleView.printRunningSummary(script, results)
+
+                if (result.status != 'PASSED' && asset.stopPipelineOnFailure == true) {
+                    script.error("${asset.name} finished with status ${result.status} and stopPipelineOnFailure=true")
+                }
+
+                if (result.status != 'PASSED') {
+                    script.currentBuild.result = 'FAILURE'
+                }
+            }
+        }
+    }
+
+    try {
+        consoleView.printFinalSummary(script, results, script.currentBuild.currentResult)
+    }
+    catch (ignored) {
+    }
+
+    script.catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+        script.junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml,Reports/logs/*.junit.xml'
+    }
+
+    script.catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+        script.archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true
+    }
+
+    if (script.currentBuild.currentResult == 'SUCCESS') {
+        def nextJobName = (cfg.nextJobName ?: '').trim()
+
+        if (nextJobName) {
+            script.echo "Triggering next Jenkins job as a separate build: ${nextJobName}"
+
+            script.build job: nextJobName,
+                         wait: false,
+                         propagate: false
+
+            script.echo "Next Jenkins job triggered successfully: ${nextJobName}"
+        }
+        else {
+            script.echo 'No next Jenkins job configured.'
+        }
+    }
+}
+
+return this
+6) jenkinsPipelines/Jenkinsfile_ArchiveMode.groovy
+/*
+ * Responsibility:
+ * Archive Mode desktop Jenkins pipeline.
+ * This build stays separated from the other desktop builds.
+ * It uses the shared desktop runner and triggers the next Jenkins job when configured.
+ */
+
+def PIPELINE_CONFIG = [
+    agent: [
+        label          : 'GI5_SWDCFRNXGI55817',
+        customWorkspace: 'D:\\jenkins\\work\\workspace\\GI5\\eMatch_Regression\\Archive Mode'
+    ],
+
+    buildDiscarder: [
+        numToKeepStr : '15',
+        daysToKeepStr: '20'
+    ],
+
+    pipelineTimeoutMinutes: 180,
+
+    execution: [
+        katalonExe           : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+        projectFileName      : 'eMatch POC.prj',
+        winDriverTask        : 'startWinDriver',
+        defaultTimeoutMinutes: 30,
+        stageName            : 'Run Test Assets'
+    ],
+
+    assets: [
+        [
+            name                 : 'Archive Mode',
+            type                 : 'SUITE',
+            path                 : 'Test Suites/Archive Mode/Archive Mode',
+            timeoutMinutes       : 30,
+            stopPipelineOnFailure: false
+        ],
+        [
+            name                 : 'Archive Mode Collection',
+            type                 : 'COLLECTION',
+            path                 : 'Test Suites/Archive Mode/Archive Mode Collection',
+            timeoutMinutes       : 30,
+            stopPipelineOnFailure: false
+        ]
+    ],
+
+    nextJobName: 'Passerelle Bilan'
+]
+
+properties([
+    buildDiscarder(logRotator(
+        numToKeepStr : PIPELINE_CONFIG.buildDiscarder.numToKeepStr,
+        daysToKeepStr: PIPELINE_CONFIG.buildDiscarder.daysToKeepStr
+    )),
+    disableConcurrentBuilds()
+])
+
+node(PIPELINE_CONFIG.agent.label) {
+    def runBlock = {
+        checkout scm
+
+        def runner = load('jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy')
+        runner.run(this, PIPELINE_CONFIG)
+    }
+
+    if ((PIPELINE_CONFIG.agent.customWorkspace ?: '').trim()) {
+        ws(PIPELINE_CONFIG.agent.customWorkspace) {
+            timestamps {
+                ansiColor('xterm') {
+                    timeout(time: PIPELINE_CONFIG.pipelineTimeoutMinutes as int, unit: 'MINUTES') {
+                        runBlock()
+                    }
+                }
+            }
+        }
+    }
+    else {
+        timestamps {
+            ansiColor('xterm') {
+                timeout(time: PIPELINE_CONFIG.pipelineTimeoutMinutes as int, unit: 'MINUTES') {
+                    runBlock()
+                }
+            }
+        }
+    }
+}
+
+return this
+7) jenkinsPipelines/Jenkinsfile_PasserelleBilan.groovy
+/*
+ * Responsibility:
+ * Passerelle Bilan desktop Jenkins pipeline.
+ * This build stays separated from the other desktop builds.
+ * It uses the shared desktop runner and triggers the next Jenkins job when configured.
+ */
+
+def PIPELINE_CONFIG = [
+    agent: [
+        label          : 'GI5_SWDCFRNXGI55817',
+        customWorkspace: 'D:\\jenkins\\work\\workspace\\GI5\\eMatch_Regression\\Passerelle Bilan'
+    ],
+
+    buildDiscarder: [
+        numToKeepStr : '15',
+        daysToKeepStr: '20'
+    ],
+
+    pipelineTimeoutMinutes: 180,
+
+    execution: [
+        katalonExe           : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+        projectFileName      : 'eMatch POC.prj',
+        winDriverTask        : 'startWinDriver',
+        defaultTimeoutMinutes: 30,
+        stageName            : 'Run Test Assets'
+    ],
+
+    assets: [
+        [
+            name                 : 'Passerelle Bilan',
+            type                 : 'SUITE',
+            path                 : 'Test Suites/PasserelleBilan/Passerelle Bilan',
+            timeoutMinutes       : 30,
+            stopPipelineOnFailure: false
+        ],
+        [
+            name                 : 'Passerelle Bilan Collection',
+            type                 : 'COLLECTION',
+            path                 : 'Test Suites/PasserelleBilan/Passerelle Bilan Collection',
+            timeoutMinutes       : 30,
+            stopPipelineOnFailure: false
+        ]
+    ],
+
+    nextJobName: ''
+]
+
+properties([
+    buildDiscarder(logRotator(
+        numToKeepStr : PIPELINE_CONFIG.buildDiscarder.numToKeepStr,
+        daysToKeepStr: PIPELINE_CONFIG.buildDiscarder.daysToKeepStr
+    )),
+    disableConcurrentBuilds()
+])
+
+node(PIPELINE_CONFIG.agent.label) {
+    def runBlock = {
+        checkout scm
+
+        def runner = load('jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy')
+        runner.run(this, PIPELINE_CONFIG)
+    }
+
+    if ((PIPELINE_CONFIG.agent.customWorkspace ?: '').trim()) {
+        ws(PIPELINE_CONFIG.agent.customWorkspace) {
+            timestamps {
+                ansiColor('xterm') {
+                    timeout(time: PIPELINE_CONFIG.pipelineTimeoutMinutes as int, unit: 'MINUTES') {
+                        runBlock()
+                    }
+                }
+            }
+        }
+    }
+    else {
+        timestamps {
+            ansiColor('xterm') {
+                timeout(time: PIPELINE_CONFIG.pipelineTimeoutMinutes as int, unit: 'MINUTES') {
+                    runBlock()
+                }
+            }
+        }
+    }
+}
+
+return this
 
 
 
+C:\Users\adgi5appjenkins\Desktop\Windows Application Driver\WinAppDriver.exe
