@@ -1,3 +1,207 @@
+/*
+ * Responsibility:
+ * Self-contained Jenkins pipeline for Archive Mode desktop execution.
+ * This file uses:
+ * 1) checkout scm
+ * 2) a loop over TEST_ASSETS
+ * 3) environment variables for all shared values
+ * 4) one shared WinDriver scheduled task only
+ *
+ * To add or remove suites/collections, edit only TEST_ASSETS.
+ */
+
+def TEST_ASSETS = [
+    [
+        name : 'Archive Mode',
+        type : 'SUITE',
+        path : 'Test Suites/ArchiveMode/Archive Mode'
+    ],
+    [
+        name : 'Archive Mode Collection',
+        type : 'COLLECTION',
+        path : 'Test Suites/ArchiveMode/Archive Mode Collection'
+    ]
+]
+
+def runDesktopAsset(script, Map asset) {
+    script.withEnv([
+        "ENV_ASSET_NAME=${asset.name}",
+        "ENV_ASSET_TYPE=${asset.type}",
+        "ENV_ASSET_PATH=${asset.path}"
+    ]) {
+        script.powershell '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Start-WinDriverTask {
+    param([string]$TaskName)
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+
+    Write-Host ("[INFO] Starting WinDriver task: " + $TaskName)
+    schtasks /run /tn $TaskName | Out-Host
+    Start-Sleep -Seconds 3
+}
+
+function Stop-WinDriverTask {
+    param([string]$TaskName)
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+
+    try {
+        Write-Host ("[INFO] Stopping WinDriver task: " + $TaskName)
+        schtasks /end /tn $TaskName 1>$null 2>$null
+    }
+    catch {
+    }
+}
+
+function Run-CloseBatIfNeeded {
+    param([string]$BatPath)
+
+    if ([string]::IsNullOrWhiteSpace($BatPath)) {
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $BatPath)) {
+        Write-Host ("[WARN] Close BAT not found: " + $BatPath)
+        return
+    }
+
+    Write-Host ("[INFO] Running close BAT: " + $BatPath)
+    Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('"' + $BatPath + '"') -Wait -NoNewWindow
+    Start-Sleep -Seconds 2
+}
+
+Write-Host '------------------------------------------------------------'
+Write-Host ('🚀 STARTING ASSET | ' + $env:ENV_ASSET_NAME)
+Write-Host ('🧪 TYPE          | ' + $env:ENV_ASSET_TYPE)
+Write-Host ('📁 PATH          | ' + $env:ENV_ASSET_PATH)
+Write-Host '------------------------------------------------------------'
+
+Start-WinDriverTask -TaskName $env:WIN_DRIVER_TASK
+
+try {
+    $args = @(
+        '-noSplash',
+        '-runMode=console',
+        '-consoleLog',
+        ('-projectPath="' + $env:WORKSPACE + '\\' + $env:PROJECT_FILE + '"'),
+        '-retry=0',
+        '-browserType="Windows"',
+        ('-reportFolder="' + $env:WORKSPACE + '\\' + $env:REPORTS_DIR + '"')
+    )
+
+    if ($env:ENV_ASSET_TYPE -eq 'COLLECTION') {
+        $args += ('-testSuiteCollectionPath="' + $env:ENV_ASSET_PATH + '"')
+    }
+    else {
+        $args += ('-testSuitePath="' + $env:ENV_ASSET_PATH + '"')
+    }
+
+    & "$env:KATALON_EXE" @args
+
+    if ($LASTEXITCODE -ne 0) {
+        throw ($env:ENV_ASSET_NAME + ' failed with exit code ' + $LASTEXITCODE)
+    }
+}
+finally {
+    Run-CloseBatIfNeeded -BatPath $env:CLOSE_BAT_PATH
+    Stop-WinDriverTask -TaskName $env:WIN_DRIVER_TASK
+}
+'''
+    }
+}
+
+pipeline {
+    agent { label 'GI5_SWDCFRNXGI55817' }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 180, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '20'))
+    }
+
+    environment {
+        KATALON_EXE     = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+        PROJECT_FILE    = 'eMatch POC.prj'
+        WIN_DRIVER_TASK = 'startWinDriver'
+        CLOSE_BAT_PATH  = 'D:\\Projects\\eMatchStarters\\closeEmatch.bat'
+        NEXT_JOB_NAME   = 'Passerelle Bilan'
+        REPORTS_DIR     = 'Reports'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Environment') {
+            steps {
+                bat """
+@echo off
+echo ------------------------------------------------------------
+echo VALIDATING ENVIRONMENT
+echo ------------------------------------------------------------
+
+if not exist "${env.KATALON_EXE}" (
+    echo [ERROR] Katalon executable not found
+    echo ${env.KATALON_EXE}
+    exit /b 1
+)
+
+if not exist "%WORKSPACE%\\${env.PROJECT_FILE}" (
+    echo [ERROR] Project file not found
+    echo %WORKSPACE%\\${env.PROJECT_FILE}
+    exit /b 1
+)
+
+if exist "%WORKSPACE%\\${env.REPORTS_DIR}" rmdir /s /q "%WORKSPACE%\\${env.REPORTS_DIR}"
+mkdir "%WORKSPACE%\\${env.REPORTS_DIR}"
+mkdir "%WORKSPACE%\\${env.REPORTS_DIR}\\logs"
+
+echo [OK] Environment validated
+echo ------------------------------------------------------------
+"""
+            }
+        }
+
+        stage('Run Test Assets') {
+            steps {
+                script {
+                    TEST_ASSETS.each { asset ->
+                        stage("Run - ${asset.name}") {
+                            runDesktopAsset(this, asset)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
+            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true
+        }
+
+        success {
+            script {
+                if ((env.NEXT_JOB_NAME ?: '').trim()) {
+                    build job: env.NEXT_JOB_NAME, wait: false, propagate: false
+                }
+            }
+        }
+    }
+}
 
 
 
@@ -8,4 +212,207 @@
 
 
 
+/*
+ * Responsibility:
+ * Self-contained Jenkins pipeline for Passerelle Bilan desktop execution.
+ * This file uses:
+ * 1) checkout scm
+ * 2) a loop over TEST_ASSETS
+ * 3) environment variables for all shared values
+ * 4) one shared WinDriver scheduled task only
+ *
+ * To add or remove suites/collections, edit only TEST_ASSETS.
+ */
 
+def TEST_ASSETS = [
+    [
+        name : 'Passerelle Bilan',
+        type : 'SUITE',
+        path : 'Test Suites/PasserelleBilan/Passerelle Bilan'
+    ],
+    [
+        name : 'Passerelle Bilan Collection',
+        type : 'COLLECTION',
+        path : 'Test Suites/PasserelleBilan/Passerelle Bilan Collection'
+    ]
+]
+
+def runDesktopAsset(script, Map asset) {
+    script.withEnv([
+        "ENV_ASSET_NAME=${asset.name}",
+        "ENV_ASSET_TYPE=${asset.type}",
+        "ENV_ASSET_PATH=${asset.path}"
+    ]) {
+        script.powershell '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Start-WinDriverTask {
+    param([string]$TaskName)
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+
+    Write-Host ("[INFO] Starting WinDriver task: " + $TaskName)
+    schtasks /run /tn $TaskName | Out-Host
+    Start-Sleep -Seconds 3
+}
+
+function Stop-WinDriverTask {
+    param([string]$TaskName)
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+
+    try {
+        Write-Host ("[INFO] Stopping WinDriver task: " + $TaskName)
+        schtasks /end /tn $TaskName 1>$null 2>$null
+    }
+    catch {
+    }
+}
+
+function Run-CloseBatIfNeeded {
+    param([string]$BatPath)
+
+    if ([string]::IsNullOrWhiteSpace($BatPath)) {
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $BatPath)) {
+        Write-Host ("[WARN] Close BAT not found: " + $BatPath)
+        return
+    }
+
+    Write-Host ("[INFO] Running close BAT: " + $BatPath)
+    Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', ('"' + $BatPath + '"') -Wait -NoNewWindow
+    Start-Sleep -Seconds 2
+}
+
+Write-Host '------------------------------------------------------------'
+Write-Host ('🚀 STARTING ASSET | ' + $env:ENV_ASSET_NAME)
+Write-Host ('🧪 TYPE          | ' + $env:ENV_ASSET_TYPE)
+Write-Host ('📁 PATH          | ' + $env:ENV_ASSET_PATH)
+Write-Host '------------------------------------------------------------'
+
+Start-WinDriverTask -TaskName $env:WIN_DRIVER_TASK
+
+try {
+    $args = @(
+        '-noSplash',
+        '-runMode=console',
+        '-consoleLog',
+        ('-projectPath="' + $env:WORKSPACE + '\\' + $env:PROJECT_FILE + '"'),
+        '-retry=0',
+        '-browserType="Windows"',
+        ('-reportFolder="' + $env:WORKSPACE + '\\' + $env:REPORTS_DIR + '"')
+    )
+
+    if ($env:ENV_ASSET_TYPE -eq 'COLLECTION') {
+        $args += ('-testSuiteCollectionPath="' + $env:ENV_ASSET_PATH + '"')
+    }
+    else {
+        $args += ('-testSuitePath="' + $env:ENV_ASSET_PATH + '"')
+    }
+
+    & "$env:KATALON_EXE" @args
+
+    if ($LASTEXITCODE -ne 0) {
+        throw ($env:ENV_ASSET_NAME + ' failed with exit code ' + $LASTEXITCODE)
+    }
+}
+finally {
+    Run-CloseBatIfNeeded -BatPath $env:CLOSE_BAT_PATH
+    Stop-WinDriverTask -TaskName $env:WIN_DRIVER_TASK
+}
+'''
+    }
+}
+
+pipeline {
+    agent { label 'GI5_SWDCFRNXGI55817' }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 180, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '20'))
+    }
+
+    environment {
+        KATALON_EXE     = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+        PROJECT_FILE    = 'eMatch POC.prj'
+        WIN_DRIVER_TASK = 'startWinDriver'
+        CLOSE_BAT_PATH  = 'D:\\Projects\\eMatchStarters\\closeEmatch.bat'
+        NEXT_JOB_NAME   = ''
+        REPORTS_DIR     = 'Reports'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate Environment') {
+            steps {
+                bat """
+@echo off
+echo ------------------------------------------------------------
+echo VALIDATING ENVIRONMENT
+echo ------------------------------------------------------------
+
+if not exist "${env.KATALON_EXE}" (
+    echo [ERROR] Katalon executable not found
+    echo ${env.KATALON_EXE}
+    exit /b 1
+)
+
+if not exist "%WORKSPACE%\\${env.PROJECT_FILE}" (
+    echo [ERROR] Project file not found
+    echo %WORKSPACE%\\${env.PROJECT_FILE}
+    exit /b 1
+)
+
+if exist "%WORKSPACE%\\${env.REPORTS_DIR}" rmdir /s /q "%WORKSPACE%\\${env.REPORTS_DIR}"
+mkdir "%WORKSPACE%\\${env.REPORTS_DIR}"
+mkdir "%WORKSPACE%\\${env.REPORTS_DIR}\\logs"
+
+echo [OK] Environment validated
+echo ------------------------------------------------------------
+"""
+            }
+        }
+
+        stage('Run Test Assets') {
+            steps {
+                script {
+                    TEST_ASSETS.each { asset ->
+                        stage("Run - ${asset.name}") {
+                            runDesktopAsset(this, asset)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
+            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true
+        }
+
+        success {
+            script {
+                if ((env.NEXT_JOB_NAME ?: '').trim()) {
+                    build job: env.NEXT_JOB_NAME, wait: false, propagate: false
+                }
+            }
+        }
+    }
+}
