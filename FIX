@@ -1,511 +1,363 @@
-✅ FILE 1: JenkinsPipelines/Jenkinsfile_ArchiveMode.groovy (INTEIRO)
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+rem ==========================================================
+rem eMatch generic runner (called by Task Scheduler)
+rem Reads: D:\Projects\eMatchStarters\run-context.properties
+rem Writes:
+rem   %WORKSPACE%\Reports\_jenkins_task_exitcode.txt
+rem   %WORKSPACE%\Reports\**\JUnit_Report.xml (Katalon)
+rem ==========================================================
+
+set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+
+if not exist "%CTX_FILE%" (
+  echo [ERROR] Context file not found: "%CTX_FILE%"
+  exit /b 2
+)
+
+rem ---------- Load properties ----------
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
+  set "K=%%A"
+  set "V=%%B"
+  if not "!K!"=="" set "!K!=!V!"
+)
+
+rem Expected keys:
+rem   WORKSPACE
+rem   PROJECT_FILE
+rem   COLLECTION_PATH
+rem   REPORT_FOLDER
+
+if "%WORKSPACE%"=="" (
+  echo [ERROR] WORKSPACE missing in context file
+  exit /b 3
+)
+
+if "%PROJECT_FILE%"=="" (
+  echo [ERROR] PROJECT_FILE missing in context file
+  exit /b 3
+)
+
+if "%COLLECTION_PATH%"=="" (
+  echo [ERROR] COLLECTION_PATH missing in context file
+  exit /b 3
+)
+
+if "%REPORT_FOLDER%"=="" (
+  set "REPORT_FOLDER=%WORKSPACE%\Reports"
+)
+
+rem ---------- Paths ----------
+set "KATALON_HOME=C:\Users\adgj5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0"
+set "KATALON_EXE=%KATALON_HOME%\katalonc.exe"
+
+set "PROJECT_PATH=%WORKSPACE%\%PROJECT_FILE%"
+set "EXIT_FILE=%REPORT_FOLDER%\_jenkins_task_exitcode.txt"
+
+rem ---------- Ensure report folder ----------
+if not exist "%REPORT_FOLDER%" mkdir "%REPORT_FOLDER%" >nul 2>nul
+
+echo ==========================================================
+echo RUNNING KATALON (Task Scheduler)
+echo WORKSPACE      : %WORKSPACE%
+echo PROJECT        : %PROJECT_PATH%
+echo COLLECTION     : %COLLECTION_PATH%
+echo REPORT_FOLDER  : %REPORT_FOLDER%
+echo ==========================================================
+
+if not exist "%KATALON_EXE%" (
+  echo [ERROR] Katalon executable not found: "%KATALON_EXE%"
+  echo 10>"%EXIT_FILE%"
+  exit /b 10
+)
+
+if not exist "%PROJECT_PATH%" (
+  echo [ERROR] Katalon project not found: "%PROJECT_PATH%"
+  echo 11>"%EXIT_FILE%"
+  exit /b 11
+)
+
+rem ---------- Run ----------
+pushd "%WORKSPACE%"
+
+"%KATALON_EXE%" ^
+  -noSplash ^
+  -runMode=console ^
+  -projectPath="%PROJECT_PATH%" ^
+  -retry=0 ^
+  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
+  -executionProfile="default" ^
+  -reportFolder="%REPORT_FOLDER%" ^
+  -reportFileName="report" ^
+  -apiKey="" 
+
+set "RC=%ERRORLEVEL%"
+
+popd
+
+echo ==========================================================
+echo KATALON EXIT CODE: %RC%
+echo ==========================================================
+echo %RC%>"%EXIT_FILE%"
+
+exit /b %RC%
+
+
+
+
+
+
+
+
+
+
 /*
- * Responsibility:
- * Dedicated Jenkins pipeline for Archive Mode build.
- * This build triggers the next job when successful.
- */
+  Archive Mode - SIMPLE PIPELINE
+  - No custom DSL methods
+  - Uses only built-in Jenkins steps
+  - Runs Windows Scheduled Tasks and waits for completion
+*/
 
-def PIPELINE_CONFIG = [
-    agentLabel             : 'GI5_SWDCFRNXGI55817',
+def CFG = [
+  agentLabel: 'GI5_SWDCFRNXGI55817',
 
-    pipelineTimeoutMinutes : 180,
-    defaultTimeoutMinutes  : 30,
+  // Katalon project file inside the workspace root
+  projectFile: 'eMatch POC.prj',
 
-    executionStageName     : 'Run Test Assets',
-    projectFileName        : 'eMatch POC.prj',
+  // Katalon collection path (must match exactly what exists in Katalon)
+  collectionPath: 'Test Suites/Archive Mode/Archive Mode Collection',
 
-    // Katalon is executed by the Scheduled Task, but we keep it here for context if needed later
-    katalonExe             : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+  // Scheduled tasks
+  winDriverTask: 'startWinDriver',
+  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
 
-    // Scheduled Tasks
-    winDriverTask          : 'startWinDriver',
-    desktopRunnerTask      : '\\eMatch Automation\\RunEMatchDesktop',
+  // Fixed context file location read by run-ematch-command.bat
+  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
 
-    // Optional: next job to trigger at the end
-    nextJobName            : 'Passerelle Bilan',
+  // Where we want Katalon to generate output
+  reportFolderRel: 'Reports',
 
-    // What to run
-    assets : [
-        [
-            name          : 'Archive Mode Collection',
-            type          : 'COLLECTION',
-            path          : 'Test Suites/Archive Mode/Archive Mode Collection',
-            timeoutMinutes: 30
-        ]
-    ]
+  // Next job
+  nextJobName: 'Passerelle Bilan'
 ]
 
-node(PIPELINE_CONFIG.agentLabel) {
-    timestamps {
-        ansiColor('xterm') {
-            timeout(time: PIPELINE_CONFIG.pipelineTimeoutMinutes, unit: 'MINUTES') {
+node(CFG.agentLabel) {
+  timestamps {
+    ansiColor('xterm') {
+      timeout(time: 180, unit: 'MINUTES') {
 
-                stage('Checkout') {
-                    checkout scm
-                }
-
-                def runner = load('jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy')
-                runner.run(this, PIPELINE_CONFIG)
-            }
-        }
-    }
-}
-✅ FILE 2: jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy (INTEIRO)
-import java.nio.file.Paths
-
-def run(script, cfg) {
-
-    stageSafe(script, 'Validate Environment') {
-        script.echo('------------------------------------------------------------')
-        script.echo('VALIDATING TOOLS AND SUPPORT FILES')
-        script.echo('------------------------------------------------------------')
-
-        assertNotBlank(script, cfg.winDriverTask, 'winDriverTask')
-        assertNotBlank(script, cfg.desktopRunnerTask, 'desktopRunnerTask')
-        assertNotBlank(script, cfg.projectFileName, 'projectFileName')
-        assertNotBlank(script, cfg.executionStageName, 'executionStageName')
-
-        if (!cfg.assets || cfg.assets.size() == 0) {
-            script.error('No assets configured to run.')
+        stage('Checkout') {
+          checkout scm
         }
 
-        script.echo('[OK] Support files and scheduled tasks found')
-        script.echo('------------------------------------------------------------')
-    }
+        stage('Validate') {
+          echo "============================================================"
+          echo "VALIDATING TOOLS AND SUPPORT FILES"
+          echo "============================================================"
 
-    stageSafe(script, 'Prepare Run Context') {
-        // This file is NOT a Scheduled Task. It is just a context file read by your runner BAT.
-        // Keep it in the fixed location so the Task Scheduler always finds it.
-        def contextFile = 'D:\\Projects\\eMatchStarters\\run-context.properties'
-
-        def workspacePath = script.pwd()
-        def projectFileAbs = Paths.get(workspacePath, cfg.projectFileName).toString()
-
-        def content = []
-        content << "WORKSPACE=${workspacePath}"
-        content << "PROJECT_FILE=${projectFileAbs}"
-        content << "PROJECT_FILE_NAME=${cfg.projectFileName}"
-        content << "DEFAULT_TIMEOUT_MINUTES=${cfg.defaultTimeoutMinutes ?: 30}"
-
-        // We only run 1 asset per job in this pipeline (Archive Mode). If you later add more, we can loop.
-        def asset = cfg.assets[0]
-        content << "ASSET_NAME=${asset.name}"
-        content << "ASSET_TYPE=${asset.type}"
-        content << "COLLECTION_PATH=${asset.path}"
-        content << "ASSET_TIMEOUT_MINUTES=${asset.timeoutMinutes ?: (cfg.defaultTimeoutMinutes ?: 30)}"
-
-        script.writeFile file: contextFile, text: content.join('\r\n') + '\r\n'
-        script.echo("✅ run-context.properties written: ${contextFile}")
-    }
-
-    stageSafe(script, cfg.executionStageName) {
-
-        cfg.assets.each { asset ->
-
-            stageSafe(script, "Run - ${asset.name}") {
-
-                banner(script, "START ASSET: ${asset.name}")
-                script.echo("TASK: ${cfg.desktopRunnerTask}")
-
-                // Start WinAppDriver task
-                runTask(script, cfg.winDriverTask)
-
-                // Start Desktop runner task
-                runTask(script, cfg.desktopRunnerTask)
-
-                // Wait the Desktop runner to finish (Status becomes Ready)
-                waitTaskFinish(script, cfg.desktopRunnerTask, (asset.timeoutMinutes ?: (cfg.defaultTimeoutMinutes ?: 30)))
-
-                // Stop WinAppDriver task
-                endTask(script, cfg.winDriverTask)
-            }
-        }
-    }
-
-    stageSafe(script, 'Collect Reports') {
-
-        // Try common patterns. Your project sometimes creates nested folders like "Archive Mode@2".
-        def junitFiles = script.findFiles(glob: '**/Reports/**/JUnit_Report.xml')
-        def anyReports = script.findFiles(glob: '**/Reports/**/*')
-
-        if (junitFiles && junitFiles.size() > 0) {
-            script.echo("✅ JUnit reports found: ${junitFiles.size()}")
-        } else {
-            script.echo("⚠️ No JUnit_Report.xml found under **/Reports/**")
+          bat """
+            @echo off
+            if not exist "D:\\\\Projects\\\\eMatchStarters\\\\run-ematch-command.bat" (
+              echo [ERROR] Missing: D:\\Projects\\eMatchStarters\\run-ematch-command.bat
+              exit /b 2
+            )
+            schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul || (echo [ERROR] Scheduled task not found: ${CFG.winDriverTask} & exit /b 2)
+            schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul || (echo [ERROR] Scheduled task not found: ${CFG.desktopTask} & exit /b 2)
+            echo [OK] Support files and scheduled tasks found
+          """
         }
 
-        // Publish results (won't fail the build if empty)
-        script.catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-            script.junit allowEmptyResults: true, testResults: '**/Reports/**/JUnit_Report.xml'
+        stage('Prepare Run Context') {
+          def ws = pwd()
+          def reportFolderAbs = "${ws}\\${CFG.reportFolderRel}"
+
+          def content = """WORKSPACE=${ws}
+PROJECT_FILE=${CFG.projectFile}
+COLLECTION_PATH=${CFG.collectionPath}
+REPORT_FOLDER=${reportFolderAbs}
+"""
+
+          writeFile file: 'run-context.properties.tmp', text: content
+
+          bat """
+            @echo off
+            copy /Y "run-context.properties.tmp" "${CFG.contextFile}" >nul
+            echo [OK] run-context.properties written: ${CFG.contextFile}
+          """
         }
 
-        // Archive whatever exists (won't fail the build if empty)
-        script.catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-            script.archiveArtifacts allowEmptyArchive: true, artifacts: '**/Reports/**/*'
+        stage('Run - Archive Mode Collection') {
+          echo "============================================================"
+          echo "START ASSET: Archive Mode Collection"
+          echo "TASK: ${CFG.desktopTask}"
+          echo "============================================================"
+
+          bat """
+            @echo off
+            schtasks /run /tn "${CFG.winDriverTask}"
+            if errorlevel 1 exit /b 10
+
+            schtasks /run /tn "${CFG.desktopTask}"
+            if errorlevel 1 exit /b 11
+
+            :loop
+            for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
+                if /I "%%f"=="Running" (
+                    ping -n 6 localhost >nul 2>nul
+                    goto loop
+                )
+            )
+
+            schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
+            exit /b 0
+          """
         }
 
-        if (!anyReports || anyReports.size() == 0) {
-            script.echo('⚠️ Reports folder not found in workspace. That means the Scheduled Task is generating reports somewhere else.')
-            script.echo('📌 Next action: open the Scheduled Task action and confirm the "Start in" (working directory) points to the Jenkins workspace before running katalonc.')
+        stage('Collect Reports') {
+          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
+          }
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            archiveArtifacts allowEmptyArchive: true, artifacts: 'Reports/**/*'
+          }
+
+          def exitFile = "${pwd()}\\Reports\\_jenkins_task_exitcode.txt"
+          if (fileExists(exitFile)) {
+            def rc = readFile(exitFile).trim()
+            echo "Desktop task exit code: ${rc}"
+          } else {
+            echo "Desktop task exit code file not found: ${exitFile}"
+          }
         }
-    }
 
-    stageSafe(script, 'Trigger Next Job') {
-        def nextJob = (cfg.nextJobName ?: '').trim()
-        if (nextJob.length() > 0) {
-            script.echo("Triggering next Jenkins job: ${nextJob}")
-            script.build job: nextJob, wait: false
-        } else {
-            script.echo('Next job is empty. Skipping trigger.')
+        stage('Trigger Next Job') {
+          echo "Triggering next Jenkins job: ${CFG.nextJobName}"
+          build job: CFG.nextJobName, wait: false
         }
+      }
     }
+  }
 }
 
-private void banner(script, String title) {
-    script.echo('============================================================')
-    script.echo(title)
-    script.echo('============================================================')
-}
-
-private void stageSafe(script, String name, Closure body) {
-    script.stage(name) {
-        body.call()
-    }
-}
-
-private void assertNotBlank(script, Object value, String fieldName) {
-    def v = value == null ? '' : value.toString().trim()
-    if (v.length() == 0) {
-        script.error("Missing required config: ${fieldName}")
-    }
-}
-
-private void runTask(script, String taskName) {
-    def tn = normalizeTaskName(taskName)
-    script.bat """
-        @echo off
-        schtasks /run /tn "${tn}"
-        exit /b %errorlevel%
-    """.stripIndent()
-    script.echo("SUCCESS: Attempted to run the scheduled task \"${tn}\".")
-}
-
-private void endTask(script, String taskName) {
-    def tn = normalizeTaskName(taskName)
-    script.bat """
-        @echo off
-        schtasks /end /tn "${tn}"
-        exit /b 0
-    """.stripIndent()
-    script.echo("STOPPING TASK: ${tn}")
-}
-
-private void waitTaskFinish(script, String taskName, int timeoutMinutes) {
-    def tn = normalizeTaskName(taskName)
-
-    script.echo("WAITING DESKTOP TASK TO FINISH: ${tn}")
-
-    // Poll status until "Ready" (or not Running)
-    // Timeout implemented in minutes
-    def maxLoops = Math.max(1, (timeoutMinutes * 60) / 6)
-
-    script.bat """
-        @echo off
-        setlocal EnableExtensions EnableDelayedExpansion
-
-        set "TASK_NAME=${tn}"
-        set /a MAX_LOOPS=${maxLoops}
-        set /a COUNT=0
-
-        :loop
-        set /a COUNT+=1
-        if !COUNT! GTR !MAX_LOOPS! (
-            echo ERROR: Timeout waiting task to finish: %TASK_NAME%
-            exit /b 1
-        )
-
-        for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "%TASK_NAME%" /fo list ^| find "Status:"') do (
-            set "STATUS=%%f"
-        )
-
-        if /i "!STATUS!"=="Running" (
-            ping -n 6 127.0.0.1 >nul 2>nul
-            goto loop
-        )
-
-        echo DESKTOP TASK FINISHED. STATUS=!STATUS!
-        exit /b 0
-    """.stripIndent()
-}
-
-private String normalizeTaskName(String taskName) {
-    // Accept both:
-    // startWinDriver
-    // \\eMatch Automation\\RunEMatchDesktop
-    def t = taskName.trim()
-    if (t.startsWith('\\\\')) {
-        t = t.substring(1)
-    }
-    return t
-}
-
-return this
-✅
 
 
 
-
-
-✅ FILE 1: JenkinsPipelines/Jenkinsfile_ArchiveMode.groovy (INTEIRO)
 /*
- * Responsibility:
- * Dedicated Jenkins pipeline for Archive Mode build.
- * This build triggers the next job when successful.
- */
+  Passerelle Bilan - SIMPLE PIPELINE
+  - Same runner + same scheduled tasks
+  - Only changes collection path
+*/
 
-def PIPELINE_CONFIG = [
-    agentLabel             : 'GI5_SWDCFRNXGI55817',
+def CFG = [
+  agentLabel: 'GI5_SWDCFRNXGI55817',
 
-    pipelineTimeoutMinutes : 180,
-    defaultTimeoutMinutes  : 30,
+  projectFile: 'eMatch POC.prj',
+  collectionPath: 'Test Suites/Passerelle Bilan/Passerelle Bilan Collection',
 
-    executionStageName     : 'Run Test Assets',
-    projectFileName        : 'eMatch POC.prj',
+  winDriverTask: 'startWinDriver',
+  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
 
-    // Katalon is executed by the Scheduled Task, but we keep it here for context if needed later
-    katalonExe             : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
+  reportFolderRel: 'Reports',
 
-    // Scheduled Tasks
-    winDriverTask          : 'startWinDriver',
-    desktopRunnerTask      : '\\eMatch Automation\\RunEMatchDesktop',
-
-    // Optional: next job to trigger at the end
-    nextJobName            : 'Passerelle Bilan',
-
-    // What to run
-    assets : [
-        [
-            name          : 'Archive Mode Collection',
-            type          : 'COLLECTION',
-            path          : 'Test Suites/Archive Mode/Archive Mode Collection',
-            timeoutMinutes: 30
-        ]
-    ]
+  nextJobName: '' // deixa vazio se não quiser disparar mais nada
 ]
 
-node(PIPELINE_CONFIG.agentLabel) {
-    timestamps {
-        ansiColor('xterm') {
-            timeout(time: PIPELINE_CONFIG.pipelineTimeoutMinutes, unit: 'MINUTES') {
+node(CFG.agentLabel) {
+  timestamps {
+    ansiColor('xterm') {
+      timeout(time: 180, unit: 'MINUTES') {
 
-                stage('Checkout') {
-                    checkout scm
-                }
-
-                def runner = load('jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy')
-                runner.run(this, PIPELINE_CONFIG)
-            }
-        }
-    }
-}
-✅ FILE 2: jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy (INTEIRO)
-import java.nio.file.Paths
-
-def run(script, cfg) {
-
-    stageSafe(script, 'Validate Environment') {
-        script.echo('------------------------------------------------------------')
-        script.echo('VALIDATING TOOLS AND SUPPORT FILES')
-        script.echo('------------------------------------------------------------')
-
-        assertNotBlank(script, cfg.winDriverTask, 'winDriverTask')
-        assertNotBlank(script, cfg.desktopRunnerTask, 'desktopRunnerTask')
-        assertNotBlank(script, cfg.projectFileName, 'projectFileName')
-        assertNotBlank(script, cfg.executionStageName, 'executionStageName')
-
-        if (!cfg.assets || cfg.assets.size() == 0) {
-            script.error('No assets configured to run.')
+        stage('Checkout') {
+          checkout scm
         }
 
-        script.echo('[OK] Support files and scheduled tasks found')
-        script.echo('------------------------------------------------------------')
-    }
-
-    stageSafe(script, 'Prepare Run Context') {
-        // This file is NOT a Scheduled Task. It is just a context file read by your runner BAT.
-        // Keep it in the fixed location so the Task Scheduler always finds it.
-        def contextFile = 'D:\\Projects\\eMatchStarters\\run-context.properties'
-
-        def workspacePath = script.pwd()
-        def projectFileAbs = Paths.get(workspacePath, cfg.projectFileName).toString()
-
-        def content = []
-        content << "WORKSPACE=${workspacePath}"
-        content << "PROJECT_FILE=${projectFileAbs}"
-        content << "PROJECT_FILE_NAME=${cfg.projectFileName}"
-        content << "DEFAULT_TIMEOUT_MINUTES=${cfg.defaultTimeoutMinutes ?: 30}"
-
-        // We only run 1 asset per job in this pipeline (Archive Mode). If you later add more, we can loop.
-        def asset = cfg.assets[0]
-        content << "ASSET_NAME=${asset.name}"
-        content << "ASSET_TYPE=${asset.type}"
-        content << "COLLECTION_PATH=${asset.path}"
-        content << "ASSET_TIMEOUT_MINUTES=${asset.timeoutMinutes ?: (cfg.defaultTimeoutMinutes ?: 30)}"
-
-        script.writeFile file: contextFile, text: content.join('\r\n') + '\r\n'
-        script.echo("✅ run-context.properties written: ${contextFile}")
-    }
-
-    stageSafe(script, cfg.executionStageName) {
-
-        cfg.assets.each { asset ->
-
-            stageSafe(script, "Run - ${asset.name}") {
-
-                banner(script, "START ASSET: ${asset.name}")
-                script.echo("TASK: ${cfg.desktopRunnerTask}")
-
-                // Start WinAppDriver task
-                runTask(script, cfg.winDriverTask)
-
-                // Start Desktop runner task
-                runTask(script, cfg.desktopRunnerTask)
-
-                // Wait the Desktop runner to finish (Status becomes Ready)
-                waitTaskFinish(script, cfg.desktopRunnerTask, (asset.timeoutMinutes ?: (cfg.defaultTimeoutMinutes ?: 30)))
-
-                // Stop WinAppDriver task
-                endTask(script, cfg.winDriverTask)
-            }
-        }
-    }
-
-    stageSafe(script, 'Collect Reports') {
-
-        // Try common patterns. Your project sometimes creates nested folders like "Archive Mode@2".
-        def junitFiles = script.findFiles(glob: '**/Reports/**/JUnit_Report.xml')
-        def anyReports = script.findFiles(glob: '**/Reports/**/*')
-
-        if (junitFiles && junitFiles.size() > 0) {
-            script.echo("✅ JUnit reports found: ${junitFiles.size()}")
-        } else {
-            script.echo("⚠️ No JUnit_Report.xml found under **/Reports/**")
+        stage('Validate') {
+          bat """
+            @echo off
+            schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul || (echo [ERROR] Scheduled task not found: ${CFG.winDriverTask} & exit /b 2)
+            schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul || (echo [ERROR] Scheduled task not found: ${CFG.desktopTask} & exit /b 2)
+            echo [OK] Support files and scheduled tasks found
+          """
         }
 
-        // Publish results (won't fail the build if empty)
-        script.catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-            script.junit allowEmptyResults: true, testResults: '**/Reports/**/JUnit_Report.xml'
+        stage('Prepare Run Context') {
+          def ws = pwd()
+          def reportFolderAbs = "${ws}\\${CFG.reportFolderRel}"
+
+          def content = """WORKSPACE=${ws}
+PROJECT_FILE=${CFG.projectFile}
+COLLECTION_PATH=${CFG.collectionPath}
+REPORT_FOLDER=${reportFolderAbs}
+"""
+
+          writeFile file: 'run-context.properties.tmp', text: content
+
+          bat """
+            @echo off
+            copy /Y "run-context.properties.tmp" "${CFG.contextFile}" >nul
+            echo [OK] run-context.properties written: ${CFG.contextFile}
+          """
         }
 
-        // Archive whatever exists (won't fail the build if empty)
-        script.catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') {
-            script.archiveArtifacts allowEmptyArchive: true, artifacts: '**/Reports/**/*'
+        stage('Run - Passerelle Bilan Collection') {
+          echo "============================================================"
+          echo "START ASSET: Passerelle Bilan Collection"
+          echo "TASK: ${CFG.desktopTask}"
+          echo "============================================================"
+
+          bat """
+            @echo off
+            schtasks /run /tn "${CFG.winDriverTask}"
+            if errorlevel 1 exit /b 10
+
+            schtasks /run /tn "${CFG.desktopTask}"
+            if errorlevel 1 exit /b 11
+
+            :loop
+            for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
+                if /I "%%f"=="Running" (
+                    ping -n 6 localhost >nul 2>nul
+                    goto loop
+                )
+            )
+
+            schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
+            exit /b 0
+          """
         }
 
-        if (!anyReports || anyReports.size() == 0) {
-            script.echo('⚠️ Reports folder not found in workspace. That means the Scheduled Task is generating reports somewhere else.')
-            script.echo('📌 Next action: open the Scheduled Task action and confirm the "Start in" (working directory) points to the Jenkins workspace before running katalonc.')
+        stage('Collect Reports') {
+          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
+          }
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            archiveArtifacts allowEmptyArchive: true, artifacts: 'Reports/**/*'
+          }
+
+          def exitFile = "${pwd()}\\Reports\\_jenkins_task_exitcode.txt"
+          if (fileExists(exitFile)) {
+            def rc = readFile(exitFile).trim()
+            echo "Desktop task exit code: ${rc}"
+          } else {
+            echo "Desktop task exit code file not found: ${exitFile}"
+          }
         }
-    }
 
-    stageSafe(script, 'Trigger Next Job') {
-        def nextJob = (cfg.nextJobName ?: '').trim()
-        if (nextJob.length() > 0) {
-            script.echo("Triggering next Jenkins job: ${nextJob}")
-            script.build job: nextJob, wait: false
-        } else {
-            script.echo('Next job is empty. Skipping trigger.')
+        stage('Trigger Next Job') {
+          if (CFG.nextJobName?.trim()) {
+            echo "Triggering next Jenkins job: ${CFG.nextJobName}"
+            build job: CFG.nextJobName, wait: false
+          } else {
+            echo "Next job disabled"
+          }
         }
+      }
     }
+  }
 }
 
-private void banner(script, String title) {
-    script.echo('============================================================')
-    script.echo(title)
-    script.echo('============================================================')
-}
 
-private void stageSafe(script, String name, Closure body) {
-    script.stage(name) {
-        body.call()
-    }
-}
-
-private void assertNotBlank(script, Object value, String fieldName) {
-    def v = value == null ? '' : value.toString().trim()
-    if (v.length() == 0) {
-        script.error("Missing required config: ${fieldName}")
-    }
-}
-
-private void runTask(script, String taskName) {
-    def tn = normalizeTaskName(taskName)
-    script.bat """
-        @echo off
-        schtasks /run /tn "${tn}"
-        exit /b %errorlevel%
-    """.stripIndent()
-    script.echo("SUCCESS: Attempted to run the scheduled task \"${tn}\".")
-}
-
-private void endTask(script, String taskName) {
-    def tn = normalizeTaskName(taskName)
-    script.bat """
-        @echo off
-        schtasks /end /tn "${tn}"
-        exit /b 0
-    """.stripIndent()
-    script.echo("STOPPING TASK: ${tn}")
-}
-
-private void waitTaskFinish(script, String taskName, int timeoutMinutes) {
-    def tn = normalizeTaskName(taskName)
-
-    script.echo("WAITING DESKTOP TASK TO FINISH: ${tn}")
-
-    // Poll status until "Ready" (or not Running)
-    // Timeout implemented in minutes
-    def maxLoops = Math.max(1, (timeoutMinutes * 60) / 6)
-
-    script.bat """
-        @echo off
-        setlocal EnableExtensions EnableDelayedExpansion
-
-        set "TASK_NAME=${tn}"
-        set /a MAX_LOOPS=${maxLoops}
-        set /a COUNT=0
-
-        :loop
-        set /a COUNT+=1
-        if !COUNT! GTR !MAX_LOOPS! (
-            echo ERROR: Timeout waiting task to finish: %TASK_NAME%
-            exit /b 1
-        )
-
-        for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "%TASK_NAME%" /fo list ^| find "Status:"') do (
-            set "STATUS=%%f"
-        )
-
-        if /i "!STATUS!"=="Running" (
-            ping -n 6 127.0.0.1 >nul 2>nul
-            goto loop
-        )
-
-        echo DESKTOP TASK FINISHED. STATUS=!STATUS!
-        exit /b 0
-    """.stripIndent()
-}
-
-private String normalizeTaskName(String taskName) {
-    // Accept both:
-    // startWinDriver
-    // \\eMatch Automation\\RunEMatchDesktop
-    def t = taskName.trim()
-    if (t.startsWith('\\\\')) {
-        t = t.substring(1)
-    }
-    return t
-}
-
-return this
-✅
