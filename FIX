@@ -1,21 +1,351 @@
+✅ FILE 1: Jenkinsfile_ArchiveMode.groovy (INTEIRO)
+/*
+  Archive Mode - Jenkins Pipeline
+  Strategy:
+  - Checkout repo
+  - Write run-context.properties to D:\Projects\eMatchStarters\run-context.properties
+  - Trigger scheduled tasks:
+      1) startWinDriver
+      2) \eMatch Automation\RunEMatchDesktop
+  - Wait until desktop task finishes (query schtasks status)
+  - Collect reports from workspace Reports/
+*/
+
+def CFG = [
+  agentLabel: 'GI5_SWDCFRNXGI55817',
+
+  // Katalon engine exe (GUI-capable; task runs in interactive session)
+  katalonExe: 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+
+  // Katalon project file inside workspace
+  projectFile: 'eMatch POC.prj',
+
+  // Suite collection path for Archive Mode
+  suiteCollectionPath: 'Test Suites/Archive Mode/Archive Mode Collection',
+
+  // Scheduled tasks
+  winDriverTask: 'startWinDriver',
+  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
+
+  // Where the task runner reads the context
+  runContextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
+
+  // Timeouts
+  pipelineTimeoutMinutes: 180,
+  desktopTaskTimeoutMinutes: 120
+]
+
+node(CFG.agentLabel) {
+  timestamps {
+    ansiColor('xterm') {
+      timeout(time: CFG.pipelineTimeoutMinutes, unit: 'MINUTES') {
+        stage('Checkout') {
+          checkout scm
+        }
+
+        stage('Validate Tools and Scheduled Tasks') {
+          echo "============================================================"
+          echo "VALIDATING TOOLS AND SUPPORT FILES"
+          echo "============================================================"
+
+          bat(label: 'Check schtasks', script: """
+            @echo off
+            schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul
+            if %errorlevel% neq 0 (
+              echo [ERROR] Task not found: ${CFG.winDriverTask}
+              exit /b 2
+            )
+            schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul
+            if %errorlevel% neq 0 (
+              echo [ERROR] Task not found: ${CFG.desktopTask}
+              exit /b 3
+            )
+            echo [OK] Support files and scheduled tasks found
+          """)
+        }
+
+        stage('Prepare Run Context') {
+          def ws = pwd()
+          def reportsDir = "${ws}\\Reports"
+          def logsDir = "D:\\Projects\\eMatchStarters\\logs"
+
+          def props = []
+          props << "WORKSPACE=${ws}"
+          props << "PROJECT_FILE=${CFG.projectFile}"
+          props << "KATALON_EXE=${CFG.katalonExe}"
+          props << "COLLECTION_PATH=${CFG.suiteCollectionPath}"
+          props << "REPORTS_DIR=${reportsDir}"
+          props << "LOG_DIR=${logsDir}"
+          props << "BROWSER_TYPE=Windows"
+          props << "RETRY=0"
+
+          writeFile(file: CFG.runContextFile, text: props.join("\r\n") + "\r\n")
+
+          echo "✅ run-context.properties written: ${CFG.runContextFile}"
+          echo "📌 WORKSPACE: ${ws}"
+          echo "📌 COLLECTION: ${CFG.suiteCollectionPath}"
+        }
+
+        stage('Run Archive Mode') {
+          echo "============================================================"
+          echo "START ASSET: Archive Mode Collection"
+          echo "TASK: ${CFG.desktopTask}"
+          echo "============================================================"
+
+          // Ensure previous exit code file is cleared
+          bat(label: 'Cleanup previous exitcode', script: """
+            @echo off
+            set WS=${pwd()}
+            if exist "%WS%\\Reports\\_jenkins_task_exitcode.txt" del /f /q "%WS%\\Reports\\_jenkins_task_exitcode.txt"
+          """)
+
+          // Start WinAppDriver
+          bat(label: 'Start WinDriver', script: """
+            @echo off
+            schtasks /run /tn "${CFG.winDriverTask}"
+            if %errorlevel% neq 0 exit /b %errorlevel%
+          """)
+
+          // Start desktop task
+          bat(label: 'Start Desktop Task', script: """
+            @echo off
+            schtasks /run /tn "${CFG.desktopTask}"
+            if %errorlevel% neq 0 exit /b %errorlevel%
+          """)
+
+          // Wait until task finishes OR timeout
+          timeout(time: CFG.desktopTaskTimeoutMinutes, unit: 'MINUTES') {
+            bat(label: 'Wait Desktop Task', script: """
+              @echo off
+              :loop
+              for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
+                if /I "%%f"=="Running" (
+                  ping -n 6 localhost >nul 2>nul
+                  goto loop
+                )
+              )
+              echo Desktop task finished
+            """)
+          }
+
+          // Stop WinAppDriver task (best effort)
+          bat(label: 'Stop WinDriver', script: """
+            @echo off
+            schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
+            exit /b 0
+          """)
+        }
+
+        stage('Collect Reports') {
+          def ws = pwd()
+          def reportsRoot = "${ws}\\Reports"
+
+          // Read exit code if created by the runner .bat
+          def exitFile = "${reportsRoot}\\_jenkins_task_exitcode.txt"
+          if (fileExists(exitFile)) {
+            def txt = readFile(exitFile).trim()
+            echo "📌 Desktop task exit code: ${txt}"
+            if (txt.isInteger() && txt.toInteger() != 0) {
+              currentBuild.result = 'UNSTABLE'
+              echo "⚠️ Katalon returned non-zero exit code: ${txt}"
+            }
+          } else {
+            currentBuild.result = 'UNSTABLE'
+            echo "⚠️ Exit code file not found: ${exitFile}"
+          }
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            junit(testResults: 'Reports/**/JUnit_Report.xml', allowEmptyResults: true)
+          }
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            archiveArtifacts(artifacts: 'Reports/**/*', allowEmptyArchive: true, fingerprint: false)
+          }
+        }
+
+        stage('Trigger Next Job') {
+          echo "▶️ Triggering next Jenkins job: Passerelle Bilan"
+          build job: 'GI5/eMatch_Regression/Passerelle Bilan', wait: false
+        }
+      }
+    }
+  }
+}
+✅ FILE 2: Jenkinsfile_PasserelleBilan.groovy (INTEIRO)
+
+Ajuste só o suiteCollectionPath para o collection correto do Passerelle Bilan.
+
+/*
+  Passerelle Bilan - Jenkins Pipeline
+  Same orchestrator strategy as Archive Mode.
+*/
+
+def CFG = [
+  agentLabel: 'GI5_SWDCFRNXGI55817',
+
+  katalonExe: 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+  projectFile: 'eMatch POC.prj',
+
+  suiteCollectionPath: 'Test Suites/PasserelleBilan/Passerelle Bilan H Bilan French IFRS Collection',
+
+  winDriverTask: 'startWinDriver',
+  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
+
+  runContextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
+
+  pipelineTimeoutMinutes: 240,
+  desktopTaskTimeoutMinutes: 180
+]
+
+node(CFG.agentLabel) {
+  timestamps {
+    ansiColor('xterm') {
+      timeout(time: CFG.pipelineTimeoutMinutes, unit: 'MINUTES') {
+        stage('Checkout') {
+          checkout scm
+        }
+
+        stage('Validate Tools and Scheduled Tasks') {
+          echo "============================================================"
+          echo "VALIDATING TOOLS AND SUPPORT FILES"
+          echo "============================================================"
+
+          bat(label: 'Check schtasks', script: """
+            @echo off
+            schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul
+            if %errorlevel% neq 0 (
+              echo [ERROR] Task not found: ${CFG.winDriverTask}
+              exit /b 2
+            )
+            schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul
+            if %errorlevel% neq 0 (
+              echo [ERROR] Task not found: ${CFG.desktopTask}
+              exit /b 3
+            )
+            echo [OK] Support files and scheduled tasks found
+          """)
+        }
+
+        stage('Prepare Run Context') {
+          def ws = pwd()
+          def reportsDir = "${ws}\\Reports"
+          def logsDir = "D:\\Projects\\eMatchStarters\\logs"
+
+          def props = []
+          props << "WORKSPACE=${ws}"
+          props << "PROJECT_FILE=${CFG.projectFile}"
+          props << "KATALON_EXE=${CFG.katalonExe}"
+          props << "COLLECTION_PATH=${CFG.suiteCollectionPath}"
+          props << "REPORTS_DIR=${reportsDir}"
+          props << "LOG_DIR=${logsDir}"
+          props << "BROWSER_TYPE=Windows"
+          props << "RETRY=0"
+
+          writeFile(file: CFG.runContextFile, text: props.join("\r\n") + "\r\n")
+
+          echo "✅ run-context.properties written: ${CFG.runContextFile}"
+          echo "📌 WORKSPACE: ${ws}"
+          echo "📌 COLLECTION: ${CFG.suiteCollectionPath}"
+        }
+
+        stage('Run Passerelle Bilan') {
+          echo "============================================================"
+          echo "START ASSET: Passerelle Bilan Collection"
+          echo "TASK: ${CFG.desktopTask}"
+          echo "============================================================"
+
+          bat(label: 'Cleanup previous exitcode', script: """
+            @echo off
+            set WS=${pwd()}
+            if exist "%WS%\\Reports\\_jenkins_task_exitcode.txt" del /f /q "%WS%\\Reports\\_jenkins_task_exitcode.txt"
+          """)
+
+          bat(label: 'Start WinDriver', script: """
+            @echo off
+            schtasks /run /tn "${CFG.winDriverTask}"
+            if %errorlevel% neq 0 exit /b %errorlevel%
+          """)
+
+          bat(label: 'Start Desktop Task', script: """
+            @echo off
+            schtasks /run /tn "${CFG.desktopTask}"
+            if %errorlevel% neq 0 exit /b %errorlevel%
+          """)
+
+          timeout(time: CFG.desktopTaskTimeoutMinutes, unit: 'MINUTES') {
+            bat(label: 'Wait Desktop Task', script: """
+              @echo off
+              :loop
+              for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
+                if /I "%%f"=="Running" (
+                  ping -n 6 localhost >nul 2>nul
+                  goto loop
+                )
+              )
+              echo Desktop task finished
+            """)
+          }
+
+          bat(label: 'Stop WinDriver', script: """
+            @echo off
+            schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
+            exit /b 0
+          """)
+        }
+
+        stage('Collect Reports') {
+          def ws = pwd()
+          def reportsRoot = "${ws}\\Reports"
+          def exitFile = "${reportsRoot}\\_jenkins_task_exitcode.txt"
+
+          if (fileExists(exitFile)) {
+            def txt = readFile(exitFile).trim()
+            echo "📌 Desktop task exit code: ${txt}"
+            if (txt.isInteger() && txt.toInteger() != 0) {
+              currentBuild.result = 'UNSTABLE'
+              echo "⚠️ Katalon returned non-zero exit code: ${txt}"
+            }
+          } else {
+            currentBuild.result = 'UNSTABLE'
+            echo "⚠️ Exit code file not found: ${exitFile}"
+          }
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            junit(testResults: 'Reports/**/JUnit_Report.xml', allowEmptyResults: true)
+          }
+
+          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            archiveArtifacts(artifacts: 'Reports/**/*', allowEmptyArchive: true, fingerprint: false)
+          }
+        }
+      }
+    }
+  }
+}
+✅ FILE 3: D:\Projects\eMatchStarters\run-ematch-command.bat (INTEIRO)
+
+🎯 Esse é o file que faz “igual antes”: abre o app e executa na sessão interativa porque ele roda via Task Scheduler.
+
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-rem ============================================================
-rem  eMatch Desktop Runner (Triggered by Windows Task Scheduler)
-rem  Reads: D:\Projects\eMatchStarters\run-context.properties
-rem  Writes: EXITCODE_FILE (configured in properties)
-rem ============================================================
+rem =========================================================
+rem eMatch Desktop Runner (Task Scheduler entrypoint)
+rem Reads: D:\Projects\eMatchStarters\run-context.properties
+rem Runs Katalon collection and writes:
+rem   - %REPORTS_DIR%\_jenkins_task_exitcode.txt
+rem   - Logs under %LOG_DIR%
+rem =========================================================
 
-set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+set "CTX=D:\Projects\eMatchStarters\run-context.properties"
 
-if not exist "%CTX_FILE%" (
-  echo [ERROR] Context file not found: %CTX_FILE%
-  exit /b 99
+if not exist "%CTX%" (
+  echo [ERROR] run-context.properties not found: %CTX%
+  exit /b 10
 )
 
-rem --- Load properties (key=value) into environment variables ---
-for /f "usebackq tokens=1* delims==" %%A in ("%CTX_FILE%") do (
+rem --- Read properties file ---
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX%") do (
   set "K=%%A"
   set "V=%%B"
   if not "!K!"=="" (
@@ -23,319 +353,81 @@ for /f "usebackq tokens=1* delims==" %%A in ("%CTX_FILE%") do (
   )
 )
 
-rem --- Mandatory fields validation ---
+rem --- Validate required keys ---
 if "%WORKSPACE%"=="" (
-  echo [ERROR] WORKSPACE not set in %CTX_FILE%
-  exit /b 98
+  echo [ERROR] WORKSPACE missing in %CTX%
+  exit /b 11
+)
+if "%PROJECT_FILE%"=="" (
+  echo [ERROR] PROJECT_FILE missing in %CTX%
+  exit /b 12
 )
 if "%KATALON_EXE%"=="" (
-  echo [ERROR] KATALON_EXE not set in %CTX_FILE%
-  exit /b 97
+  echo [ERROR] KATALON_EXE missing in %CTX%
+  exit /b 13
 )
-if "%PROJECT_PATH%"=="" (
-  echo [ERROR] PROJECT_PATH not set in %CTX_FILE%
-  exit /b 96
+if "%COLLECTION_PATH%"=="" (
+  echo [ERROR] COLLECTION_PATH missing in %CTX%
+  exit /b 14
 )
-if "%TEST_COLLECTION_PATH%"=="" (
-  echo [ERROR] TEST_COLLECTION_PATH not set in %CTX_FILE%
-  exit /b 95
-)
-if "%BROWSER_TYPE%"=="" (
-  echo [ERROR] BROWSER_TYPE not set in %CTX_FILE%
-  exit /b 94
-)
-if "%REPORT_FOLDER%"=="" (
-  echo [ERROR] REPORT_FOLDER not set in %CTX_FILE%
-  exit /b 93
-)
-if "%EXITCODE_FILE%"=="" (
-  echo [ERROR] EXITCODE_FILE not set in %CTX_FILE%
-  exit /b 92
+if "%REPORTS_DIR%"=="" (
+  echo [ERROR] REPORTS_DIR missing in %CTX%
+  exit /b 15
 )
 
-rem --- Ensure report folder exists ---
-if not exist "%REPORT_FOLDER%" (
-  mkdir "%REPORT_FOLDER%" >nul 2>nul
-)
+if "%BROWSER_TYPE%"=="" set "BROWSER_TYPE=Windows"
+if "%RETRY%"=="" set "RETRY=0"
+if "%LOG_DIR%"=="" set "LOG_DIR=D:\Projects\eMatchStarters\logs"
 
-rem --- Move to workspace so relative paths work ---
-cd /d "%WORKSPACE%"
+rem --- Ensure folders ---
+if not exist "%REPORTS_DIR%" mkdir "%REPORTS_DIR%" >nul 2>nul
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>nul
 
-echo ============================================================
-echo [INFO] WORKSPACE           = %WORKSPACE%
-echo [INFO] PROJECT_PATH        = %PROJECT_PATH%
-echo [INFO] TEST_COLLECTION     = %TEST_COLLECTION_PATH%
-echo [INFO] BROWSER_TYPE        = %BROWSER_TYPE%
-echo [INFO] REPORT_FOLDER       = %REPORT_FOLDER%
-echo [INFO] EXITCODE_FILE       = %EXITCODE_FILE%
-echo ============================================================
+rem --- Build timestamp ---
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%i"
 
-rem --- Execute Katalon ---
+set "LOG_FILE=%LOG_DIR%\katalon_%TS%.log"
+set "EXIT_FILE=%REPORTS_DIR%\_jenkins_task_exitcode.txt"
+
+rem --- Clear previous exit file ---
+if exist "%EXIT_FILE%" del /f /q "%EXIT_FILE%" >nul 2>nul
+
+set "PROJECT_PATH=%WORKSPACE%\%PROJECT_FILE%"
+
+echo ================================================================>>"%LOG_FILE%"
+echo START KATALON %TS%>>"%LOG_FILE%"
+echo WORKSPACE=%WORKSPACE%>>"%LOG_FILE%"
+echo PROJECT_PATH=%PROJECT_PATH%>>"%LOG_FILE%"
+echo COLLECTION=%COLLECTION_PATH%>>"%LOG_FILE%"
+echo REPORTS_DIR=%REPORTS_DIR%>>"%LOG_FILE%"
+echo ================================================================>>"%LOG_FILE%"
+
+rem --- Run Katalon ---
+rem IMPORTANT:
+rem - This is console mode but it still runs in the interactive session (Task Scheduler)
+rem - Reports are forced to %REPORTS_DIR% so Jenkins can collect them
+
 "%KATALON_EXE%" ^
   -noSplash ^
   -runMode=console ^
-  -retry=0 ^
+  -retry=%RETRY% ^
   -projectPath="%PROJECT_PATH%" ^
-  -testSuiteCollectionPath="%TEST_COLLECTION_PATH%" ^
+  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
   -browserType="%BROWSER_TYPE%" ^
-  -reportFolder="%REPORT_FOLDER%"
+  -reportFolder="%REPORTS_DIR%" ^
+  -reportFileName="JUnit_Report" ^
+  -reportFormat="JUnit" ^
+  -consoleLog ^
+  > "%LOG_FILE%" 2>&1
 
 set "RC=%ERRORLEVEL%"
 
-rem --- Persist exit code for Jenkins to read ---
-rem (Jenkins uses this to know if the task really failed)
-echo %RC% > "%EXITCODE_FILE%"
+echo %RC%>"%EXIT_FILE%"
 
-echo ============================================================
-echo [INFO] Katalon finished with exit code: %RC%
-echo ============================================================
+echo ================================================================>>"%LOG_FILE%"
+echo END KATALON RC=%RC%>>"%LOG_FILE%"
+echo EXIT_FILE=%EXIT_FILE%>>"%LOG_FILE%"
+echo ================================================================>>"%LOG_FILE%"
 
 exit /b %RC%
-
-
-
-
-
-
-
-
-
-
-
-
-def CFG = [
-  agentLabel: 'GI5_SWDCFRNXGI55817',
-
-  katalonExe: 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
-
-  projectFileName: 'eMatch POC.prj',
-  testCollectionPath: 'Test Suites/Archive Mode/Archive Mode Collection',
-  browserType: 'Windows',
-
-  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
-
-  winDriverTask: 'startWinDriver',
-  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
-
-  nextJobName: 'Passerelle Bilan'
-]
-
-node(CFG.agentLabel) {
-  timestamps {
-    ansiColor('xterm') {
-
-      stage('Checkout') {
-        checkout scm
-      }
-
-      stage('Validate Scheduled Tasks') {
-        bat """
-          @echo off
-          echo ============================================================
-          echo VALIDATING TOOLS AND SUPPORT FILES
-          echo ============================================================
-          schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul
-          if errorlevel 1 (
-            echo [ERROR] Scheduled task not found: ${CFG.winDriverTask}
-            exit /b 1
-          )
-          schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul
-          if errorlevel 1 (
-            echo [ERROR] Scheduled task not found: ${CFG.desktopTask}
-            exit /b 1
-          )
-          echo [OK] Support files and scheduled tasks found
-          echo ============================================================
-        """
-      }
-
-      stage('Prepare Run Context') {
-        def wsPath = pwd()
-        def projectPath = "${wsPath}\\${CFG.projectFileName}"
-        def reportFolder = "${wsPath}\\Reports"
-        def exitCodeFile = "${wsPath}\\Reports\\_jenkins_task_exitcode.txt"
-
-        writeFile file: CFG.contextFile, text: """WORKSPACE=${wsPath}
-KATALON_EXE=${CFG.katalonExe}
-PROJECT_PATH=${projectPath}
-TEST_COLLECTION_PATH=${CFG.testCollectionPath}
-BROWSER_TYPE=${CFG.browserType}
-REPORT_FOLDER=${reportFolder}
-EXITCODE_FILE=${exitCodeFile}
-"""
-        echo "✅ run-context.properties written: ${CFG.contextFile}"
-      }
-
-      stage('Run - Archive Mode Collection') {
-        bat """
-          @echo off
-          echo ============================================================
-          echo START ASSET: Archive Mode Collection
-          echo TASK: ${CFG.desktopTask}
-          echo ============================================================
-
-          schtasks /run /tn "${CFG.winDriverTask}"
-          if errorlevel 1 exit /b 1
-
-          schtasks /run /tn "${CFG.desktopTask}"
-          if errorlevel 1 exit /b 1
-
-          :loop
-          for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
-              if "%%f"=="Running" (
-                  ping -n 6 localhost >nul 2>nul
-                  goto loop
-              )
-          )
-
-          schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
-          exit /b 0
-        """
-      }
-
-      stage('Collect Reports') {
-        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-
-          if (fileExists('Reports/_jenkins_task_exitcode.txt')) {
-            def exitCode = readFile('Reports/_jenkins_task_exitcode.txt').trim()
-            echo "📌 Desktop task exit code: ${exitCode}"
-          } else {
-            echo "⚠️ Desktop task exit code file not found: ${pwd()}\\Reports\\_jenkins_task_exitcode.txt"
-          }
-
-          if (!fileExists('Reports')) {
-            error("❌ Reports folder not found after execution. The scheduled task likely ran with a wrong PROJECT_PATH/WORKSPACE.")
-          }
-
-          junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'Reports/**/*'
-        }
-      }
-
-      stage('Trigger Next Job') {
-        echo "Triggering next Jenkins job: ${CFG.nextJobName}"
-        build job: CFG.nextJobName, wait: false
-      }
-    }
-  }
-}
-
-
-
-
-
-
-
-
-
-
-
-def CFG = [
-  agentLabel: 'GI5_SWDCFRNXGI55817',
-
-  katalonExe: 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
-
-  projectFileName: 'eMatch POC.prj',
-  testCollectionPath: 'Test Suites/PasserelleBilan/Passerelle Bilan H Bilan French IFRS Collection',
-  browserType: 'Windows',
-
-  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
-
-  winDriverTask: 'startWinDriver',
-  desktopTask: '\\eMatch Automation\\RunEMatchDesktop'
-]
-
-node(CFG.agentLabel) {
-  timestamps {
-    ansiColor('xterm') {
-
-      stage('Checkout') {
-        checkout scm
-      }
-
-      stage('Validate Scheduled Tasks') {
-        bat """
-          @echo off
-          echo ============================================================
-          echo VALIDATING TOOLS AND SUPPORT FILES
-          echo ============================================================
-          schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul
-          if errorlevel 1 (
-            echo [ERROR] Scheduled task not found: ${CFG.winDriverTask}
-            exit /b 1
-          )
-          schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul
-          if errorlevel 1 (
-            echo [ERROR] Scheduled task not found: ${CFG.desktopTask}
-            exit /b 1
-          )
-          echo [OK] Support files and scheduled tasks found
-          echo ============================================================
-        """
-      }
-
-      stage('Prepare Run Context') {
-        def wsPath = pwd()
-        def projectPath = "${wsPath}\\${CFG.projectFileName}"
-        def reportFolder = "${wsPath}\\Reports"
-        def exitCodeFile = "${wsPath}\\Reports\\_jenkins_task_exitcode.txt"
-
-        writeFile file: CFG.contextFile, text: """WORKSPACE=${wsPath}
-KATALON_EXE=${CFG.katalonExe}
-PROJECT_PATH=${projectPath}
-TEST_COLLECTION_PATH=${CFG.testCollectionPath}
-BROWSER_TYPE=${CFG.browserType}
-REPORT_FOLDER=${reportFolder}
-EXITCODE_FILE=${exitCodeFile}
-"""
-        echo "✅ run-context.properties written: ${CFG.contextFile}"
-      }
-
-      stage('Run - Passerelle Bilan Collection') {
-        bat """
-          @echo off
-          echo ============================================================
-          echo START ASSET: Passerelle Bilan Collection
-          echo TASK: ${CFG.desktopTask}
-          echo ============================================================
-
-          schtasks /run /tn "${CFG.winDriverTask}"
-          if errorlevel 1 exit /b 1
-
-          schtasks /run /tn "${CFG.desktopTask}"
-          if errorlevel 1 exit /b 1
-
-          :loop
-          for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
-              if "%%f"=="Running" (
-                  ping -n 6 localhost >nul 2>nul
-                  goto loop
-              )
-          )
-
-          schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
-          exit /b 0
-        """
-      }
-
-      stage('Collect Reports') {
-        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-
-          if (fileExists('Reports/_jenkins_task_exitcode.txt')) {
-            def exitCode = readFile('Reports/_jenkins_task_exitcode.txt').trim()
-            echo "📌 Desktop task exit code: ${exitCode}"
-          } else {
-            echo "⚠️ Desktop task exit code file not found: ${pwd()}\\Reports\\_jenkins_task_exitcode.txt"
-          }
-
-          if (!fileExists('Reports')) {
-            error("❌ Reports folder not found after execution. The scheduled task likely ran with a wrong PROJECT_PATH/WORKSPACE.")
-          }
-
-          junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'Reports/**/*'
-        }
-      }
-    }
-  }
-}
+🧠
