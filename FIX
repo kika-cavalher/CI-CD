@@ -1,329 +1,55 @@
-✅ 1) BAT genérico (ÚNICO) para todas as suítes
-
-📌 Caminho sugerido (igual teu padrão):
-
-D:\Projects\eMatchStarters\run-ematch-command.bat
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-
-rem ============================================================
-rem  Generic runner for ALL suites/collections
-rem  Reads: D:\Projects\eMatchStarters\run-context.properties
-rem  Keys expected:
-rem    WORKSPACE=<jenkins workspace full path>
-rem    PROJECT_FILE=<katalon project file name>
-rem    COLLECTION_PATH=<Test Suites/... collection path>
-rem ============================================================
-
-set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
-set "LOG_DIR=D:\Projects\eMatchStarters\logs"
-
-if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>nul
-
-for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
-  set "%%A=%%B"
-)
-
-if "%WORKSPACE%"=="" (
-  echo [ERROR] WORKSPACE is empty. Check %CTX_FILE%
-  exit /b 10
-)
-
-if "%PROJECT_FILE%"=="" (
-  echo [ERROR] PROJECT_FILE is empty. Check %CTX_FILE%
-  exit /b 11
-)
-
-if "%COLLECTION_PATH%"=="" (
-  echo [ERROR] COLLECTION_PATH is empty. Check %CTX_FILE%
-  exit /b 12
-)
-
-set "KATALON_EXE=C:\Users\ladgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\katalonc.exe"
-if not exist "%KATALON_EXE%" (
-  echo [ERROR] Katalon not found: %KATALON_EXE%
-  exit /b 13
-)
-
-set "PROJECT_PATH=%WORKSPACE%\%PROJECT_FILE%"
-if not exist "%PROJECT_PATH%" (
-  echo [ERROR] Project not found: %PROJECT_PATH%
-  exit /b 14
-)
-
-set "REPORT_FOLDER=%WORKSPACE%\Reports"
-if not exist "%REPORT_FOLDER%" mkdir "%REPORT_FOLDER%" >nul 2>nul
-
-set "TS=%DATE:~-4%%DATE:~3,2%%DATE:~0,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%"
-set "TS=%TS: =0%"
-set "OUT_LOG=%REPORT_FOLDER%\_jenkins_task_%TS%.log"
-set "EXIT_FILE=%REPORT_FOLDER%\_jenkins_task_exitcode.txt"
-
-echo ============================================================ > "%OUT_LOG%"
-echo RUN CONTEXT >> "%OUT_LOG%"
-echo WORKSPACE=%WORKSPACE% >> "%OUT_LOG%"
-echo PROJECT_FILE=%PROJECT_FILE% >> "%OUT_LOG%"
-echo COLLECTION_PATH=%COLLECTION_PATH% >> "%OUT_LOG%"
-echo REPORT_FOLDER=%REPORT_FOLDER% >> "%OUT_LOG%"
-echo ============================================================ >> "%OUT_LOG%"
-
-pushd "%WORKSPACE%"
-
-"%KATALON_EXE%" ^
-  -noSplash ^
-  -runMode=console ^
-  -projectPath="%PROJECT_PATH%" ^
-  -retry=0 ^
-  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
-  -browserType="Windows" ^
-  -reportFolder="%REPORT_FOLDER%" ^
-  -reportFileName="report" ^
-  > "%OUT_LOG%" 2>&1
-
-set "RC=%ERRORLEVEL%"
-echo %RC% > "%EXIT_FILE%"
-
-popd
-
-exit /b %RC%
-
-✅ Esse BAT é “o único runner”.
-
-Ele não escolhe REC/PRD
-Ele só roda a Collection que o Jenkins mandar
-O teste de login continua decidindo REC/PRD no runtime
-✅ 2) Jenkinsfile do Archive Mode (INTEIRO)
-
-📌 Nome sugerido: JenkinsPipelines/Jenkinsfile_ArchiveMode.groovy
-
-/*
- * Dedicated Jenkins pipeline for Archive Mode build.
- * Runs eMatch via Windows Scheduled Tasks (interactive desktop).
- * The test itself decides REC/PRD (login test), not Jenkins.
- */
-
-def PIPELINE_CFG = [
-  agentLabel: 'GI5_SWDCFRNXGI55817',
-
-  projectFileName: 'eMatch POC.prj',
-
-  winDriverTask: 'startWinDriver',
-
-  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
-
-  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
-
-  collectionPath: 'Test Suites/Archive Mode/Archive Mode Collection',
-
-  pipelineTimeoutMinutes: 180,
-  defaultSuiteTimeoutMinutes: 30,
-
-  nextJobName: 'Passerelle Bilan'
-]
-
-node(PIPELINE_CFG.agentLabel) {
-  timestamps {
-    ansiColor('xterm') {
-      timeout(time: PIPELINE_CFG.pipelineTimeoutMinutes, unit: 'MINUTES') {
-
-        stage('Checkout') {
-          checkout scm
-        }
-
-        stage('Prepare Run Context') {
-          def content = [
-            "WORKSPACE=${env.WORKSPACE}",
-            "PROJECT_FILE=${PIPELINE_CFG.projectFileName}",
-            "COLLECTION_PATH=${PIPELINE_CFG.collectionPath}"
-          ].join('\r\n') + '\r\n'
-
-          writeFile file: 'run-context.properties', text: content
-          bat """
-            @echo off
-            copy /Y "run-context.properties" "${PIPELINE_CFG.contextFile}" >nul
-          """
-        }
-
-        stage('Run - Archive Mode Collection') {
-          echo "============================================================"
-          echo "START ASSET: Archive Mode Collection"
-          echo "TASK: ${PIPELINE_CFG.desktopTask}"
-          echo "============================================================"
-
-          bat """
-            @echo off
-            schtasks /run /tn "${PIPELINE_CFG.winDriverTask}"
-            if errorlevel 1 exit /b 1
-
-            schtasks /run /tn "${PIPELINE_CFG.desktopTask}"
-            if errorlevel 1 exit /b 2
-
-            :loop
-            for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${PIPELINE_CFG.desktopTask}" /fo list ^| find "Status:"') do (
-                if "%%f"=="Running" (
-                    ping -n 6 localhost >nul 2>nul
-                    goto loop
-                )
-            )
-
-            schtasks /end /tn "${PIPELINE_CFG.winDriverTask}" >nul 2>nul
-            exit /b 0
-          """
-        }
-
-        stage('Collect Reports') {
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            junit testResults: 'Reports/**/JUnit_Report.xml', allowEmptyResults: true
-          }
-
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true
-          }
-
-          def exitFile = "${env.WORKSPACE}\\Reports\\_jenkins_task_exitcode.txt"
-          if (fileExists(exitFile)) {
-            def rc = readFile(exitFile).trim()
-            echo "Desktop task exit code: ${rc}"
-          } else {
-            echo "Desktop task exit code file not found: ${exitFile}"
-          }
-        }
-
-        stage('Trigger Next Job') {
-          if (PIPELINE_CFG.nextJobName?.trim()) {
-            echo "Triggering next Jenkins job: ${PIPELINE_CFG.nextJobName}"
-            build job: PIPELINE_CFG.nextJobName, wait: false
-          } else {
-            echo "Next job is empty. Skipping."
-          }
-        }
-      }
-    }
-  }
-}
-✅ 3) Jenkinsfile do Passerelle Bilan (INTEIRO)
-
-📌 Nome sugerido: JenkinsPipelines/Jenkinsfile_PasserelleBilan.groovy
-
-/*
- * Dedicated Jenkins pipeline for Passerelle Bilan build.
- * Runs eMatch via Windows Scheduled Tasks (interactive desktop).
- * The test itself decides REC/PRD (login test), not Jenkins.
- */
-
-def PIPELINE_CFG = [
-  agentLabel: 'GI5_SWDCFRNXGI55817',
-
-  projectFileName: 'eMatch POC.prj',
-
-  winDriverTask: 'startWinDriver',
-
-  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
-
-  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
-
-  collectionPath: 'Test Suites/PasserelleBilan/Passerelle Bilan Collection',
-
-  pipelineTimeoutMinutes: 180
-]
-
-node(PIPELINE_CFG.agentLabel) {
-  timestamps {
-    ansiColor('xterm') {
-      timeout(time: PIPELINE_CFG.pipelineTimeoutMinutes, unit: 'MINUTES') {
-
-        stage('Checkout') {
-          checkout scm
-        }
-
-        stage('Prepare Run Context') {
-          def content = [
-            "WORKSPACE=${env.WORKSPACE}",
-            "PROJECT_FILE=${PIPELINE_CFG.projectFileName}",
-            "COLLECTION_PATH=${PIPELINE_CFG.collectionPath}"
-          ].join('\r\n') + '\r\n'
-
-          writeFile file: 'run-context.properties', text: content
-          bat """
-            @echo off
-            copy /Y "run-context.properties" "${PIPELINE_CFG.contextFile}" >nul
-          """
-        }
-
-        stage('Run - Passerelle Bilan Collection') {
-          echo "============================================================"
-          echo "START ASSET: Passerelle Bilan Collection"
-          echo "TASK: ${PIPELINE_CFG.desktopTask}"
-          echo "============================================================"
-
-          bat """
-            @echo off
-            schtasks /run /tn "${PIPELINE_CFG.winDriverTask}"
-            if errorlevel 1 exit /b 1
-
-            schtasks /run /tn "${PIPELINE_CFG.desktopTask}"
-            if errorlevel 1 exit /b 2
-
-            :loop
-            for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${PIPELINE_CFG.desktopTask}" /fo list ^| find "Status:"') do (
-                if "%%f"=="Running" (
-                    ping -n 6 localhost >nul 2>nul
-                    goto loop
-                )
-            )
-
-            schtasks /end /tn "${PIPELINE_CFG.winDriverTask}" >nul 2>nul
-            exit /b 0
-          """
-        }
-
-        stage('Collect Reports') {
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            junit testResults: 'Reports/**/JUnit_Report.xml', allowEmptyResults: true
-          }
-
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true
-          }
-
-          def exitFile = "${env.WORKSPACE}\\Reports\\_jenkins_task_exitcode.txt"
-          if (fileExists(exitFile)) {
-            def rc = readFile(exitFile).trim()
-            echo "Desktop task exit code: ${rc}"
-          } else {
-            echo "Desktop task exit code file not found: ${exitFile}"
-          }
-        }
-      }
-    }
-  }
-}
-✅ 4) Scheduled Tasks, sim: precisa (para abrir o app como antes)
-
-👉 Pelo teu log, o task “RunEMatchDesktop” até roda e termina, mas sem abrir o app e sem gerar reports.
-Isso acontece quando o task está chamando um BAT “errado” ou sem contexto de workspace.
-
-📌 Tarefas que você precisa ter
-startWinDriver
-\eMatch Automation\RunEMatchDesktop ✅ única, genérica, reaproveitada
-✅ Como configurar \eMatch Automation\RunEMatchDesktop
-
-No Task Scheduler:
-
-General
-
-Run only when user is logged on ✅
-Run with highest privileges ✅
-Configure for Windows Server (o que você usa) ✅
-
-Actions
-
-Action: Start a program
-Program/script: D:\Projects\eMatchStarters\run-ematch-command.bat
-Start in: D:\Projects\eMatchStarters
-
-Settings
-
-If the task is already running: Do not start a new instance ✅
-
-💡 O Jenkinsfile é quem troca a suíte/collection via run-context.properties.
+19:17:41  ============================================================
+[Pipeline] echo
+19:17:41  START ASSET: Archive Mode Collection
+[Pipeline] echo
+19:17:41  TASK: \eMatch Automation\RunEMatchDesktop
+[Pipeline] echo
+19:17:41  ============================================================
+[Pipeline] bat
+19:17:42  SUCCESS: Attempted to run the scheduled task "startWinDriver".
+19:17:42  SUCCESS: Attempted to run the scheduled task "\eMatch Automation\RunEMatchDesktop".
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Collect Reports)
+[Pipeline] catchError
+[Pipeline] {
+[Pipeline] junit
+19:17:48  Recording test results
+19:17:48  None of the test reports contained any result
+19:17:48  [Checks API] No suitable checks publisher found.
+[Pipeline] }
+[Pipeline] // catchError
+[Pipeline] catchError
+[Pipeline] {
+[Pipeline] archiveArtifacts
+19:17:48  Archiving artifacts
+19:17:48  ‘Reports/**/*’ doesn’t match anything, but ‘**/*’ does. Perhaps that’s what you mean?
+19:17:48  No artifacts found that match the file pattern "Reports/**/*". Configuration error?
+[Pipeline] }
+[Pipeline] // catchError
+19:17:48  No test report files were found. Configuration error?
+[Pipeline] fileExists
+[Pipeline] echo
+19:17:49  Desktop task exit code file not found: D:\jenkins\work\workspace\GI5\eMatch_Regression\Archive Mode\Reports\_jenkins_task_exitcode.txt
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Trigger Next Job)
+[Pipeline] echo
+19:17:49  Triggering next Jenkins job: Passerelle Bilan
+[Pipeline] build (Building GI5 » eMatch_Regression » Passerelle Bilan)
+19:17:49  Scheduling project: GI5 » eMatch_Regression » Passerelle Bilan
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // timeout
+[Pipeline] }
+19:17:50  
+[Pipeline] // ansiColor
+[Pipeline] }
+[Pipeline] // timestamps
+[Pipeline] }
+[Pipeline] // node
+[Pipeline] End of Pipeline
+Finished: SUCCESS
