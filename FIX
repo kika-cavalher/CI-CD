@@ -1,144 +1,223 @@
-/*
- * Archive Mode pipeline
- * Runs Windows Desktop tests through Task Scheduler (same approach as before),
- * but keeps everything inside a fixed workspace to avoid @2 folders.
- */
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
 
-def PIPELINE_CONFIG = [
-    agentLabel: 'GI5_SWDCFRNXGI55817',
+rem ============================================================
+rem  eMatch Desktop Runner (Triggered by Windows Task Scheduler)
+rem  Reads: D:\Projects\eMatchStarters\run-context.properties
+rem  Writes: EXITCODE_FILE (configured in properties)
+rem ============================================================
 
-    // Make workspace deterministic to avoid "Archive Mode@2"
-    fixedWorkspaceRoot: 'D:\\jenkins\\work\\workspace\\GI5\\eMatch_Regression',
+set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
 
-    // Project folder name inside workspace
-    projectFolderName: 'Archive Mode',
+if not exist "%CTX_FILE%" (
+  echo [ERROR] Context file not found: %CTX_FILE%
+  exit /b 99
+)
 
-    // Scheduled tasks
-    winDriverTask: 'startWinDriver',
-    desktopTask : '\\eMatch Automation\\RunEMatchDesktop',
+rem --- Load properties (key=value) into environment variables ---
+for /f "usebackq tokens=1* delims==" %%A in ("%CTX_FILE%") do (
+  set "K=%%A"
+  set "V=%%B"
+  if not "!K!"=="" (
+    set "!K!=!V!"
+  )
+)
 
-    // Report patterns (Katalon default in-project Reports folder)
-    junitPattern: 'Reports/**/JUnit_Report.xml',
-    archivePattern: 'Reports/**/*',
+rem --- Mandatory fields validation ---
+if "%WORKSPACE%"=="" (
+  echo [ERROR] WORKSPACE not set in %CTX_FILE%
+  exit /b 98
+)
+if "%KATALON_EXE%"=="" (
+  echo [ERROR] KATALON_EXE not set in %CTX_FILE%
+  exit /b 97
+)
+if "%PROJECT_PATH%"=="" (
+  echo [ERROR] PROJECT_PATH not set in %CTX_FILE%
+  exit /b 96
+)
+if "%TEST_COLLECTION_PATH%"=="" (
+  echo [ERROR] TEST_COLLECTION_PATH not set in %CTX_FILE%
+  exit /b 95
+)
+if "%BROWSER_TYPE%"=="" (
+  echo [ERROR] BROWSER_TYPE not set in %CTX_FILE%
+  exit /b 94
+)
+if "%REPORT_FOLDER%"=="" (
+  echo [ERROR] REPORT_FOLDER not set in %CTX_FILE%
+  exit /b 93
+)
+if "%EXITCODE_FILE%"=="" (
+  echo [ERROR] EXITCODE_FILE not set in %CTX_FILE%
+  exit /b 92
+)
 
-    // Next job
-    nextJobName: 'Passerelle Bilan'
+rem --- Ensure report folder exists ---
+if not exist "%REPORT_FOLDER%" (
+  mkdir "%REPORT_FOLDER%" >nul 2>nul
+)
+
+rem --- Move to workspace so relative paths work ---
+cd /d "%WORKSPACE%"
+
+echo ============================================================
+echo [INFO] WORKSPACE           = %WORKSPACE%
+echo [INFO] PROJECT_PATH        = %PROJECT_PATH%
+echo [INFO] TEST_COLLECTION     = %TEST_COLLECTION_PATH%
+echo [INFO] BROWSER_TYPE        = %BROWSER_TYPE%
+echo [INFO] REPORT_FOLDER       = %REPORT_FOLDER%
+echo [INFO] EXITCODE_FILE       = %EXITCODE_FILE%
+echo ============================================================
+
+rem --- Execute Katalon ---
+"%KATALON_EXE%" ^
+  -noSplash ^
+  -runMode=console ^
+  -retry=0 ^
+  -projectPath="%PROJECT_PATH%" ^
+  -testSuiteCollectionPath="%TEST_COLLECTION_PATH%" ^
+  -browserType="%BROWSER_TYPE%" ^
+  -reportFolder="%REPORT_FOLDER%"
+
+set "RC=%ERRORLEVEL%"
+
+rem --- Persist exit code for Jenkins to read ---
+rem (Jenkins uses this to know if the task really failed)
+echo %RC% > "%EXITCODE_FILE%"
+
+echo ============================================================
+echo [INFO] Katalon finished with exit code: %RC%
+echo ============================================================
+
+exit /b %RC%
+
+
+
+
+
+
+
+
+
+
+
+
+def CFG = [
+  agentLabel: 'GI5_SWDCFRNXGI55817',
+
+  katalonExe: 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+
+  projectFileName: 'eMatch POC.prj',
+  testCollectionPath: 'Test Suites/Archive Mode/Archive Mode Collection',
+  browserType: 'Windows',
+
+  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
+
+  winDriverTask: 'startWinDriver',
+  desktopTask: '\\eMatch Automation\\RunEMatchDesktop',
+
+  nextJobName: 'Passerelle Bilan'
 ]
 
-node(PIPELINE_CONFIG.agentLabel) {
-    timestamps {
-        ansiColor('xterm') {
+node(CFG.agentLabel) {
+  timestamps {
+    ansiColor('xterm') {
 
-            // Prevent parallel runs creating @2, @3...
-            properties([
-                disableConcurrentBuilds()
-            ])
+      stage('Checkout') {
+        checkout scm
+      }
 
-            def fixedWs = "${PIPELINE_CONFIG.fixedWorkspaceRoot}\\Archive Mode"
+      stage('Validate Scheduled Tasks') {
+        bat """
+          @echo off
+          echo ============================================================
+          echo VALIDATING TOOLS AND SUPPORT FILES
+          echo ============================================================
+          schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul
+          if errorlevel 1 (
+            echo [ERROR] Scheduled task not found: ${CFG.winDriverTask}
+            exit /b 1
+          )
+          schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul
+          if errorlevel 1 (
+            echo [ERROR] Scheduled task not found: ${CFG.desktopTask}
+            exit /b 1
+          )
+          echo [OK] Support files and scheduled tasks found
+          echo ============================================================
+        """
+      }
 
-            ws(fixedWs) {
+      stage('Prepare Run Context') {
+        def wsPath = pwd()
+        def projectPath = "${wsPath}\\${CFG.projectFileName}"
+        def reportFolder = "${wsPath}\\Reports"
+        def exitCodeFile = "${wsPath}\\Reports\\_jenkins_task_exitcode.txt"
 
-                stage('Checkout') {
-                    checkout scm
-                }
+        writeFile file: CFG.contextFile, text: """WORKSPACE=${wsPath}
+KATALON_EXE=${CFG.katalonExe}
+PROJECT_PATH=${projectPath}
+TEST_COLLECTION_PATH=${CFG.testCollectionPath}
+BROWSER_TYPE=${CFG.browserType}
+REPORT_FOLDER=${reportFolder}
+EXITCODE_FILE=${exitCodeFile}
+"""
+        echo "✅ run-context.properties written: ${CFG.contextFile}"
+      }
 
-                stage('Validate Scheduled Tasks') {
-                    echo "============================================================"
-                    echo "VALIDATING TOOLS AND SUPPORT FILES"
-                    echo "============================================================"
+      stage('Run - Archive Mode Collection') {
+        bat """
+          @echo off
+          echo ============================================================
+          echo START ASSET: Archive Mode Collection
+          echo TASK: ${CFG.desktopTask}
+          echo ============================================================
 
-                    bat """
-                        @echo off
-                        schtasks /query /tn "${PIPELINE_CONFIG.winDriverTask}" >nul 2>nul
-                        if errorlevel 1 (
-                          echo [ERROR] Scheduled task not found: ${PIPELINE_CONFIG.winDriverTask}
-                          exit /b 1
-                        )
+          schtasks /run /tn "${CFG.winDriverTask}"
+          if errorlevel 1 exit /b 1
 
-                        schtasks /query /tn "${PIPELINE_CONFIG.desktopTask}" >nul 2>nul
-                        if errorlevel 1 (
-                          echo [ERROR] Scheduled task not found: ${PIPELINE_CONFIG.desktopTask}
-                          exit /b 1
-                        )
+          schtasks /run /tn "${CFG.desktopTask}"
+          if errorlevel 1 exit /b 1
 
-                        echo [OK] Support files and scheduled tasks found
-                    """
-                }
+          :loop
+          for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
+              if "%%f"=="Running" (
+                  ping -n 6 localhost >nul 2>nul
+                  goto loop
+              )
+          )
 
-                stage('Run Archive Mode') {
-                    echo "============================================================"
-                    echo "START ASSET: Archive Mode Collection"
-                    echo "TASK: ${PIPELINE_CONFIG.desktopTask}"
-                    echo "============================================================"
+          schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
+          exit /b 0
+        """
+      }
 
-                    // Clean Reports to avoid mixing old executions
-                    bat """
-                        @echo off
-                        if exist "Reports" (
-                          rmdir /s /q "Reports"
-                        )
-                    """
+      stage('Collect Reports') {
+        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
 
-                    // Run tasks and wait until desktop task is not Running anymore
-                    bat """
-                        @echo off
-                        setlocal EnableExtensions EnableDelayedExpansion
+          if (fileExists('Reports/_jenkins_task_exitcode.txt')) {
+            def exitCode = readFile('Reports/_jenkins_task_exitcode.txt').trim()
+            echo "📌 Desktop task exit code: ${exitCode}"
+          } else {
+            echo "⚠️ Desktop task exit code file not found: ${pwd()}\\Reports\\_jenkins_task_exitcode.txt"
+          }
 
-                        echo STARTING WINDRIVER TASK: ${PIPELINE_CONFIG.winDriverTask}
-                        schtasks /run /tn "${PIPELINE_CONFIG.winDriverTask}"
-                        if errorlevel 1 exit /b 1
+          if (!fileExists('Reports')) {
+            error("❌ Reports folder not found after execution. The scheduled task likely ran with a wrong PROJECT_PATH/WORKSPACE.")
+          }
 
-                        echo STARTING DESKTOP TASK: ${PIPELINE_CONFIG.desktopTask}
-                        schtasks /run /tn "${PIPELINE_CONFIG.desktopTask}"
-                        if errorlevel 1 exit /b 1
-
-                        echo WAITING DESKTOP TASK TO FINISH: ${PIPELINE_CONFIG.desktopTask}
-
-                        :loop
-                        for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${PIPELINE_CONFIG.desktopTask}" /fo list ^| find "Status:"') do (
-                            set STATUS=%%f
-                        )
-
-                        if /I "!STATUS!"=="Running" (
-                            powershell -NoProfile -Command "Start-Sleep -Seconds 5"
-                            goto loop
-                        )
-
-                        echo DESKTOP TASK FINISHED. STATUS=!STATUS!
-
-                        echo STOPPING WINDRIVER TASK: ${PIPELINE_CONFIG.winDriverTask}
-                        schtasks /end /tn "${PIPELINE_CONFIG.winDriverTask}" >nul 2>nul
-
-                        endlocal
-                    """
-                }
-
-                stage('Collect Reports') {
-
-                    // JUnit
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        junit allowEmptyResults: true, testResults: PIPELINE_CONFIG.junitPattern
-                    }
-
-                    // Artifacts
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        archiveArtifacts allowEmptyArchive: true, artifacts: PIPELINE_CONFIG.archivePattern
-                    }
-
-                    // Extra signal in console if no reports were produced
-                    def hasReports = fileExists('Reports')
-                    if (!hasReports) {
-                        echo "⚠️ No Reports folder found after execution."
-                    }
-                }
-
-                stage('Trigger Next Job') {
-                    echo "Triggering next Jenkins job: ${PIPELINE_CONFIG.nextJobName}"
-                    build job: PIPELINE_CONFIG.nextJobName, wait: false
-                }
-            }
+          junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'Reports/**/*'
         }
+      }
+
+      stage('Trigger Next Job') {
+        echo "Triggering next Jenkins job: ${CFG.nextJobName}"
+        build job: CFG.nextJobName, wait: false
+      }
     }
+  }
 }
 
 
@@ -146,125 +225,117 @@ node(PIPELINE_CONFIG.agentLabel) {
 
 
 
-/*
- * Passerelle Bilan pipeline
- * Same mechanism: Task Scheduler + deterministic workspace + clean/simple reporting.
- */
 
-def PIPELINE_CONFIG = [
-    agentLabel: 'GI5_SWDCFRNXGI55817',
 
-    fixedWorkspaceRoot: 'D:\\jenkins\\work\\workspace\\GI5\\eMatch_Regression',
-    projectFolderName: 'Passerelle Bilan',
 
-    winDriverTask: 'startWinDriver',
-    desktopTask : '\\eMatch Automation\\RunEMatchDesktop',
 
-    junitPattern: 'Reports/**/JUnit_Report.xml',
-    archivePattern: 'Reports/**/*'
+
+def CFG = [
+  agentLabel: 'GI5_SWDCFRNXGI55817',
+
+  katalonExe: 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+
+  projectFileName: 'eMatch POC.prj',
+  testCollectionPath: 'Test Suites/PasserelleBilan/Passerelle Bilan H Bilan French IFRS Collection',
+  browserType: 'Windows',
+
+  contextFile: 'D:\\Projects\\eMatchStarters\\run-context.properties',
+
+  winDriverTask: 'startWinDriver',
+  desktopTask: '\\eMatch Automation\\RunEMatchDesktop'
 ]
 
-node(PIPELINE_CONFIG.agentLabel) {
-    timestamps {
-        ansiColor('xterm') {
+node(CFG.agentLabel) {
+  timestamps {
+    ansiColor('xterm') {
 
-            properties([
-                disableConcurrentBuilds()
-            ])
+      stage('Checkout') {
+        checkout scm
+      }
 
-            def fixedWs = "${PIPELINE_CONFIG.fixedWorkspaceRoot}\\Passerelle Bilan"
+      stage('Validate Scheduled Tasks') {
+        bat """
+          @echo off
+          echo ============================================================
+          echo VALIDATING TOOLS AND SUPPORT FILES
+          echo ============================================================
+          schtasks /query /tn "${CFG.winDriverTask}" >nul 2>nul
+          if errorlevel 1 (
+            echo [ERROR] Scheduled task not found: ${CFG.winDriverTask}
+            exit /b 1
+          )
+          schtasks /query /tn "${CFG.desktopTask}" >nul 2>nul
+          if errorlevel 1 (
+            echo [ERROR] Scheduled task not found: ${CFG.desktopTask}
+            exit /b 1
+          )
+          echo [OK] Support files and scheduled tasks found
+          echo ============================================================
+        """
+      }
 
-            ws(fixedWs) {
+      stage('Prepare Run Context') {
+        def wsPath = pwd()
+        def projectPath = "${wsPath}\\${CFG.projectFileName}"
+        def reportFolder = "${wsPath}\\Reports"
+        def exitCodeFile = "${wsPath}\\Reports\\_jenkins_task_exitcode.txt"
 
-                stage('Checkout') {
-                    checkout scm
-                }
+        writeFile file: CFG.contextFile, text: """WORKSPACE=${wsPath}
+KATALON_EXE=${CFG.katalonExe}
+PROJECT_PATH=${projectPath}
+TEST_COLLECTION_PATH=${CFG.testCollectionPath}
+BROWSER_TYPE=${CFG.browserType}
+REPORT_FOLDER=${reportFolder}
+EXITCODE_FILE=${exitCodeFile}
+"""
+        echo "✅ run-context.properties written: ${CFG.contextFile}"
+      }
 
-                stage('Validate Scheduled Tasks') {
-                    echo "============================================================"
-                    echo "VALIDATING TOOLS AND SUPPORT FILES"
-                    echo "============================================================"
+      stage('Run - Passerelle Bilan Collection') {
+        bat """
+          @echo off
+          echo ============================================================
+          echo START ASSET: Passerelle Bilan Collection
+          echo TASK: ${CFG.desktopTask}
+          echo ============================================================
 
-                    bat """
-                        @echo off
-                        schtasks /query /tn "${PIPELINE_CONFIG.winDriverTask}" >nul 2>nul
-                        if errorlevel 1 (
-                          echo [ERROR] Scheduled task not found: ${PIPELINE_CONFIG.winDriverTask}
-                          exit /b 1
-                        )
+          schtasks /run /tn "${CFG.winDriverTask}"
+          if errorlevel 1 exit /b 1
 
-                        schtasks /query /tn "${PIPELINE_CONFIG.desktopTask}" >nul 2>nul
-                        if errorlevel 1 (
-                          echo [ERROR] Scheduled task not found: ${PIPELINE_CONFIG.desktopTask}
-                          exit /b 1
-                        )
+          schtasks /run /tn "${CFG.desktopTask}"
+          if errorlevel 1 exit /b 1
 
-                        echo [OK] Support files and scheduled tasks found
-                    """
-                }
+          :loop
+          for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${CFG.desktopTask}" /fo list ^| find "Status:"') do (
+              if "%%f"=="Running" (
+                  ping -n 6 localhost >nul 2>nul
+                  goto loop
+              )
+          )
 
-                stage('Run Passerelle Bilan') {
-                    echo "============================================================"
-                    echo "START ASSET: Passerelle Bilan Collection"
-                    echo "TASK: ${PIPELINE_CONFIG.desktopTask}"
-                    echo "============================================================"
+          schtasks /end /tn "${CFG.winDriverTask}" >nul 2>nul
+          exit /b 0
+        """
+      }
 
-                    bat """
-                        @echo off
-                        if exist "Reports" (
-                          rmdir /s /q "Reports"
-                        )
-                    """
+      stage('Collect Reports') {
+        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
 
-                    bat """
-                        @echo off
-                        setlocal EnableExtensions EnableDelayedExpansion
+          if (fileExists('Reports/_jenkins_task_exitcode.txt')) {
+            def exitCode = readFile('Reports/_jenkins_task_exitcode.txt').trim()
+            echo "📌 Desktop task exit code: ${exitCode}"
+          } else {
+            echo "⚠️ Desktop task exit code file not found: ${pwd()}\\Reports\\_jenkins_task_exitcode.txt"
+          }
 
-                        echo STARTING WINDRIVER TASK: ${PIPELINE_CONFIG.winDriverTask}
-                        schtasks /run /tn "${PIPELINE_CONFIG.winDriverTask}"
-                        if errorlevel 1 exit /b 1
+          if (!fileExists('Reports')) {
+            error("❌ Reports folder not found after execution. The scheduled task likely ran with a wrong PROJECT_PATH/WORKSPACE.")
+          }
 
-                        echo STARTING DESKTOP TASK: ${PIPELINE_CONFIG.desktopTask}
-                        schtasks /run /tn "${PIPELINE_CONFIG.desktopTask}"
-                        if errorlevel 1 exit /b 1
-
-                        echo WAITING DESKTOP TASK TO FINISH: ${PIPELINE_CONFIG.desktopTask}
-
-                        :loop
-                        for /f "tokens=2 delims=: " %%f in ('schtasks /query /tn "${PIPELINE_CONFIG.desktopTask}" /fo list ^| find "Status:"') do (
-                            set STATUS=%%f
-                        )
-
-                        if /I "!STATUS!"=="Running" (
-                            powershell -NoProfile -Command "Start-Sleep -Seconds 5"
-                            goto loop
-                        )
-
-                        echo DESKTOP TASK FINISHED. STATUS=!STATUS!
-
-                        echo STOPPING WINDRIVER TASK: ${PIPELINE_CONFIG.winDriverTask}
-                        schtasks /end /tn "${PIPELINE_CONFIG.winDriverTask}" >nul 2>nul
-
-                        endlocal
-                    """
-                }
-
-                stage('Collect Reports') {
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        junit allowEmptyResults: true, testResults: PIPELINE_CONFIG.junitPattern
-                    }
-
-                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        archiveArtifacts allowEmptyArchive: true, artifacts: PIPELINE_CONFIG.archivePattern
-                    }
-
-                    def hasReports = fileExists('Reports')
-                    if (!hasReports) {
-                        echo "⚠️ No Reports folder found after execution."
-                    }
-                }
-            }
+          junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'Reports/**/*'
         }
+      }
     }
+  }
 }
-
