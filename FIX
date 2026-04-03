@@ -1,90 +1,92 @@
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
 
-REM ------------------------------------------------------------
-REM Read run context
-REM ------------------------------------------------------------
-set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
-if not exist "%CTX_FILE%" (
-  echo [ERROR] Missing run context: "%CTX_FILE%"
-  exit /b 2
-)
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    timeout(time: 4, unit: 'HOURS')
+  }
 
-for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
-  set "K=%%A"
-  set "V=%%B"
-  if not "!K!"=="" set "!K!=!V!"
-)
+  environment {
+    CTX_FILE   = 'D:\\Projects\\eMatchStarters\\run-context.properties'
+    TASK_NAME  = '\\eMatch Automation\\RunEMatchDesktop'
+    PROJECT_FILE = 'eMatch POC.prj'
+    KATALON_EXE  = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+    COLLECTION_PATH = 'Test Suites/Archive Mode/Archive Mode Collection'
+    BROWSER_TYPE = 'Windows'
+    RETRY = '0'
+  }
 
-REM ------------------------------------------------------------
-REM Validate required vars
-REM ------------------------------------------------------------
-if "%WORKSPACE%"=="" (
-  echo [ERROR] WORKSPACE is empty
-  exit /b 2
-)
+  stages {
+    stage('Prepare Context') {
+      steps {
+        script {
+          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
 
-if "%KATALON_EXE%"=="" (
-  echo [ERROR] KATALON_EXE is empty
-  exit /b 2
-)
+          bat """@echo off
+if not exist "%WORKSPACE%\\Reports" mkdir "%WORKSPACE%\\Reports"
+if exist "${marker}" del /f /q "${marker}"
+exit /b 0
+"""
 
-if "%PROJECT_FILE%"=="" (
-  echo [ERROR] PROJECT_FILE is empty
-  exit /b 2
-)
+          def ctx =
+            "WORKSPACE=${env.WORKSPACE}\r\n" +
+            "PROJECT_FILE=${env.PROJECT_FILE}\r\n" +
+            "KATALON_EXE=${env.KATALON_EXE}\r\n" +
+            "COLLECTION_PATH=${env.COLLECTION_PATH}\r\n" +
+            "BROWSER_TYPE=${env.BROWSER_TYPE}\r\n" +
+            "RETRY=${env.RETRY}\r\n"
 
-if "%COLLECTION_PATH%"=="" (
-  echo [ERROR] COLLECTION_PATH is empty
-  exit /b 2
-)
+          writeFile file: env.CTX_FILE, text: ctx, encoding: 'ASCII'
 
-REM ------------------------------------------------------------
-REM Paths
-REM ------------------------------------------------------------
-set "PROJECT_FILE_PATH=%WORKSPACE%\%PROJECT_FILE%"
-set "REPORTS_DIR=%WORKSPACE%\Reports"
-set "MARKER_FILE=%REPORTS_DIR%\__jenkins_task_exitcode.txt"
-set "LOG_FILE=%REPORTS_DIR%\desktop_task.log"
+          env.DESKTOP_MARKER = marker
+        }
+      }
+    }
 
-if not exist "%REPORTS_DIR%" mkdir "%REPORTS_DIR%" >nul 2>&1
-if exist "%MARKER_FILE%" del /f /q "%MARKER_FILE%" >nul 2>&1
+    stage('Run Desktop') {
+      steps {
+        script {
+          echo "Running Task Scheduler: ${env.TASK_NAME}"
 
-echo [INFO] WORKSPACE=%WORKSPACE%               > "%LOG_FILE%"
-echo [INFO] PROJECT_FILE=%PROJECT_FILE_PATH%  >> "%LOG_FILE%"
-echo [INFO] KATALON_EXE=%KATALON_EXE%          >> "%LOG_FILE%"
-echo [INFO] COLLECTION=%COLLECTION_PATH%       >> "%LOG_FILE%"
-echo [INFO] BROWSER_TYPE=%BROWSER_TYPE%        >> "%LOG_FILE%"
-echo [INFO] RETRY=%RETRY%                      >> "%LOG_FILE%"
-echo ---------------------------------------------------------- >> "%LOG_FILE%"
+          bat """@echo off
+schtasks /run /tn "${env.TASK_NAME}"
+exit /b %ERRORLEVEL%
+"""
 
-REM ------------------------------------------------------------
-REM Run Katalon (desktop)
-REM ------------------------------------------------------------
-pushd "%WORKSPACE%"
+          timeout(time: 180, unit: 'MINUTES') {
+            echo "Waiting marker file: ${env.DESKTOP_MARKER}"
 
-"%KATALON_EXE%" ^
-  -noSplash ^
-  -runMode=console ^
-  -consoleLog ^
-  -projectPath="%PROJECT_FILE_PATH%" ^
-  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
-  -browserType="%BROWSER_TYPE%" ^
-  -retry=%RETRY% ^
-  -reportFolder="%REPORTS_DIR%" ^
-  1>> "%LOG_FILE%" 2>&1
+            while (true) {
+              if (fileExists(env.DESKTOP_MARKER)) {
+                break
+              }
+              sleep time: 3, unit: 'SECONDS'
+            }
+          }
 
-set "EC=%ERRORLEVEL%"
+          def ecText = readFile(env.DESKTOP_MARKER).trim()
+          int ec = 1
+          try {
+            ec = Integer.parseInt(ecText)
+          } catch (ignored) {
+            ec = 1
+          }
 
-popd
+          echo "Desktop task finished. ExitCode=${ec}"
 
-REM ------------------------------------------------------------
-REM Write marker for Jenkins
-REM ------------------------------------------------------------
-echo %EC%> "%MARKER_FILE%"
+          if (ec != 0) {
+            error("Desktop execution failed. ExitCode=${ec}")
+          }
+        }
+      }
+    }
+  }
 
-echo ---------------------------------------------------------- >> "%LOG_FILE%"
-echo [INFO] ExitCode=%EC%                                     >> "%LOG_FILE%"
-echo [INFO] Marker=%MARKER_FILE%                               >> "%LOG_FILE%"
-
-exit /b %EC%
+  post {
+    always {
+      archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
+    }
+  }
+}
