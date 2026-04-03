@@ -1,5 +1,12 @@
-✅ Files reescritos completos (só os que precisam)
-1) jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy (corrigido)
+) ✅ jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy (COMPLETO)
+/*
+ * Responsibility:
+ * Helper for Jenkins desktop pipelines:
+ * - delete marker files
+ * - write run-context.properties safely (no broken cmd escaping)
+ * - run scheduled task and wait marker file
+ */
+
 def deleteIfExists(String path) {
   bat """@echo off
 if exist "${path}" del /f /q "${path}"
@@ -8,26 +15,39 @@ exit /b 0
 }
 
 def writeRunContextFile(String targetFile, Map ctx) {
-  def content = ctx.collect { k, v -> "${k}=${v}" }.join("\r\n") + "\r\n"
   echo "Writing run-context.properties to: ${targetFile}"
 
-  def safePath = targetFile.replace("\\", "\\\\")
+  def lines = (ctx ?: [:]).collect { k, v -> "${k}=${v}" }
+
+  // PowerShell-safe quoting for single quotes
+  def linesEsc = lines.collect { it.replace("'", "''") }
+  def pathEsc  = (targetFile ?: '').replace("'", "''")
+
   def ps = """
-\$p = '${safePath}'
+\$ErrorActionPreference = 'Stop'
+\$p = '${pathEsc}'
 \$dir = Split-Path -Parent \$p
 if (!(Test-Path \$dir)) { New-Item -ItemType Directory -Force -Path \$dir | Out-Null }
-Set-Content -Path \$p -Value @'
-${content}
-'@ -Encoding ASCII
+
+\$lines = @(
+  '${linesEsc.join("'\r\n  '")}'
+)
+
+# guarantees CRLF at end
+\$content = (\$lines -join "`r`n") + "`r`n"
+Set-Content -Path \$p -Value \$content -Encoding ASCII
 """.trim()
 
-  bat """@echo off
-powershell -NoProfile -ExecutionPolicy Bypass -Command "${escapeForCmd(ps)}"
-"""
+  // IMPORTANT: run via Jenkins powershell step (avoid cmd quoting problems)
+  def rc = powershell(returnStatus: true, script: ps)
+  if (rc != 0) {
+    error("Failed to write run-context.properties. ExitCode=${rc}")
+  }
 }
 
 def runScheduledTaskAndWaitMarker(String taskName, String markerPath, int timeoutMinutes) {
   echo "Running Task Scheduler: ${taskName}"
+
   bat """@echo off
 schtasks /run /tn "${taskName}"
 if errorlevel 1 exit /b 1
@@ -36,122 +56,27 @@ if errorlevel 1 exit /b 1
   timeout(time: timeoutMinutes, unit: 'MINUTES') {
     echo "Waiting marker file: ${markerPath}"
     while (true) {
-      if (fileExists(markerPath)) { break }
+      if (fileExists(markerPath)) break
       sleep time: 3, unit: 'SECONDS'
     }
   }
 
-  def raw = readFile(markerPath).trim()
-
+  def ecText = readFile(markerPath).trim()
   int ec = 1
-  try {
-    def m = (raw =~ /(\d+)/)
-    if (m.find()) {
-      ec = Integer.parseInt(m.group(1))
-    } else {
-      ec = 1
-    }
-  }
-  catch (ignored) {
-    ec = 1
-  }
+  try { ec = Integer.parseInt(ecText) } catch (ignored) { ec = 1 }
 
   echo "Desktop task finished. ExitCode=${ec}"
   return ec
 }
 
-def escapeForCmd(String s) {
-  return s
-    .replace("^", "^^")
-    .replace("&", "^&")
-    .replace("<", "^<")
-    .replace(">", "^>")
-    .replace("|", "^|")
-    .replace("\"", "\\\"")
-    .replace("\r", "")
-    .replace("\n", " ")
-}
-
 return this
-2) JenkinsPipelines/Jenkinsfile_ArchiveMode.groovy (corrigido)
+2) ✅ jenkinsPipelines/Jenkinsfile_PasserelleBilan.groovy (COMPLETO)
 
-📌 Troquei agent any por agent label pra garantir Windows.
-
-⚠️ Eu vou colocar o label que aparece nos seus prints: GI5_SWDCFRNXGI55817
-Se o seu label for diferente, você só troca essa string.
+⚠️ Esse file estava quebrando porque você tentou instanciar new JenkinsDesktopPipelineRunner(this) — isso não existe quando você usa load.
+✅ Aqui está o Jenkinsfile inteiro corrigido, no MESMO padrão do ArchiveMode:
 
 pipeline {
-  agent { label 'GI5_SWDCFRNXGI55817' }
-
-  options {
-    timestamps()
-    ansiColor('xterm')
-    disableConcurrentBuilds()
-    timeout(time: 4, unit: 'HOURS')
-  }
-
-  stages {
-    stage('Prepare Context') {
-      steps {
-        script {
-          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
-
-          def CONFIG = [
-            CTX_FILE        : 'D:\\Projects\\eMatchStarters\\run-context.properties',
-            TASK_NAME       : '\\eMatch Automation\\RunEMatchDesktop',
-            PROJECT_FILE    : 'eMatch POC.prj',
-            KATALON_EXE      : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
-            COLLECTION_PATH : 'Test Suites/Archive Mode/Archive Mode Collection',
-            BROWSER_TYPE    : 'Windows',
-            RETRY           : '0'
-          ]
-
-          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
-
-          runner.deleteIfExists(marker)
-
-          runner.writeRunContextFile(CONFIG.CTX_FILE, [
-            WORKSPACE       : env.WORKSPACE,
-            PROJECT_FILE    : CONFIG.PROJECT_FILE,
-            KATALON_EXE      : CONFIG.KATALON_EXE,
-            COLLECTION_PATH : CONFIG.COLLECTION_PATH,
-            BROWSER_TYPE    : CONFIG.BROWSER_TYPE,
-            RETRY           : CONFIG.RETRY
-          ])
-
-          env.DESKTOP_TASK_NAME = CONFIG.TASK_NAME
-          env.DESKTOP_MARKER    = marker
-        }
-      }
-    }
-
-    stage('Run Desktop') {
-      steps {
-        script {
-          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
-          int ec = runner.runScheduledTaskAndWaitMarker(env.DESKTOP_TASK_NAME, env.DESKTOP_MARKER, 180)
-          if (ec != 0) {
-            error("Desktop execution failed. ExitCode=${ec}")
-          }
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
-    }
-  }
-}
-3) JenkinsPipelines/Jenkinsfile_PasserelleBilan.groovy (corrigido)
-
-✅ Corrigi os 2 erros:
-
-agent Windows label
-remove new JenkinsDesktopPipelineRunner
-pipeline {
-  agent { label 'GI5_SWDCFRNXGI55817' }
+  agent any
 
   options {
     timestamps()
