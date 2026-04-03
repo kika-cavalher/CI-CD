@@ -1,176 +1,67 @@
-✅ File 1) Bat Files\run-ematch-command.bat (COMPLETO)
+✅ File 1) jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy (COMPLETO, SEM package)
+def deleteIfExists(String path) {
+  bat """@echo off
+if exist "${path}" del /f /q "${path}"
+exit /b 0
+"""
+}
 
-Cole exatamente assim.
-Importante: no Notepad, salve como .bat normal.
+def writeRunContextFile(String targetFile, Map ctx) {
+  def content = ctx.collect { k, v -> "${k}=${v}" }.join("\r\n") + "\r\n"
+  echo "Writing run-context.properties to: ${targetFile}"
 
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-
-REM ==========================================================
-REM eMatch Desktop Runner
-REM Reads run-context.properties and runs Katalon collection
-REM Writes marker: %WORKSPACE%\Reports\__jenkins_task_exitcode.txt
-REM ==========================================================
-
-set "BASE_DIR=D:\Projects\eMatchStarters"
-set "CTX_FILE=%BASE_DIR%\run-context.properties"
-
-if not exist "%CTX_FILE%" (
-  echo ERROR: Context file not found: %CTX_FILE%
-  exit /b 2
-)
-
-REM Load KEY=VALUE from run-context.properties
-for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
-  set "K=%%A"
-  set "V=%%B"
-  if not "!K!"=="" (
-    set "!K!=!V!"
-  )
-)
-
-REM Required vars
-if "%WORKSPACE%"=="" (
-  echo ERROR: WORKSPACE is empty in run-context.properties
-  exit /b 2
-)
-if "%KATALON_EXE%"=="" (
-  echo ERROR: KATALON_EXE is empty in run-context.properties
-  exit /b 2
-)
-if "%PROJECT_FILE%"=="" (
-  echo ERROR: PROJECT_FILE is empty in run-context.properties
-  exit /b 2
-)
-if "%COLLECTION_PATH%"=="" (
-  echo ERROR: COLLECTION_PATH is empty in run-context.properties
-  exit /b 2
-)
-
-REM Defaults
-if "%BROWSER_TYPE%"=="" set "BROWSER_TYPE=Windows"
-if "%RETRY%"=="" set "RETRY=0"
-
-set "REPORT_ROOT=%WORKSPACE%\Reports"
-set "MARKER=%REPORT_ROOT%\__jenkins_task_exitcode.txt"
-
-if not exist "%REPORT_ROOT%" mkdir "%REPORT_ROOT%" >nul 2>&1
-if exist "%MARKER%" del /f /q "%MARKER%" >nul 2>&1
-
-echo ==========================================================
-echo WORKSPACE        = %WORKSPACE%
-echo PROJECT_FILE     = %PROJECT_FILE%
-echo KATALON_EXE      = %KATALON_EXE%
-echo COLLECTION_PATH  = %COLLECTION_PATH%
-echo REPORT_ROOT      = %REPORT_ROOT%
-echo ==========================================================
-
-pushd "%WORKSPACE%"
-
-"%KATALON_EXE%" ^
-  -noSplash ^
-  -runMode=console ^
-  -projectPath="%WORKSPACE%\%PROJECT_FILE%" ^
-  -retry=%RETRY% ^
-  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
-  -browserType="%BROWSER_TYPE%" ^
-  -reportFolder="Reports" ^
-  -reportFileName="report"
-
-set "EC=%ERRORLEVEL%"
-
-popd
-
-echo %EC% > "%MARKER%"
-
-echo.
-echo KATALON FINISHED. EXITCODE=%EC%
-echo Marker file: %MARKER%
-echo.
-
-exit /b %EC%
-✅ File 2) jenkinsIntegration\JenkinsDesktopPipelineRunner.groovy (COMPLETO)
-package jenkinsIntegration
-
-class JenkinsDesktopPipelineRunner implements Serializable {
-
-  private final def steps
-
-  JenkinsDesktopPipelineRunner(def steps) {
-    this.steps = steps
-  }
-
-  void writeRunContextFile(String targetFile, Map<String, String> ctx) {
-    String content = ctx.collect { k, v -> "${k}=${v}" }.join("\r\n") + "\r\n"
-
-    steps.echo "Writing run-context.properties to: ${targetFile}"
-
-    String ps = """
-      \$p = '${targetFile.replace("\\", "\\\\")}'
-      \$dir = Split-Path -Parent \$p
-      if (!(Test-Path \$dir)) { New-Item -ItemType Directory -Force -Path \$dir | Out-Null }
-      Set-Content -Path \$p -Value @'
+  def safePath = targetFile.replace("\\", "\\\\")
+  def ps = """
+\$p = '${safePath}'
+\$dir = Split-Path -Parent \$p
+if (!(Test-Path \$dir)) { New-Item -ItemType Directory -Force -Path \$dir | Out-Null }
+Set-Content -Path \$p -Value @'
 ${content}
 '@ -Encoding ASCII
-    """.trim()
+""".trim()
 
-    steps.bat """@echo off
+  bat """@echo off
 powershell -NoProfile -ExecutionPolicy Bypass -Command "${escapeForCmd(ps)}"
 """
-  }
+}
 
-  int runScheduledTaskAndWaitMarker(String taskName, String markerPath, int timeoutMinutes) {
-    steps.echo "Running Task Scheduler: ${taskName}"
-    steps.bat """@echo off
+def runScheduledTaskAndWaitMarker(String taskName, String markerPath, int timeoutMinutes) {
+  echo "Running Task Scheduler: ${taskName}"
+  bat """@echo off
 schtasks /run /tn "${taskName}"
 if errorlevel 1 exit /b 1
 """
 
-    steps.timeout(time: timeoutMinutes, unit: 'MINUTES') {
-      steps.echo "Waiting marker file: ${markerPath}"
-      while (true) {
-        if (steps.fileExists(markerPath)) break
-        steps.sleep time: 3, unit: 'SECONDS'
-      }
+  timeout(time: timeoutMinutes, unit: 'MINUTES') {
+    echo "Waiting marker file: ${markerPath}"
+    while (true) {
+      if (fileExists(markerPath)) break
+      sleep time: 3, unit: 'SECONDS'
     }
-
-    String ecText = steps.readFile(markerPath).trim()
-    int ec = 1
-    try {
-      ec = Integer.parseInt(ecText)
-    } catch (Exception ignored) {
-      ec = 1
-    }
-
-    steps.echo "Desktop task finished. ExitCode=${ec}"
-    return ec
   }
 
-  void deleteIfExists(String path) {
-    steps.bat """@echo off
-if exist "${path}" del /f /q "${path}"
-exit /b 0
-"""
-  }
+  def ecText = readFile(markerPath).trim()
+  int ec = 1
+  try { ec = Integer.parseInt(ecText) } catch (ignored) { ec = 1 }
 
-  private static String escapeForCmd(String s) {
-    return s
-      .replace("^", "^^")
-      .replace("&", "^&")
-      .replace("<", "^<")
-      .replace(">", "^>")
-      .replace("|", "^|")
-      .replace("\"", "\\\"")
-      .replace("\r", "")
-      .replace("\n", " ")
-  }
+  echo "Desktop task finished. ExitCode=${ec}"
+  return ec
 }
-✅ File 3) JenkinsPipelines\Jenkinsfile_ArchiveMode.groovy (COMPLETO)
 
-Ajuste só os valores no bloco CONFIG.
+def escapeForCmd(String s) {
+  return s
+    .replace("^", "^^")
+    .replace("&", "^&")
+    .replace("<", "^<")
+    .replace(">", "^>")
+    .replace("|", "^|")
+    .replace("\"", "\\\"")
+    .replace("\r", "")
+    .replace("\n", " ")
+}
 
-import jenkinsIntegration.JenkinsDesktopPipelineRunner
-
+return this
+✅ File 2) JenkinsPipelines/Jenkinsfile_ArchiveMode.groovy (COMPLETO, SEM import)
 pipeline {
   agent any
 
@@ -185,10 +76,9 @@ pipeline {
     stage('Prepare Context') {
       steps {
         script {
-          def runner = new JenkinsDesktopPipelineRunner(this)
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
 
           def CONFIG = [
-            BASE_DIR        : 'D:\\Projects\\eMatchStarters',
             CTX_FILE        : 'D:\\Projects\\eMatchStarters\\run-context.properties',
             TASK_NAME       : '\\eMatch Automation\\RunEMatchDesktop',
             PROJECT_FILE    : 'eMatch POC.prj',
@@ -220,77 +110,7 @@ pipeline {
     stage('Run Desktop') {
       steps {
         script {
-          def runner = new JenkinsDesktopPipelineRunner(this)
-          int ec = runner.runScheduledTaskAndWaitMarker(env.DESKTOP_TASK_NAME, env.DESKTOP_MARKER, 180)
-          if (ec != 0) {
-            error("Desktop execution failed. ExitCode=${ec}")
-          }
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
-    }
-  }
-}
-✅ File 4) JenkinsPipelines\Jenkinsfile_PasserelleBilan.groovy (COMPLETO)
-
-Mesma lógica. Só muda a collection.
-
-import jenkinsIntegration.JenkinsDesktopPipelineRunner
-
-pipeline {
-  agent any
-
-  options {
-    timestamps()
-    ansiColor('xterm')
-    disableConcurrentBuilds()
-    timeout(time: 4, unit: 'HOURS')
-  }
-
-  stages {
-    stage('Prepare Context') {
-      steps {
-        script {
-          def runner = new JenkinsDesktopPipelineRunner(this)
-
-          def CONFIG = [
-            CTX_FILE        : 'D:\\Projects\\eMatchStarters\\run-context.properties',
-            TASK_NAME       : '\\eMatch Automation\\RunEMatchDesktop',
-            PROJECT_FILE    : 'eMatch POC.prj',
-            KATALON_EXE      : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
-            COLLECTION_PATH : 'Test Suites/PasserelleBilan/Passerelle Bilan H Bilan French IFRS Collection',
-            BROWSER_TYPE    : 'Windows',
-            RETRY           : '0'
-          ]
-
-          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
-
-          runner.deleteIfExists(marker)
-
-          runner.writeRunContextFile(CONFIG.CTX_FILE, [
-            WORKSPACE       : env.WORKSPACE,
-            PROJECT_FILE    : CONFIG.PROJECT_FILE,
-            KATALON_EXE      : CONFIG.KATALON_EXE,
-            COLLECTION_PATH : CONFIG.COLLECTION_PATH,
-            BROWSER_TYPE    : CONFIG.BROWSER_TYPE,
-            RETRY           : CONFIG.RETRY
-          ])
-
-          env.DESKTOP_TASK_NAME = CONFIG.TASK_NAME
-          env.DESKTOP_MARKER    = marker
-        }
-      }
-    }
-
-    stage('Run Desktop') {
-      steps {
-        script {
-          def runner = new JenkinsDesktopPipelineRunner(this)
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
           int ec = runner.runScheduledTaskAndWaitMarker(env.DESKTOP_TASK_NAME, env.DESKTOP_MARKER, 180)
           if (ec != 0) {
             error("Desktop execution failed. ExitCode=${ec}")
