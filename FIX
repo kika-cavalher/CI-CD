@@ -1,1 +1,128 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
 
+REM ============================================================
+REM  eMatch Runner (Task Scheduler)
+REM  Reads: D:\Projects\eMatchStarters\run-context.properties
+REM  Writes marker: %WORKSPACE%\Reports\_jenkins_task_exitcode.txt
+REM ============================================================
+
+set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+
+if not exist "%CTX_FILE%" (
+  echo [ERROR] Context file not found: "%CTX_FILE%"
+  exit /b 2
+)
+
+REM --- Load key=value lines from properties (ignore blanks/#/;)
+for /f "usebackq tokens=1* delims==" %%A in ("%CTX_FILE%") do (
+  set "K=%%A"
+  set "V=%%B"
+  if not "!K!"=="" (
+    set "F=!K:~0,1!"
+    if /i not "!F!"=="#" if /i not "!F!"==";" (
+      for /f "tokens=* delims= " %%K in ("!K!") do set "K=%%K"
+      for /f "tokens=* delims= " %%V in ("!V!") do set "V=%%V"
+      set "!K!=!V!"
+    )
+  )
+)
+
+REM --- Basic validation
+if "%WORKSPACE%"=="" (
+  echo [ERROR] WORKSPACE is empty in run-context.properties
+  exit /b 3
+)
+if "%KATALON_EXE%"=="" (
+  echo [ERROR] KATALON_EXE is empty in run-context.properties
+  exit /b 3
+)
+if "%PROJECT_FILE%"=="" (
+  echo [ERROR] PROJECT_FILE is empty in run-context.properties
+  exit /b 3
+)
+if "%COLLECTION_PATH%"=="" (
+  echo [ERROR] COLLECTION_PATH is empty in run-context.properties
+  exit /b 3
+)
+
+REM --- Defaults
+if "%BROWSER_TYPE%"=="" set "BROWSER_TYPE=Windows"
+if "%RETRY%"=="" set "RETRY=0"
+
+REM --- Ensure reports dir
+if "%REPORTS_DIR%"=="" (
+  set "REPORTS_DIR=%WORKSPACE%\Reports"
+)
+
+if not exist "%REPORTS_DIR%" (
+  mkdir "%REPORTS_DIR%" 2>nul
+)
+
+REM --- Marker file path (Jenkins reads this)
+set "EXITFILE=%REPORTS_DIR%\_jenkins_task_exitcode.txt"
+
+REM --- Log file path
+if "%LOG_DIR%"=="" set "LOG_DIR=D:\Projects\eMatchStarters\logs"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" 2>nul
+
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%i"
+set "LOGFILE=%LOG_DIR%\katalon_%TS%.log"
+
+echo ============================================================ > "%LOGFILE%"
+echo START %DATE% %TIME%>> "%LOGFILE%"
+echo WORKSPACE=%WORKSPACE%>> "%LOGFILE%"
+echo PROJECT_FILE=%PROJECT_FILE%>> "%LOGFILE%"
+echo COLLECTION_PATH=%COLLECTION_PATH%>> "%LOGFILE%"
+echo REPORTS_DIR=%REPORTS_DIR%>> "%LOGFILE%"
+echo BROWSER_TYPE=%BROWSER_TYPE%>> "%LOGFILE%"
+echo RETRY=%RETRY%>> "%LOGFILE%"
+echo KATALON_EXE=%KATALON_EXE%>> "%LOGFILE%"
+echo ============================================================>> "%LOGFILE%"
+
+REM --- Run katalon from workspace (important for relative paths)
+pushd "%WORKSPACE%" >nul 2>nul
+if errorlevel 1 (
+  echo [ERROR] Cannot cd to WORKSPACE: "%WORKSPACE%"
+  echo 9 > "%EXITFILE%"
+  exit /b 9
+)
+
+REM --- Execute
+echo [INFO] Running Katalon...>> "%LOGFILE%"
+"%KATALON_EXE%" ^
+  -noSplash ^
+  -runMode=console ^
+  -retry=%RETRY% ^
+  -projectPath="%WORKSPACE%\%PROJECT_FILE%" ^
+  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
+  -browserType="%BROWSER_TYPE%" ^
+  -reportFolder="%REPORTS_DIR%" ^
+  -reportFileName="report" ^
+  >> "%LOGFILE%" 2>&1
+
+set "EC=%ERRORLEVEL%"
+
+REM --- Write marker for Jenkins
+echo %EC% > "%EXITFILE%"
+
+echo ============================================================>> "%LOGFILE%"
+echo END %DATE% %TIME%>> "%LOGFILE%"
+echo EXITCODE=%EC%>> "%LOGFILE%"
+echo MARKER=%EXITFILE%>> "%LOGFILE%"
+echo LOG=%LOGFILE%>> "%LOGFILE%"
+echo ============================================================>> "%LOGFILE%"
+
+popd >nul 2>nul
+
+REM --- Keep window open on failure (so you can see it)
+if not "%EC%"=="0" (
+  echo.
+  echo [FAIL] Katalon exit code: %EC%
+  echo [INFO] Log: %LOGFILE%
+  echo [INFO] Marker: %EXITFILE%
+  echo.
+  pause
+)
+
+exit /b %EC%
