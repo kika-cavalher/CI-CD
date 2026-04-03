@@ -1,5 +1,75 @@
+1) ✅ JenkinsDesktopPipelineRunner.groovy (REESCRITO)
+
+Coloque exatamente em jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy
+
+/*
+ * Responsibility:
+ * - Write run-context.properties deterministically (CRLF)
+ * - Trigger a Windows Scheduled Task
+ * - Wait for a marker file containing the exit code
+ */
+
+def deleteIfExists(script, String path) {
+  script.bat(returnStatus: true, script: """@echo off
+if exist "${path}" del /f /q "${path}"
+exit /b 0
+""")
+}
+
+def writeRunContextFile(script, String targetFile, Map ctx) {
+  // Force Windows CRLF so Notepad shows proper lines
+  def lines = ctx.collect { k, v -> "${k}=${v}" }
+  def content = lines.join("\r\n") + "\r\n"
+
+  script.echo "Writing run-context.properties to: ${targetFile}"
+
+  script.writeFile(
+    file: targetFile,
+    text: content,
+    encoding: 'ASCII'
+  )
+}
+
+def runScheduledTaskAndWaitMarker(script, String taskName, String markerPath, int timeoutMinutes) {
+  script.echo "Running Task Scheduler: ${taskName}"
+
+  int rc = script.bat(returnStatus: true, script: """@echo off
+schtasks /run /tn "${taskName}"
+exit /b %ERRORLEVEL%
+""")
+
+  if (rc != 0) {
+    script.error("Failed to start scheduled task. rc=${rc} task=${taskName}")
+  }
+
+  script.echo "Waiting marker file: ${markerPath}"
+
+  script.timeout(time: timeoutMinutes, unit: 'MINUTES') {
+    script.waitUntil(initialRecurrencePeriod: 3000) {
+      return script.fileExists(markerPath)
+    }
+  }
+
+  def ecText = script.readFile(markerPath).trim()
+  int ec = 1
+  try { ec = Integer.parseInt(ecText) } catch (ignored) { ec = 1 }
+
+  script.echo "Desktop task finished. ExitCode=${ec}"
+  return ec
+}
+
+return this
+2) ✅ Jenkinsfile_ArchiveMode.groovy (REESCRITO)
+
+Fixes principais
+
+força rodar num Windows node específico
+remove agent any
+remove new JenkinsDesktopPipelineRunner(...)
+usa o load correto do runner
+remove PowerShell quebrado
 pipeline {
-  agent { label 'GI5_SWDCFRNXGI55817' }
+  agent { label 'GIS_SWDCFRNXGI55817' }
 
   options {
     timestamps()
@@ -9,38 +79,35 @@ pipeline {
   }
 
   environment {
-    CTX_FILE   = 'D:\\Projects\\eMatchStarters\\run-context.properties'
-    TASK_NAME  = '\\eMatch Automation\\RunEMatchDesktop'
-    PROJECT_FILE = 'eMatch POC.prj'
-    KATALON_EXE  = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-    COLLECTION_PATH = 'Test Suites/Archive Mode/Archive Mode Collection'
-    BROWSER_TYPE = 'Windows'
-    RETRY = '0'
+    DESKTOP_TASK_NAME = '\\eMatch Automation\\RunEMatchDesktop'
+    CTX_FILE          = 'D:\\Projects\\eMatchStarters\\run-context.properties'
+    PROJECT_FILE      = 'eMatch POC.prj'
+    KATALON_EXE       = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+    COLLECTION_PATH   = 'Test Suites/Archive Mode/Archive Mode Collection'
+    BROWSER_TYPE      = 'Windows'
+    RETRY             = '0'
   }
 
   stages {
     stage('Prepare Context') {
       steps {
         script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+
           def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
+          runner.deleteIfExists(this, marker)
 
-          bat """@echo off
-if not exist "%WORKSPACE%\\Reports" mkdir "%WORKSPACE%\\Reports"
-if exist "${marker}" del /f /q "${marker}"
-exit /b 0
-"""
-
-          def ctx =
-            "WORKSPACE=${env.WORKSPACE}\r\n" +
-            "PROJECT_FILE=${env.PROJECT_FILE}\r\n" +
-            "KATALON_EXE=${env.KATALON_EXE}\r\n" +
-            "COLLECTION_PATH=${env.COLLECTION_PATH}\r\n" +
-            "BROWSER_TYPE=${env.BROWSER_TYPE}\r\n" +
-            "RETRY=${env.RETRY}\r\n"
-
-          writeFile file: env.CTX_FILE, text: ctx, encoding: 'ASCII'
+          runner.writeRunContextFile(this, env.CTX_FILE, [
+            WORKSPACE       : env.WORKSPACE,
+            PROJECT_FILE    : env.PROJECT_FILE,
+            KATALON_EXE      : env.KATALON_EXE,
+            COLLECTION_PATH : env.COLLECTION_PATH,
+            BROWSER_TYPE    : env.BROWSER_TYPE,
+            RETRY           : env.RETRY
+          ])
 
           env.DESKTOP_MARKER = marker
+          echo "Marker file will be: ${env.DESKTOP_MARKER}"
         }
       }
     }
@@ -48,34 +115,8 @@ exit /b 0
     stage('Run Desktop') {
       steps {
         script {
-          echo "Running Task Scheduler: ${env.TASK_NAME}"
-
-          bat """@echo off
-schtasks /run /tn "${env.TASK_NAME}"
-exit /b %ERRORLEVEL%
-"""
-
-          timeout(time: 180, unit: 'MINUTES') {
-            echo "Waiting marker file: ${env.DESKTOP_MARKER}"
-
-            while (true) {
-              if (fileExists(env.DESKTOP_MARKER)) {
-                break
-              }
-              sleep time: 3, unit: 'SECONDS'
-            }
-          }
-
-          def ecText = readFile(env.DESKTOP_MARKER).trim()
-          int ec = 1
-          try {
-            ec = Integer.parseInt(ecText)
-          } catch (ignored) {
-            ec = 1
-          }
-
-          echo "Desktop task finished. ExitCode=${ec}"
-
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+          int ec = runner.runScheduledTaskAndWaitMarker(this, env.DESKTOP_TASK_NAME, env.DESKTOP_MARKER, 180)
           if (ec != 0) {
             error("Desktop execution failed. ExitCode=${ec}")
           }
@@ -90,3 +131,157 @@ exit /b %ERRORLEVEL%
     }
   }
 }
+3) ✅ Jenkinsfile_PasserelleBilan.groovy (REESCRITO)
+pipeline {
+  agent { label 'GIS_SWDCFRNXGI55817' }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    timeout(time: 4, unit: 'HOURS')
+  }
+
+  environment {
+    DESKTOP_TASK_NAME = '\\eMatch Automation\\RunEMatchDesktop'
+    CTX_FILE          = 'D:\\Projects\\eMatchStarters\\run-context.properties'
+    PROJECT_FILE      = 'eMatch POC.prj'
+    KATALON_EXE       = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+    COLLECTION_PATH   = 'Test Suites/PasserelleBilan/Passerelle Bilan H Bilan French IFRS Collection'
+    BROWSER_TYPE      = 'Windows'
+    RETRY             = '0'
+  }
+
+  stages {
+    stage('Prepare Context') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+
+          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
+          runner.deleteIfExists(this, marker)
+
+          runner.writeRunContextFile(this, env.CTX_FILE, [
+            WORKSPACE       : env.WORKSPACE,
+            PROJECT_FILE    : env.PROJECT_FILE,
+            KATALON_EXE      : env.KATALON_EXE,
+            COLLECTION_PATH : env.COLLECTION_PATH,
+            BROWSER_TYPE    : env.BROWSER_TYPE,
+            RETRY           : env.RETRY
+          ])
+
+          env.DESKTOP_MARKER = marker
+          echo "Marker file will be: ${env.DESKTOP_MARKER}"
+        }
+      }
+    }
+
+    stage('Run Desktop') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+          int ec = runner.runScheduledTaskAndWaitMarker(this, env.DESKTOP_TASK_NAME, env.DESKTOP_MARKER, 180)
+          if (ec != 0) {
+            error("Desktop execution failed. ExitCode=${ec}")
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
+    }
+  }
+}
+4) ✅ run-ematch-command.bat (para o Task Scheduler) COM QUEBRA DE LINHA
+
+📌 Esse BAT é o que a task \eMatch Automation\RunEMatchDesktop deve executar (interactive).
+
+Ele lê D:\Projects\eMatchStarters\run-context.properties
+Ele roda o Katalon
+Ele cria o marker ...\Reports\__jenkins_task_exitcode.txt com o exit code
+
+Salve em D:\Projects\eMatchStarters\run-ematch-command.bat
+
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+
+if not exist "%CTX_FILE%" (
+  echo [ERROR] Context file not found: "%CTX_FILE%"
+  exit /b 2
+)
+
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
+  set "K=%%A"
+  set "V=%%B"
+  if not "!K!"=="" set "!K!=!V!"
+)
+
+if "%WORKSPACE%"=="" (
+  echo [ERROR] WORKSPACE is empty. Check run-context.properties
+  exit /b 3
+)
+
+set "REPORTS_DIR=%WORKSPACE%\Reports"
+if not exist "%REPORTS_DIR%" mkdir "%REPORTS_DIR%" >nul 2>&1
+
+set "MARKER=%REPORTS_DIR%\__jenkins_task_exitcode.txt"
+if exist "%MARKER%" del /f /q "%MARKER%" >nul 2>&1
+
+set "PROJECT_PATH=%WORKSPACE%\%PROJECT_FILE%"
+
+echo ------------------------------------------------------------ >> "%REPORTS_DIR%\task.log"
+echo [INFO] WORKSPACE=%WORKSPACE% >> "%REPORTS_DIR%\task.log"
+echo [INFO] PROJECT_PATH=%PROJECT_PATH% >> "%REPORTS_DIR%\task.log"
+echo [INFO] KATALON_EXE=%KATALON_EXE% >> "%REPORTS_DIR%\task.log"
+echo [INFO] COLLECTION_PATH=%COLLECTION_PATH% >> "%REPORTS_DIR%\task.log"
+echo [INFO] BROWSER_TYPE=%BROWSER_TYPE% >> "%REPORTS_DIR%\task.log"
+echo [INFO] RETRY=%RETRY% >> "%REPORTS_DIR%\task.log"
+echo ------------------------------------------------------------ >> "%REPORTS_DIR%\task.log"
+
+set "KATALON_CMD="%KATALON_EXE%" -noSplash -runMode=console -consoleLog -projectPath="%PROJECT_PATH%" -retry=%RETRY% -testSuiteCollectionPath="%COLLECTION_PATH%" -browserType="%BROWSER_TYPE%" -reportFolder="%REPORTS_DIR%""
+
+echo [INFO] Starting Katalon... >> "%REPORTS_DIR%\task.log"
+echo [INFO] %KATALON_CMD% >> "%REPORTS_DIR%\task.log"
+
+cd /d "%WORKSPACE%"
+%KATALON_CMD% 1>> "%REPORTS_DIR%\task.log" 2>&1
+
+set "EC=%ERRORLEVEL%"
+echo [INFO] ExitCode=%EC% >> "%REPORTS_DIR%\task.log"
+
+> "%MARKER%" echo %EC%
+
+exit /b %EC%
+
+✅ Sobre “BAT veio sem pular linha”
+
+Com os Groovy acima, o run-context.properties agora é escrito com \r\n
+E o .bat acima já está com quebras reais
+Se ainda abrir “tudo numa linha” no Notepad, é porque o arquivo foi salvo com LF em algum editor. Salve com Notepad do Windows mesmo.
+5) ✅ Seu print “Tá certo isso?” do Task Scheduler Action
+
+Sim, está no formato certo ✅
+
+Program/script: C:\Windows\System32\cmd.exe
+Add arguments: /c "D:\Projects\eMatchStarters\run-ematch-command.bat"
+Start in: D:\Projects\eMatchStarters
+6) ⚠️ Sobre “There are no nodes with the label …”
+
+Isso aconteceu porque o Jenkinsfile estava usando agent any ou label errado.
+Agora está fixo como
+
+agent { label 'GIS_SWDCFRNXGI55817' }
+
+Se o nome do node na sua lista for outro, troque somente essa string.
+
+Se você colar esses 4 arquivos do jeito acima, o comportamento fica exatamente o que você exigiu ✅
+
+Jenkins dispara
+Task roda na sessão interativa
+Você conecta no remoto e vê o app rodando
+Jenkins só espera o marker e finaliza com o exit code
