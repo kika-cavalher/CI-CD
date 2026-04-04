@@ -1,113 +1,207 @@
+1) ✅ Jenkinsfile_ArchiveMode.groovy (INTEIRO REESCRITO)
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    timeout(time: 4, unit: 'HOURS')
+  }
+
+  environment {
+    TASK_NAME = '\\eMatch Automation\\RunEMatchDesktop'
+    CTX_FILE  = 'D:\\Projects\\eMatchStarters\\run-context.properties'
+  }
+
+  stages {
+    stage('Prepare Context') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+
+          def config = [
+            WORKSPACE       : env.WORKSPACE,
+            PROJECT_FILE    : 'eMatch POC.prj',
+            KATALON_EXE      : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+            COLLECTION_PATH : 'Test Suites/Archive Mode/Archive Mode Collection',
+            BROWSER_TYPE    : 'Windows',
+            RETRY           : '0'
+          ]
+
+          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
+
+          runner.deleteIfExists(marker)
+          runner.writeRunContextFile(env.CTX_FILE, config)
+
+          env.DESKTOP_MARKER = marker
+        }
+      }
+    }
+
+    stage('Run Desktop') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+          int ec = runner.runScheduledTaskAndWaitMarker(env.TASK_NAME, env.DESKTOP_MARKER, 180)
+          if (ec != 0) {
+            error("Desktop execution failed. ExitCode=${ec}")
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
+    }
+  }
+}
+2) ✅ JenkinsDesktopPipelineRunner.groovy (INTEIRO REESCRITO)
+✅ Remove o PowerShell que estava gerando arquivo “sem pular linha” e sem segurança
+✅ Usa writeFile com CRLF de verdade
+def deleteIfExists(String path) {
+  bat """@echo off
+if exist "${path}" del /f /q "${path}"
+exit /b 0
+"""
+}
+
+def writeRunContextFile(String targetFile, Map ctx) {
+  def lines = []
+  ctx.each { k, v ->
+    lines << "${k}=${(v ?: '').toString()}"
+  }
+
+  def content = lines.join("\r\n") + "\r\n"
+  echo "Writing run-context.properties to: ${targetFile}"
+
+  def parentDir = targetFile.replaceAll('\\\\[^\\\\]+$', '')
+  bat """@echo off
+if not exist "${parentDir}" mkdir "${parentDir}"
+exit /b 0
+"""
+
+  writeFile file: targetFile, text: content, encoding: 'UTF-8'
+}
+
+def runScheduledTaskAndWaitMarker(String taskName, String markerPath, int timeoutMinutes) {
+  echo "Running Task Scheduler: ${taskName}"
+
+  bat """@echo off
+schtasks /run /tn "${taskName}"
+if errorlevel 1 exit /b 1
+exit /b 0
+"""
+
+  timeout(time: timeoutMinutes, unit: 'MINUTES') {
+    echo "Waiting marker file: ${markerPath}"
+    while (true) {
+      if (fileExists(markerPath)) {
+        break
+      }
+      sleep time: 3, unit: 'SECONDS'
+    }
+  }
+
+  def ecText = readFile(markerPath).trim()
+  int ec = 1
+  try { ec = Integer.parseInt(ecText) } catch (ignored) { ec = 1 }
+
+  echo "Desktop task finished. ExitCode=${ec}"
+  return ec
+}
+
+return this
+3) ✅ run-ematch-command.bat (GENÉRICO, BEM FORMATADO, FUNCIONA)
+✅ Lê run-context.properties
+✅ Valida variáveis
+✅ Cria pasta Reports
+✅ Log em D:\Projects\eMatchStarters\logs\katalon_YYYYMMDD_HHMMSS.log
+✅ Marker em %WORKSPACE%\Reports\__jenkins_task_exitcode.txt
+✅ Sai com o exit code correto
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-
-REM ============================================================
-REM  Run eMatch Desktop via Katalon (interactive Task Scheduler)
-REM  Reads:   D:\Projects\eMatchStarters\run-context.properties
-REM  Writes:  %WORKSPACE%\Reports\__jenkins_task_exitcode.txt
-REM  Logs:    D:\Projects\eMatchStarters\logs\RunEMatchDesktop_task_*.log
-REM ============================================================
 
 set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
 set "LOG_DIR=D:\Projects\eMatchStarters\logs"
 
-if not exist "%LOG_DIR%" (
-  mkdir "%LOG_DIR%" >nul 2>&1
-)
-
-REM Timestamp safe for filenames
-set "STAMP=%DATE:~6,4%%DATE:~3,2%%DATE:~0,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%"
-set "STAMP=%STAMP: =0%"
-set "LOG_FILE=%LOG_DIR%\RunEMatchDesktop_task_%STAMP%.log"
-
-echo ============================================================>> "%LOG_FILE%"
-echo [INFO] START RunEMatchDesktop                               >> "%LOG_FILE%"
-echo [INFO] CTX_FILE=%CTX_FILE%                                  >> "%LOG_FILE%"
-echo ============================================================>> "%LOG_FILE%"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 
 if not exist "%CTX_FILE%" (
-  echo [ERROR] CTX_FILE not found: %CTX_FILE%                    >> "%LOG_FILE%"
+  echo [ERROR] Context file not found: "%CTX_FILE%"
   exit /b 2
 )
 
-REM Load KEY=VALUE from run-context.properties
 for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
   set "K=%%A"
   set "V=%%B"
-  if not "!K!"=="" (
-    set "!K!=!V!"
-  )
+  if not "!K!"=="" set "!K!=!V!"
 )
 
-REM Required vars validation
 if "%WORKSPACE%"=="" (
-  echo [ERROR] WORKSPACE is empty                                 >> "%LOG_FILE%"
+  echo [ERROR] WORKSPACE is empty. Check run-context.properties
+  exit /b 3
+)
+
+if "%PROJECT_FILE%"=="" (
+  echo [ERROR] PROJECT_FILE is empty. Check run-context.properties
   exit /b 3
 )
 
 if "%KATALON_EXE%"=="" (
-  echo [ERROR] KATALON_EXE is empty                                >> "%LOG_FILE%"
-  exit /b 4
-)
-
-if "%PROJECT_FILE%"=="" (
-  echo [ERROR] PROJECT_FILE is empty                               >> "%LOG_FILE%"
-  exit /b 5
+  echo [ERROR] KATALON_EXE is empty. Check run-context.properties
+  exit /b 3
 )
 
 if "%COLLECTION_PATH%"=="" (
-  echo [ERROR] COLLECTION_PATH is empty                            >> "%LOG_FILE%"
-  exit /b 6
-)
-
-if "%BROWSER_TYPE%"=="" (
-  set "BROWSER_TYPE=Windows"
-)
-
-if "%RETRY%"=="" (
-  set "RETRY=0"
+  echo [ERROR] COLLECTION_PATH is empty. Check run-context.properties
+  exit /b 3
 )
 
 set "PROJECT_PATH=%WORKSPACE%\%PROJECT_FILE%"
 set "REPORTS_DIR=%WORKSPACE%\Reports"
-set "MARKER=%REPORTS_DIR%\__jenkins_task_exitcode.txt"
+set "MARKER_FILE=%REPORTS_DIR%\__jenkins_task_exitcode.txt"
 
-if not exist "%REPORTS_DIR%" (
-  mkdir "%REPORTS_DIR%" >nul 2>&1
+if not exist "%REPORTS_DIR%" mkdir "%REPORTS_DIR%"
+
+del /f /q "%MARKER_FILE%" 2>nul
+
+for /f "tokens=1-6 delims=/:. " %%a in ("%date% %time%") do (
+  set "TS=%%c%%a%%b_%%d%%e%%f"
 )
 
-del /f /q "%MARKER%" >nul 2>&1
+set "LOG_FILE=%LOG_DIR%\katalon_%TS%.log"
 
-echo [INFO] WORKSPACE=%WORKSPACE%                                 >> "%LOG_FILE%"
-echo [INFO] PROJECT_PATH=%PROJECT_PATH%                           >> "%LOG_FILE%"
-echo [INFO] KATALON_EXE=%KATALON_EXE%                             >> "%LOG_FILE%"
-echo [INFO] COLLECTION_PATH=%COLLECTION_PATH%                     >> "%LOG_FILE%"
-echo [INFO] BROWSER_TYPE=%BROWSER_TYPE%                           >> "%LOG_FILE%"
-echo [INFO] RETRY=%RETRY%                                         >> "%LOG_FILE%"
-echo [INFO] REPORTS_DIR=%REPORTS_DIR%                             >> "%LOG_FILE%"
-echo [INFO] MARKER=%MARKER%                                       >> "%LOG_FILE%"
+echo [INFO] WORKSPACE        "%WORKSPACE%"
+echo [INFO] PROJECT_PATH     "%PROJECT_PATH%"
+echo [INFO] KATALON_EXE      "%KATALON_EXE%"
+echo [INFO] COLLECTION_PATH  "%COLLECTION_PATH%"
+echo [INFO] REPORTS_DIR      "%REPORTS_DIR%"
+echo [INFO] LOG_FILE         "%LOG_FILE%"
+echo [INFO] MARKER_FILE      "%MARKER_FILE%"
 
-pushd "%WORKSPACE%"
-
-echo [INFO] Running Katalon...                                    >> "%LOG_FILE%"
-
-"%KATALON_EXE%" -noSplash -runMode=console -consoleLog ^
+"%KATALON_EXE%" ^
+  -noSplash ^
+  -runMode=console ^
+  -consoleLog ^
   -projectPath="%PROJECT_PATH%" ^
   -retry=%RETRY% ^
   -testSuiteCollectionPath="%COLLECTION_PATH%" ^
   -browserType="%BROWSER_TYPE%" ^
   -reportFolder="%REPORTS_DIR%" ^
-  1>> "%LOG_FILE%" 2>&1
+  > "%LOG_FILE%" 2>&1
 
 set "EC=%ERRORLEVEL%"
 
-popd
+echo %EC% > "%MARKER_FILE%"
 
-echo [INFO] ExitCode=%EC%                                         >> "%LOG_FILE%"
-echo %EC%> "%MARKER%"
-
-echo ============================================================>> "%LOG_FILE%"
-echo [INFO] END RunEMatchDesktop                                  >> "%LOG_FILE%"
-echo ============================================================>> "%LOG_FILE%"
-
+echo [INFO] ExitCode=%EC%
 exit /b %EC%
+4) ✅ Task Scheduler Action (para não “abrir cmd vazio”)
+✅ Opção A (mais limpa)
+Program/script
+D:\Projects\eMatchStarters\run-ematch-command.bat
+Start in
+D:\Projects\eMatchStarters
