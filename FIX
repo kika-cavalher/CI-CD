@@ -1,1 +1,399 @@
+✅ 1) jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy (INTEIRO)
 
+Motivo ✅
+
+seu writeRunContextFile() estava gerando conteúdo quebrado em 1 linha e ferrando a execução
+agora escreve o .properties via writeFile do Jenkins com CRLF correto
+mantém o marker file sempre com EXIT_CODE=<n> e valida conteúdo
+/*
+ * Responsibility:
+ * Helper methods used by Jenkins desktop pipelines (Task Scheduler runner)
+ */
+
+def deleteIfExists(script, String path) {
+    script.bat """@echo off
+if exist "${path}" del /f /q "${path}"
+exit /b 0
+"""
+}
+
+def writeRunContextFile(script, String targetFile, Map ctx) {
+    String content = (ctx.collect { k, v -> "${k}=${v}" }.join("\r\n")) + "\r\n"
+
+    script.echo "Writing run-context.properties to: ${targetFile}"
+    script.writeFile file: targetFile, text: content, encoding: 'UTF-8'
+}
+
+def runScheduledTaskAndWaitMarker(script, String taskName, String markerPath, int timeoutMinutes) {
+    script.echo "Running Task Scheduler: ${taskName}"
+
+    int startEc = script.bat(returnStatus: true, script: """@echo off
+schtasks /run /tn "${taskName}"
+exit /b %ERRORLEVEL%
+""")
+
+    if (startEc != 0) {
+        script.error("Failed to start scheduled task '${taskName}'. ExitCode=${startEc}")
+    }
+
+    script.timeout(time: timeoutMinutes, unit: 'MINUTES') {
+        script.echo "Waiting marker file: ${markerPath}"
+
+        while (true) {
+            if (script.fileExists(markerPath)) {
+                String raw = (script.readFile(markerPath) ?: '').trim()
+
+                def m = (raw =~ /EXIT_CODE=(\d+)/)
+                if (m.find()) {
+                    int ec = m.group(1).toInteger()
+                    script.echo "Desktop task finished. ExitCode=${ec}"
+                    return ec
+                }
+
+                script.echo "Marker exists but invalid content: '${raw}'. Waiting..."
+            }
+
+            script.sleep time: 3, unit: 'SECONDS'
+        }
+    }
+
+    return 124
+}
+
+return this
+✅ 2) jenkinsPipelines/Jenkinsfile_ArchiveMode.groovy (INTEIRO)
+
+Motivo ✅
+
+parou de pegar o node correto e começou a cair em “no nodes with label”
+aqui eu forço o node certo e mantenho seu fluxo atual
+
+⚠️ Ajuste que você PRECISA fazer
+
+setar o label certo na variável NODE_LABEL
+pelo seu print antigo, o que existia é parecido com GI5_SWDCFRNXGI55817
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    timeout(time: 4, unit: 'HOURS')
+  }
+
+  stages {
+    stage('Prepare Context') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+
+          def CONFIG = [
+            CTX_FILE        : 'D:\\Projects\\eMatchStarters\\run-context.properties',
+            TASK_NAME       : '\\eMatch Automation\\RunEMatchDesktop',
+            PROJECT_FILE    : 'eMatch POC.prj',
+            KATALON_EXE      : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+            COLLECTION_PATH : 'Test Suites/Archive Mode/Archive Mode Collection',
+            BROWSER_TYPE    : 'Windows',
+            RETRY           : '0'
+          ]
+
+          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
+
+          runner.deleteIfExists(this, marker)
+
+          runner.writeRunContextFile(this, CONFIG.CTX_FILE, [
+            WORKSPACE        : env.WORKSPACE,
+            PROJECT_FILE     : CONFIG.PROJECT_FILE,
+            KATALON_EXE      : CONFIG.KATALON_EXE,
+            COLLECTION_PATH  : CONFIG.COLLECTION_PATH,
+            BROWSER_TYPE     : CONFIG.BROWSER_TYPE,
+            RETRY            : CONFIG.RETRY
+          ])
+
+          env.DESKTOP_TASK_NAME = CONFIG.TASK_NAME
+          env.DESKTOP_MARKER    = marker
+        }
+      }
+    }
+
+    stage('Run Desktop') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+
+          int ec = runner.runScheduledTaskAndWaitMarker(this, env.DESKTOP_TASK_NAME, env.DESKTOP_MARKER, 180)
+          if (ec != 0) {
+            error("Desktop execution failed. ExitCode=${ec}")
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
+    }
+  }
+}
+✅ 3) jenkinsPipelines/Jenkinsfile_PasserelleBilan.groovy (INTEIRO)
+
+Motivo ✅
+
+mesmo problema do node
+mesma estrutura do Archive Mode
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    disableConcurrentBuilds()
+    timeout(time: 4, unit: 'HOURS')
+  }
+
+  stages {
+    stage('Prepare Context') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+
+          def CONFIG = [
+            CTX_FILE        : 'D:\\Projects\\eMatchStarters\\run-context.properties',
+            TASK_NAME       : '\\eMatch Automation\\RunEMatchDesktop',
+            PROJECT_FILE    : 'eMatch POC.prj',
+            KATALON_EXE      : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+            COLLECTION_PATH : 'Test Suites/PasserelleBilan/Passerelle Bilan H Bilan French IFRS Collection',
+            BROWSER_TYPE    : 'Windows',
+            RETRY           : '0'
+          ]
+
+          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
+
+          runner.deleteIfExists(this, marker)
+
+          runner.writeRunContextFile(this, CONFIG.CTX_FILE, [
+            WORKSPACE        : env.WORKSPACE,
+            PROJECT_FILE     : CONFIG.PROJECT_FILE,
+            KATALON_EXE      : CONFIG.KATALON_EXE,
+            COLLECTION_PATH  : CONFIG.COLLECTION_PATH,
+            BROWSER_TYPE     : CONFIG.BROWSER_TYPE,
+            RETRY            : CONFIG.RETRY
+          ])
+
+          env.DESKTOP_TASK_NAME = CONFIG.TASK_NAME
+          env.DESKTOP_MARKER    = marker
+        }
+      }
+    }
+
+    stage('Run Desktop') {
+      steps {
+        script {
+          def runner = load 'jenkinsIntegration/JenkinsDesktopPipelineRunner.groovy'
+
+          int ec = runner.runScheduledTaskAndWaitMarker(this, env.DESKTOP_TASK_NAME, env.DESKTOP_MARKER, 180)
+          if (ec != 0) {
+            error("Desktop execution failed. ExitCode=${ec}")
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
+    }
+  }
+}
+✅ 4) D:\Projects\eMatchStarters\run-ematch-command.bat (INTEIRO)
+
+Motivo ✅
+
+garante CRLF
+garante marker SEMPRE com EXIT_CODE=<n>
+para o Jenkins sair do loop
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+rem ============================================================
+rem  Generic Desktop Runner for eMatch
+rem  Reads: D:\Projects\eMatchStarters\run-context.properties
+rem  Writes marker: %WORKSPACE%\Reports\__jenkins_task_exitcode.txt
+rem  Writes log: D:\Projects\eMatchStarters\logs\katalon_<ts>.log
+rem ============================================================
+
+set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+
+if not exist "%CTX_FILE%" (
+  echo [ERROR] CTX_FILE not found: "%CTX_FILE%"
+  exit /b 2
+)
+
+rem Load key=value
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
+  set "K=%%A"
+  set "V=%%B"
+  if not "!K!"=="" set "!K!=!V!"
+)
+
+rem Validate
+if "%WORKSPACE%"=="" (
+  echo [ERROR] WORKSPACE is empty in "%CTX_FILE%"
+  exit /b 3
+)
+
+if "%KATALON_EXE%"=="" (
+  echo [ERROR] KATALON_EXE is empty in "%CTX_FILE%"
+  exit /b 4
+)
+
+if "%PROJECT_FILE%"=="" (
+  echo [ERROR] PROJECT_FILE is empty in "%CTX_FILE%"
+  exit /b 5
+)
+
+if "%COLLECTION_PATH%"=="" (
+  echo [ERROR] COLLECTION_PATH is empty in "%CTX_FILE%"
+  exit /b 6
+)
+
+set "REPORTS_DIR=%WORKSPACE%\Reports"
+set "MARKER_FILE=%REPORTS_DIR%\__jenkins_task_exitcode.txt"
+set "LOG_DIR=D:\Projects\eMatchStarters\logs"
+
+if not exist "%REPORTS_DIR%" mkdir "%REPORTS_DIR%" >nul 2>&1
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
+
+if exist "%MARKER_FILE%" del /f /q "%MARKER_FILE%" >nul 2>&1
+
+for /f "tokens=1-6 delims=/:. " %%a in ("%date% %time%") do (
+  set "TS=%%a%%b%%c_%%d%%e%%f"
+)
+set "LOG_FILE=%LOG_DIR%\katalon_%TS%.log"
+
+set "PROJECT_PATH=%WORKSPACE%\%PROJECT_FILE%"
+
+echo [INFO] WORKSPACE       = "%WORKSPACE%"
+echo [INFO] PROJECT_PATH    = "%PROJECT_PATH%"
+echo [INFO] KATALON_EXE     = "%KATALON_EXE%"
+echo [INFO] COLLECTION_PATH = "%COLLECTION_PATH%"
+echo [INFO] BROWSER_TYPE    = "%BROWSER_TYPE%"
+echo [INFO] RETRY           = "%RETRY%"
+echo [INFO] LOG_FILE        = "%LOG_FILE%"
+echo [INFO] MARKER_FILE     = "%MARKER_FILE%"
+
+if not exist "%PROJECT_PATH%" (
+  echo [ERROR] PROJECT_PATH not found: "%PROJECT_PATH%"
+  > "%MARKER_FILE%" echo EXIT_CODE=7
+  exit /b 7
+)
+
+pushd "%WORKSPACE%"
+
+"%KATALON_EXE%" ^
+  -noSplash ^
+  -runMode=console ^
+  -consoleLog ^
+  -projectPath="%PROJECT_PATH%" ^
+  -retry=%RETRY% ^
+  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
+  -browserType="%BROWSER_TYPE%" ^
+  -reportFolder="%REPORTS_DIR%" 1>> "%LOG_FILE%" 2>&1
+
+set "EC=%ERRORLEVEL%"
+
+popd
+
+> "%MARKER_FILE%" echo EXIT_CODE=%EC%
+
+echo [INFO] EXIT_CODE=%EC%
+exit /b %EC%
+✅ 5) Keywords/jiraIntegration/JenkinsResultStore.groovy (INTEIRO)
+
+Motivo ✅
+
+seu logger escreve .meta.properties
+seu store tentava ler .meta
+isso quebra a coleta depois
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def saveSuiteResults(script, String reportsRoot, List suiteResults) {
+    String targetFile = "${reportsRoot}\\suite-results.json"
+    script.writeFile(
+        file: targetFile,
+        text: JsonOutput.prettyPrint(JsonOutput.toJson(suiteResults ?: [])),
+        encoding: 'UTF-8'
+    )
+}
+
+def loadSuiteResults(script, String reportsRoot) {
+    String targetFile = "${reportsRoot}\\suite-results.json"
+    if (!script.fileExists(targetFile)) {
+        return []
+    }
+
+    String raw = script.readFile(file: targetFile, encoding: 'UTF-8')
+    if (!raw?.trim()) {
+        return []
+    }
+
+    def parsed = new JsonSlurperClassic().parseText(raw)
+    return (parsed instanceof List) ? parsed : []
+}
+
+def readSuiteMeta(script, String reportsRoot, String assetName) {
+    String safeName = sanitizeFileName(assetName)
+
+    String metaFile = "${reportsRoot}\\logs\\${safeName}.meta.properties"
+
+    if (!script.fileExists(metaFile)) {
+        return [:]
+    }
+
+    String raw = script.readFile(file: metaFile, encoding: 'UTF-8')
+    Map result = [:]
+
+    raw.readLines().each { line ->
+        int idx = line.indexOf('=')
+        if (idx > 0) {
+            String key = line.substring(0, idx).trim()
+            String value = line.substring(idx + 1).trim()
+            result[key] = value
+        }
+    }
+
+    return result
+}
+
+def splitSummary(String value) {
+    if (!value?.trim()) {
+        return []
+    }
+
+    return value
+        .split(/\s*\|\|\|\s*/)
+        .collect { it?.trim() }
+        .findAll { it }
+}
+
+def sanitizeFileName(String value) {
+    return (value ?: 'suite')
+        .replaceAll(/[\\\\\\/:"*?<>|]+/, '_')
+        .replaceAll(/\s+/, '_')
+}
+
+return this
+✅ Checklist rápido pra você validar em 30 segundos 🧪
+✅ Task Scheduler Action
+Program: C:\Windows\System32\cmd.exe
+Arguments: /c ""D:\Projects\eMatchStarters\run-ematch-command.bat""
+Start in: D:\Projects\eMatchStarters
+✅ Depois de rodar 1 vez
+o arquivo existe:
+%WORKSPACE%\Reports\__jenkins_task_exitcode.txt
+conteúdo é:
+EXIT_CODE=0 ou EXIT_CODE=<n>
