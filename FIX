@@ -1,99 +1,125 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-REM ============================================================
-REM  eMatch - Desktop execution entrypoint (Interactive session)
-REM  Reads:  D:\Projects\eMatchStarters\run-context.properties
-REM  Writes: logs\katalon_*.log
-REM  Writes: %MARKER_FILE% with exit code (for Jenkins to stop waiting)
-REM ============================================================
+rem ==========================================================
+rem   eMatch - Generic runner (Task Scheduler)
+rem   Reads:  D:\Projects\eMatchStarters\run-context.properties
+rem   Writes: LOG_FILE (streaming)  +  MARKER_FILE (exit code)
+rem ==========================================================
 
-set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
-set "LOG_DIR=D:\Projects\eMatchStarters\logs"
+set "SCRIPT_DIR=%~dp0"
+cd /d "%SCRIPT_DIR%"
 
-if not exist "%LOG_DIR%" (
-  mkdir "%LOG_DIR%" >nul 2>&1
-)
+set "CTX_FILE=%SCRIPT_DIR%run-context.properties"
 
 if not exist "%CTX_FILE%" (
-  echo [ERROR] Missing context file: "%CTX_FILE%"
+  echo [ERROR] Context file not found: "%CTX_FILE%"
   exit /b 2
 )
 
-REM ---- Load properties (key=value) ----
+rem ---------- Load key=value from run-context.properties ----------
 for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
   set "K=%%A"
   set "V=%%B"
   if not "!K!"=="" set "!K!=!V!"
 )
 
-REM ---- Required vars ----
-if "%WORKSPACE%"=="" (
-  echo [ERROR] WORKSPACE is empty in run-context.properties
-  exit /b 3
+rem ---------- Basic sanitize (remove quotes if Jenkins added them) ----------
+for %%V in (WORKSPACE PROJECT_PATH KATALON_EXE COLLECTION_PATH BROWSER_TYPE LOG_FILE MARKER_FILE RETRY) do (
+  if defined %%V (
+    set "TMP=!%%V!"
+    set "TMP=!TMP:"=!"
+    set "%%V=!TMP!"
+  )
 )
 
-if "%KATALON_EXE%"=="" (
-  echo [ERROR] KATALON_EXE is empty in run-context.properties
-  exit /b 4
-)
+echo.
+echo [INFO] WORKSPACE        = "%WORKSPACE%"
+echo [INFO] PROJECT_PATH     = "%PROJECT_PATH%"
+echo [INFO] KATALON_EXE      = "%KATALON_EXE%"
+echo [INFO] COLLECTION_PATH  = "%COLLECTION_PATH%"
+echo [INFO] BROWSER_TYPE     = "%BROWSER_TYPE%"
+echo [INFO] RETRY            = "%RETRY%"
+echo [INFO] LOG_FILE         = "%LOG_FILE%"
+echo [INFO] MARKER_FILE      = "%MARKER_FILE%"
+echo.
 
-if "%COLLECTION_PATH%"=="" (
-  echo [ERROR] COLLECTION_PATH is empty in run-context.properties
-  exit /b 5
-)
-
-if "%PROJECT_PATH%"=="" (
+rem ---------- Validate required fields (do NOT hardcode anything) ----------
+if not defined PROJECT_PATH (
   echo [ERROR] PROJECT_PATH is empty in run-context.properties
-  exit /b 6
+  goto :FAIL_FAST
 )
 
-if "%MARKER_FILE%"=="" (
-  echo [ERROR] MARKER_FILE is empty in run-context.properties
-  exit /b 7
+if not defined KATALON_EXE (
+  echo [ERROR] KATALON_EXE is empty in run-context.properties
+  goto :FAIL_FAST
 )
 
-if "%BROWSER_TYPE%"=="" set "BROWSER_TYPE=Windows"
-if "%RETRY%"=="" set "RETRY=0"
+if not defined COLLECTION_PATH (
+  echo [ERROR] COLLECTION_PATH is empty in run-context.properties
+  goto :FAIL_FAST
+)
 
-REM ---- Log file name ----
-for /f "tokens=1-3 delims=/: " %%a in ("%date%") do set "D=%%c%%b%%a"
-for /f "tokens=1-3 delims=:." %%a in ("%time%") do set "T=%%a%%b%%c"
+if not exist "%KATALON_EXE%" (
+  echo [ERROR] KATALON_EXE not found: "%KATALON_EXE%"
+  goto :FAIL_FAST
+)
 
-set "LOG_FILE=%LOG_DIR%\katalon_%D%_%T%.log"
+if not exist "%PROJECT_PATH%" (
+  echo [ERROR] PROJECT_PATH not found: "%PROJECT_PATH%"
+  goto :FAIL_FAST
+)
 
-echo [INFO] WORKSPACE      = "%WORKSPACE%"
-echo [INFO] PROJECT_PATH   = "%PROJECT_PATH%"
-echo [INFO] KATALON_EXE    = "%KATALON_EXE%"
-echo [INFO] COLLECTION     = "%COLLECTION_PATH%"
-echo [INFO] BROWSER_TYPE   = "%BROWSER_TYPE%"
-echo [INFO] RETRY          = "%RETRY%"
-echo [INFO] LOG_FILE       = "%LOG_FILE%"
-echo [INFO] MARKER_FILE    = "%MARKER_FILE%"
+rem ---------- Defaults ----------
+if not defined RETRY set "RETRY=0"
+
+if not defined LOG_FILE (
+  if not exist "%SCRIPT_DIR%logs" mkdir "%SCRIPT_DIR%logs" >nul 2>&1
+  set "LOG_FILE=%SCRIPT_DIR%logs\katalon_%DATE:~-4%%DATE:~3,2%%DATE:~0,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%.log"
+  set "LOG_FILE=%LOG_FILE: =0%"
+)
+
+rem If MARKER_FILE not provided, fallback to script folder (keeps Jenkins from waiting forever)
+if not defined MARKER_FILE (
+  set "MARKER_FILE=%SCRIPT_DIR%__jenkins_task_exitcode.txt"
+)
+
+rem Ensure marker folder exists
+for %%D in ("%MARKER_FILE%") do (
+  if not exist "%%~dpD" mkdir "%%~dpD" >nul 2>&1
+)
+
+echo [INFO] Starting Katalon with live log streaming...
+echo [INFO] (You should see output here AND in "%LOG_FILE%")
 echo.
 
-REM ---- Clean marker before running ----
-del /f /q "%MARKER_FILE%" >nul 2>&1
+rem ---------- Run Katalon with live streaming + file logging ----------
+rem Using PowerShell Tee-Object so the cmd shows logs in real time
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "& { ^
+      $exe = '%KATALON_EXE%'; ^
+      $args = @(
+        '-noSplash',
+        '-runMode=console',
+        ('-projectPath=' + '\"%PROJECT_PATH%\"'),
+        ('-testSuiteCollectionPath=' + '\"%COLLECTION_PATH%\"'),
+        ('-browserType=' + '%BROWSER_TYPE%'),
+        ('-retry=' + '%RETRY%')
+      ); ^
+      & $exe $args 2>&1 | Tee-Object -FilePath '%LOG_FILE%'; ^
+      exit $LASTEXITCODE ^
+    }"
 
-REM ---- Execute Katalon (console visible) ----
-"%KATALON_EXE%" ^
-  -noSplash ^
-  -runMode=console ^
-  -projectPath="%PROJECT_PATH%" ^
-  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
-  -executionProfile="default" ^
-  -browserType="%BROWSER_TYPE%" ^
-  -retry="%RETRY%" ^
-  > "%LOG_FILE%" 2>&1
-
-set "KEX=%errorlevel%"
+set "EC=%ERRORLEVEL%"
 
 echo.
-echo [INFO] Katalon exit code = %KEX%
+echo [INFO] Katalon finished with exit code: %EC%
+echo %EC%> "%MARKER_FILE%"
 
-echo %KEX%> "%MARKER_FILE%"
+exit /b %EC%
 
-exit /b %KEX%
-
-
-cmd /k "D:\Projects\eMatchStarters\run-ematch-command.bat"
+:FAIL_FAST
+echo.
+echo [INFO] Writing failure exit code 2 to marker file...
+echo 2> "%MARKER_FILE%"
+exit /b 2
