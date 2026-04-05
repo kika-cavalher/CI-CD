@@ -1,303 +1,223 @@
-1) D:\Projects\eMatchStarters\run-ematch-command.bat (INTEIRO)
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-REM ============================================================================
-REM  eMatch Automation Runner
-REM  Reads context from:  D:\Projects\eMatchStarters\run-context.properties
-REM  Writes marker to:    D:\Projects\eMatchStarters\logs\__jenkins_task_exitcode.txt
-REM ============================================================================
+rem ============================================================
+rem  eMatch Desktop runner (Task Scheduler)
+rem  Reads:  D:\Projects\eMatchStarters\run-context.properties
+rem  Writes: marker file (atomic) + log file
+rem ============================================================
 
 set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
 
+rem Default fallback marker (safe location, not inside Reports)
+set "MARKER_FILE=D:\Projects\eMatchStarters\logs\__jenkins_task_exitcode.txt"
+
+rem Ensure logs folder exists
+if not exist "D:\Projects\eMatchStarters\logs" (
+  mkdir "D:\Projects\eMatchStarters\logs" >nul 2>&1
+)
+
+rem Build log file name
+for /f %%i in ('powershell -NoProfile -Command "(Get-Date).ToString(\"yyyyMMdd_HHmmss\")"') do set "TS=%%i"
+set "LOG_FILE=D:\Projects\eMatchStarters\logs\katalon_%TS%.log"
+
+rem Start log
+echo [INFO] Starting run-ematch-command.bat > "%LOG_FILE%"
+echo [INFO] CTX_FILE=%CTX_FILE% >> "%LOG_FILE%"
+
+rem Validate context exists
 if not exist "%CTX_FILE%" (
-    echo [ERROR] CTX_FILE not found: "%CTX_FILE%"
-    exit /b 98
+  echo [ERROR] Context file not found: %CTX_FILE% >> "%LOG_FILE%"
+  call :WriteMarker 2 "CTX_FILE_NOT_FOUND"
+  exit /b 2
 )
 
-REM ---------------------------------------------------------------------------
-REM Load key=value pairs from ctx into env vars
-REM ---------------------------------------------------------------------------
-for /f "usebackq tokens=1* delims==" %%A in ("%CTX_FILE%") do (
-    set "K=%%A"
-    set "V=%%B"
-    if not "!K!"=="" set "!K!=!V!"
+rem Load context key=val
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
+  set "K=%%A"
+  set "V=%%B"
+  if not "!K!"=="" set "!K!=!V!"
 )
 
-REM ---------------------------------------------------------------------------
-REM Defaults
-REM ---------------------------------------------------------------------------
-if "%BROWSER_TYPE%"==""    set "BROWSER_TYPE=Windows"
-if "%RETRY%"==""           set "RETRY=0"
+rem Allow Jenkins to override marker location
+if not "%MARKER_FILE%"=="" set "MARKER_FILE=%MARKER_FILE%"
 
-if "%LOG_FILE%"=="" (
-    set "LOG_FILE=D:\Projects\eMatchStarters\logs\katalon_%DATE:~-4%%DATE:~3,2%%DATE:~0,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%.log"
-    set "LOG_FILE=%LOG_FILE: =0%"
-)
+rem Print resolved context
+echo. >> "%LOG_FILE%"
+echo [INFO] WORKSPACE=%WORKSPACE% >> "%LOG_FILE%"
+echo [INFO] PROJECT_PATH=%PROJECT_PATH% >> "%LOG_FILE%"
+echo [INFO] KATALON_EXE=%KATALON_EXE% >> "%LOG_FILE%"
+echo [INFO] COLLECTION_PATH=%COLLECTION_PATH% >> "%LOG_FILE%"
+echo [INFO] BROWSER_TYPE=%BROWSER_TYPE% >> "%LOG_FILE%"
+echo [INFO] RETRY=%RETRY% >> "%LOG_FILE%"
+echo [INFO] LOG_FILE=%LOG_FILE% >> "%LOG_FILE%"
+echo [INFO] MARKER_FILE=%MARKER_FILE% >> "%LOG_FILE%"
+echo. >> "%LOG_FILE%"
 
-if "%MARKER_FILE%"=="" (
-    set "MARKER_FILE=D:\Projects\eMatchStarters\logs\__jenkins_task_exitcode.txt"
-)
-
-REM Ensure logs folder exists
-for %%D in ("%LOG_FILE%") do if not exist "%%~dpD" mkdir "%%~dpD" 1>nul 2>nul
-for %%D in ("%MARKER_FILE%") do if not exist "%%~dpD" mkdir "%%~dpD" 1>nul 2>nul
-
-REM ---------------------------------------------------------------------------
-REM Print context
-REM ---------------------------------------------------------------------------
-echo.
-echo [INFO] WORKSPACE      "%WORKSPACE%"
-echo [INFO] PROJECT_PATH   "%PROJECT_PATH%"
-echo [INFO] KATALON_EXE    "%KATALON_EXE%"
-echo [INFO] COLLECTION     "%COLLECTION_PATH%"
-echo [INFO] BROWSER_TYPE   "%BROWSER_TYPE%"
-echo [INFO] RETRY          "%RETRY%"
-echo [INFO] LOG_FILE       "%LOG_FILE%"
-echo [INFO] MARKER_FILE    "%MARKER_FILE%"
-echo.
-
-REM ---------------------------------------------------------------------------
-REM Validate required vars
-REM ---------------------------------------------------------------------------
+rem Hard validations (latest real issue)
 if "%PROJECT_PATH%"=="" (
-    echo [ERROR] PROJECT_PATH is empty in run-context.properties
-    call :WriteMarker 97
-    exit /b 97
-)
-
-if "%KATALON_EXE%"=="" (
-    echo [ERROR] KATALON_EXE is empty in run-context.properties
-    call :WriteMarker 96
-    exit /b 96
-)
-
-if "%COLLECTION_PATH%"=="" (
-    echo [ERROR] COLLECTION_PATH is empty in run-context.properties
-    call :WriteMarker 95
-    exit /b 95
+  echo [ERROR] PROJECT_PATH is empty in run-context.properties >> "%LOG_FILE%"
+  call :WriteMarker 3 "PROJECT_PATH_EMPTY"
+  exit /b 3
 )
 
 if not exist "%PROJECT_PATH%" (
-    echo [ERROR] PROJECT_PATH not found: "%PROJECT_PATH%"
-    call :WriteMarker 94
-    exit /b 94
+  echo [ERROR] PROJECT_PATH not found: %PROJECT_PATH% >> "%LOG_FILE%"
+  call :WriteMarker 4 "PROJECT_PATH_NOT_FOUND"
+  exit /b 4
+)
+
+if "%KATALON_EXE%"=="" (
+  echo [ERROR] KATALON_EXE is empty >> "%LOG_FILE%"
+  call :WriteMarker 5 "KATALON_EXE_EMPTY"
+  exit /b 5
 )
 
 if not exist "%KATALON_EXE%" (
-    echo [ERROR] KATALON_EXE not found: "%KATALON_EXE%"
-    call :WriteMarker 93
-    exit /b 93
+  echo [ERROR] KATALON_EXE not found: %KATALON_EXE% >> "%LOG_FILE%"
+  call :WriteMarker 6 "KATALON_EXE_NOT_FOUND"
+  exit /b 6
 )
 
-REM ---------------------------------------------------------------------------
-REM Clean old marker to avoid Jenkins reading stale values
-REM ---------------------------------------------------------------------------
-if exist "%MARKER_FILE%" del /f /q "%MARKER_FILE%" 1>nul 2>nul
-if exist "%MARKER_FILE%.tmp" del /f /q "%MARKER_FILE%.tmp" 1>nul 2>nul
+if "%COLLECTION_PATH%"=="" (
+  echo [ERROR] COLLECTION_PATH is empty >> "%LOG_FILE%"
+  call :WriteMarker 7 "COLLECTION_PATH_EMPTY"
+  exit /b 7
+)
 
-REM ---------------------------------------------------------------------------
-REM Run Katalon in the SAME visible console
-REM Keep it visible so you can see execution
-REM ---------------------------------------------------------------------------
-echo [INFO] Starting Katalon execution...
-echo.
+rem Move to workspace so relative paths behave
+if not "%WORKSPACE%"=="" (
+  pushd "%WORKSPACE%" >> "%LOG_FILE%" 2>&1
+)
 
-pushd "%WORKSPACE%" 1>nul 2>nul
+rem Run Katalon (console mode). This still runs in the interactive session because Task Scheduler runs it.
+echo [INFO] Launching Katalon... >> "%LOG_FILE%"
+echo [INFO] Command: "%KATALON_EXE%" -runMode=console -projectPath="%PROJECT_PATH%" -testSuiteCollectionPath="%COLLECTION_PATH%" -browserType="%BROWSER_TYPE%" -retry=%RETRY% >> "%LOG_FILE%"
 
 "%KATALON_EXE%" ^
-  -noSplash ^
   -runMode=console ^
   -projectPath="%PROJECT_PATH%" ^
   -testSuiteCollectionPath="%COLLECTION_PATH%" ^
   -browserType="%BROWSER_TYPE%" ^
-  -retry="%RETRY%"
+  -retry=%RETRY% >> "%LOG_FILE%" 2>&1
 
-set "EXITCODE=%ERRORLEVEL%"
+set "KATALON_EXIT=%ERRORLEVEL%"
 
-popd 1>nul 2>nul
-
-echo.
-echo [INFO] Katalon finished with exit code: %EXITCODE%
-echo.
-
-call :WriteMarker %EXITCODE%
-exit /b %EXITCODE%
-
-REM ---------------------------------------------------------------------------
-REM Write marker atomically to avoid AccessDenied or partial reads
-REM ---------------------------------------------------------------------------
-:WriteMarker
-set "CODE=%~1"
-
-REM Write to tmp then move
-> "%MARKER_FILE%.tmp" echo %CODE%
-move /y "%MARKER_FILE%.tmp" "%MARKER_FILE%" 1>nul 2>nul
-
-REM Extra safety: ensure marker exists
-if not exist "%MARKER_FILE%" (
-    echo [WARN] Marker could not be written, retrying once...
-    > "%MARKER_FILE%.tmp" echo %CODE%
-    move /y "%MARKER_FILE%.tmp" "%MARKER_FILE%" 1>nul 2>nul
+if not "%WORKSPACE%"=="" (
+  popd >> "%LOG_FILE%" 2>&1
 )
 
+echo. >> "%LOG_FILE%"
+echo [INFO] Katalon exit code: %KATALON_EXIT% >> "%LOG_FILE%"
+
+rem Write marker atomically (fixes your AccessDenied in Jenkins readFile)
+call :WriteMarker %KATALON_EXIT% "KATALON_DONE"
+
+exit /b %KATALON_EXIT%
+
+rem ------------------------------------------------------------
+rem Atomic marker write: write .tmp then rename to final
+rem ------------------------------------------------------------
+:WriteMarker
+set "EC=%~1"
+set "MSG=%~2"
+
+if "%MARKER_FILE%"=="" (
+  set "MARKER_FILE=D:\Projects\eMatchStarters\logs\__jenkins_task_exitcode.txt"
+)
+
+set "MARKER_DIR=%~dp0"
+for %%Z in ("%MARKER_FILE%") do set "MARKER_DIR=%%~dpZ"
+
+if not exist "%MARKER_DIR%" (
+  mkdir "%MARKER_DIR%" >nul 2>&1
+)
+
+set "TMP=%MARKER_FILE%.tmp"
+
+> "%TMP%" (
+  echo %EC%
+  echo %MSG%
+  echo %DATE% %TIME%
+  echo %LOG_FILE%
+)
+
+move /y "%TMP%" "%MARKER_FILE%" >nul 2>&1
+
+echo [INFO] Marker written: %MARKER_FILE% >> "%LOG_FILE%"
+echo [INFO] Marker value: %EC% (%MSG%) >> "%LOG_FILE%"
+
 exit /b 0
-2) JenkinsIntegration/JenkinsDesktopPipelineRunner.groovy (INTEIRO)
 
-✅ Aqui a mudança é:
 
-escrever MARKER_FILE fora do workspace
-esperar e ler com retry sem morrer no primeiro lock
-nunca usar readFile direto no Reports\...
-import java.text.SimpleDateFormat
 
-def nowStamp() {
-    return new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date())
-}
+package jenkinsIntegration
 
-def sharedMarkerFile() {
-    return "D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt"
-}
+class JenkinsDesktopPipelineRunner {
 
-def sharedCtxFile() {
-    return "D:\\Projects\\eMatchStarters\\run-context.properties"
-}
+    static Map runDesktopViaTaskScheduler(Map cfg) {
 
-def writeContextFile(Map ctx) {
-    def lines = []
-    ctx.each { k, v ->
-        lines << "${k}=${v}"
-    }
-    writeFile file: sharedCtxFile(), text: lines.join("\n")
-    echo "[INFO] Context written to: ${sharedCtxFile()}"
-}
+        String taskName      = cfg.taskName ?: 'eMatch Automation\\RunEMatchDesktop'
+        String ctxFile       = cfg.ctxFile ?: 'D:\\Projects\\eMatchStarters\\run-context.properties'
+        String markerFile    = cfg.markerFile ?: 'D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt'
+        int    pollSeconds   = (cfg.pollSeconds ?: 3) as int
+        int    maxWaitSecs   = (cfg.maxWaitSecs ?: (3 * 60 * 60)) as int
 
-def safeDelete(String path) {
-    try {
-        bat(label: "Delete if exists: ${path}", script: """
+        echo "[INFO] Writing run-context.properties to: ${ctxFile}"
+        writeFile file: ctxFile, text: cfg.ctxText
+
+        echo "[INFO] Running Task Scheduler: ${taskName}"
+        bat """
             @echo off
-            if exist "${path}" del /f /q "${path}" 1>nul 2>nul
-            if exist "${path}.tmp" del /f /q "${path}.tmp" 1>nul 2>nul
-            exit /b 0
-        """.trim())
-    } catch (ignored) {
-        echo "[WARN] Could not delete: ${path}"
-    }
-}
+            schtasks /run /tn "${taskName}"
+        """
 
-def waitForFile(String path, int timeoutSeconds) {
-    int waited = 0
-    int step = 2
-    while (waited < timeoutSeconds) {
-        def exists = fileExists(path)
-        if (exists) return true
-        sleep time: step, unit: 'SECONDS'
-        waited += step
-    }
-    return false
-}
+        echo "[INFO] Waiting for marker file: ${markerFile}"
+        int waited = 0
+        while (waited < maxWaitSecs) {
+            if (fileExists(markerFile)) {
+                break
+            }
+            sleep pollSeconds
+            waited += pollSeconds
+        }
 
-def readMarkerWithRetry(String path, int maxAttempts, int sleepSeconds) {
-    for (int i = 1; i <= maxAttempts; i++) {
+        if (!fileExists(markerFile)) {
+            error "[ERROR] Marker file was not created within timeout: ${markerFile}"
+        }
+
+        String markerText
         try {
-            def txt = readFile(path).trim()
-            if (txt?.isInteger()) return txt.toInteger()
-            echo "[WARN] Marker content not numeric on attempt ${i}: '${txt}'"
+            markerText = readFile(markerFile).trim()
         } catch (Exception ex) {
-            echo "[WARN] Failed to read marker on attempt ${i}: ${ex.getClass().getName()} ${ex.message}"
-        }
-        sleep time: sleepSeconds, unit: 'SECONDS'
-    }
-    return null
-}
-
-pipeline {
-    agent { label 'GI5_SWDCFRNXGI55817' }
-
-    options {
-        timestamps()
-        ansiColor('xterm')
-        timeout(time: 4, unit: 'HOURS')
-        disableConcurrentBuilds()
-    }
-
-    environment {
-        TASK_NAME = '\\eMatch Automation\\RunEmatchDesktop'
-        EMATCH_STARTERS = 'D:\\Projects\\eMatchStarters'
-        MARKER_FILE = 'D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt'
-        CTX_FILE = 'D:\\Projects\\eMatchStarters\\run-context.properties'
-    }
-
-    stages {
-        stage('Prepare Context') {
-            steps {
-                script {
-                    def ctx = [
-                        WORKSPACE       : "${env.WORKSPACE}",
-                        PROJECT_PATH    : "${env.WORKSPACE}\\eMatch POC.prj",
-                        KATALON_EXE     : "C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe",
-                        COLLECTION_PATH : "Test Suites\\Archive Mode\\Archive Mode Collection",
-                        BROWSER_TYPE    : "Windows",
-                        RETRY           : "0",
-                        LOG_FILE        : "D:\\Projects\\eMatchStarters\\logs\\katalon_${nowStamp()}.log",
-                        MARKER_FILE     : sharedMarkerFile()
-                    ]
-
-                    safeDelete(sharedMarkerFile())
-                    safeDelete("${sharedMarkerFile()}.tmp")
-
-                    writeContextFile(ctx)
-
-                    echo "[INFO] MARKER_FILE set to: ${sharedMarkerFile()}"
-                }
-            }
+            echo "[WARN] Failed to read marker file (maybe transient lock). Retrying once..."
+            sleep 2
+            markerText = readFile(markerFile).trim()
         }
 
-        stage('Run Desktop (Task Scheduler)') {
-            steps {
-                script {
-                    echo "[INFO] Running Task Scheduler: ${env.TASK_NAME}"
-
-                    bat(label: "Run scheduled task", script: """
-                        @echo off
-                        schtasks /run /tn "${env.TASK_NAME}"
-                        exit /b %ERRORLEVEL%
-                    """.trim())
-
-                    echo "[INFO] Waiting marker file: ${sharedMarkerFile()}"
-
-                    def ok = waitForFile(sharedMarkerFile(), 900)
-                    if (!ok) {
-                        error("[ERROR] Marker file not created within timeout: ${sharedMarkerFile()}")
-                    }
-
-                    def exitCode = readMarkerWithRetry(sharedMarkerFile(), 15, 2)
-                    if (exitCode == null) {
-                        error("[ERROR] Marker exists but could not be read (locked or invalid): ${sharedMarkerFile()}")
-                    }
-
-                    echo "[INFO] Desktop exit code from marker: ${exitCode}"
-                    if (exitCode != 0) {
-                        error("[ERROR] Desktop run failed with exit code: ${exitCode}")
-                    }
-                }
-            }
+        def lines = markerText.readLines()
+        int exitCode = 1
+        try {
+            exitCode = Integer.parseInt(lines[0].trim())
+        } catch (ignored) {
+            exitCode = 1
         }
+
+        echo "[INFO] Task exit code from marker: ${exitCode}"
+        return [exitCode: exitCode, markerLines: lines]
     }
 
-    post {
-        always {
-            archiveArtifacts artifacts: 'Reports/**/*', allowEmptyArchive: true
+    static void archiveSafeArtifacts() {
+
+        echo "[INFO] Archiving artifacts (safe mode)"
+        try {
+            archiveArtifacts allowEmptyArchive: true, artifacts: [
+                'Reports/**/*',
+                'D:\\Projects\\eMatchStarters\\logs\\*.log',
+                'D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt'
+            ].join(',')
+        } catch (Exception ex) {
+            echo "[WARN] archiveArtifacts failed but build will continue: ${ex.getMessage()}"
         }
     }
 }
-3) Task Scheduler Action (o que precisa ficar)
-
-✅ Mantenha assim, sem argumentos no campo errado:
-
-Program/script
-C:\Windows\System32\cmd.exe
-Add arguments
-/c call "D:\Projects\eMatchStarters\run-ematch-command.bat"
-Start in
-D:\Projects\eMatchStarters
