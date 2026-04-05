@@ -1,1 +1,220 @@
+2) D:\Projects\eMatchStarters\run-ematch-command.bat (INTEIRO) ✅
 
+Este é o único bat que a task chama.
+
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+REM ============================================================
+REM  eMatch - Desktop execution entrypoint (Interactive session)
+REM  Reads:  D:\Projects\eMatchStarters\run-context.properties
+REM  Writes: logs\katalon_*.log
+REM  Writes: %MARKER_FILE% with exit code (for Jenkins to stop waiting)
+REM ============================================================
+
+set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+set "LOG_DIR=D:\Projects\eMatchStarters\logs"
+
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
+
+if not exist "%CTX_FILE%" (
+  echo [ERROR] Missing context file: "%CTX_FILE%"
+  exit /b 2
+)
+
+REM ---- Load properties (key=value) ----
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
+  set "K=%%A"
+  set "V=%%B"
+  if not "!K!"=="" set "!K!=!V!"
+)
+
+REM ---- Required vars ----
+if "%WORKSPACE%"=="" (
+  echo [ERROR] WORKSPACE is empty in run-context.properties
+  exit /b 3
+)
+
+if "%KATALON_EXE%"=="" (
+  echo [ERROR] KATALON_EXE is empty in run-context.properties
+  exit /b 4
+)
+
+if "%COLLECTION_PATH%"=="" (
+  echo [ERROR] COLLECTION_PATH is empty in run-context.properties
+  exit /b 5
+)
+
+if "%PROJECT_PATH%"=="" (
+  echo [ERROR] PROJECT_PATH is empty in run-context.properties
+  exit /b 6
+)
+
+if "%MARKER_FILE%"=="" (
+  echo [ERROR] MARKER_FILE is empty in run-context.properties
+  exit /b 7
+)
+
+if "%BROWSER_TYPE%"=="" set "BROWSER_TYPE=Windows"
+if "%RETRY%"=="" set "RETRY=0"
+
+REM ---- Log file ----
+for /f "tokens=1-3 delims=/: " %%a in ("%date%") do set "D=%%c%%b%%a"
+for /f "tokens=1-3 delims=:." %%a in ("%time%") do set "T=%%a%%b%%c"
+set "LOG_FILE=%LOG_DIR%\katalon_%D%_%T%.log"
+
+echo [INFO] WORKSPACE      = "%WORKSPACE%"
+echo [INFO] PROJECT_PATH   = "%PROJECT_PATH%"
+echo [INFO] KATALON_EXE    = "%KATALON_EXE%"
+echo [INFO] COLLECTION     = "%COLLECTION_PATH%"
+echo [INFO] BROWSER_TYPE   = "%BROWSER_TYPE%"
+echo [INFO] RETRY          = "%RETRY%"
+echo [INFO] LOG_FILE       = "%LOG_FILE%"
+echo [INFO] MARKER_FILE    = "%MARKER_FILE%"
+echo.
+
+REM ---- Clean marker before running ----
+del /f /q "%MARKER_FILE%" >nul 2>&1
+
+REM ---- Execute Katalon (console visible) ----
+REM If you want the window to stay open after finishing, keep /k in Task Scheduler (already done)
+"%KATALON_EXE%" ^
+  -noSplash ^
+  -runMode=console ^
+  -projectPath="%PROJECT_PATH%" ^
+  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
+  -executionProfile="default" ^
+  -browserType="%BROWSER_TYPE%" ^
+  -retry="%RETRY%" ^
+  > "%LOG_FILE%" 2>&1
+
+set "KEX=!errorlevel!"
+
+echo.
+echo [INFO] Katalon exit code = !KEX!
+echo !KEX!> "%MARKER_FILE%"
+
+exit /b !KEX!
+3) D:\Projects\eMatchStarters\run-context.properties (INTEIRO) ✅
+
+O Jenkins sobrescreve este arquivo a cada build.
+
+WORKSPACE=D:\jenkins\work\workspace\GI5\eMatch_Regression\Archive Mode
+PROJECT_PATH=D:\jenkins\work\workspace\GI5\eMatch_Regression\Archive Mode\eMatch POC.prj
+KATALON_EXE=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\katalonc.exe
+COLLECTION_PATH=Test Suites/Archive Mode/Archive Mode Collection
+BROWSER_TYPE=Windows
+RETRY=0
+MARKER_FILE=D:\jenkins\work\workspace\GI5\eMatch_Regression\Archive Mode\Reports\__jenkins_task_exitcode.txt
+4) Jenkinsfile (INTEIRO) ✅
+
+Ponto crítico aqui: fixar o agent label certo e parar de ficar preso no loop quando o marker não aparece.
+
+pipeline {
+  agent { label 'GI5_SWDCFRNXGI55817' }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+    timeout(time: 4, unit: 'HOURS')
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    TASK_NAME   = '\\eMatch Automation\\RunEMatchDesktop'
+    CTX_FILE    = 'D:\\Projects\\eMatchStarters\\run-context.properties'
+    KATALON_EXE = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+    BROWSER     = 'Windows'
+    RETRY       = '0'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Prepare Context') {
+      steps {
+        script {
+          def ws = env.WORKSPACE
+          def projectPath = "${ws}\\eMatch POC.prj"
+          def markerFile  = "${ws}\\Reports\\__jenkins_task_exitcode.txt"
+
+          def collectionPath = 'Test Suites/Archive Mode/Archive Mode Collection'
+
+          bat """
+            @echo off
+            if not exist "${ws}\\Reports" mkdir "${ws}\\Reports"
+            del /f /q "${markerFile}" >nul 2>&1
+
+            echo WORKSPACE=${ws}> "${env.CTX_FILE}"
+            echo PROJECT_PATH=${projectPath}>> "${env.CTX_FILE}"
+            echo KATALON_EXE=${env.KATALON_EXE}>> "${env.CTX_FILE}"
+            echo COLLECTION_PATH=${collectionPath}>> "${env.CTX_FILE}"
+            echo BROWSER_TYPE=${env.BROWSER}>> "${env.CTX_FILE}"
+            echo RETRY=${env.RETRY}>> "${env.CTX_FILE}"
+            echo MARKER_FILE=${markerFile}>> "${env.CTX_FILE}"
+
+            echo [INFO] Context written to: ${env.CTX_FILE}
+            type "${env.CTX_FILE}"
+          """
+        }
+      }
+    }
+
+    stage('Run Desktop (Task Scheduler)') {
+      steps {
+        script {
+          bat """
+            @echo off
+            echo [INFO] Running Task Scheduler: ${env.TASK_NAME}
+            schtasks /run /tn "${env.TASK_NAME}"
+            if errorlevel 1 (
+              echo [ERROR] schtasks failed to run task
+              exit /b 10
+            )
+          """
+
+          def marker = "${env.WORKSPACE}\\Reports\\__jenkins_task_exitcode.txt"
+
+          int maxLoops = 240
+          int sleepSec = 3
+          boolean found = false
+
+          for (int i = 1; i <= maxLoops; i++) {
+            if (fileExists(marker)) {
+              found = true
+              break
+            }
+            sleep time: sleepSec, unit: 'SECONDS'
+          }
+
+          if (!found) {
+            error("Marker not found: ${marker}. Task did not write exit code.")
+          }
+
+          def exitCode = readFile(marker).trim()
+          echo "✅ Marker exit code: ${exitCode}"
+
+          if (!exitCode.isInteger()) {
+            error("Invalid exit code in marker: ${exitCode}")
+          }
+
+          int code = exitCode.toInteger()
+          if (code != 0) {
+            error("Katalon finished with exit code: ${code}")
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'Reports/**/*, **/*.log', allowEmptyArchive: true
+    }
+  }
+}
+O
