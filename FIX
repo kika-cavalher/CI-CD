@@ -1,1 +1,269 @@
+pipeline {
+    agent {
+        node {
+            label 'GI5_SWDCFRNXGI55817'
+            customWorkspace 'D:\\jenkins\\work\\workspace\\GI5\\eMatch_Regression\\Archive Mode'
+        }
+    }
 
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 4, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '20', daysToKeepStr: '30'))
+        skipDefaultCheckout(true)
+    }
+
+    environment {
+        STARTERS_DIR = 'D:\\Projects\\eMatchStarters'
+        CTX_FILE     = 'D:\\Projects\\eMatchStarters\\run-context.properties'
+        TASK_NAME    = '\\eMatch Automation\\RunEMatchDesktop'
+
+        KATALON_EXE  = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+        PROJECT_FILE = 'eMatch POC.prj'
+        COLLECTION   = 'Test Suites\\Archive Mode\\Archive Mode Collection'
+        BROWSER_TYPE = 'Windows'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "Workspace: ${pwd()}"
+            }
+        }
+
+        stage('Prepare Context + Reports') {
+            steps {
+                script {
+                    def ws = pwd()
+                    def projectPath = "${ws}\\${env.PROJECT_FILE}"
+                    def reportsDir = "${ws}\\Reports"
+                    def markerFile = "${reportsDir}\\__jenkins_task_exitcode.txt"
+
+                    bat """
+@echo off
+setlocal
+
+if not exist "${reportsDir}" mkdir "${reportsDir}"
+if not exist "${env.STARTERS_DIR}" mkdir "${env.STARTERS_DIR}"
+
+del /f /q "${markerFile}" 2>nul
+
+(
+  echo WORKSPACE=${ws}
+  echo PROJECT_PATH=${projectPath}
+  echo KATALON_EXE=${env.KATALON_EXE}
+  echo COLLECTION_PATH=${env.COLLECTION}
+  echo BROWSER_TYPE=${env.BROWSER_TYPE}
+  echo RETRY=0
+  echo MARKER_FILE=${markerFile}
+  echo LOG_DIR=${reportsDir}\\_desktop_logs
+) > "${env.CTX_FILE}"
+
+echo -------------------- run-context.properties --------------------
+type "${env.CTX_FILE}"
+echo ----------------------------------------------------------------
+
+endlocal
+"""
+                }
+            }
+        }
+
+        stage('Run Desktop (Task Scheduler)') {
+            steps {
+                script {
+                    def ws = pwd()
+                    def markerFile = "${ws}\\Reports\\__jenkins_task_exitcode.txt"
+
+                    bat """
+@echo off
+echo ------------------------------------------------------------
+echo START ASSET: Archive Mode Collection
+echo TASK: ${env.TASK_NAME}
+echo ------------------------------------------------------------
+schtasks /run /tn "${env.TASK_NAME}"
+exit /b %ERRORLEVEL%
+"""
+
+                    timeout(time: 180, unit: 'MINUTES') {
+                        waitUntil {
+                            sleep time: 3, unit: 'SECONDS'
+                            return fileExists(markerFile)
+                        }
+                    }
+
+                    def markerText = readFile(markerFile).trim()
+                    echo "Marker content: '${markerText}'"
+
+                    int exitCode = 999
+                    try {
+                        exitCode = Integer.parseInt(markerText.readLines()[0].trim())
+                    } catch (ignored) {
+                        exitCode = 999
+                    }
+
+                    if (exitCode != 0) {
+                        error("Desktop execution failed. ExitCode=${exitCode}. Check Reports\\_desktop_logs\\katalon_*.log")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
+                }
+
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml,Reports/**/JUnit*.xml,Reports/**/junit*.xml'
+                }
+            }
+        }
+
+
+
+
+
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+REM ============================================================
+REM  Generic runner called by ONE Task Scheduler
+REM  Reads: D:\Projects\eMatchStarters\run-context.properties
+REM  Writes:
+REM    - Log file into Reports\_desktop_logs
+REM    - Marker file (exit code) at MARKER_FILE
+REM ============================================================
+
+set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+
+if not exist "%CTX_FILE%" (
+    echo [ERROR] Context file not found: "%CTX_FILE%"
+    exit /b 90
+)
+
+REM ----------------------------
+REM Read key=value from ctx
+REM ----------------------------
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
+    set "K=%%A"
+    set "V=%%B"
+    if /I "!K!"=="WORKSPACE"        set "WORKSPACE=!V!"
+    if /I "!K!"=="PROJECT_PATH"     set "PROJECT_PATH=!V!"
+    if /I "!K!"=="KATALON_EXE"      set "KATALON_EXE=!V!"
+    if /I "!K!"=="COLLECTION_PATH"  set "COLLECTION_PATH=!V!"
+    if /I "!K!"=="BROWSER_TYPE"     set "BROWSER_TYPE=!V!"
+    if /I "!K!"=="RETRY"            set "RETRY=!V!"
+    if /I "!K!"=="MARKER_FILE"      set "MARKER_FILE=!V!"
+    if /I "!K!"=="LOG_DIR"          set "LOG_DIR=!V!"
+)
+
+REM ----------------------------
+REM Validate required values
+REM ----------------------------
+if "%PROJECT_PATH%"=="" (
+    echo [ERROR] PROJECT_PATH is empty
+    exit /b 91
+)
+
+if "%KATALON_EXE%"=="" (
+    echo [ERROR] KATALON_EXE is empty
+    exit /b 92
+)
+
+if "%COLLECTION_PATH%"=="" (
+    echo [ERROR] COLLECTION_PATH is empty
+    exit /b 93
+)
+
+if "%BROWSER_TYPE%"=="" (
+    set "BROWSER_TYPE=Windows"
+)
+
+if "%RETRY%"=="" (
+    set "RETRY=0"
+)
+
+if "%MARKER_FILE%"=="" (
+    echo [ERROR] MARKER_FILE is empty
+    exit /b 94
+)
+
+if "%LOG_DIR%"=="" (
+    set "LOG_DIR=%WORKSPACE%\Reports\_desktop_logs"
+)
+
+if not exist "%LOG_DIR%" (
+    mkdir "%LOG_DIR%" >nul 2>&1
+)
+
+REM marker folder
+for %%F in ("%MARKER_FILE%") do (
+    if not exist "%%~dpF" mkdir "%%~dpF" >nul 2>&1
+)
+
+REM ----------------------------
+REM Build log filename
+REM ----------------------------
+for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%I"
+set "LOG_FILE=%LOG_DIR%\katalon_%TS%.log"
+
+echo.
+echo ============================================================
+echo  eMatch Desktop Run
+echo ============================================================
+echo [INFO] WORKSPACE       = "%WORKSPACE%"
+echo [INFO] PROJECT_PATH    = "%PROJECT_PATH%"
+echo [INFO] KATALON_EXE     = "%KATALON_EXE%"
+echo [INFO] COLLECTION_PATH = "%COLLECTION_PATH%"
+echo [INFO] BROWSER_TYPE    = "%BROWSER_TYPE%"
+echo [INFO] RETRY           = "%RETRY%"
+echo [INFO] LOG_FILE        = "%LOG_FILE%"
+echo [INFO] MARKER_FILE     = "%MARKER_FILE%"
+echo ============================================================
+echo.
+
+REM clean previous marker
+if exist "%MARKER_FILE%" (
+    del /f /q "%MARKER_FILE%" >nul 2>&1
+)
+
+REM ----------------------------
+REM Run Katalon
+REM ----------------------------
+"%KATALON_EXE%" ^
+  -noSplash ^
+  -runMode=console ^
+  -consoleLog ^
+  -projectPath="%PROJECT_PATH%" ^
+  -retry=%RETRY% ^
+  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
+  -browserType="%BROWSER_TYPE%" ^
+  > "%LOG_FILE%" 2>&1
+
+set "EXITCODE=%ERRORLEVEL%"
+
+echo.
+echo [INFO] Katalon ExitCode = %EXITCODE%
+echo [INFO] Writing marker...
+
+REM atomic marker write
+(
+  echo %EXITCODE%
+) > "%MARKER_FILE%.tmp"
+
+move /Y "%MARKER_FILE%.tmp" "%MARKER_FILE%" >nul 2>&1
+
+echo [INFO] Marker OK: "%MARKER_FILE%"
+echo [INFO] Log OK   : "%LOG_FILE%"
+echo.
+
+exit /b %EXITCODE%
+}
