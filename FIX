@@ -1,5 +1,767 @@
 
 
+JenkinsConsoleView.groovy
+/*
+ * Responsibility:
+ * Clean Jenkins console output for desktop asset execution.
+ */
 
+def cleanText(String value) {
+    return (value ?: '').replaceAll(/\s+/, ' ').trim()
+}
+
+def formatDurationSeconds(def rawValue) {
+    long total = 0L
+
+    try {
+        total = (rawValue ?: '0').toString().toLong()
+    }
+    catch (ignored) {
+        total = 0L
+    }
+
+    long hours = (long) (total / 3600)
+    long minutes = (long) ((total % 3600) / 60)
+    long seconds = (long) (total % 60)
+
+    return String.format('%02d:%02d:%02d', hours, minutes, seconds)
+}
+
+def sumDurationSeconds(List results) {
+    long total = 0L
+
+    results.each { item ->
+        try {
+            total += (item.durationSeconds ?: '0').toString().toLong()
+        }
+        catch (ignored) {
+        }
+    }
+
+    return total
+}
+
+def printAssetHeader(script, Map asset, String timeoutMinutes) {
+    script.echo '------------------------------------------------------------'
+    script.echo '🚀 [START ASSET]'
+    script.echo "📛 Name    : ${asset.name}"
+    script.echo "🧪 Type    : ${asset.type}"
+    script.echo "📁 Path    : ${asset.path}"
+    script.echo "⏱️ Timeout : ${timeoutMinutes} min"
+    script.echo '------------------------------------------------------------'
+}
+
+def printAssetResult(script, Map result) {
+    script.echo '------------------------------------------------------------'
+    script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
+    script.echo "🧪 Type    : ${result.type ?: ''}"
+    script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
+    script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
+
+    if (result.reason) {
+        script.echo "🧾 Reason  : ${cleanText(result.reason)}"
+    }
+
+    if (result.logRel) {
+        script.echo "📄 Log     : Reports/${result.logRel}"
+    }
+
+    (result.caseSummary ?: []).take(3).each { line ->
+        script.echo "🧪 Case    : ${cleanText(line.toString())}"
+    }
+
+    script.echo '------------------------------------------------------------'
+}
+
+def printRunningSummary(script, List results) {
+    def passed = results.count { it.status == 'PASSED' }
+    def failed = results.count { it.status == 'FAILED' }
+    def timeout = results.count { it.status == 'TIMEOUT' }
+    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
+
+    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
+
+    script.echo '------------------------------------------------------------'
+    script.echo "📌 RUNNING SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
+    script.echo '------------------------------------------------------------'
+}
+
+def printFinalSummary(script, List results, String currentResult) {
+    def passed = results.count { it.status == 'PASSED' }
+    def failed = results.count { it.status == 'FAILED' }
+    def timeout = results.count { it.status == 'TIMEOUT' }
+    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
+    def total = results.size()
+
+    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
+
+    script.echo '============================================================'
+
+    if (total == 0) {
+        script.echo '⚠️ PIPELINE STOPPED BEFORE ANY ASSET WAS EXECUTED'
+    }
+    else if (currentResult == 'ABORTED') {
+        script.echo '🛑 PIPELINE ABORTED'
+    }
+    else if (failed > 0 || timeout > 0) {
+        script.echo '❌ PIPELINE FINISHED WITH ERRORS'
+    }
+    else {
+        script.echo '✅ PIPELINE FINISHED SUCCESSFULLY'
+    }
+
+    script.echo "📌 FINAL SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
+    script.echo '============================================================'
+
+    results.each { result ->
+        script.echo '------------------------------------------------------------'
+        script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
+        script.echo "🧪 Type    : ${result.type ?: ''}"
+        script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
+        script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
+
+        if (result.reason) {
+            script.echo "🧾 Reason  : ${cleanText(result.reason)}"
+        }
+
+        script.echo '------------------------------------------------------------'
+    }
+}
+
+return this
+
+
+
+
+
+
+
+
+
+
+
+JenkinsDesktopPipelineRunner.groovy
+package jenkinsIntegration
+
+class JenkinsDesktopPipelineRunner {
+
+    static Map runDesktopViaTaskScheduler(Map cfg) {
+
+        String taskName      = cfg.taskName ?: 'eMatch Automation\\RunEMatchDesktop'
+        String ctxFile       = cfg.ctxFile ?: 'D:\\Projects\\eMatchStarters\\run-context.properties'
+        String markerFile    = cfg.markerFile ?: 'D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt'
+        int    pollSeconds   = (cfg.pollSeconds ?: 3) as int
+        int    maxWaitSecs   = (cfg.maxWaitSecs ?: (3 * 60 * 60)) as int
+
+        echo "[INFO] Writing run-context.properties to: ${ctxFile}"
+        writeFile file: ctxFile, text: cfg.ctxText
+
+        echo "[INFO] Running Task Scheduler: ${taskName}"
+        bat """
+            @echo off
+            schtasks /run /tn "${taskName}"
+        """
+
+        echo "[INFO] Waiting for marker file: ${markerFile}"
+        int waited = 0
+        while (waited < maxWaitSecs) {
+            if (fileExists(markerFile)) {
+                break
+            }
+            sleep pollSeconds
+            waited += pollSeconds
+        }
+
+        if (!fileExists(markerFile)) {
+            error "[ERROR] Marker file was not created within timeout: ${markerFile}"
+        }
+
+        String markerText
+        try {
+            markerText = readFile(markerFile).trim()
+        } catch (Exception ex) {
+            echo "[WARN] Failed to read marker file (maybe transient lock). Retrying once..."
+            sleep 2
+            markerText = readFile(markerFile).trim()
+        }
+
+        def lines = markerText.readLines()
+        int exitCode = 1
+        try {
+            exitCode = Integer.parseInt(lines[0].trim())
+        } catch (ignored) {
+            exitCode = 1
+        }
+
+        echo "[INFO] Task exit code from marker: ${exitCode}"
+        return [exitCode: exitCode, markerLines: lines]
+    }
+
+    static void archiveSafeArtifacts() {
+
+        echo "[INFO] Archiving artifacts (safe mode)"
+        try {
+            archiveArtifacts allowEmptyArchive: true, artifacts: [
+                'Reports/**/*',
+                'D:\\Projects\\eMatchStarters\\logs\\*.log',
+                'D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt'
+            ].join(',')
+        } catch (Exception ex) {
+            echo "[WARN] archiveArtifacts failed but build will continue: ${ex.getMessage()}"
+        }
+    }
+}
+
+
+
+
+
+
+JenkinsDesktopTaskLogger.groovy
+import groovy.json.JsonSlurperClassic
+
+def safeFileName(String value) {
+    return (value ?: 'asset')
+        .replaceAll(/[\\\\\\/:"*?<>|]+/, '_')
+        .replaceAll(/\s+/, '_')
+}
+
+def loadResultFile(script, String resultFile, Map fallback) {
+    if (!script.fileExists(resultFile)) {
+        return fallback
+    }
+
+    try {
+        String raw = script.readFile(file: resultFile, encoding: 'UTF-8')
+        if (!raw?.trim()) {
+            return fallback
+        }
+
+        def parsed = new JsonSlurperClassic().parseText(raw)
+        return (parsed instanceof Map) ? parsed : fallback
+    }
+    catch (ignored) {
+        return fallback
+    }
+}
+
+def runAsset(script, Map cfg, Map asset) {
+    String workspace              = cfg.workspace ?: script.pwd()
+    String reportsRoot            = cfg.reportsRoot ?: "${workspace}\\Reports"
+    String logsDir                = cfg.logsDir ?: "${reportsRoot}\\_desktop_logs"
+    String startersDir            = cfg.startersDir ?: 'D:\\Projects\\eMatchStarters'
+    String ctxFile                = cfg.ctxFile ?: "${startersDir}\\run-context.properties"
+    String markerFile             = cfg.markerFile ?: "${startersDir}\\logs\\__jenkins_task_exitcode.txt"
+    String currentLogFile         = cfg.currentLogFile ?: "${logsDir}\\katalon_current.log"
+    String resultFile             = cfg.resultFile ?: "${logsDir}\\desktop-run-result.json"
+    String desktopRunnerTask      = cfg.desktopRunnerTask ?: '\\eMatch Automation\\RunEMatchDesktop'
+    String winAppDriverExe        = cfg.winAppDriverExe ?: 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+    String autoStartWinAppDriver  = (cfg.autoStartWinAppDriver ?: 'true').toString()
+    String katalonExe             = cfg.katalonExe ?: ''
+    String projectPath            = cfg.projectPath ?: ''
+    String browserType            = cfg.browserType ?: 'Windows'
+    String retry                  = (cfg.retry ?: '0').toString()
+    String timeoutMinutes         = (asset.timeoutMinutes ?: cfg.defaultTimeoutMinutes ?: 180).toString()
+    String runLabel               = cfg.runLabel ?: "${asset.name} Build ${script.env.BUILD_NUMBER ?: ''}".trim()
+    String assetName              = asset.name ?: 'Desktop Asset'
+    String assetType              = asset.type ?: 'COLLECTION'
+    String assetPath              = asset.path ?: ''
+
+    Map fallback = [
+        name         : assetName,
+        type         : assetType,
+        status       : 'FAILED',
+        icon         : '❌',
+        exitCode     : 1,
+        executed     : 0,
+        passed       : 0,
+        failed       : 0,
+        skipped      : 0,
+        reason       : 'Desktop execution did not produce a result file',
+        currentLog   : currentLogFile,
+        resultFile   : resultFile
+    ]
+
+    int psExit = script.withEnv([
+        "WORKSPACE=${workspace}",
+        "REPORTS_ROOT=${reportsRoot}",
+        "LOGS_DIR=${logsDir}",
+        "CTX_FILE=${ctxFile}",
+        "MARKER_FILE=${markerFile}",
+        "CURRENT_LOG_FILE=${currentLogFile}",
+        "RESULT_FILE=${resultFile}",
+        "DESKTOP_RUNNER_TASK=${desktopRunnerTask}",
+        "WINAPPDRIVER_EXE=${winAppDriverExe}",
+        "AUTO_START_WINAPPDRIVER=${autoStartWinAppDriver}",
+        "KATALON_EXE=${katalonExe}",
+        "PROJECT_PATH=${projectPath}",
+        "BROWSER_TYPE=${browserType}",
+        "RETRY=${retry}",
+        "ASSET_NAME=${assetName}",
+        "ASSET_TYPE=${assetType}",
+        "ASSET_PATH=${assetPath}",
+        "ASSET_TIMEOUT_MINUTES=${timeoutMinutes}",
+        "RUN_LABEL=${runLabel}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Clean-Text {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    return (($Value -replace '[\\r\\n]+', ' ') -replace '\\s+', ' ').Trim()
+}
+
+function Short-Text {
+    param(
+        [string]$Value,
+        [int]$Max = 180
+    )
+
+    $text = Clean-Text $Value
+
+    if ($text.Length -gt $Max) {
+        return $text.Substring(0, $Max - 3) + '...'
+    }
+
+    return $text
+}
+
+function Ensure-ParentDirectory {
+    param([string]$Path)
+
+    $parent = Split-Path -Path $Path -Parent
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+}
+
+function Read-NewContent {
+    param(
+        [string]$Path,
+        [ref]$Offset
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    $fs = $null
+    $sr = $null
+
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
+        $sr = New-Object System.IO.StreamReader($fs)
+        $content = $sr.ReadToEnd()
+        $Offset.Value = $fs.Position
+
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            return @()
+        }
+
+        return @($content -split "`r?`n")
+    }
+    catch {
+        return @()
+    }
+    finally {
+        if ($sr) { $sr.Close() }
+        if ($fs) { $fs.Close() }
+    }
+}
+
+function Find-LatestJunit {
+    param([string]$Root)
+
+    if (-not (Test-Path -LiteralPath $Root)) {
+        return ''
+    }
+
+    $candidate = Get-ChildItem -Path $Root -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if ($candidate) {
+        return $candidate.FullName
+    }
+
+    return ''
+}
+
+function Get-JUnitSummary {
+    param([string]$JunitFile)
+
+    $result = [ordered]@{
+        Executed = 0
+        Passed   = 0
+        Failed   = 0
+        Skipped  = 0
+        Reason   = ''
+    }
+
+    if ([string]::IsNullOrWhiteSpace($JunitFile) -or -not (Test-Path -LiteralPath $JunitFile)) {
+        return $result
+    }
+
+    try {
+        [xml]$xml = Get-Content -LiteralPath $JunitFile -Raw
+
+        $testcases = @()
+
+        if ($xml.testsuite) {
+            $testcases = @($xml.testsuite.testcase)
+        }
+        elseif ($xml.testsuites) {
+            foreach ($ts in @($xml.testsuites.testsuite)) {
+                $testcases += @($ts.testcase)
+            }
+        }
+
+        $testcases = @($testcases | Where-Object { $_ })
+        $result.Executed = $testcases.Count
+
+        $failedNodes = @($testcases | Where-Object { $_.failure -or $_.error })
+        $skippedNodes = @($testcases | Where-Object { $_.skipped })
+
+        $result.Failed = $failedNodes.Count
+        $result.Skipped = $skippedNodes.Count
+        $result.Passed = $result.Executed - $result.Failed - $result.Skipped
+
+        if ($failedNodes.Count -gt 0) {
+            $firstBad = $failedNodes[0]
+
+            if ($firstBad.failure) {
+                $result.Reason = Short-Text (($firstBad.failure.message + ' ' + $firstBad.failure.InnerText)) 180
+            }
+            elseif ($firstBad.error) {
+                $result.Reason = Short-Text (($firstBad.error.message + ' ' + $firstBad.error.InnerText)) 180
+            }
+        }
+    }
+    catch {
+        $result.Reason = Short-Text $_.Exception.Message 180
+    }
+
+    return $result
+}
+
+Ensure-ParentDirectory -Path $env:CTX_FILE
+Ensure-ParentDirectory -Path $env:MARKER_FILE
+Ensure-ParentDirectory -Path $env:CURRENT_LOG_FILE
+Ensure-ParentDirectory -Path $env:RESULT_FILE
+
+if (-not (Test-Path -LiteralPath $env:REPORTS_ROOT)) {
+    New-Item -ItemType Directory -Path $env:REPORTS_ROOT -Force | Out-Null
+}
+
+if (-not (Test-Path -LiteralPath $env:LOGS_DIR)) {
+    New-Item -ItemType Directory -Path $env:LOGS_DIR -Force | Out-Null
+}
+
+Remove-Item -LiteralPath $env:MARKER_FILE -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath ($env:MARKER_FILE + '.tmp') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $env:CURRENT_LOG_FILE -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $env:RESULT_FILE -Force -ErrorAction SilentlyContinue
+
+Set-Content -LiteralPath $env:CURRENT_LOG_FILE -Value '' -Encoding UTF8
+
+$ctxLines = @()
+$ctxLines += ('WORKSPACE=' + $env:WORKSPACE)
+$ctxLines += ('PROJECT_PATH=' + $env:PROJECT_PATH)
+$ctxLines += ('KATALON_EXE=' + $env:KATALON_EXE)
+$ctxLines += ('ASSET_TYPE=' + $env:ASSET_TYPE)
+$ctxLines += ('ASSET_PATH=' + $env:ASSET_PATH)
+$ctxLines += ('BROWSER_TYPE=' + $env:BROWSER_TYPE)
+$ctxLines += ('RETRY=' + $env:RETRY)
+$ctxLines += ('REPORTS_DIR=' + $env:REPORTS_ROOT)
+$ctxLines += ('LOG_DIR=' + $env:LOGS_DIR)
+$ctxLines += ('CURRENT_LOG_FILE=' + $env:CURRENT_LOG_FILE)
+$ctxLines += ('MARKER_FILE=' + $env:MARKER_FILE)
+$ctxLines += ('RUN_LABEL=' + $env:RUN_LABEL)
+$ctxLines += ('WINAPPDRIVER_EXE=' + $env:WINAPPDRIVER_EXE)
+$ctxLines += ('AUTO_START_WINAPPDRIVER=' + $env:AUTO_START_WINAPPDRIVER)
+
+Set-Content -LiteralPath $env:CTX_FILE -Value $ctxLines -Encoding ASCII
+
+Write-Host '------------------------------------------------------------'
+Write-Host ('🚀 DESKTOP START | ' + $env:ASSET_NAME)
+Write-Host ('📁 WORKSPACE     | ' + $env:WORKSPACE)
+Write-Host ('📄 PROJECT       | ' + $env:PROJECT_PATH)
+Write-Host ('🧪 TYPE          | ' + $env:ASSET_TYPE)
+Write-Host ('🗂️ PATH          | ' + $env:ASSET_PATH)
+Write-Host ('📜 LOG           | ' + $env:CURRENT_LOG_FILE)
+Write-Host ('⏱️ TIMEOUT       | ' + $env:ASSET_TIMEOUT_MINUTES + ' min')
+Write-Host ('🖥️ TASK          | ' + $env:DESKTOP_RUNNER_TASK)
+Write-Host '------------------------------------------------------------'
+
+$taskOutput = & schtasks /run /tn $env:DESKTOP_RUNNER_TASK 2>&1
+$taskExitCode = $LASTEXITCODE
+
+foreach ($line in @($taskOutput)) {
+    if (-not [string]::IsNullOrWhiteSpace($line)) {
+        Write-Host ('[TASK] ' + (Clean-Text $line))
+    }
+}
+
+if ($taskExitCode -ne 0) {
+    throw ('Failed to start scheduled task. ExitCode=' + $taskExitCode)
+}
+
+$stdoutOffset = 0L
+$deadline = (Get-Date).AddMinutes([int]$env:ASSET_TIMEOUT_MINUTES)
+$lastHeartbeat = Get-Date
+$exitCode = 124
+
+while ((Get-Date) -lt $deadline) {
+    $stdoutLines = Read-NewContent -Path $env:CURRENT_LOG_FILE -Offset ([ref]$stdoutOffset)
+
+    if ($stdoutLines.Count -gt 0) {
+        foreach ($line in $stdoutLines) {
+            $text = Clean-Text $line
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                Write-Host ('[KATALON] ' + $text)
+            }
+        }
+
+        $lastHeartbeat = Get-Date
+    }
+    else {
+        if ((New-TimeSpan -Start $lastHeartbeat -End (Get-Date)).TotalSeconds -ge 15) {
+            Write-Host '[WAIT] Desktop run is alive. Waiting for new log output...'
+            $lastHeartbeat = Get-Date
+        }
+    }
+
+    if (Test-Path -LiteralPath $env:MARKER_FILE) {
+        try {
+            $exitLine = Get-Content -LiteralPath $env:MARKER_FILE -ErrorAction Stop | Select-Object -First 1
+            $exitCode = [int]$exitLine.ToString().Trim()
+        }
+        catch {
+            $exitCode = 1
+        }
+
+        break
+    }
+
+    Start-Sleep -Seconds 2
+}
+
+$stdoutLines = Read-NewContent -Path $env:CURRENT_LOG_FILE -Offset ([ref]$stdoutOffset)
+foreach ($line in $stdoutLines) {
+    $text = Clean-Text $line
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+        Write-Host ('[KATALON] ' + $text)
+    }
+}
+
+$junitFile = Find-LatestJunit -Root $env:REPORTS_ROOT
+$junitSummary = Get-JUnitSummary -JunitFile $junitFile
+
+$status = 'PASSED'
+$icon = '✅'
+
+if ($exitCode -eq 124) {
+    $status = 'TIMEOUT'
+    $icon = '⏰'
+}
+elseif ($exitCode -ne 0 -or $junitSummary.Failed -gt 0) {
+    $status = 'FAILED'
+    $icon = '❌'
+}
+
+$reason = $junitSummary.Reason
+if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'TIMEOUT') {
+    $reason = 'Desktop execution exceeded timeout'
+}
+if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'FAILED') {
+    $reason = 'Desktop execution failed without explicit JUnit reason'
+}
+
+$result = [ordered]@{
+    name       = $env:ASSET_NAME
+    type       = $env:ASSET_TYPE
+    status     = $status
+    icon       = $icon
+    exitCode   = $exitCode
+    executed   = $junitSummary.Executed
+    passed     = $junitSummary.Passed
+    failed     = $junitSummary.Failed
+    skipped    = $junitSummary.Skipped
+    reason     = $reason
+    currentLog = $env:CURRENT_LOG_FILE
+    junitFile  = $junitFile
+    resultFile = $env:RESULT_FILE
+}
+
+$result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $env:RESULT_FILE -Encoding UTF8
+
+Write-Host '------------------------------------------------------------'
+Write-Host ($icon + ' DESKTOP END   | ' + $env:ASSET_NAME)
+Write-Host ('📌 STATUS       | ' + $status)
+Write-Host ('📊 EXECUTED     | ' + $junitSummary.Executed)
+Write-Host ('✅ PASSED       | ' + $junitSummary.Passed)
+Write-Host ('❌ FAILED       | ' + $junitSummary.Failed)
+Write-Host ('⏭️ SKIPPED      | ' + $junitSummary.Skipped)
+if (-not [string]::IsNullOrWhiteSpace($reason)) {
+    Write-Host ('🧾 REASON       | ' + $reason)
+}
+Write-Host ('📜 LOG          | ' + $env:CURRENT_LOG_FILE)
+Write-Host '------------------------------------------------------------'
+
+if ($status -eq 'PASSED') {
+    exit 0
+}
+elseif ($status -eq 'TIMEOUT') {
+    exit 124
+}
+else {
+    exit 1
+}
+'''
+        )
+    }
+
+    Map result = loadResultFile(script, resultFile, fallback)
+    result.psExitCode = psExit
+
+    if (!result.status) {
+        result.status = (psExit == 0 ? 'PASSED' : (psExit == 124 ? 'TIMEOUT' : 'FAILED'))
+    }
+
+    if (!result.icon) {
+        result.icon = (result.status == 'PASSED' ? '✅' : (result.status == 'TIMEOUT' ? '⏰' : '❌'))
+    }
+
+    return result
+}
+
+return this
+
+
+
+
+
+
+
+
+
+JenkinsPaths.groovy
+/*
+ * Responsibility:
+ * Centralize path calculations used by Jenkins desktop pipeline files.
+ */
+
+def workspace(script) {
+    return script.pwd()
+}
+
+def projectPath(script, String projectFileName) {
+    return "${workspace(script)}\\${projectFileName}"
+}
+
+def reportsRoot(script) {
+    return "${workspace(script)}\\Reports"
+}
+
+def logsRoot(script) {
+    return "${reportsRoot(script)}\\logs"
+}
+
+def artifactsRoot(script) {
+    return "${reportsRoot(script)}\\suite-artifacts"
+}
+
+return this
+
+
+
+
+
+
+
+
+
+
+
+
+JenkinsResultStore.groovy
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurperClassic
+
+def saveSuiteResults(script, String reportsRoot, List suiteResults) {
+    String targetFile = "${reportsRoot}\\suite-results.json"
+    script.writeFile(
+        file: targetFile,
+        text: JsonOutput.prettyPrint(JsonOutput.toJson(suiteResults ?: [])),
+        encoding: 'UTF-8'
+    )
+}
+
+def loadSuiteResults(script, String reportsRoot) {
+    String targetFile = "${reportsRoot}\\suite-results.json"
+    if (!script.fileExists(targetFile)) {
+        return []
+    }
+
+    String raw = script.readFile(file: targetFile, encoding: 'UTF-8')
+    if (!raw?.trim()) {
+        return []
+    }
+
+    def parsed = new JsonSlurperClassic().parseText(raw)
+    return (parsed instanceof List) ? parsed : []
+}
+
+def readSuiteMeta(script, String reportsRoot, String assetName) {
+    String safeName = sanitizeFileName(assetName)
+
+    String metaFile = "${reportsRoot}\\logs\\${safeName}.meta.properties"
+
+    if (!script.fileExists(metaFile)) {
+        return [:]
+    }
+
+    String raw = script.readFile(file: metaFile, encoding: 'UTF-8')
+    Map result = [:]
+
+    raw.readLines().each { line ->
+        int idx = line.indexOf('=')
+        if (idx > 0) {
+            String key = line.substring(0, idx).trim()
+            String value = line.substring(idx + 1).trim()
+            result[key] = value
+        }
+    }
+
+    return result
+}
+
+def splitSummary(String value) {
+    if (!value?.trim()) {
+        return []
+    }
+
+    return value
+        .split(/\s*\|\|\|\s*/)
+        .collect { it?.trim() }
+        .findAll { it }
+}
+
+def sanitizeFileName(String value) {
+    return (value ?: 'suite')
+        .replaceAll(/[\\\\\\/:"*?<>|]+/, '_')
+        .replaceAll(/\s+/, '_')
+}
+
+return this
 
 
