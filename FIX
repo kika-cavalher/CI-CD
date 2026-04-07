@@ -1,3 +1,434 @@
+import groovy.json.JsonSlurperClassic
+
+def safeFileName(String value) {
+    return (value ?: 'asset')
+        .replaceAll(/[\\\\\\/:"*?<>|]+/, '_')
+        .replaceAll(/\s+/, '_')
+}
+
+def loadResultFile(script, String resultFile, Map fallback) {
+    if (!script.fileExists(resultFile)) {
+        return fallback
+    }
+
+    try {
+        String raw = script.readFile(file: resultFile, encoding: 'UTF-8')
+        if (!raw?.trim()) {
+            return fallback
+        }
+
+        def parsed = new JsonSlurperClassic().parseText(raw)
+        return (parsed instanceof Map) ? parsed : fallback
+    }
+    catch (ignored) {
+        return fallback
+    }
+}
+
+def runAsset(script, Map cfg, Map asset) {
+    String workspace              = cfg.workspace ?: script.pwd()
+    String reportsRoot            = cfg.reportsRoot ?: "${workspace}\\Reports"
+    String logsDir                = cfg.logsDir ?: "${reportsRoot}\\_desktop_logs"
+    String startersDir            = cfg.startersDir ?: 'D:\\Projects\\eMatchStarters'
+    String ctxFile                = cfg.ctxFile ?: "${startersDir}\\run-context.properties"
+    String markerFile             = cfg.markerFile ?: "${startersDir}\\logs\\__jenkins_task_exitcode.txt"
+    String currentLogFile         = cfg.currentLogFile ?: "${logsDir}\\katalon_current.log"
+    String resultFile             = cfg.resultFile ?: "${logsDir}\\desktop-run-result.json"
+    String desktopRunnerTask      = cfg.desktopRunnerTask ?: '\\eMatch Automation\\RunEMatchDesktop'
+    String winAppDriverExe        = cfg.winAppDriverExe ?: 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+    String autoStartWinAppDriver  = (cfg.autoStartWinAppDriver ?: 'true').toString()
+    String katalonExe             = cfg.katalonExe ?: ''
+    String projectPath            = cfg.projectPath ?: ''
+    String browserType            = cfg.browserType ?: 'Windows'
+    String retry                  = (cfg.retry ?: '0').toString()
+    String timeoutMinutes         = (asset.timeoutMinutes ?: cfg.defaultTimeoutMinutes ?: 180).toString()
+    String runLabel               = cfg.runLabel ?: "${asset.name} Build ${script.env.BUILD_NUMBER ?: ''}".trim()
+    String assetName              = asset.name ?: 'Desktop Asset'
+    String assetType              = asset.type ?: 'COLLECTION'
+    String assetPath              = asset.path ?: ''
+
+    Map fallback = [
+        name         : assetName,
+        type         : assetType,
+        status       : 'FAILED',
+        icon         : '❌',
+        exitCode     : 1,
+        executed     : 0,
+        passed       : 0,
+        failed       : 0,
+        skipped      : 0,
+        reason       : 'Desktop execution did not produce a result file',
+        currentLog   : currentLogFile,
+        resultFile   : resultFile
+    ]
+
+    int psExit = script.withEnv([
+        "WORKSPACE=${workspace}",
+        "REPORTS_ROOT=${reportsRoot}",
+        "LOGS_DIR=${logsDir}",
+        "CTX_FILE=${ctxFile}",
+        "MARKER_FILE=${markerFile}",
+        "CURRENT_LOG_FILE=${currentLogFile}",
+        "RESULT_FILE=${resultFile}",
+        "DESKTOP_RUNNER_TASK=${desktopRunnerTask}",
+        "WINAPPDRIVER_EXE=${winAppDriverExe}",
+        "AUTO_START_WINAPPDRIVER=${autoStartWinAppDriver}",
+        "KATALON_EXE=${katalonExe}",
+        "PROJECT_PATH=${projectPath}",
+        "BROWSER_TYPE=${browserType}",
+        "RETRY=${retry}",
+        "ASSET_NAME=${assetName}",
+        "ASSET_TYPE=${assetType}",
+        "ASSET_PATH=${assetPath}",
+        "ASSET_TIMEOUT_MINUTES=${timeoutMinutes}",
+        "RUN_LABEL=${runLabel}"
+    ]) {
+        script.powershell(
+            returnStatus: true,
+            script: '''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+function Clean-Text {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    return (($Value -replace '[\\r\\n]+', ' ') -replace '\\s+', ' ').Trim()
+}
+
+function Short-Text {
+    param(
+        [string]$Value,
+        [int]$Max = 180
+    )
+
+    $text = Clean-Text $Value
+
+    if ($text.Length -gt $Max) {
+        return $text.Substring(0, $Max - 3) + '...'
+    }
+
+    return $text
+}
+
+function Ensure-ParentDirectory {
+    param([string]$Path)
+
+    $parent = Split-Path -Path $Path -Parent
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+}
+
+function Read-NewContent {
+    param(
+        [string]$Path,
+        [ref]$Offset
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    $fs = $null
+    $sr = $null
+
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        [void]$fs.Seek($Offset.Value, [System.IO.SeekOrigin]::Begin)
+        $sr = New-Object System.IO.StreamReader($fs)
+        $content = $sr.ReadToEnd()
+        $Offset.Value = $fs.Position
+
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            return @()
+        }
+
+        return @($content -split "`r?`n")
+    }
+    catch {
+        return @()
+    }
+    finally {
+        if ($sr) { $sr.Close() }
+        if ($fs) { $fs.Close() }
+    }
+}
+
+function Find-LatestJunit {
+    param([string]$Root)
+
+    if (-not (Test-Path -LiteralPath $Root)) {
+        return ''
+    }
+
+    $candidate = Get-ChildItem -Path $Root -Filter 'JUnit_Report.xml' -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if ($candidate) {
+        return $candidate.FullName
+    }
+
+    return ''
+}
+
+function Get-JUnitSummary {
+    param([string]$JunitFile)
+
+    $result = [ordered]@{
+        Executed = 0
+        Passed   = 0
+        Failed   = 0
+        Skipped  = 0
+        Reason   = ''
+    }
+
+    if ([string]::IsNullOrWhiteSpace($JunitFile) -or -not (Test-Path -LiteralPath $JunitFile)) {
+        return $result
+    }
+
+    try {
+        [xml]$xml = Get-Content -LiteralPath $JunitFile -Raw
+
+        $testcases = @()
+
+        if ($xml.testsuite) {
+            $testcases = @($xml.testsuite.testcase)
+        }
+        elseif ($xml.testsuites) {
+            foreach ($ts in @($xml.testsuites.testsuite)) {
+                $testcases += @($ts.testcase)
+            }
+        }
+
+        $testcases = @($testcases | Where-Object { $_ })
+        $result.Executed = $testcases.Count
+
+        $failedNodes = @($testcases | Where-Object { $_.failure -or $_.error })
+        $skippedNodes = @($testcases | Where-Object { $_.skipped })
+
+        $result.Failed = $failedNodes.Count
+        $result.Skipped = $skippedNodes.Count
+        $result.Passed = $result.Executed - $result.Failed - $result.Skipped
+
+        if ($failedNodes.Count -gt 0) {
+            $firstBad = $failedNodes[0]
+
+            if ($firstBad.failure) {
+                $result.Reason = Short-Text (($firstBad.failure.message + ' ' + $firstBad.failure.InnerText)) 180
+            }
+            elseif ($firstBad.error) {
+                $result.Reason = Short-Text (($firstBad.error.message + ' ' + $firstBad.error.InnerText)) 180
+            }
+        }
+    }
+    catch {
+        $result.Reason = Short-Text $_.Exception.Message 180
+    }
+
+    return $result
+}
+
+Ensure-ParentDirectory -Path $env:CTX_FILE
+Ensure-ParentDirectory -Path $env:MARKER_FILE
+Ensure-ParentDirectory -Path $env:CURRENT_LOG_FILE
+Ensure-ParentDirectory -Path $env:RESULT_FILE
+
+if (-not (Test-Path -LiteralPath $env:REPORTS_ROOT)) {
+    New-Item -ItemType Directory -Path $env:REPORTS_ROOT -Force | Out-Null
+}
+
+if (-not (Test-Path -LiteralPath $env:LOGS_DIR)) {
+    New-Item -ItemType Directory -Path $env:LOGS_DIR -Force | Out-Null
+}
+
+Remove-Item -LiteralPath $env:MARKER_FILE -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath ($env:MARKER_FILE + '.tmp') -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $env:CURRENT_LOG_FILE -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $env:RESULT_FILE -Force -ErrorAction SilentlyContinue
+
+Set-Content -LiteralPath $env:CURRENT_LOG_FILE -Value '' -Encoding UTF8
+
+$ctxLines = @()
+$ctxLines += ('WORKSPACE=' + $env:WORKSPACE)
+$ctxLines += ('PROJECT_PATH=' + $env:PROJECT_PATH)
+$ctxLines += ('KATALON_EXE=' + $env:KATALON_EXE)
+$ctxLines += ('ASSET_TYPE=' + $env:ASSET_TYPE)
+$ctxLines += ('ASSET_PATH=' + $env:ASSET_PATH)
+$ctxLines += ('BROWSER_TYPE=' + $env:BROWSER_TYPE)
+$ctxLines += ('RETRY=' + $env:RETRY)
+$ctxLines += ('REPORTS_DIR=' + $env:REPORTS_ROOT)
+$ctxLines += ('LOG_DIR=' + $env:LOGS_DIR)
+$ctxLines += ('CURRENT_LOG_FILE=' + $env:CURRENT_LOG_FILE)
+$ctxLines += ('MARKER_FILE=' + $env:MARKER_FILE)
+$ctxLines += ('RUN_LABEL=' + $env:RUN_LABEL)
+$ctxLines += ('WINAPPDRIVER_EXE=' + $env:WINAPPDRIVER_EXE)
+$ctxLines += ('AUTO_START_WINAPPDRIVER=' + $env:AUTO_START_WINAPPDRIVER)
+
+Set-Content -LiteralPath $env:CTX_FILE -Value $ctxLines -Encoding ASCII
+
+Write-Host '------------------------------------------------------------'
+Write-Host ('🚀 DESKTOP START | ' + $env:ASSET_NAME)
+Write-Host ('📁 WORKSPACE     | ' + $env:WORKSPACE)
+Write-Host ('📄 PROJECT       | ' + $env:PROJECT_PATH)
+Write-Host ('🧪 TYPE          | ' + $env:ASSET_TYPE)
+Write-Host ('🗂️ PATH          | ' + $env:ASSET_PATH)
+Write-Host ('📜 LOG           | ' + $env:CURRENT_LOG_FILE)
+Write-Host ('⏱️ TIMEOUT       | ' + $env:ASSET_TIMEOUT_MINUTES + ' min')
+Write-Host ('🖥️ TASK          | ' + $env:DESKTOP_RUNNER_TASK)
+Write-Host '------------------------------------------------------------'
+
+$taskOutput = & schtasks /run /tn $env:DESKTOP_RUNNER_TASK 2>&1
+$taskExitCode = $LASTEXITCODE
+
+foreach ($line in @($taskOutput)) {
+    if (-not [string]::IsNullOrWhiteSpace($line)) {
+        Write-Host ('[TASK] ' + (Clean-Text $line))
+    }
+}
+
+if ($taskExitCode -ne 0) {
+    throw ('Failed to start scheduled task. ExitCode=' + $taskExitCode)
+}
+
+$stdoutOffset = 0L
+$deadline = (Get-Date).AddMinutes([int]$env:ASSET_TIMEOUT_MINUTES)
+$lastHeartbeat = Get-Date
+$exitCode = 124
+
+while ((Get-Date) -lt $deadline) {
+    $stdoutLines = Read-NewContent -Path $env:CURRENT_LOG_FILE -Offset ([ref]$stdoutOffset)
+
+    if ($stdoutLines.Count -gt 0) {
+        foreach ($line in $stdoutLines) {
+            $text = Clean-Text $line
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                Write-Host ('[KATALON] ' + $text)
+            }
+        }
+
+        $lastHeartbeat = Get-Date
+    }
+    else {
+        if ((New-TimeSpan -Start $lastHeartbeat -End (Get-Date)).TotalSeconds -ge 15) {
+            Write-Host '[WAIT] Desktop run is alive. Waiting for new log output...'
+            $lastHeartbeat = Get-Date
+        }
+    }
+
+    if (Test-Path -LiteralPath $env:MARKER_FILE) {
+        try {
+            $exitLine = Get-Content -LiteralPath $env:MARKER_FILE -ErrorAction Stop | Select-Object -First 1
+            $exitCode = [int]$exitLine.ToString().Trim()
+        }
+        catch {
+            $exitCode = 1
+        }
+
+        break
+    }
+
+    Start-Sleep -Seconds 2
+}
+
+$stdoutLines = Read-NewContent -Path $env:CURRENT_LOG_FILE -Offset ([ref]$stdoutOffset)
+foreach ($line in $stdoutLines) {
+    $text = Clean-Text $line
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+        Write-Host ('[KATALON] ' + $text)
+    }
+}
+
+$junitFile = Find-LatestJunit -Root $env:REPORTS_ROOT
+$junitSummary = Get-JUnitSummary -JunitFile $junitFile
+
+$status = 'PASSED'
+$icon = '✅'
+
+if ($exitCode -eq 124) {
+    $status = 'TIMEOUT'
+    $icon = '⏰'
+}
+elseif ($exitCode -ne 0 -or $junitSummary.Failed -gt 0) {
+    $status = 'FAILED'
+    $icon = '❌'
+}
+
+$reason = $junitSummary.Reason
+if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'TIMEOUT') {
+    $reason = 'Desktop execution exceeded timeout'
+}
+if ([string]::IsNullOrWhiteSpace($reason) -and $status -eq 'FAILED') {
+    $reason = 'Desktop execution failed without explicit JUnit reason'
+}
+
+$result = [ordered]@{
+    name       = $env:ASSET_NAME
+    type       = $env:ASSET_TYPE
+    status     = $status
+    icon       = $icon
+    exitCode   = $exitCode
+    executed   = $junitSummary.Executed
+    passed     = $junitSummary.Passed
+    failed     = $junitSummary.Failed
+    skipped    = $junitSummary.Skipped
+    reason     = $reason
+    currentLog = $env:CURRENT_LOG_FILE
+    junitFile  = $junitFile
+    resultFile = $env:RESULT_FILE
+}
+
+$result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $env:RESULT_FILE -Encoding UTF8
+
+Write-Host '------------------------------------------------------------'
+Write-Host ($icon + ' DESKTOP END   | ' + $env:ASSET_NAME)
+Write-Host ('📌 STATUS       | ' + $status)
+Write-Host ('📊 EXECUTED     | ' + $junitSummary.Executed)
+Write-Host ('✅ PASSED       | ' + $junitSummary.Passed)
+Write-Host ('❌ FAILED       | ' + $junitSummary.Failed)
+Write-Host ('⏭️ SKIPPED      | ' + $junitSummary.Skipped)
+if (-not [string]::IsNullOrWhiteSpace($reason)) {
+    Write-Host ('🧾 REASON       | ' + $reason)
+}
+Write-Host ('📜 LOG          | ' + $env:CURRENT_LOG_FILE)
+Write-Host '------------------------------------------------------------'
+
+if ($status -eq 'PASSED') {
+    exit 0
+}
+elseif ($status -eq 'TIMEOUT') {
+    exit 124
+}
+else {
+    exit 1
+}
+'''
+        )
+    }
+
+    Map result = loadResultFile(script, resultFile, fallback)
+    result.psExitCode = psExit
+
+    if (!result.status) {
+        result.status = (psExit == 0 ? 'PASSED' : (psExit == 124 ? 'TIMEOUT' : 'FAILED'))
+    }
+
+    if (!result.icon) {
+        result.icon = (result.status == 'PASSED' ? '✅' : (result.status == 'TIMEOUT' ? '⏰' : '❌'))
+    }
+
+    return result
+}
+
+return this
+
+
+
+
 pipeline {
     agent {
         node {
@@ -16,14 +447,16 @@ pipeline {
     }
 
     environment {
-        STARTERS_DIR = 'D:\\Projects\\eMatchStarters'
-        CTX_FILE     = 'D:\\Projects\\eMatchStarters\\run-context.properties'
-        TASK_NAME    = '\\eMatch Automation\\RunEMatchDesktop'
+        STARTERS_DIR             = 'D:\\Projects\\eMatchStarters'
+        TASK_NAME                = '\\eMatch Automation\\RunEMatchDesktop'
+        WINAPPDRIVER_EXE         = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+        AUTO_START_WINAPPDRIVER  = 'true'
 
-        KATALON_EXE  = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        PROJECT_FILE = 'eMatch POC.prj'
-        COLLECTION   = 'Test Suites\\Archive Mode\\Archive Mode Collection'
-        BROWSER_TYPE = 'Windows'
+        KATALON_EXE              = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+        PROJECT_FILE             = 'eMatch POC.prj'
+        COLLECTION               = 'Test Suites\\Archive Mode\\Archive Mode Collection'
+        BROWSER_TYPE             = 'Windows'
+        RETRY                    = '0'
     }
 
     stages {
@@ -35,105 +468,55 @@ pipeline {
             }
         }
 
-        stage('Prepare Context + Reports') {
+        stage('Run Desktop') {
             steps {
                 script {
                     def ws = pwd()
-                    def projectPath = "${ws}\\${env.PROJECT_FILE}"
-                    def reportsDir = "${ws}\\Reports"
-                    def startersLogsDir = "${env.STARTERS_DIR}\\logs"
-                    def markerFile = "${startersLogsDir}\\__jenkins_task_exitcode.txt"
+                    def taskLogger = load 'JenkinsDesktopTaskLogger.groovy'
 
-                    bat """
-@echo off
-setlocal
+                    def cfg = [
+                        workspace             : ws,
+                        reportsRoot           : "${ws}\\Reports",
+                        logsDir               : "${ws}\\Reports\\_desktop_logs",
+                        startersDir           : env.STARTERS_DIR,
+                        ctxFile               : "${env.STARTERS_DIR}\\run-context.properties",
+                        markerFile            : "${env.STARTERS_DIR}\\logs\\__jenkins_task_exitcode.txt",
+                        currentLogFile        : "${ws}\\Reports\\_desktop_logs\\katalon_current.log",
+                        resultFile            : "${ws}\\Reports\\_desktop_logs\\desktop-run-result.json",
+                        desktopRunnerTask     : env.TASK_NAME,
+                        winAppDriverExe       : env.WINAPPDRIVER_EXE,
+                        autoStartWinAppDriver : env.AUTO_START_WINAPPDRIVER,
+                        katalonExe            : env.KATALON_EXE,
+                        projectPath           : "${ws}\\${env.PROJECT_FILE}",
+                        browserType           : env.BROWSER_TYPE,
+                        retry                 : env.RETRY,
+                        runLabel              : "Archive Mode Build ${env.BUILD_NUMBER}",
+                        defaultTimeoutMinutes : 180
+                    ]
 
-if not exist "${reportsDir}" mkdir "${reportsDir}"
-if not exist "${env.STARTERS_DIR}" mkdir "${env.STARTERS_DIR}"
-if not exist "${startersLogsDir}" mkdir "${startersLogsDir}"
+                    def asset = [
+                        name           : 'Archive Mode Collection',
+                        type           : 'COLLECTION',
+                        path           : env.COLLECTION,
+                        timeoutMinutes : 180
+                    ]
 
-del /f /q "${markerFile}" 2>nul
-del /f /q "${markerFile}.tmp" 2>nul
+                    def result = taskLogger.runAsset(this, cfg, asset)
 
-(
-  echo WORKSPACE=${ws}
-  echo PROJECT_PATH=${projectPath}
-  echo KATALON_EXE=${env.KATALON_EXE}
-  echo COLLECTION_PATH=${env.COLLECTION}
-  echo BROWSER_TYPE=${env.BROWSER_TYPE}
-  echo RETRY=0
-  echo MARKER_FILE=${markerFile}
-  echo LOG_DIR=${reportsDir}\\_desktop_logs
-) > "${env.CTX_FILE}"
+                    currentBuild.description = "${result.icon} ${result.status} | P=${result.passed ?: 0} F=${result.failed ?: 0}"
 
-echo -------------------- run-context.properties --------------------
-type "${env.CTX_FILE}"
-echo ----------------------------------------------------------------
+                    echo '============================================================'
+                    echo "${result.icon} FINAL RESULT | ${result.name}"
+                    echo "📌 Status   : ${result.status}"
+                    echo "📊 Stats    : Executed=${result.executed ?: 0} | Passed=${result.passed ?: 0} | Failed=${result.failed ?: 0} | Skipped=${result.skipped ?: 0}"
+                    echo "📜 Log      : Reports\\_desktop_logs\\katalon_current.log"
+                    if (result.reason) {
+                        echo "🧾 Reason   : ${result.reason}"
+                    }
+                    echo '============================================================'
 
-endlocal
-"""
-                }
-            }
-        }
-
-        stage('Run Desktop (Task Scheduler)') {
-            steps {
-                script {
-                    def markerFile = "${env.STARTERS_DIR}\\logs\\__jenkins_task_exitcode.txt"
-
-                    bat """
-@echo off
-echo ------------------------------------------------------------
-echo START ASSET: Archive Mode Collection
-echo TASK: ${env.TASK_NAME}
-echo ------------------------------------------------------------
-schtasks /run /tn "${env.TASK_NAME}"
-exit /b %ERRORLEVEL%
-"""
-
-                    withEnv(["MARKER_FILE=${markerFile}"]) {
-                        def markerText = timeout(time: 180, unit: 'MINUTES') {
-                            powershell(
-                                returnStdout: true,
-                                script: '''
-$path = $env:MARKER_FILE
-$pollSeconds = 2
-$deadline = (Get-Date).AddMinutes(180)
-
-while ((Get-Date) -lt $deadline) {
-    try {
-        if (Test-Path -LiteralPath $path) {
-            $content = Get-Content -LiteralPath $path -ErrorAction Stop | Select-Object -First 1
-            if ($null -ne $content -and $content.ToString().Trim() -ne '') {
-                Write-Output $content.ToString().Trim()
-                exit 0
-            }
-        }
-    }
-    catch {
-    }
-
-    Start-Sleep -Seconds $pollSeconds
-}
-
-throw "Unable to read marker file within timeout: $path"
-'''
-                            ).trim()
-                        }
-
-                        echo "Marker content: '${markerText}'"
-
-                        int exitCode = 999
-                        try {
-                            exitCode = Integer.parseInt(markerText)
-                        }
-                        catch (ignored) {
-                            exitCode = 999
-                        }
-
-                        if (exitCode != 0) {
-                            error("Desktop execution failed. ExitCode=${exitCode}. Check Reports\\_desktop_logs\\katalon_*.log")
-                        }
+                    if (result.status != 'PASSED') {
+                        error("Desktop execution failed. Check Reports\\_desktop_logs\\katalon_current.log")
                     }
                 }
             }
@@ -154,6 +537,11 @@ throw "Unable to read marker file within timeout: $path"
         }
     }
 }
+
+
+
+
+
 
 
 
@@ -174,14 +562,16 @@ pipeline {
     }
 
     environment {
-        STARTERS_DIR = 'D:\\Projects\\eMatchStarters'
-        CTX_FILE     = 'D:\\Projects\\eMatchStarters\\run-context.properties'
-        TASK_NAME    = '\\eMatch Automation\\RunEMatchDesktop'
+        STARTERS_DIR             = 'D:\\Projects\\eMatchStarters'
+        TASK_NAME                = '\\eMatch Automation\\RunEMatchDesktop'
+        WINAPPDRIVER_EXE         = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+        AUTO_START_WINAPPDRIVER  = 'true'
 
-        KATALON_EXE  = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
-        PROJECT_FILE = 'eMatch POC.prj'
-        COLLECTION   = 'Test Suites\\PasserelleBilan\\Passerelle Bilan Collection'
-        BROWSER_TYPE = 'Windows'
+        KATALON_EXE              = 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe'
+        PROJECT_FILE             = 'eMatch POC.prj'
+        COLLECTION               = 'Test Suites\\PasserelleBilan\\Passerelle Bilan Collection'
+        BROWSER_TYPE             = 'Windows'
+        RETRY                    = '0'
     }
 
     stages {
@@ -193,105 +583,55 @@ pipeline {
             }
         }
 
-        stage('Prepare Context + Reports') {
+        stage('Run Desktop') {
             steps {
                 script {
                     def ws = pwd()
-                    def projectPath = "${ws}\\${env.PROJECT_FILE}"
-                    def reportsDir = "${ws}\\Reports"
-                    def startersLogsDir = "${env.STARTERS_DIR}\\logs"
-                    def markerFile = "${startersLogsDir}\\__jenkins_task_exitcode.txt"
+                    def taskLogger = load 'JenkinsDesktopTaskLogger.groovy'
 
-                    bat """
-@echo off
-setlocal
+                    def cfg = [
+                        workspace             : ws,
+                        reportsRoot           : "${ws}\\Reports",
+                        logsDir               : "${ws}\\Reports\\_desktop_logs",
+                        startersDir           : env.STARTERS_DIR,
+                        ctxFile               : "${env.STARTERS_DIR}\\run-context.properties",
+                        markerFile            : "${env.STARTERS_DIR}\\logs\\__jenkins_task_exitcode.txt",
+                        currentLogFile        : "${ws}\\Reports\\_desktop_logs\\katalon_current.log",
+                        resultFile            : "${ws}\\Reports\\_desktop_logs\\desktop-run-result.json",
+                        desktopRunnerTask     : env.TASK_NAME,
+                        winAppDriverExe       : env.WINAPPDRIVER_EXE,
+                        autoStartWinAppDriver : env.AUTO_START_WINAPPDRIVER,
+                        katalonExe            : env.KATALON_EXE,
+                        projectPath           : "${ws}\\${env.PROJECT_FILE}",
+                        browserType           : env.BROWSER_TYPE,
+                        retry                 : env.RETRY,
+                        runLabel              : "Passerelle Bilan Build ${env.BUILD_NUMBER}",
+                        defaultTimeoutMinutes : 180
+                    ]
 
-if not exist "${reportsDir}" mkdir "${reportsDir}"
-if not exist "${env.STARTERS_DIR}" mkdir "${env.STARTERS_DIR}"
-if not exist "${startersLogsDir}" mkdir "${startersLogsDir}"
+                    def asset = [
+                        name           : 'Passerelle Bilan Collection',
+                        type           : 'COLLECTION',
+                        path           : env.COLLECTION,
+                        timeoutMinutes : 180
+                    ]
 
-del /f /q "${markerFile}" 2>nul
-del /f /q "${markerFile}.tmp" 2>nul
+                    def result = taskLogger.runAsset(this, cfg, asset)
 
-(
-  echo WORKSPACE=${ws}
-  echo PROJECT_PATH=${projectPath}
-  echo KATALON_EXE=${env.KATALON_EXE}
-  echo COLLECTION_PATH=${env.COLLECTION}
-  echo BROWSER_TYPE=${env.BROWSER_TYPE}
-  echo RETRY=0
-  echo MARKER_FILE=${markerFile}
-  echo LOG_DIR=${reportsDir}\\_desktop_logs
-) > "${env.CTX_FILE}"
+                    currentBuild.description = "${result.icon} ${result.status} | P=${result.passed ?: 0} F=${result.failed ?: 0}"
 
-echo -------------------- run-context.properties --------------------
-type "${env.CTX_FILE}"
-echo ----------------------------------------------------------------
+                    echo '============================================================'
+                    echo "${result.icon} FINAL RESULT | ${result.name}"
+                    echo "📌 Status   : ${result.status}"
+                    echo "📊 Stats    : Executed=${result.executed ?: 0} | Passed=${result.passed ?: 0} | Failed=${result.failed ?: 0} | Skipped=${result.skipped ?: 0}"
+                    echo "📜 Log      : Reports\\_desktop_logs\\katalon_current.log"
+                    if (result.reason) {
+                        echo "🧾 Reason   : ${result.reason}"
+                    }
+                    echo '============================================================'
 
-endlocal
-"""
-                }
-            }
-        }
-
-        stage('Run Desktop (Task Scheduler)') {
-            steps {
-                script {
-                    def markerFile = "${env.STARTERS_DIR}\\logs\\__jenkins_task_exitcode.txt"
-
-                    bat """
-@echo off
-echo ------------------------------------------------------------
-echo START ASSET: Passerelle Bilan Collection
-echo TASK: ${env.TASK_NAME}
-echo ------------------------------------------------------------
-schtasks /run /tn "${env.TASK_NAME}"
-exit /b %ERRORLEVEL%
-"""
-
-                    withEnv(["MARKER_FILE=${markerFile}"]) {
-                        def markerText = timeout(time: 180, unit: 'MINUTES') {
-                            powershell(
-                                returnStdout: true,
-                                script: '''
-$path = $env:MARKER_FILE
-$pollSeconds = 2
-$deadline = (Get-Date).AddMinutes(180)
-
-while ((Get-Date) -lt $deadline) {
-    try {
-        if (Test-Path -LiteralPath $path) {
-            $content = Get-Content -LiteralPath $path -ErrorAction Stop | Select-Object -First 1
-            if ($null -ne $content -and $content.ToString().Trim() -ne '') {
-                Write-Output $content.ToString().Trim()
-                exit 0
-            }
-        }
-    }
-    catch {
-    }
-
-    Start-Sleep -Seconds $pollSeconds
-}
-
-throw "Unable to read marker file within timeout: $path"
-'''
-                            ).trim()
-                        }
-
-                        echo "Marker content: '${markerText}'"
-
-                        int exitCode = 999
-                        try {
-                            exitCode = Integer.parseInt(markerText)
-                        }
-                        catch (ignored) {
-                            exitCode = 999
-                        }
-
-                        if (exitCode != 0) {
-                            error("Desktop execution failed. ExitCode=${exitCode}. Check Reports\\_desktop_logs\\katalon_*.log")
-                        }
+                    if (result.status != 'PASSED') {
+                        error("Desktop execution failed. Check Reports\\_desktop_logs\\katalon_current.log")
                     }
                 }
             }
@@ -316,16 +656,11 @@ throw "Unable to read marker file within timeout: $path"
 
 
 
+
+
+
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-
-REM ============================================================
-REM  Generic runner called by ONE Task Scheduler
-REM  Reads: D:\Projects\eMatchStarters\run-context.properties
-REM  Writes:
-REM    - Log file into Reports\_desktop_logs
-REM    - Marker file at MARKER_FILE
-REM ============================================================
 
 set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
 
@@ -334,43 +669,66 @@ if not exist "%CTX_FILE%" (
     exit /b 90
 )
 
-REM ----------------------------
-REM Read key=value from context
-REM ----------------------------
 for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
     set "K=%%A"
     set "V=%%B"
-    if /I "!K!"=="WORKSPACE"        set "WORKSPACE=!V!"
-    if /I "!K!"=="PROJECT_PATH"     set "PROJECT_PATH=!V!"
-    if /I "!K!"=="KATALON_EXE"      set "KATALON_EXE=!V!"
-    if /I "!K!"=="COLLECTION_PATH"  set "COLLECTION_PATH=!V!"
-    if /I "!K!"=="BROWSER_TYPE"     set "BROWSER_TYPE=!V!"
-    if /I "!K!"=="RETRY"            set "RETRY=!V!"
-    if /I "!K!"=="MARKER_FILE"      set "MARKER_FILE=!V!"
-    if /I "!K!"=="LOG_DIR"          set "LOG_DIR=!V!"
+
+    if /I "!K!"=="WORKSPACE"                set "WORKSPACE=!V!"
+    if /I "!K!"=="PROJECT_PATH"             set "PROJECT_PATH=!V!"
+    if /I "!K!"=="KATALON_EXE"              set "KATALON_EXE=!V!"
+    if /I "!K!"=="ASSET_TYPE"               set "ASSET_TYPE=!V!"
+    if /I "!K!"=="ASSET_PATH"               set "ASSET_PATH=!V!"
+    if /I "!K!"=="BROWSER_TYPE"             set "BROWSER_TYPE=!V!"
+    if /I "!K!"=="RETRY"                    set "RETRY=!V!"
+    if /I "!K!"=="REPORTS_DIR"              set "REPORTS_DIR=!V!"
+    if /I "!K!"=="LOG_DIR"                  set "LOG_DIR=!V!"
+    if /I "!K!"=="CURRENT_LOG_FILE"         set "CURRENT_LOG_FILE=!V!"
+    if /I "!K!"=="MARKER_FILE"              set "MARKER_FILE=!V!"
+    if /I "!K!"=="RUN_LABEL"                set "RUN_LABEL=!V!"
+    if /I "!K!"=="WINAPPDRIVER_EXE"         set "WINAPPDRIVER_EXE=!V!"
+    if /I "!K!"=="AUTO_START_WINAPPDRIVER"  set "AUTO_START_WINAPPDRIVER=!V!"
 )
 
-REM ----------------------------
-REM Validate required values
-REM ----------------------------
 if "%WORKSPACE%"=="" (
     echo [ERROR] WORKSPACE is empty
-    exit /b 95
+    exit /b 91
 )
 
 if "%PROJECT_PATH%"=="" (
     echo [ERROR] PROJECT_PATH is empty
-    exit /b 91
+    exit /b 92
 )
 
 if "%KATALON_EXE%"=="" (
     echo [ERROR] KATALON_EXE is empty
-    exit /b 92
+    exit /b 93
 )
 
-if "%COLLECTION_PATH%"=="" (
-    echo [ERROR] COLLECTION_PATH is empty
-    exit /b 93
+if "%ASSET_TYPE%"=="" (
+    echo [ERROR] ASSET_TYPE is empty
+    exit /b 94
+)
+
+if "%ASSET_PATH%"=="" (
+    echo [ERROR] ASSET_PATH is empty
+    exit /b 95
+)
+
+if "%MARKER_FILE%"=="" (
+    echo [ERROR] MARKER_FILE is empty
+    exit /b 96
+)
+
+if "%REPORTS_DIR%"=="" (
+    set "REPORTS_DIR=%WORKSPACE%\Reports"
+)
+
+if "%LOG_DIR%"=="" (
+    set "LOG_DIR=%REPORTS_DIR%\_desktop_logs"
+)
+
+if "%CURRENT_LOG_FILE%"=="" (
+    set "CURRENT_LOG_FILE=%LOG_DIR%\katalon_current.log"
 )
 
 if "%BROWSER_TYPE%"=="" (
@@ -381,92 +739,140 @@ if "%RETRY%"=="" (
     set "RETRY=0"
 )
 
-if "%MARKER_FILE%"=="" (
-    echo [ERROR] MARKER_FILE is empty
-    exit /b 94
+if "%RUN_LABEL%"=="" (
+    set "RUN_LABEL=eMatch Desktop Run"
 )
 
-if "%LOG_DIR%"=="" (
-    set "LOG_DIR=%WORKSPACE%\Reports\_desktop_logs"
+if "%AUTO_START_WINAPPDRIVER%"=="" (
+    set "AUTO_START_WINAPPDRIVER=true"
 )
 
-set "REPORTS_DIR=%WORKSPACE%\Reports"
-
-if not exist "%REPORTS_DIR%" (
-    mkdir "%REPORTS_DIR%" >nul 2>&1
+if "%WINAPPDRIVER_EXE%"=="" (
+    set "WINAPPDRIVER_EXE=C:\Program Files (x86)\Windows Application Driver\WinAppDriver.exe"
 )
 
-if not exist "%LOG_DIR%" (
-    mkdir "%LOG_DIR%" >nul 2>&1
+for %%F in ("%REPORTS_DIR%") do (
+    if not exist "%%~fF" mkdir "%%~fF" >nul 2>&1
+)
+
+for %%F in ("%LOG_DIR%") do (
+    if not exist "%%~fF" mkdir "%%~fF" >nul 2>&1
 )
 
 for %%F in ("%MARKER_FILE%") do (
     if not exist "%%~dpF" mkdir "%%~dpF" >nul 2>&1
 )
 
-REM ----------------------------
-REM Build log filename
-REM ----------------------------
-for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%I"
-set "LOG_FILE=%LOG_DIR%\katalon_%TS%.log"
-
-echo.
-echo ============================================================
-echo  eMatch Desktop Run
-echo ============================================================
-echo [INFO] WORKSPACE       = "%WORKSPACE%"
-echo [INFO] PROJECT_PATH    = "%PROJECT_PATH%"
-echo [INFO] KATALON_EXE     = "%KATALON_EXE%"
-echo [INFO] COLLECTION_PATH = "%COLLECTION_PATH%"
-echo [INFO] BROWSER_TYPE    = "%BROWSER_TYPE%"
-echo [INFO] RETRY           = "%RETRY%"
-echo [INFO] REPORTS_DIR     = "%REPORTS_DIR%"
-echo [INFO] LOG_FILE        = "%LOG_FILE%"
-echo [INFO] MARKER_FILE     = "%MARKER_FILE%"
-echo ============================================================
-echo.
-
-if exist "%MARKER_FILE%" (
-    del /f /q "%MARKER_FILE%" >nul 2>&1
+for %%F in ("%CURRENT_LOG_FILE%") do (
+    if not exist "%%~dpF" mkdir "%%~dpF" >nul 2>&1
 )
 
-if exist "%MARKER_FILE%.tmp" (
-    del /f /q "%MARKER_FILE%.tmp" >nul 2>&1
+if exist "%MARKER_FILE%" del /f /q "%MARKER_FILE%" >nul 2>&1
+if exist "%MARKER_FILE%.tmp" del /f /q "%MARKER_FILE%.tmp" >nul 2>&1
+if exist "%CURRENT_LOG_FILE%" del /f /q "%CURRENT_LOG_FILE%" >nul 2>&1
+
+type nul > "%CURRENT_LOG_FILE%"
+
+for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%I"
+set "FINAL_LOG_FILE=%LOG_DIR%\katalon_%TS%.log"
+
+taskkill /FI "WINDOWTITLE eq eMatch Live Log*" /T /F >nul 2>&1
+
+start "eMatch Live Log | %RUN_LABEL%" cmd /k powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath '%CURRENT_LOG_FILE%' -Wait -Tail 20"
+
+timeout /t 1 >nul
+
+call :appendlog ============================================================
+call :appendlog  eMatch Desktop Run
+call :appendlog ============================================================
+call :appendlog [INFO] RUN_LABEL       = "%RUN_LABEL%"
+call :appendlog [INFO] WORKSPACE       = "%WORKSPACE%"
+call :appendlog [INFO] PROJECT_PATH    = "%PROJECT_PATH%"
+call :appendlog [INFO] KATALON_EXE     = "%KATALON_EXE%"
+call :appendlog [INFO] ASSET_TYPE      = "%ASSET_TYPE%"
+call :appendlog [INFO] ASSET_PATH      = "%ASSET_PATH%"
+call :appendlog [INFO] BROWSER_TYPE    = "%BROWSER_TYPE%"
+call :appendlog [INFO] RETRY           = "%RETRY%"
+call :appendlog [INFO] REPORTS_DIR     = "%REPORTS_DIR%"
+call :appendlog [INFO] CURRENT_LOG     = "%CURRENT_LOG_FILE%"
+call :appendlog [INFO] FINAL_LOG       = "%FINAL_LOG_FILE%"
+call :appendlog [INFO] MARKER_FILE     = "%MARKER_FILE%"
+call :appendlog ============================================================
+call :appendlog.
+
+if /I "%AUTO_START_WINAPPDRIVER%"=="true" (
+    tasklist /FI "IMAGENAME eq WinAppDriver.exe" | find /I "WinAppDriver.exe" >nul
+
+    if errorlevel 1 (
+        if exist "%WINAPPDRIVER_EXE%" (
+            call :appendlog [INFO] WinAppDriver is not running. Starting it now...
+            start "WinAppDriver" "%WINAPPDRIVER_EXE%"
+            timeout /t 3 >nul
+        ) else (
+            call :appendlog [WARN] WinAppDriver executable not found: "%WINAPPDRIVER_EXE%"
+        )
+    ) else (
+        call :appendlog [INFO] WinAppDriver is already running
+    )
+) else (
+    call :appendlog [INFO] AUTO_START_WINAPPDRIVER=false
 )
 
 cd /d "%WORKSPACE%"
 
-REM ----------------------------
-REM Run Katalon
-REM ----------------------------
-"%KATALON_EXE%" ^
-  -noSplash ^
-  -runMode=console ^
-  -consoleLog ^
-  -projectPath="%PROJECT_PATH%" ^
-  -retry=%RETRY% ^
-  -testSuiteCollectionPath="%COLLECTION_PATH%" ^
-  -browserType="%BROWSER_TYPE%" ^
-  -reportFolder="%REPORTS_DIR%" ^
-  > "%LOG_FILE%" 2>&1
+if /I "%ASSET_TYPE%"=="COLLECTION" (
+    call :appendlog [INFO] Running Katalon test suite collection...
+
+    "%KATALON_EXE%" ^
+      -noSplash ^
+      -runMode=console ^
+      -consoleLog ^
+      -projectPath="%PROJECT_PATH%" ^
+      -retry=%RETRY% ^
+      -testSuiteCollectionPath="%ASSET_PATH%" ^
+      -browserType="%BROWSER_TYPE%" ^
+      -reportFolder="%REPORTS_DIR%" ^
+      >> "%CURRENT_LOG_FILE%" 2>&1
+) else (
+    call :appendlog [INFO] Running Katalon test suite...
+
+    "%KATALON_EXE%" ^
+      -noSplash ^
+      -runMode=console ^
+      -consoleLog ^
+      -projectPath="%PROJECT_PATH%" ^
+      -retry=%RETRY% ^
+      -testSuitePath="%ASSET_PATH%" ^
+      -browserType="%BROWSER_TYPE%" ^
+      -reportFolder="%REPORTS_DIR%" ^
+      >> "%CURRENT_LOG_FILE%" 2>&1
+)
 
 set "EXITCODE=%ERRORLEVEL%"
 
-echo.
-echo [INFO] Katalon ExitCode = %EXITCODE%
-echo [INFO] Writing marker...
+copy /Y "%CURRENT_LOG_FILE%" "%FINAL_LOG_FILE%" >nul 2>&1
+
+call :appendlog.
+call :appendlog [INFO] Katalon ExitCode = %EXITCODE%
+call :appendlog [INFO] Writing marker file...
 
 (
-  echo %EXITCODE%
+    echo %EXITCODE%
 ) > "%MARKER_FILE%.tmp"
 
 move /Y "%MARKER_FILE%.tmp" "%MARKER_FILE%" >nul 2>&1
 
-timeout /t 1 >nul
-
-echo [INFO] Marker OK: "%MARKER_FILE%"
-echo [INFO] Log OK   : "%LOG_FILE%"
-echo.
+call :appendlog [INFO] Marker file written: "%MARKER_FILE%"
+call :appendlog [INFO] Final log saved   : "%FINAL_LOG_FILE%"
+call :appendlog.
 
 exit /b %EXITCODE%
+
+:appendlog
+echo %*
+>> "%CURRENT_LOG_FILE%" echo %*
+exit /b 0
+
+
+
 
