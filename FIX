@@ -1,287 +1,519 @@
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
+package jiraIntegration
 
-REM ============================================================
-REM  eMatch desktop runner
-REM ============================================================
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
 
-set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+import internal.GlobalVariable
 
-if not exist "%CTX_FILE%" (
-    echo [ERROR] Context file not found: "%CTX_FILE%"
-    exit /b 90
-)
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
-REM ============================================================
-REM  Read context file
-REM ============================================================
+class JiraFlowCoordinator {
 
-for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
-    set "K=%%A"
-    set "V=%%B"
+	private static final String JIRA_BASE_URL = 'https://jira-mut.d.bbg'
+	private static final String PROJECT_KEY = 'GI5PRD'
+	private static final String TEST_PLAN_ISSUE_TYPE_ID = '10604'
+	private static final String EPIC_LINK_FIELD_ID = 'customfield_10006'
 
-    if /I "!K!"=="WORKSPACE"                set "WORKSPACE=!V!"
-    if /I "!K!"=="PROJECT_PATH"             set "PROJECT_PATH=!V!"
-    if /I "!K!"=="KATALON_EXE"              set "KATALON_EXE=!V!"
-    if /I "!K!"=="ASSET_TYPE"               set "ASSET_TYPE=!V!"
-    if /I "!K!"=="ASSET_PATH"               set "ASSET_PATH=!V!"
-    if /I "!K!"=="BROWSER_TYPE"             set "BROWSER_TYPE=!V!"
-    if /I "!K!"=="RETRY"                    set "RETRY=!V!"
-    if /I "!K!"=="REPORTS_DIR"              set "REPORTS_DIR=!V!"
-    if /I "!K!"=="LOG_DIR"                  set "LOG_DIR=!V!"
-    if /I "!K!"=="CURRENT_LOG_FILE"         set "CURRENT_LOG_FILE=!V!"
-    if /I "!K!"=="MARKER_FILE"              set "MARKER_FILE=!V!"
-    if /I "!K!"=="RUN_LABEL"                set "RUN_LABEL=!V!"
-    if /I "!K!"=="RUNNER_WINDOW_TITLE"      set "RUNNER_WINDOW_TITLE=!V!"
-    if /I "!K!"=="WINAPPDRIVER_EXE"         set "WINAPPDRIVER_EXE=!V!"
-    if /I "!K!"=="AUTO_START_WINAPPDRIVER"  set "AUTO_START_WINAPPDRIVER=!V!"
-    if /I "!K!"=="APP_EXE_PATH"             set "APP_EXE_PATH=!V!"
-    if /I "!K!"=="APP_LNK_PATH"             set "APP_LNK_PATH=!V!"
-)
+	private static final String DEFAULT_EPIC_KEY = 'GI5PRD-9877'
+	private static final String TEST_PLAN_ASSIGNEE = 'cavalherer'
 
-REM ============================================================
-REM  Validate required values
-REM ============================================================
+	private static final boolean FORCE_CREATE_NEW_TEST_PLAN = false
 
-if "%WORKSPACE%"=="" (
-    echo [ERROR] WORKSPACE is empty
-    exit /b 91
-)
+	/*
+	 * Leave empty if your token already comes from:
+	 * 1) GlobalVariable.JIRA_TOKEN
+	 * 2) GlobalVariable.jiraToken
+	 * 3) System env JIRA_TOKEN
+	 */
+	private static final String JIRA_TOKEN = ''
 
-if "%PROJECT_PATH%"=="" (
-    echo [ERROR] PROJECT_PATH is empty
-    exit /b 92
-)
+	@Keyword
+	String jiraImport(String epicKey = '') {
+		try {
+			KeywordUtil.logInfo('============================================================')
+			KeywordUtil.logInfo('Starting Jira import flow')
+			KeywordUtil.logInfo('============================================================')
 
-if "%KATALON_EXE%"=="" (
-    echo [ERROR] KATALON_EXE is empty
-    exit /b 93
-)
+			String token = resolveToken()
 
-if "%ASSET_TYPE%"=="" (
-    echo [ERROR] ASSET_TYPE is empty
-    exit /b 94
-)
+			if (blank(token)) {
+				throw new RuntimeException('JIRA token is empty. Fill JIRA_TOKEN or GlobalVariable.JIRA_TOKEN or env JIRA_TOKEN.')
+			}
 
-if "%ASSET_PATH%"=="" (
-    echo [ERROR] ASSET_PATH is empty
-    exit /b 95
-)
+			String effectiveEpicKey = !blank(epicKey) ? safe(epicKey) : DEFAULT_EPIC_KEY
 
-if "%MARKER_FILE%"=="" (
-    echo [ERROR] MARKER_FILE is empty
-    exit /b 96
-)
+			File reportFolder = locateTargetReportFolder()
+			File latestRunFolder = findLatestRunFolder(new File(RunConfiguration.getProjectDir(), 'Reports'))
+			File junitXml = findJUnitXml(reportFolder)
 
-if "%REPORTS_DIR%"=="" (
-    set "REPORTS_DIR=%WORKSPACE%\Reports"
-)
+			if (reportFolder == null || !reportFolder.exists()) {
+				throw new RuntimeException('Could not locate the target report folder.')
+			}
 
-if "%LOG_DIR%"=="" (
-    set "LOG_DIR=%REPORTS_DIR%\_desktop_logs"
-)
+			if (junitXml == null || !junitXml.exists()) {
+				throw new RuntimeException('JUnit XML was not found inside the selected report folder.')
+			}
 
-if "%CURRENT_LOG_FILE%"=="" (
-    set "CURRENT_LOG_FILE=%LOG_DIR%\katalon_current.log"
-)
+			String suiteName = safe(reportFolder.parentFile?.name)
+			String executionTitle = buildExecutionTitle(suiteName, latestRunFolder)
 
-if "%BROWSER_TYPE%"=="" (
-    set "BROWSER_TYPE=Windows"
-)
+			KeywordUtil.logInfo('Using report folder: ' + reportFolder.absolutePath)
+			KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
+			KeywordUtil.logInfo('Execution title used: ' + executionTitle)
+			KeywordUtil.logInfo('Test Plan title used: ' + suiteName + ' Test Plan')
+			KeywordUtil.logInfo('Epic key used: ' + effectiveEpicKey)
+			KeywordUtil.logInfo('Assignee used on Test Plan: ' + TEST_PLAN_ASSIGNEE)
+			KeywordUtil.logInfo('JUnit XML found: ' + junitXml.absolutePath)
 
-if "%RETRY%"=="" (
-    set "RETRY=0"
-)
+			File customReport = buildCustomHtmlReport(reportFolder, suiteName, executionTitle)
+			KeywordUtil.logInfo('Custom Jira report created: ' + customReport.absolutePath)
 
-if "%RUN_LABEL%"=="" (
-    set "RUN_LABEL=eMatch Desktop Run"
-)
+			File resultsZip = new File(reportFolder, 'Results.zip')
+			createZipFromFolder(reportFolder, resultsZip, [
+				'Results.zip',
+				'Evidences.zip'
+			])
+			KeywordUtil.logInfo('Results ZIP created: ' + resultsZip.absolutePath)
 
-if "%RUNNER_WINDOW_TITLE%"=="" (
-    set "RUNNER_WINDOW_TITLE=eMatch Runner"
-)
+			File evidencesZip = createEvidencesZip(reportFolder)
+			if (evidencesZip != null && evidencesZip.exists()) {
+				KeywordUtil.logInfo('Evidences ZIP created: ' + evidencesZip.absolutePath)
+			}
 
-if "%AUTO_START_WINAPPDRIVER%"=="" (
-    set "AUTO_START_WINAPPDRIVER=true"
-)
+			JiraGateway gateway = new JiraGateway(JIRA_BASE_URL, token)
 
-if "%WINAPPDRIVER_EXE%"=="" (
-    set "WINAPPDRIVER_EXE=C:\Program Files (x86)\Windows Application Driver\WinAppDriver.exe"
-)
+			JiraTestPlanManager testPlanManager = new JiraTestPlanManager(
+					gateway,
+					PROJECT_KEY,
+					TEST_PLAN_ISSUE_TYPE_ID,
+					EPIC_LINK_FIELD_ID,
+					effectiveEpicKey,
+					TEST_PLAN_ASSIGNEE
+					)
 
-REM ============================================================
-REM  Ensure folders
-REM ============================================================
+			String testPlanKey = testPlanManager.getOrCreateTestPlanKey(
+					suiteName,
+					'',
+					FORCE_CREATE_NEW_TEST_PLAN
+					)
 
-for %%F in ("%REPORTS_DIR%") do (
-    if not exist "%%~fF" mkdir "%%~fF" >nul 2>&1
-)
+			List<File> attachments = []
+			attachments << customReport
+			attachments << resultsZip
 
-for %%F in ("%LOG_DIR%") do (
-    if not exist "%%~fF" mkdir "%%~fF" >nul 2>&1
-)
+			if (evidencesZip != null && evidencesZip.exists()) {
+				attachments << evidencesZip
+			}
 
-for %%F in ("%MARKER_FILE%") do (
-    if not exist "%%~dpF" mkdir "%%~dpF" >nul 2>&1
-)
+			JiraExecutionPublisher publisher = new JiraExecutionPublisher(gateway)
 
-for %%F in ("%CURRENT_LOG_FILE%") do (
-    if not exist "%%~dpF" mkdir "%%~dpF" >nul 2>&1
-)
+			Map publishResponse = publisher.publishExecution([
+				junitXml      : junitXml,
+				customReport  : customReport,
+				reportFolder  : reportFolder,
+				projectKey    : PROJECT_KEY,
+				testPlanKey   : testPlanKey,
+				executionTitle: executionTitle,
+				attachments   : attachments
+			])
 
-REM ============================================================
-REM  Cleanup previous run
-REM ============================================================
+			String executionKey = safe(publishResponse.executionKey)
 
-if exist "%MARKER_FILE%" del /f /q "%MARKER_FILE%" >nul 2>&1
-if exist "%MARKER_FILE%.tmp" del /f /q "%MARKER_FILE%.tmp" >nul 2>&1
-if exist "%CURRENT_LOG_FILE%" del /f /q "%CURRENT_LOG_FILE%" >nul 2>&1
+			KeywordUtil.logInfo('Jira import completed successfully.')
+			KeywordUtil.logInfo('Test Plan key: ' + testPlanKey)
+			KeywordUtil.logInfo('Execution key: ' + executionKey)
+			KeywordUtil.logInfo('============================================================')
 
-type nul > "%CURRENT_LOG_FILE%"
+			return executionKey
+		} catch (Exception e) {
+			KeywordUtil.markFailed('Jira import failed: ' + safe(e.message))
+			throw e
+		}
+	}
 
-for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TS=%%I"
-set "FINAL_LOG_FILE=%LOG_DIR%\katalon_%TS%.log"
+	private File buildCustomHtmlReport(File reportFolder, String suiteName, String executionTitle) {
+		JiraReportBuilder reportBuilder = new JiraReportBuilder()
+		File customReport = reportBuilder.buildReport(reportFolder, suiteName, executionTitle)
 
-title %RUNNER_WINDOW_TITLE%
+		if (customReport == null || !customReport.exists()) {
+			throw new RuntimeException('Custom HTML report was not generated.')
+		}
 
-call :appendlog ============================================================
-call :appendlog eMatch Desktop Run
-call :appendlog ============================================================
-call :appendlog [INFO] RUN_LABEL       = "%RUN_LABEL%"
-call :appendlog [INFO] WORKSPACE       = "%WORKSPACE%"
-call :appendlog [INFO] PROJECT_PATH    = "%PROJECT_PATH%"
-call :appendlog [INFO] KATALON_EXE     = "%KATALON_EXE%"
-call :appendlog [INFO] ASSET_TYPE      = "%ASSET_TYPE%"
-call :appendlog [INFO] ASSET_PATH      = "%ASSET_PATH%"
-call :appendlog [INFO] BROWSER_TYPE    = "%BROWSER_TYPE%"
-call :appendlog [INFO] RETRY           = "%RETRY%"
-call :appendlog [INFO] REPORTS_DIR     = "%REPORTS_DIR%"
-call :appendlog [INFO] CURRENT_LOG     = "%CURRENT_LOG_FILE%"
-call :appendlog [INFO] FINAL_LOG       = "%FINAL_LOG_FILE%"
-call :appendlog [INFO] MARKER_FILE     = "%MARKER_FILE%"
-call :appendlog ============================================================
-call :appendlog.
+		return customReport
+	}
 
-REM ============================================================
-REM  Minimize runner window
-REM ============================================================
+	private String resolveToken() {
+		if (!blank(JIRA_TOKEN)) {
+			return JIRA_TOKEN
+		}
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-"$sig='[DllImport(\"user32.dll\")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);';" ^
-"Add-Type -MemberDefinition $sig -Name Win32Show -Namespace Native;" ^
-"$title='%RUNNER_WINDOW_TITLE%';" ^
-"1..15 | ForEach-Object {" ^
-"    $p = Get-Process | Where-Object { $_.MainWindowTitle -eq $title } | Select-Object -First 1;" ^
-"    if ($p) {" ^
-"        [Native.Win32Show]::ShowWindowAsync($p.MainWindowHandle, 2) | Out-Null;" ^
-"        break" ^
-"    }" ^
-"    Start-Sleep -Milliseconds 200" ^
-"}" >nul 2>&1
+		String envToken = System.getenv('JIRA_TOKEN')
+		if (!blank(envToken)) {
+			return envToken
+		}
 
-REM ============================================================
-REM  Start WinAppDriver if needed
-REM ============================================================
+		List<String> candidates = [
+			'JIRA_TOKEN',
+			'jiraToken',
+			'jira_token',
+			'JiraToken',
+			'TOKEN'
+		]
 
-if /I "%AUTO_START_WINAPPDRIVER%"=="true" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "if (-not (Get-Process WinAppDriver -ErrorAction SilentlyContinue)) {" ^
-    "    if (Test-Path '%WINAPPDRIVER_EXE%') {" ^
-    "        Start-Process -FilePath '%WINAPPDRIVER_EXE%' -WindowStyle Minimized | Out-Null" ^
-    "    }" ^
-    "}" >nul 2>&1
+		for (String fieldName : candidates) {
+			try {
+				def value = GlobalVariable."${fieldName}"
+				if (!blank(safe(value))) {
+					return safe(value)
+				}
+			} catch (Exception ignored) {
+			}
+		}
 
-    call :appendlog [INFO] WinAppDriver check executed
-) else (
-    call :appendlog [INFO] AUTO_START_WINAPPDRIVER=false
-)
+		return ''
+	}
 
-REM ============================================================
-REM  Optional app opening before Katalon
-REM ============================================================
+	private File locateTargetReportFolder() {
+		File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+		File latestRunFolder = findLatestRunFolder(reportsRoot)
 
-if defined APP_EXE_PATH (
-    if exist "%APP_EXE_PATH%" (
-        call :appendlog [INFO] Opening app from APP_EXE_PATH...
-        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "Start-Process -FilePath '%APP_EXE_PATH%' -WindowStyle Normal | Out-Null" >nul 2>&1
-        timeout /t 3 >nul
-    ) else (
-        call :appendlog [WARN] APP_EXE_PATH not found: "%APP_EXE_PATH%"
-    )
-)
+		if (latestRunFolder == null || !latestRunFolder.exists()) {
+			throw new RuntimeException('No timestamp report folder was found under Reports.')
+		}
 
-if not defined APP_EXE_PATH if defined APP_LNK_PATH (
-    if exist "%APP_LNK_PATH%" (
-        call :appendlog [INFO] Opening app from APP_LNK_PATH...
-        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-        "Start-Process -FilePath '%APP_LNK_PATH%' -WindowStyle Normal | Out-Null" >nul 2>&1
-        timeout /t 3 >nul
-    ) else (
-        call :appendlog [WARN] APP_LNK_PATH not found: "%APP_LNK_PATH%"
-    )
-)
+		List<File> candidates = []
 
-REM ============================================================
-REM  Run Katalon
-REM ============================================================
+		latestRunFolder.eachFileRecurse { File dir ->
+			if (!dir.isDirectory()) {
+				return
+			}
 
-cd /d "%WORKSPACE%"
+			boolean hasJUnit = new File(dir, 'JUnit_Report.xml').exists()
+			String lowerName = safe(dir.name).toLowerCase(Locale.ENGLISH)
 
-if /I "%ASSET_TYPE%"=="COLLECTION" (
-    call :appendlog [INFO] Running Katalon test suite collection...
+			if (hasJUnit && !lowerName.contains('jira import') && !lowerName.contains('collection')) {
+				candidates << dir
+			}
+		}
 
-    "%KATALON_EXE%" ^
-        -noSplash ^
-        -runMode=console ^
-        -consoleLog ^
-        -projectPath="%PROJECT_PATH%" ^
-        -retry=%RETRY% ^
-        -testSuiteCollectionPath="%ASSET_PATH%" ^
-        -browserType="%BROWSER_TYPE%" ^
-        -reportFolder="%REPORTS_DIR%" ^
-        >> "%CURRENT_LOG_FILE%" 2>&1
-) else (
-    call :appendlog [INFO] Running Katalon test suite...
+		if (candidates.isEmpty()) {
+			throw new RuntimeException('No main suite report folder with JUnit_Report.xml was found.')
+		}
 
-    "%KATALON_EXE%" ^
-        -noSplash ^
-        -runMode=console ^
-        -consoleLog ^
-        -projectPath="%PROJECT_PATH%" ^
-        -retry=%RETRY% ^
-        -testSuitePath="%ASSET_PATH%" ^
-        -browserType="%BROWSER_TYPE%" ^
-        -reportFolder="%REPORTS_DIR%" ^
-        >> "%CURRENT_LOG_FILE%" 2>&1
-)
+		candidates = candidates.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
 
-set "EXITCODE=%ERRORLEVEL%"
+		return candidates[0]
+	}
 
-REM ============================================================
-REM  Save artifacts and marker
-REM ============================================================
+	private File findLatestRunFolder(File reportsRoot) {
+		if (reportsRoot == null || !reportsRoot.exists()) {
+			return null
+		}
 
-copy /Y "%CURRENT_LOG_FILE%" "%FINAL_LOG_FILE%" >nul 2>&1
+		List<File> folders = reportsRoot.listFiles()?.findAll { File file ->
+			file.isDirectory()
+		} ?: []
 
-call :appendlog.
-call :appendlog [INFO] Katalon ExitCode = %EXITCODE%
-call :appendlog [INFO] Writing marker file...
+		if (folders.isEmpty()) {
+			return null
+		}
 
-(
-    echo %EXITCODE%
-) > "%MARKER_FILE%.tmp"
+		folders = folders.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
 
-move /Y "%MARKER_FILE%.tmp" "%MARKER_FILE%" >nul 2>&1
+		return folders[0]
+	}
 
-call :appendlog [INFO] Marker file written: "%MARKER_FILE%"
-call :appendlog [INFO] Final log saved   : "%FINAL_LOG_FILE%"
-call :appendlog [INFO] Runner finished
-call :appendlog.
+	private File findJUnitXml(File reportFolder) {
+		if (reportFolder == null || !reportFolder.exists()) {
+			return null
+		}
 
-endlocal & exit /b %EXITCODE%
+		List<File> xmls = []
 
-:appendlog
-echo %*
->> "%CURRENT_LOG_FILE%" echo %*
-exit /b 0
+		reportFolder.eachFileRecurse { File file ->
+			if (file.isFile() && file.name.equalsIgnoreCase('JUnit_Report.xml')) {
+				xmls << file
+			}
+		}
+
+		if (xmls.isEmpty()) {
+			return null
+		}
+
+		xmls = xmls.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		return xmls[0]
+	}
+
+	private String buildExecutionTitle(String suiteName, File latestRunFolder) {
+		String formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+
+		if (latestRunFolder != null) {
+			try {
+				Date parsed = new SimpleDateFormat('yyyyMMdd_HHmmss').parse(latestRunFolder.name)
+				formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(parsed)
+			} catch (Exception ignored) {
+			}
+		}
+
+		return safe(suiteName) + ' ' + formattedDate
+	}
+
+	private void createZipFromFolder(File sourceFolder, File targetZip, List<String> excludedNames) {
+		if (sourceFolder == null || !sourceFolder.exists()) {
+			return
+		}
+
+		if (targetZip.exists()) {
+			targetZip.delete()
+		}
+
+		ZipOutputStream zos = null
+
+		try {
+			zos = new ZipOutputStream(new FileOutputStream(targetZip))
+
+			sourceFolder.eachFileRecurse { File file ->
+				if (!file.isFile()) {
+					return
+				}
+
+				if (excludedNames?.contains(file.name)) {
+					return
+				}
+
+				String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+				ZipEntry entry = new ZipEntry(relativePath)
+				zos.putNextEntry(entry)
+				zos << file.bytes
+				zos.closeEntry()
+			}
+		} finally {
+			try {
+				zos?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private File createEvidencesZip(File sourceFolder) {
+		if (sourceFolder == null || !sourceFolder.exists()) {
+			return null
+		}
+
+		List<File> images = []
+
+		sourceFolder.eachFileRecurse { File file ->
+			if (!file.isFile()) {
+				return
+			}
+
+			String name = safe(file.name).toLowerCase(Locale.ENGLISH)
+			if (name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.gif') || name.endsWith('.bmp') || name.endsWith('.webp')) {
+				images << file
+			}
+		}
+
+		if (images.isEmpty()) {
+			return null
+		}
+
+		File zipFile = new File(sourceFolder, 'Evidences.zip')
+
+		if (zipFile.exists()) {
+			zipFile.delete()
+		}
+
+		ZipOutputStream zos = null
+
+		try {
+			zos = new ZipOutputStream(new FileOutputStream(zipFile))
+
+			images.each { File file ->
+				String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+				ZipEntry entry = new ZipEntry(relativePath)
+				zos.putNextEntry(entry)
+				zos << file.bytes
+				zos.closeEntry()
+			}
+		} finally {
+			try {
+				zos?.close()
+			} catch (Exception ignored) {
+			}
+		}
+
+		return zipFile
+	}
+
+	private boolean blank(String value) {
+		return safe(value).isEmpty()
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
+
+
+
+
+
+
+package jiraIntegration
+
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraExecutionPublisher {
+
+	private final JiraGateway gateway
+
+	JiraExecutionPublisher(JiraGateway gateway) {
+		this.gateway = gateway
+	}
+
+	Map publishExecution(Map request) {
+		File junitXml = request.junitXml as File
+		File customReport = request.customReport as File
+		File reportFolder = request.reportFolder as File
+		String projectKey = safe(request.projectKey)
+		String testPlanKey = safe(request.testPlanKey)
+		String executionTitle = safe(request.executionTitle)
+
+		List<File> attachments = []
+		if (request.attachments instanceof Collection) {
+			attachments.addAll((request.attachments as Collection).findAll { it instanceof File } as Collection<File>)
+		}
+
+		KeywordUtil.logInfo('Importing XML file: ' + safe(junitXml?.absolutePath))
+
+		Map importResponse = gateway.importExecutionResults(junitXml, projectKey, testPlanKey)
+
+		KeywordUtil.logInfo('Import Results status: ' + importResponse.status)
+		KeywordUtil.logInfo('Import Results response: ' + safe(importResponse.body))
+
+		if ((importResponse.status as int) != 200) {
+			throw new RuntimeException('Import execution failed with status ' + importResponse.status + '. Body: ' + safe(importResponse.body))
+		}
+
+		String executionKey = extractExecutionKey(importResponse.json)
+
+		if (blank(executionKey)) {
+			throw new RuntimeException('Import execution succeeded, but no Test Execution key was returned. Body: ' + safe(importResponse.body))
+		}
+
+		KeywordUtil.logInfo('Imported Test Execution key: ' + executionKey)
+
+		if (!blank(executionTitle)) {
+			Map renameResponse = gateway.updateIssueSummary(executionKey, executionTitle)
+			KeywordUtil.logInfo('Update execution title status: ' + renameResponse.status)
+			KeywordUtil.logInfo('Update execution title response: ' + safe(renameResponse.body))
+		}
+
+		KeywordUtil.logInfo('Skipping explicit addExecutionToTestPlan call because import/execution/junit already received testPlanKey.')
+
+		List<File> finalAttachments = []
+		finalAttachments.addAll(buildDefaultAttachments(reportFolder, junitXml, customReport))
+		finalAttachments.addAll(attachments.findAll { File f -> f != null && f.exists() })
+
+		finalAttachments = finalAttachments.findAll { File f ->
+			f != null && f.exists()
+		}.unique { File f ->
+			f.absolutePath
+		}
+
+		finalAttachments.each { File file ->
+			KeywordUtil.logInfo('Attaching file to Test Execution: ' + file.absolutePath)
+
+			Map attachResponse = gateway.attachFile(executionKey, file)
+
+			KeywordUtil.logInfo('Attachment status: ' + attachResponse.status)
+			KeywordUtil.logInfo('Attachment response: ' + safe(attachResponse.body))
+
+			if ((attachResponse.status as int) != 200) {
+				KeywordUtil.logInfo('Attachment failed but Jira import will continue for file: ' + file.name)
+			}
+		}
+
+		return [
+			executionKey  : executionKey,
+			importResponse: importResponse
+		]
+	}
+
+	private List<File> buildDefaultAttachments(File reportFolder, File junitXml, File customReport) {
+		List<File> files = []
+
+		if (customReport != null && customReport.exists()) {
+			files << customReport
+		}
+
+		if (junitXml != null && junitXml.exists()) {
+			files << junitXml
+		}
+
+		if (reportFolder != null && reportFolder.exists()) {
+			File resultsZip = new File(reportFolder, 'Results.zip')
+			File evidencesZip = new File(reportFolder, 'Evidences.zip')
+
+			if (resultsZip.exists()) {
+				files << resultsZip
+			}
+
+			if (evidencesZip.exists()) {
+				files << evidencesZip
+			}
+		}
+
+		return files
+	}
+
+	private String extractExecutionKey(Object json) {
+		if (!(json instanceof Map)) {
+			return ''
+		}
+
+		Map map = json as Map
+
+		String direct = safe(map?.testExecIssue?.key)
+		if (!blank(direct)) {
+			return direct
+		}
+
+		String flatKey = safe(map?.key)
+		if (!blank(flatKey)) {
+			return flatKey
+		}
+
+		if (map.testExecIssues instanceof List && !(map.testExecIssues as List).isEmpty()) {
+			Object first = (map.testExecIssues as List)[0]
+			if (first instanceof Map) {
+				return safe((first as Map).key)
+			}
+		}
+
+		return ''
+	}
+
+	private boolean blank(String value) {
+		return safe(value).isEmpty()
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
+
