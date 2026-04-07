@@ -1,1 +1,155 @@
 
+import groovy.transform.Field
+
+@Field Map SUITE = [
+    NODE_LABEL                    : 'GI5_SWDCFRNXGI55817',
+    CUSTOM_WORKSPACE_PATH         : 'D:\\jenkins\\work\\workspace\\GI5\\eMatch_Regression\\Archive Mode',
+
+    STARTERS_DIR                  : 'D:\\Projects\\eMatchStarters',
+    TASK_NAME                     : '\\eMatch Automation\\RunEMatchDesktop',
+    WINAPPDRIVER_EXE              : 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe',
+    AUTO_START_WINAPPDRIVER       : 'true',
+
+    KATALON_EXE                   : 'C:\\Users\\adgi5appjenkins\\Documents\\Katalon_Studio_Engine_Windows_64-8.1.0\\katalonc.exe',
+    PROJECT_FILE                  : 'eMatch POC.prj',
+
+    SUITE_NAME                    : 'Archive Mode Collection',
+    SUITE_TYPE                    : 'COLLECTION',
+    SUITE_PATH                    : 'Test Suites\\Archive Mode\\Archive Mode Collection',
+
+    BROWSER_TYPE                  : 'Windows',
+    RETRY                         : '0',
+    TIMEOUT_MINUTES               : 180,
+    ALLOW_EXIT_3_WHEN_JUNIT_GREEN : true,
+
+    APP_EXE_PATH                  : '',
+    APP_LNK_PATH                  : '',
+
+    NEXT_JOB_NAME                 : '',
+    WAIT_FOR_NEXT_JOB             : false,
+    PROPAGATE_NEXT_JOB_FAILURE    : false
+]
+
+pipeline {
+    agent {
+        node {
+            label SUITE.NODE_LABEL
+            customWorkspace SUITE.CUSTOM_WORKSPACE_PATH
+        }
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 4, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '20', daysToKeepStr: '30'))
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "Workspace: ${pwd()}"
+            }
+        }
+
+        stage('Run Desktop Suite') {
+            steps {
+                script {
+                    def consoleView = load 'JenkinsConsoleView.groovy'
+                    def desktopTaskLogger = load 'JenkinsDesktopTaskLogger.groovy'
+                    def paths = load 'JenkinsPaths.groovy'
+                    def resultStore = load 'JenkinsResultStore.groovy'
+
+                    def asset = [
+                        name           : SUITE.SUITE_NAME,
+                        type           : SUITE.SUITE_TYPE,
+                        path           : SUITE.SUITE_PATH,
+                        timeoutMinutes : SUITE.TIMEOUT_MINUTES
+                    ]
+
+                    def cfg = [
+                        workspace               : paths.workspace(this),
+                        reportsRoot             : paths.reportsRoot(this),
+                        logsDir                 : paths.desktopLogsRoot(this),
+                        startersDir             : SUITE.STARTERS_DIR,
+                        ctxFile                 : "${SUITE.STARTERS_DIR}\\run-context.properties",
+                        markerFile              : "${SUITE.STARTERS_DIR}\\logs\\__jenkins_task_exitcode.txt",
+                        currentLogFile          : paths.desktopCurrentLogFile(this),
+                        resultFile              : paths.desktopResultFile(this),
+                        desktopRunnerTask       : SUITE.TASK_NAME,
+                        winAppDriverExe         : SUITE.WINAPPDRIVER_EXE,
+                        autoStartWinAppDriver   : SUITE.AUTO_START_WINAPPDRIVER,
+                        katalonExe              : SUITE.KATALON_EXE,
+                        projectPath             : paths.projectPath(this, SUITE.PROJECT_FILE),
+                        browserType             : SUITE.BROWSER_TYPE,
+                        retry                   : SUITE.RETRY,
+                        defaultTimeoutMinutes   : SUITE.TIMEOUT_MINUTES,
+                        runLabel                : "${SUITE.SUITE_NAME} Build ${env.BUILD_NUMBER}",
+                        runnerWindowTitle       : "eMatch Runner ${SUITE.SUITE_NAME} ${env.BUILD_NUMBER}",
+                        appExePath              : SUITE.APP_EXE_PATH,
+                        appLnkPath              : SUITE.APP_LNK_PATH
+                    ]
+
+                    consoleView.printAssetHeader(this, asset, SUITE.TIMEOUT_MINUTES.toString())
+
+                    def result = desktopTaskLogger.runAsset(this, cfg, asset)
+
+                    resultStore.saveSuiteResults(this, paths.reportsRoot(this), [result])
+
+                    consoleView.printAssetResult(this, result)
+
+                    boolean softPass = SUITE.ALLOW_EXIT_3_WHEN_JUNIT_GREEN &&
+                        ((result.exitCode ?: 0) as int) == 3 &&
+                        ((result.failed ?: 0) as int) == 0 &&
+                        ((result.executed ?: 0) as int) > 0
+
+                    String finalResult = (result.status == 'PASSED' || softPass) ? 'SUCCESS' : 'FAILURE'
+                    consoleView.printFinalSummary(this, [result], finalResult)
+
+                    if (softPass) {
+                        echo '⚠️ Exit code 3 ignored because JUnit is green.'
+                    }
+
+                    if (finalResult != 'SUCCESS') {
+                        error('Desktop execution failed. Check Reports\\_desktop_logs\\katalon_current.log')
+                    }
+                }
+            }
+        }
+
+        stage('Trigger Next Job') {
+            when {
+                expression {
+                    return SUITE.NEXT_JOB_NAME?.trim()
+                }
+            }
+            steps {
+                script {
+                    echo "🚀 Triggering next job: ${SUITE.NEXT_JOB_NAME}"
+                    build(
+                        job: SUITE.NEXT_JOB_NAME,
+                        wait: SUITE.WAIT_FOR_NEXT_JOB as boolean,
+                        propagate: SUITE.PROPAGATE_NEXT_JOB_FAILURE as boolean
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    archiveArtifacts artifacts: 'Reports/**', allowEmptyArchive: true
+                }
+
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    junit allowEmptyResults: true, testResults: 'Reports/**/JUnit_Report.xml,Reports/**/JUnit*.xml,Reports/**/junit*.xml'
+                }
+            }
+        }
+    }
+}
