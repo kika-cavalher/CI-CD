@@ -1,223 +1,3 @@
-
-
-JenkinsConsoleView.groovy
-/*
- * Responsibility:
- * Clean Jenkins console output for desktop asset execution.
- */
-
-def cleanText(String value) {
-    return (value ?: '').replaceAll(/\s+/, ' ').trim()
-}
-
-def formatDurationSeconds(def rawValue) {
-    long total = 0L
-
-    try {
-        total = (rawValue ?: '0').toString().toLong()
-    }
-    catch (ignored) {
-        total = 0L
-    }
-
-    long hours = (long) (total / 3600)
-    long minutes = (long) ((total % 3600) / 60)
-    long seconds = (long) (total % 60)
-
-    return String.format('%02d:%02d:%02d', hours, minutes, seconds)
-}
-
-def sumDurationSeconds(List results) {
-    long total = 0L
-
-    results.each { item ->
-        try {
-            total += (item.durationSeconds ?: '0').toString().toLong()
-        }
-        catch (ignored) {
-        }
-    }
-
-    return total
-}
-
-def printAssetHeader(script, Map asset, String timeoutMinutes) {
-    script.echo '------------------------------------------------------------'
-    script.echo '🚀 [START ASSET]'
-    script.echo "📛 Name    : ${asset.name}"
-    script.echo "🧪 Type    : ${asset.type}"
-    script.echo "📁 Path    : ${asset.path}"
-    script.echo "⏱️ Timeout : ${timeoutMinutes} min"
-    script.echo '------------------------------------------------------------'
-}
-
-def printAssetResult(script, Map result) {
-    script.echo '------------------------------------------------------------'
-    script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
-    script.echo "🧪 Type    : ${result.type ?: ''}"
-    script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
-    script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
-
-    if (result.reason) {
-        script.echo "🧾 Reason  : ${cleanText(result.reason)}"
-    }
-
-    if (result.logRel) {
-        script.echo "📄 Log     : Reports/${result.logRel}"
-    }
-
-    (result.caseSummary ?: []).take(3).each { line ->
-        script.echo "🧪 Case    : ${cleanText(line.toString())}"
-    }
-
-    script.echo '------------------------------------------------------------'
-}
-
-def printRunningSummary(script, List results) {
-    def passed = results.count { it.status == 'PASSED' }
-    def failed = results.count { it.status == 'FAILED' }
-    def timeout = results.count { it.status == 'TIMEOUT' }
-    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
-
-    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
-
-    script.echo '------------------------------------------------------------'
-    script.echo "📌 RUNNING SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
-    script.echo '------------------------------------------------------------'
-}
-
-def printFinalSummary(script, List results, String currentResult) {
-    def passed = results.count { it.status == 'PASSED' }
-    def failed = results.count { it.status == 'FAILED' }
-    def timeout = results.count { it.status == 'TIMEOUT' }
-    def totalTime = formatDurationSeconds(sumDurationSeconds(results))
-    def total = results.size()
-
-    script.currentBuild.description = "✅ ${passed} | ❌ ${failed + timeout} | ${totalTime}"
-
-    script.echo '============================================================'
-
-    if (total == 0) {
-        script.echo '⚠️ PIPELINE STOPPED BEFORE ANY ASSET WAS EXECUTED'
-    }
-    else if (currentResult == 'ABORTED') {
-        script.echo '🛑 PIPELINE ABORTED'
-    }
-    else if (failed > 0 || timeout > 0) {
-        script.echo '❌ PIPELINE FINISHED WITH ERRORS'
-    }
-    else {
-        script.echo '✅ PIPELINE FINISHED SUCCESSFULLY'
-    }
-
-    script.echo "📌 FINAL SUMMARY | ✅=${passed} | ❌=${failed} | ⏰=${timeout} | ⏱️=${totalTime}"
-    script.echo '============================================================'
-
-    results.each { result ->
-        script.echo '------------------------------------------------------------'
-        script.echo "${result.icon ?: '❔'} ${result.name ?: ''}"
-        script.echo "🧪 Type    : ${result.type ?: ''}"
-        script.echo "⏱️ Time    : ${formatDurationSeconds(result.durationSeconds)}"
-        script.echo "📊 Stats   : Executed=${result.executed} | Passed=${result.passed} | Failed=${result.failed} | Skipped=${result.skipped}"
-
-        if (result.reason) {
-            script.echo "🧾 Reason  : ${cleanText(result.reason)}"
-        }
-
-        script.echo '------------------------------------------------------------'
-    }
-}
-
-return this
-
-
-
-
-
-
-
-
-
-
-
-JenkinsDesktopPipelineRunner.groovy
-package jenkinsIntegration
-
-class JenkinsDesktopPipelineRunner {
-
-    static Map runDesktopViaTaskScheduler(Map cfg) {
-
-        String taskName      = cfg.taskName ?: 'eMatch Automation\\RunEMatchDesktop'
-        String ctxFile       = cfg.ctxFile ?: 'D:\\Projects\\eMatchStarters\\run-context.properties'
-        String markerFile    = cfg.markerFile ?: 'D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt'
-        int    pollSeconds   = (cfg.pollSeconds ?: 3) as int
-        int    maxWaitSecs   = (cfg.maxWaitSecs ?: (3 * 60 * 60)) as int
-
-        echo "[INFO] Writing run-context.properties to: ${ctxFile}"
-        writeFile file: ctxFile, text: cfg.ctxText
-
-        echo "[INFO] Running Task Scheduler: ${taskName}"
-        bat """
-            @echo off
-            schtasks /run /tn "${taskName}"
-        """
-
-        echo "[INFO] Waiting for marker file: ${markerFile}"
-        int waited = 0
-        while (waited < maxWaitSecs) {
-            if (fileExists(markerFile)) {
-                break
-            }
-            sleep pollSeconds
-            waited += pollSeconds
-        }
-
-        if (!fileExists(markerFile)) {
-            error "[ERROR] Marker file was not created within timeout: ${markerFile}"
-        }
-
-        String markerText
-        try {
-            markerText = readFile(markerFile).trim()
-        } catch (Exception ex) {
-            echo "[WARN] Failed to read marker file (maybe transient lock). Retrying once..."
-            sleep 2
-            markerText = readFile(markerFile).trim()
-        }
-
-        def lines = markerText.readLines()
-        int exitCode = 1
-        try {
-            exitCode = Integer.parseInt(lines[0].trim())
-        } catch (ignored) {
-            exitCode = 1
-        }
-
-        echo "[INFO] Task exit code from marker: ${exitCode}"
-        return [exitCode: exitCode, markerLines: lines]
-    }
-
-    static void archiveSafeArtifacts() {
-
-        echo "[INFO] Archiving artifacts (safe mode)"
-        try {
-            archiveArtifacts allowEmptyArchive: true, artifacts: [
-                'Reports/**/*',
-                'D:\\Projects\\eMatchStarters\\logs\\*.log',
-                'D:\\Projects\\eMatchStarters\\logs\\__jenkins_task_exitcode.txt'
-            ].join(',')
-        } catch (Exception ex) {
-            echo "[WARN] archiveArtifacts failed but build will continue: ${ex.getMessage()}"
-        }
-    }
-}
-
-
-
-
-
-
-JenkinsDesktopTaskLogger.groovy
 import groovy.json.JsonSlurperClassic
 
 def safeFileName(String value) {
@@ -263,24 +43,32 @@ def runAsset(script, Map cfg, Map asset) {
     String retry                  = (cfg.retry ?: '0').toString()
     String timeoutMinutes         = (asset.timeoutMinutes ?: cfg.defaultTimeoutMinutes ?: 180).toString()
     String runLabel               = cfg.runLabel ?: "${asset.name} Build ${script.env.BUILD_NUMBER ?: ''}".trim()
+    String runnerWindowTitle      = cfg.runnerWindowTitle ?: "eMatch Runner ${asset.name ?: 'Desktop Asset'} ${script.env.BUILD_NUMBER ?: ''}".trim()
+    String appExePath             = cfg.appExePath ?: ''
+    String appLnkPath             = cfg.appLnkPath ?: ''
     String assetName              = asset.name ?: 'Desktop Asset'
     String assetType              = asset.type ?: 'COLLECTION'
     String assetPath              = asset.path ?: ''
 
     Map fallback = [
-        name         : assetName,
-        type         : assetType,
-        status       : 'FAILED',
-        icon         : '❌',
-        exitCode     : 1,
-        executed     : 0,
-        passed       : 0,
-        failed       : 0,
-        skipped      : 0,
-        reason       : 'Desktop execution did not produce a result file',
-        currentLog   : currentLogFile,
-        resultFile   : resultFile
+        name            : assetName,
+        type            : assetType,
+        status          : 'FAILED',
+        icon            : '❌',
+        exitCode        : 1,
+        executed        : 0,
+        passed          : 0,
+        failed          : 0,
+        skipped         : 0,
+        durationSeconds : 0,
+        reason          : 'Desktop execution did not produce a result file',
+        currentLog      : currentLogFile,
+        logRel          : '_desktop_logs/katalon_current.log',
+        resultFile      : resultFile,
+        caseSummary     : []
     ]
+
+    long startedAt = System.currentTimeMillis()
 
     int psExit = script.withEnv([
         "WORKSPACE=${workspace}",
@@ -301,7 +89,10 @@ def runAsset(script, Map cfg, Map asset) {
         "ASSET_TYPE=${assetType}",
         "ASSET_PATH=${assetPath}",
         "ASSET_TIMEOUT_MINUTES=${timeoutMinutes}",
-        "RUN_LABEL=${runLabel}"
+        "RUN_LABEL=${runLabel}",
+        "RUNNER_WINDOW_TITLE=${runnerWindowTitle}",
+        "APP_EXE_PATH=${appExePath}",
+        "APP_LNK_PATH=${appLnkPath}"
     ]) {
         script.powershell(
             returnStatus: true,
@@ -486,8 +277,11 @@ $ctxLines += ('LOG_DIR=' + $env:LOGS_DIR)
 $ctxLines += ('CURRENT_LOG_FILE=' + $env:CURRENT_LOG_FILE)
 $ctxLines += ('MARKER_FILE=' + $env:MARKER_FILE)
 $ctxLines += ('RUN_LABEL=' + $env:RUN_LABEL)
+$ctxLines += ('RUNNER_WINDOW_TITLE=' + $env:RUNNER_WINDOW_TITLE)
 $ctxLines += ('WINAPPDRIVER_EXE=' + $env:WINAPPDRIVER_EXE)
 $ctxLines += ('AUTO_START_WINAPPDRIVER=' + $env:AUTO_START_WINAPPDRIVER)
+$ctxLines += ('APP_EXE_PATH=' + $env:APP_EXE_PATH)
+$ctxLines += ('APP_LNK_PATH=' + $env:APP_LNK_PATH)
 
 Set-Content -LiteralPath $env:CTX_FILE -Value $ctxLines -Encoding ASCII
 
@@ -598,6 +392,7 @@ $result = [ordered]@{
     skipped    = $junitSummary.Skipped
     reason     = $reason
     currentLog = $env:CURRENT_LOG_FILE
+    logRel     = '_desktop_logs/katalon_current.log'
     junitFile  = $junitFile
     resultFile = $env:RESULT_FILE
 }
@@ -630,8 +425,14 @@ else {
         )
     }
 
+    long finishedAt = System.currentTimeMillis()
+    long durationSeconds = Math.max(0L, ((finishedAt - startedAt) / 1000L))
+
     Map result = loadResultFile(script, resultFile, fallback)
     result.psExitCode = psExit
+    result.durationSeconds = durationSeconds
+    result.logRel = result.logRel ?: '_desktop_logs/katalon_current.log'
+    result.caseSummary = result.caseSummary ?: []
 
     if (!result.status) {
         result.status = (psExit == 0 ? 'PASSED' : (psExit == 124 ? 'TIMEOUT' : 'FAILED'))
@@ -645,123 +446,3 @@ else {
 }
 
 return this
-
-
-
-
-
-
-
-
-
-JenkinsPaths.groovy
-/*
- * Responsibility:
- * Centralize path calculations used by Jenkins desktop pipeline files.
- */
-
-def workspace(script) {
-    return script.pwd()
-}
-
-def projectPath(script, String projectFileName) {
-    return "${workspace(script)}\\${projectFileName}"
-}
-
-def reportsRoot(script) {
-    return "${workspace(script)}\\Reports"
-}
-
-def logsRoot(script) {
-    return "${reportsRoot(script)}\\logs"
-}
-
-def artifactsRoot(script) {
-    return "${reportsRoot(script)}\\suite-artifacts"
-}
-
-return this
-
-
-
-
-
-
-
-
-
-
-
-
-JenkinsResultStore.groovy
-import groovy.json.JsonOutput
-import groovy.json.JsonSlurperClassic
-
-def saveSuiteResults(script, String reportsRoot, List suiteResults) {
-    String targetFile = "${reportsRoot}\\suite-results.json"
-    script.writeFile(
-        file: targetFile,
-        text: JsonOutput.prettyPrint(JsonOutput.toJson(suiteResults ?: [])),
-        encoding: 'UTF-8'
-    )
-}
-
-def loadSuiteResults(script, String reportsRoot) {
-    String targetFile = "${reportsRoot}\\suite-results.json"
-    if (!script.fileExists(targetFile)) {
-        return []
-    }
-
-    String raw = script.readFile(file: targetFile, encoding: 'UTF-8')
-    if (!raw?.trim()) {
-        return []
-    }
-
-    def parsed = new JsonSlurperClassic().parseText(raw)
-    return (parsed instanceof List) ? parsed : []
-}
-
-def readSuiteMeta(script, String reportsRoot, String assetName) {
-    String safeName = sanitizeFileName(assetName)
-
-    String metaFile = "${reportsRoot}\\logs\\${safeName}.meta.properties"
-
-    if (!script.fileExists(metaFile)) {
-        return [:]
-    }
-
-    String raw = script.readFile(file: metaFile, encoding: 'UTF-8')
-    Map result = [:]
-
-    raw.readLines().each { line ->
-        int idx = line.indexOf('=')
-        if (idx > 0) {
-            String key = line.substring(0, idx).trim()
-            String value = line.substring(idx + 1).trim()
-            result[key] = value
-        }
-    }
-
-    return result
-}
-
-def splitSummary(String value) {
-    if (!value?.trim()) {
-        return []
-    }
-
-    return value
-        .split(/\s*\|\|\|\s*/)
-        .collect { it?.trim() }
-        .findAll { it }
-}
-
-def sanitizeFileName(String value) {
-    return (value ?: 'suite')
-        .replaceAll(/[\\\\\\/:"*?<>|]+/, '_')
-        .replaceAll(/\s+/, '_')
-}
-
-return this
-
-
