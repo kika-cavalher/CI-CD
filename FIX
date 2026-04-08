@@ -1,1 +1,189 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
 
+REM ============================================================
+REM eMatch desktop runner called by Task Scheduler
+REM ============================================================
+
+if "%CTX_FILE%"=="" set "CTX_FILE=D:\Projects\eMatchStarters\run-context.properties"
+
+call :load_context
+
+call :ensure_default WORKSPACE "%CD%"
+call :ensure_default REPORTS_DIR "%WORKSPACE%\Reports"
+call :ensure_default LOG_DIR "%REPORTS_DIR%\_desktop_logs"
+call :ensure_default CURRENT_LOG_FILE "%LOG_DIR%\katalon_current.log"
+call :ensure_default MARKER_FILE "D:\Projects\eMatchStarters\logs\__jenkins_task_exitcode.txt"
+call :ensure_default APP_WINDOW_TITLE "eMatch"
+call :ensure_default OPEN_VISIBLE_APP "true"
+call :ensure_default AUTO_START_WINAPPDRIVER "true"
+call :ensure_default RETRY "0"
+call :ensure_default BROWSER_TYPE "Windows"
+call :ensure_default KATALON_EXTRA_ARGS ""
+
+if not exist "%REPORTS_DIR%" mkdir "%REPORTS_DIR%"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+
+for %%I in ("%MARKER_FILE%") do if not exist "%%~dpI" mkdir "%%~dpI"
+
+del /f /q "%MARKER_FILE%" >nul 2>&1
+del /f /q "%CURRENT_LOG_FILE%" >nul 2>&1
+
+call :appendlog [INFO] ============================================================
+call :appendlog [INFO] RUN_LABEL       = %RUN_LABEL%
+call :appendlog [INFO] WORKSPACE       = %WORKSPACE%
+call :appendlog [INFO] PROJECT_PATH    = %PROJECT_PATH%
+call :appendlog [INFO] KATALON_EXE     = %KATALON_EXE%
+call :appendlog [INFO] ASSET_TYPE      = %ASSET_TYPE%
+call :appendlog [INFO] ASSET_PATH      = %ASSET_PATH%
+call :appendlog [INFO] BROWSER_TYPE    = %BROWSER_TYPE%
+call :appendlog [INFO] REPORTS_DIR     = %REPORTS_DIR%
+call :appendlog [INFO] CURRENT_LOG     = %CURRENT_LOG_FILE%
+call :appendlog [INFO] MARKER_FILE     = %MARKER_FILE%
+call :appendlog [INFO] OPEN_VISIBLE_APP= %OPEN_VISIBLE_APP%
+call :appendlog [INFO] APP_LNK_PATH    = %APP_LNK_PATH%
+call :appendlog [INFO] APP_EXE_PATH    = %APP_EXE_PATH%
+call :appendlog [INFO] ============================================================
+
+if "%PROJECT_PATH%"=="" (
+    call :appendlog [ERROR] PROJECT_PATH is empty
+    set "KATALON_EXIT_CODE=92"
+    goto :write_marker_and_exit
+)
+
+if "%KATALON_EXE%"=="" (
+    call :appendlog [ERROR] KATALON_EXE is empty
+    set "KATALON_EXIT_CODE=93"
+    goto :write_marker_and_exit
+)
+
+if not exist "%PROJECT_PATH%" (
+    call :appendlog [ERROR] PROJECT_PATH does not exist: %PROJECT_PATH%
+    set "KATALON_EXIT_CODE=94"
+    goto :write_marker_and_exit
+)
+
+if not exist "%KATALON_EXE%" (
+    call :appendlog [ERROR] KATALON_EXE does not exist: %KATALON_EXE%
+    set "KATALON_EXIT_CODE=95"
+    goto :write_marker_and_exit
+)
+
+if /I "%AUTO_START_WINAPPDRIVER%"=="true" (
+    call :ensure_winappdriver
+)
+
+if /I "%OPEN_VISIBLE_APP%"=="true" (
+    call :open_visible_app
+)
+
+cd /d "%WORKSPACE%"
+call :appendlog [INFO] Changed directory to %CD%
+
+call :run_katalon
+
+:write_marker_and_exit
+> "%MARKER_FILE%" echo %KATALON_EXIT_CODE%
+call :appendlog [INFO] Marker file written: %MARKER_FILE%
+call :appendlog [INFO] Final log saved   : %CURRENT_LOG_FILE%
+exit /b %KATALON_EXIT_CODE%
+
+
+:load_context
+if not exist "%CTX_FILE%" (
+    exit /b 0
+)
+
+for /f "usebackq tokens=1,* delims==" %%A in ("%CTX_FILE%") do (
+    if not "%%~A"=="" (
+        set "%%~A=%%~B"
+    )
+)
+exit /b 0
+
+
+:ensure_default
+set "_VAR_NAME=%~1"
+set "_DEFAULT_VALUE=%~2"
+call set "_CURRENT_VALUE=%%%_VAR_NAME%%%"
+if "%_CURRENT_VALUE%"=="" (
+    set "%_VAR_NAME%=%_DEFAULT_VALUE%"
+)
+exit /b 0
+
+
+:ensure_winappdriver
+tasklist /FI "IMAGENAME eq WinAppDriver.exe" | find /I "WinAppDriver.exe" >nul 2>&1
+if errorlevel 1 (
+    call :appendlog [INFO] Starting WinAppDriver...
+    start "" "%WINAPPDRIVER_EXE%"
+    timeout /t 3 /nobreak >nul
+) else (
+    call :appendlog [INFO] WinAppDriver already running.
+)
+exit /b 0
+
+
+:open_visible_app
+if not "%APP_LNK_PATH%"=="" if exist "%APP_LNK_PATH%" (
+    call :appendlog [INFO] Opening visible app from shortcut...
+    start "" "%APP_LNK_PATH%"
+    timeout /t 8 /nobreak >nul
+    call :activate_visible_window
+    exit /b 0
+)
+
+if not "%APP_EXE_PATH%"=="" (
+    call :appendlog [INFO] Opening visible app from path...
+    start "" "%APP_EXE_PATH%"
+    timeout /t 8 /nobreak >nul
+    call :activate_visible_window
+    exit /b 0
+)
+
+call :appendlog [WARN] OPEN_VISIBLE_APP=true but no valid APP path was found.
+exit /b 0
+
+
+:activate_visible_window
+if "%APP_WINDOW_TITLE%"=="" exit /b 0
+
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ws = New-Object -ComObject WScript.Shell; Start-Sleep -Seconds 2; $null = $ws.AppActivate('%APP_WINDOW_TITLE%')" ^
+    >> "%CURRENT_LOG_FILE%" 2>&1
+
+exit /b 0
+
+
+:run_katalon
+set "RUN_TARGET="
+
+if /I "%ASSET_TYPE%"=="COLLECTION" (
+    set "RUN_TARGET=-testSuiteCollectionPath=""%ASSET_PATH%"""
+) else (
+    set "RUN_TARGET=-testSuitePath=""%ASSET_PATH%"""
+)
+
+call :appendlog [INFO] Starting Katalon execution...
+call :appendlog [INFO] RUN_TARGET = %RUN_TARGET%
+
+"%KATALON_EXE%" ^
+    -runMode=console ^
+    -projectPath="%PROJECT_PATH%" ^
+    %RUN_TARGET% ^
+    -retry=%RETRY% ^
+    -browserType="%BROWSER_TYPE%" ^
+    -consoleLog ^
+    -reportFolder="%REPORTS_DIR%" ^
+    %KATALON_EXTRA_ARGS% ^
+    >> "%CURRENT_LOG_FILE%" 2>&1
+
+set "KATALON_EXIT_CODE=%ERRORLEVEL%"
+call :appendlog [INFO] Katalon ExitCode = %KATALON_EXIT_CODE%
+exit /b 0
+
+
+:appendlog
+set "_LINE=%*"
+echo [%date% %time%] %_LINE%>>"%CURRENT_LOG_FILE%"
+exit /b 0
