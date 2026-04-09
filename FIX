@@ -1,3 +1,504 @@
+package pageObject
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.net.Socket
+import java.util.concurrent.TimeUnit
+
+import org.openqa.selenium.Keys
+
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import internal.GlobalVariable as GlobalVariable
+
+class authentication {
+
+    private static final String REC = 'REC'
+    private static final String PRD = 'PRD'
+
+    private static final String RUNAS_USER = 'cib\\cavalherer'
+
+    private static final String EMATCH_LNK_PATH_REC = 'D:\\RunAseMatchReq\\eMatch.lnk'
+    private static final String EMATCH_LNK_PATH_PRD = 'D:\\RunAseMatchPRD\\eMatch.lnk'
+
+    private static final String EMATCH_APPLICATION_PATH_REC = '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\REC\\IXIS.eMatch.IHM.application'
+    private static final String EMATCH_APPLICATION_PATH_PRD = '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\PROD\\IXIS.eMatch.IHM.application'
+
+    private static final String LAUNCHER_BAT_REC = 'D:\\RecEmatchAsUser.bat'
+    private static final String LAUNCHER_BAT_PRD = 'D:\\ProdEmatchAsUser.bat'
+
+    private static final String WINDOW_TITLE_REC = 'eMatch - Login REC'
+    private static final String WINDOW_TITLE_PRD = 'eMatch - Login PRD'
+
+    private static final String WINAPPDRIVER_EXE = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+    private static final String RESOLUTION_SCRIPT_PATH = 'D:\\setResolution.ps1'
+
+    private static final int WINDOW_ATTACH_TIMEOUT_SEC = 90
+    private static final int WINDOW_ATTACH_RETRY_SEC = 2
+    private static final int AFTER_START_DELAY_SEC = 8
+    private static final int AFTER_ENV_DROPDOWN_DELAY_SEC = 20
+    private static final int AFTER_ENV_SELECTION_DELAY_SEC = 7
+    private static final int MAIN_SCREEN_TIMEOUT_SEC = 60
+    private static final int AFTER_MAIN_SCREEN_DELAY_SEC = 10
+    private static final int AFTER_HOME_CLICK_DELAY_SEC = 5
+    private static final int WINAPPDRIVER_START_TIMEOUT_SEC = 15
+    private static final int COMMAND_TIMEOUT_SEC = 180
+
+    @Keyword
+    String getCurrentWindowsUser() {
+        return System.getProperty('user.name') ?: ''
+    }
+
+    @Keyword
+    String getRunAsUser() {
+        return RUNAS_USER
+    }
+
+    @Keyword
+    String resolveEnvironment() {
+        return normalizeEnvironment(GlobalVariable.env?.toString())
+    }
+
+    @Keyword
+    String resolveEnvironment(String environment) {
+        return normalizeEnvironment(environment)
+    }
+
+    @Keyword
+    String resolveWindowTitle() {
+        return resolveWindowTitle(resolveEnvironment())
+    }
+
+    @Keyword
+    String resolveWindowTitle(String environment) {
+        String env = normalizeEnvironment(environment)
+        return env == PRD ? WINDOW_TITLE_PRD : WINDOW_TITLE_REC
+    }
+
+    @Keyword
+    String getShortcutPath() {
+        return getShortcutPath(resolveEnvironment())
+    }
+
+    @Keyword
+    String getShortcutPath(String environment) {
+        String env = normalizeEnvironment(environment)
+        return env == PRD ? EMATCH_LNK_PATH_PRD : EMATCH_LNK_PATH_REC
+    }
+
+    @Keyword
+    String getApplicationPath() {
+        return getApplicationPath(resolveEnvironment())
+    }
+
+    @Keyword
+    String getApplicationPath(String environment) {
+        String env = normalizeEnvironment(environment)
+        return env == PRD ? EMATCH_APPLICATION_PATH_PRD : EMATCH_APPLICATION_PATH_REC
+    }
+
+    @Keyword
+    String getLauncherBat() {
+        return getLauncherBat(resolveEnvironment())
+    }
+
+    @Keyword
+    String getLauncherBat(String environment) {
+        String env = normalizeEnvironment(environment)
+        return env == PRD ? LAUNCHER_BAT_PRD : LAUNCHER_BAT_REC
+    }
+
+    @Keyword
+    String getResolutionScriptPath() {
+        return RESOLUTION_SCRIPT_PATH
+    }
+
+    @Keyword
+    String getWinAppDriverPath() {
+        return WINAPPDRIVER_EXE
+    }
+
+    @Keyword
+    void startEmatch(String currentUser, String targetWindowTitle) {
+        String env = resolveEnvironment()
+        String configuredShortcutPath = getShortcutPath(env)
+        String resolvedShortcutPath = resolveExistingShortcut(configuredShortcutPath)
+        String launcherBat = getLauncherBat(env)
+        boolean launcherExists = new File(launcherBat).exists()
+
+        KeywordUtil.logInfo("Starting eMatch for environment: ${env}")
+        KeywordUtil.logInfo("Current Windows user: ${currentUser}")
+        KeywordUtil.logInfo("Target window title: ${targetWindowTitle}")
+        KeywordUtil.logInfo("Configured shortcut path: ${configuredShortcutPath}")
+        KeywordUtil.logInfo("Resolved shortcut path: ${resolvedShortcutPath}")
+        KeywordUtil.logInfo("Application path: ${getApplicationPath(env)}")
+        KeywordUtil.logInfo("Launcher BAT: ${launcherBat}")
+        KeywordUtil.logInfo("Launcher BAT exists: ${launcherExists}")
+
+        runResolutionScriptIfExists()
+
+        boolean launched = false
+        Exception shortcutError = null
+
+        if (resolvedShortcutPath) {
+            try {
+                KeywordUtil.logInfo('Trying shortcut first...')
+                startDetachedCommand("start \"\" \"${resolvedShortcutPath}\"")
+                launched = true
+                Windows.delay(AFTER_START_DELAY_SEC)
+            } catch (Exception e) {
+                shortcutError = e
+                KeywordUtil.logInfo("Shortcut launch failed: ${e.message}")
+            }
+        }
+
+        if (!launched && launcherExists) {
+            KeywordUtil.logInfo('Trying launcher BAT...')
+            Map launcherResult = runCommand("call \"${launcherBat}\"", COMMAND_TIMEOUT_SEC)
+
+            if (launcherResult.output) {
+                KeywordUtil.logInfo("Launcher BAT output:\n${launcherResult.output}")
+            }
+
+            if (launcherResult.exitCode != 0) {
+                KeywordUtil.markFailedAndStop("Launcher BAT failed for environment '${env}'.")
+            }
+
+            launched = true
+            Windows.delay(AFTER_START_DELAY_SEC)
+        }
+
+        if (!launched) {
+            String shortcutMessage = resolvedShortcutPath
+                ? "Shortcut was resolved but failed to launch: ${shortcutError?.message}"
+                : "Shortcut not found from configured path: ${configuredShortcutPath}"
+
+            String batMessage = launcherExists
+                ? "Launcher BAT exists but was not used."
+                : "Launcher BAT not found: ${launcherBat}"
+
+            KeywordUtil.markFailedAndStop(
+                "Could not launch eMatch for environment '${env}'. ${shortcutMessage}. ${batMessage}"
+            )
+        }
+
+        KeywordUtil.logInfo('Launch command executed. Ensuring WinAppDriver is available...')
+        ensureWinAppDriverRunning()
+    }
+
+    @Keyword
+    void attachToLoginWindow(String targetWindowTitle) {
+        String exactWindow = targetWindowTitle
+        String containsWindow = targetWindowTitle?.contains(' - ') ? targetWindowTitle.split(' - ')[0] : targetWindowTitle
+
+        boolean windowFound = false
+        int elapsedTime = 0
+
+        while (!windowFound && elapsedTime < WINDOW_ATTACH_TIMEOUT_SEC) {
+            try {
+                try {
+                    Windows.startExistingApplication(exactWindow)
+                } catch (Exception ignored) {
+                    Windows.startExistingApplication(containsWindow)
+                }
+
+                windowFound = true
+                KeywordUtil.logInfo("Attached to target window: ${targetWindowTitle}")
+                break
+            } catch (Exception e) {
+                Windows.delay(WINDOW_ATTACH_RETRY_SEC)
+                elapsedTime += WINDOW_ATTACH_RETRY_SEC
+            }
+        }
+
+        if (!windowFound) {
+            KeywordUtil.markFailedAndStop("Target window '${targetWindowTitle}' could not be found within ${WINDOW_ATTACH_TIMEOUT_SEC} seconds.")
+        }
+    }
+
+    @Keyword
+    void openEnvironmentDropdown() {
+        clickWithRetry('Login Page/optEnv', 3, 10)
+        Windows.delay(AFTER_ENV_DROPDOWN_DELAY_SEC)
+    }
+
+    @Keyword
+    int resolveEnvironmentIndex(String environment) {
+        String envName = (environment ?: '').trim().toUpperCase()
+        int env = 3
+
+        switch (envName) {
+            case 'PRD':
+            case 'PROD':
+                env = 1
+                break
+            case 'PREX':
+                env = 2
+                break
+            case 'REC2':
+                env = 3
+                break
+            case 'REC':
+                env = 4
+                break
+            case 'DEV2':
+                env = 5
+                break
+            case 'DEV':
+                env = 6
+                break
+            default:
+                env = 4
+                break
+        }
+
+        return env
+    }
+
+    @Keyword
+    void selectEnvironment(String environment) {
+        int env = resolveEnvironmentIndex(environment)
+
+        for (int i = 0; i < env; i++) {
+            Windows.sendKeys(findWindowsObject('Login Page/optEnv'), Keys.chord(Keys.ARROW_DOWN))
+        }
+
+        Windows.sendKeys(findWindowsObject('Login Page/optEnv'), Keys.chord(Keys.ENTER))
+        Windows.delay(AFTER_ENV_SELECTION_DELAY_SEC)
+    }
+
+    @Keyword
+    boolean isConnectButtonPresent() {
+        try {
+            return Windows.waitForElementPresent(
+                findWindowsObject('Login Page/btnConnecter'),
+                5,
+                FailureHandling.OPTIONAL
+            )
+        } catch (Exception ignored) {
+            return false
+        }
+    }
+
+    @Keyword
+    void clickConnectButton() {
+        Windows.click(findWindowsObject('Login Page/btnConnecter'))
+    }
+
+    @Keyword
+    boolean waitForMainScreen() {
+        try {
+            boolean loaded = Windows.waitForElementPresent(
+                findWindowsObject('General/txtSearch'),
+                MAIN_SCREEN_TIMEOUT_SEC,
+                FailureHandling.OPTIONAL
+            )
+
+            if (loaded) {
+                Windows.delay(AFTER_MAIN_SCREEN_DELAY_SEC)
+            }
+
+            return loaded
+        } catch (Exception ignored) {
+            return false
+        }
+    }
+
+    @Keyword
+    void activateHomeTab() {
+        String home = new File(RunConfiguration.getProjectDir(), 'Images/General/Home.PNG').getAbsolutePath()
+        String homeGrey = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeGrey.PNG').getAbsolutePath()
+        String homeWhite = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeWhite.PNG').getAbsolutePath()
+
+        try {
+            if (new File(home).exists()) {
+                WindowsImageKeywords.clickImage(home)
+                Windows.delay(AFTER_HOME_CLICK_DELAY_SEC)
+                return
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            if (new File(homeGrey).exists()) {
+                def activeTab = WindowsImageKeywords.findImage(homeGrey)
+                if (activeTab != null) {
+                    return
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        try {
+            if (new File(homeWhite).exists()) {
+                def inactiveTab = WindowsImageKeywords.findImage(homeWhite)
+                if (inactiveTab != null) {
+                    WindowsImageKeywords.clickImage(homeWhite)
+                    Windows.delay(AFTER_HOME_CLICK_DELAY_SEC)
+                    return
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Keyword
+    void ensureWinAppDriverRunning() {
+        if (isPortOpen('127.0.0.1', 4723)) {
+            return
+        }
+
+        File exe = new File(WINAPPDRIVER_EXE)
+        if (!exe.exists()) {
+            KeywordUtil.markFailedAndStop("WinAppDriver not found: ${WINAPPDRIVER_EXE}")
+        }
+
+        new ProcessBuilder(WINAPPDRIVER_EXE).start()
+
+        long deadline = System.currentTimeMillis() + (WINAPPDRIVER_START_TIMEOUT_SEC * 1000L)
+
+        while (System.currentTimeMillis() < deadline) {
+            if (isPortOpen('127.0.0.1', 4723)) {
+                KeywordUtil.logInfo('WinAppDriver started successfully.')
+                return
+            }
+            Thread.sleep(1000)
+        }
+
+        KeywordUtil.markFailedAndStop("WinAppDriver did not start within ${WINAPPDRIVER_START_TIMEOUT_SEC} seconds.")
+    }
+
+    private String normalizeEnvironment(String environment) {
+        String env = (environment ?: '').trim().toUpperCase()
+
+        if (!env) {
+            env = REC
+        }
+
+        if (env == 'PROD') {
+            env = PRD
+        }
+
+        if (!(env in [REC, PRD])) {
+            KeywordUtil.markFailedAndStop("Invalid environment '${env}'. Use REC or PRD.")
+        }
+
+        return env
+    }
+
+    private void runResolutionScriptIfExists() {
+        File script = new File(RESOLUTION_SCRIPT_PATH)
+
+        if (!script.exists()) {
+            return
+        }
+
+        Map result = runCommand("powershell -ExecutionPolicy Bypass -File \"${RESOLUTION_SCRIPT_PATH}\"", 60)
+
+        if (result.exitCode != 0) {
+            KeywordUtil.logInfo("Resolution script output:\n${result.output}")
+            KeywordUtil.markFailedAndStop("Resolution script failed: ${RESOLUTION_SCRIPT_PATH}")
+        }
+    }
+
+    private void clickWithRetry(String objectId, int retries, int delaySec) {
+        Exception lastError = null
+
+        for (int i = 1; i <= retries; i++) {
+            try {
+                Windows.click(findWindowsObject(objectId))
+                return
+            } catch (Exception e) {
+                lastError = e
+                Windows.delay(delaySec)
+            }
+        }
+
+        KeywordUtil.markFailedAndStop("Could not click '${objectId}' after ${retries} attempts. Last error: ${lastError?.message}")
+    }
+
+    private String resolveExistingShortcut(String configuredPath) {
+        File configuredFile = new File(configuredPath)
+        if (configuredFile.exists()) {
+            return configuredFile.absolutePath
+        }
+
+        File parentFolder = configuredFile.parentFile
+        if (parentFolder == null || !parentFolder.exists()) {
+            return null
+        }
+
+        String configuredName = configuredFile.name
+        String baseName = configuredName.toLowerCase().endsWith('.lnk')
+            ? configuredName.substring(0, configuredName.length() - 4)
+            : configuredName
+
+        File[] files = parentFolder.listFiles()
+        if (files == null) {
+            return null
+        }
+
+        File match = files.find { File f ->
+            String fileName = f.name
+            String fileBaseName = fileName.toLowerCase().endsWith('.lnk')
+                ? fileName.substring(0, fileName.length() - 4)
+                : fileName
+
+            fileBaseName.equalsIgnoreCase(baseName) || fileName.equalsIgnoreCase(configuredName)
+        }
+
+        return match?.absolutePath
+    }
+
+    private void startDetachedCommand(String commandLine) {
+        new ProcessBuilder('cmd', '/c', commandLine)
+            .redirectErrorStream(true)
+            .start()
+    }
+
+    private Map runCommand(String commandLine, int timeoutSec) {
+        Process process = new ProcessBuilder('cmd', '/c', commandLine)
+            .redirectErrorStream(true)
+            .start()
+
+        boolean finished = process.waitFor(timeoutSec, TimeUnit.SECONDS)
+
+        if (!finished) {
+            process.destroyForcibly()
+            return [
+                exitCode: -1,
+                output  : "Command timed out after ${timeoutSec} seconds.\nCommand: ${commandLine}"
+            ]
+        }
+
+        String output = process.inputStream.getText('Cp1252')
+
+        return [
+            exitCode: process.exitValue(),
+            output  : output
+        ]
+    }
+
+    private boolean isPortOpen(String host, int port) {
+        Socket socket = null
+        try {
+            socket = new Socket(host, port)
+            return true
+        } catch (Throwable ignored) {
+            return false
+        } finally {
+            try {
+                socket?.close()
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+}
 
 
 
@@ -8,5 +509,64 @@
 
 
 
+import com.kms.katalon.core.util.KeywordUtil
+import internal.GlobalVariable as GlobalVariable
 
+String environment = 'REC'
+GlobalVariable.env = environment
 
+String currentUser = CustomKeywords.'pageObject.authentication.getCurrentWindowsUser'()
+String targetWindowTitle = CustomKeywords.'pageObject.authentication.resolveWindowTitle'()
+String shortcutPath = CustomKeywords.'pageObject.authentication.getShortcutPath'()
+String applicationPath = CustomKeywords.'pageObject.authentication.getApplicationPath'()
+String launcherBat = CustomKeywords.'pageObject.authentication.getLauncherBat'()
+String resolutionScriptPath = CustomKeywords.'pageObject.authentication.getResolutionScriptPath'()
+String winAppDriverPath = CustomKeywords.'pageObject.authentication.getWinAppDriverPath'()
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Verify username, version and startup context')
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("environment: ${environment}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("env = ${GlobalVariable.env}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("currentUser = ${currentUser}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("targetWindowTitle = ${targetWindowTitle}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("shortcutPath = ${shortcutPath}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("applicationPath = ${applicationPath}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("launcherBat = ${launcherBat}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("resolutionScriptPath = ${resolutionScriptPath}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("winAppDriverPath = ${winAppDriverPath}")
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Starting eMatch application')
+CustomKeywords.'pageObject.authentication.startEmatch'(currentUser, targetWindowTitle)
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Attaching to login window')
+CustomKeywords.'pageObject.authentication.attachToLoginWindow'(targetWindowTitle)
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Opening environment dropdown')
+CustomKeywords.'pageObject.authentication.openEnvironmentDropdown'()
+
+int envIndex = CustomKeywords.'pageObject.authentication.resolveEnvironmentIndex'(GlobalVariable.env)
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("Selecting environment '${GlobalVariable.env}' with index ${envIndex}")
+CustomKeywords.'pageObject.authentication.selectEnvironment'(GlobalVariable.env)
+
+boolean isButtonPresent = CustomKeywords.'pageObject.authentication.isConnectButtonPresent'()
+
+if (isButtonPresent) {
+    CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Connect button was present and will be clicked.')
+    CustomKeywords.'pageObject.authentication.clickConnectButton'()
+    KeywordUtil.logInfo('Connect button was present and was clicked.')
+} else {
+    CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Connect button was not present. Continuing test execution.')
+    KeywordUtil.logInfo('Connect button was not present. Continuing test execution.')
+}
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Waiting for main eMatch screen')
+boolean mainScreenLoaded = CustomKeywords.'pageObject.authentication.waitForMainScreen'()
+
+if (!mainScreenLoaded) {
+    CustomKeywords.'jiraIntegration.JiraReportSteps.note'("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
+    KeywordUtil.markFailedAndStop("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
+}
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Activating Home tab')
+CustomKeywords.'pageObject.authentication.activateHomeTab'()
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('eMatch startup flow completed successfully')
