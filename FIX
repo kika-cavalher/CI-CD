@@ -1,1 +1,184 @@
+import java.text.SimpleDateFormat
 
+def runDesktopAsset(Map cfg = [:]) {
+    String workspaceDir = normalizeWindowsPath(cfg.workspaceDir ?: pwd())
+    String projectPath = normalizeWindowsPath(cfg.projectPath ?: "${workspaceDir}\\eMatch POC.prj")
+    String katalonHome = normalizeWindowsPath(cfg.katalonHome ?: env.KATALON_HOME)
+    String starterDir = normalizeWindowsPath(cfg.starterDir ?: 'D:\\Projects\\eMatchStarters')
+    String taskName = cfg.taskName ?: '\\eMatch Automation\\RunEMatchDesktop'
+    String executionProfile = cfg.executionProfile ?: 'default'
+    String browserType = cfg.browserType ?: 'Windows'
+    String assetType = (cfg.assetType ?: '').trim().toUpperCase()
+    String assetPath = (cfg.assetPath ?: '').trim()
+    String winAppDriverExe = normalizeWindowsPath(cfg.winAppDriverExe ?: 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe')
+    boolean autoStartWinAppDriver = cfg.containsKey('autoStartWinAppDriver') ? (cfg.autoStartWinAppDriver as boolean) : true
+    int timeoutMinutes = (cfg.timeoutMinutes ?: 180) as int
+    int pollSeconds = (cfg.pollSeconds ?: 15) as int
+
+    if (!katalonHome) {
+        error('KATALON_HOME is empty.')
+    }
+
+    if (!assetPath) {
+        error('assetPath is required.')
+    }
+
+    if (!(assetType in ['SUITE', 'COLLECTION'])) {
+        error("Unsupported assetType '${assetType}'. Use SUITE or COLLECTION.")
+    }
+
+    String commandFile = "${starterDir}\\visible_katalon_command.bat"
+    String statusFile = "${starterDir}\\visible_katalon_status.txt"
+    String logFile = "${starterDir}\\run-ematch-command.log"
+
+    String assetArgument = assetType == 'COLLECTION'
+        ? "-testSuiteCollectionPath=\"${assetPath}\""
+        : "-testSuitePath=\"${assetPath}\""
+
+    String commandContent = buildVisibleKatalonCommand(
+        workspaceDir,
+        projectPath,
+        katalonHome,
+        executionProfile,
+        browserType,
+        assetArgument,
+        autoStartWinAppDriver,
+        winAppDriverExe
+    )
+
+    powershell """
+        \$ErrorActionPreference = 'Stop'
+        if (!(Test-Path '${psQuoted(starterDir)}')) {
+            New-Item -ItemType Directory -Path '${psQuoted(starterDir)}' -Force | Out-Null
+        }
+    """
+
+    writeRemoteAsciiFile(commandFile, commandContent)
+    writeRemoteAsciiFile(statusFile, "STARTING ${timestampNow()}\r\n")
+    appendRemoteText(logFile, "==================================================\r\n[${timestampNow()}] Desktop command regenerated for ${assetType} ${assetPath}\r\n")
+
+    echo '=================================================='
+    echo '[INFO] DESKTOP START'
+    echo "[INFO] WORKSPACE : ${workspaceDir}"
+    echo "[INFO] PROJECT   : ${projectPath}"
+    echo "[INFO] TYPE      : ${assetType}"
+    echo "[INFO] PATH      : ${assetPath}"
+    echo "[INFO] TASK      : ${taskName}"
+    echo "[INFO] COMMAND   : ${commandFile}"
+    echo '=================================================='
+
+    powershell """
+        \$ErrorActionPreference = 'Stop'
+        schtasks /query /tn '${psQuoted(taskName)}' | Out-Null
+        schtasks /run /tn '${psQuoted(taskName)}' | Out-Null
+    """
+
+    timeout(time: timeoutMinutes, unit: 'MINUTES') {
+        while (true) {
+            String status = readRemoteText(statusFile).trim()
+
+            if (status && status.toUpperCase().startsWith('SUCCESS')) {
+                echo '[SUCCESS] Desktop execution finished successfully.'
+                break
+            }
+
+            if (status && status.toUpperCase().startsWith('ERROR')) {
+                String remoteLog = readRemoteText(logFile)
+                error("Desktop execution failed.\nStatus: ${status}\n\nRemote log:\n${remoteLog}")
+            }
+
+            echo '[WAIT] Desktop run still in progress...'
+            sleep time: pollSeconds, unit: 'SECONDS'
+        }
+    }
+}
+
+String buildVisibleKatalonCommand(
+    String workspaceDir,
+    String projectPath,
+    String katalonHome,
+    String executionProfile,
+    String browserType,
+    String assetArgument,
+    boolean autoStartWinAppDriver,
+    String winAppDriverExe
+) {
+    List<String> lines = []
+
+    lines << '@echo off'
+    lines << 'setlocal EnableExtensions'
+    lines << ''
+    lines << "cd /d \"${workspaceDir}\""
+    lines << ''
+
+    if (autoStartWinAppDriver) {
+        lines << "tasklist /FI \"IMAGENAME eq WinAppDriver.exe\" | find /I \"WinAppDriver.exe\" >nul"
+        lines << 'if errorlevel 1 ('
+        lines << "    start \"\" \"${winAppDriverExe}\""
+        lines << '    timeout /t 3 /nobreak >nul'
+        lines << ')'
+        lines << ''
+    }
+
+    lines << "call \"${katalonHome}\\katalonc.exe\" ^"
+    lines << '-noSplash ^'
+    lines << '-runMode=console ^'
+    lines << "-projectPath=\"${projectPath}\" ^"
+    lines << "${assetArgument} ^"
+    lines << "-executionProfile=\"${executionProfile}\" ^"
+    lines << "-browserType=\"${browserType}\" ^"
+    lines << '-consoleLog ^'
+    lines << '-statusDelay=15 ^'
+    lines << '-retry=0'
+    lines << ''
+    lines << 'set "RC=%ERRORLEVEL%"'
+    lines << 'exit /b %RC%'
+
+    return lines.join('\r\n')
+}
+
+String normalizeWindowsPath(String value) {
+    return (value ?: '').replace('/', '\\')
+}
+
+void writeRemoteAsciiFile(String path, String content) {
+    String encoded = content.getBytes('UTF-8').encodeBase64().toString()
+
+    powershell """
+        \$bytes = [System.Convert]::FromBase64String('${encoded}')
+        \$text = [System.Text.Encoding]::UTF8.GetString(\$bytes)
+        \$enc = New-Object System.Text.ASCIIEncoding
+        [System.IO.File]::WriteAllText('${psQuoted(path)}', \$text, \$enc)
+    """
+}
+
+void appendRemoteText(String path, String content) {
+    String encoded = content.getBytes('UTF-8').encodeBase64().toString()
+
+    powershell """
+        \$bytes = [System.Convert]::FromBase64String('${encoded}')
+        \$text = [System.Text.Encoding]::UTF8.GetString(\$bytes)
+        [System.IO.File]::AppendAllText('${psQuoted(path)}', \$text)
+    """
+}
+
+String readRemoteText(String path) {
+    return powershell(
+        returnStdout: true,
+        script: """
+            if (Test-Path '${psQuoted(path)}') {
+                [System.IO.File]::ReadAllText('${psQuoted(path)}')
+            }
+        """
+    ).trim()
+}
+
+String psQuoted(String value) {
+    return (value ?: '').replace("'", "''")
+}
+
+String timestampNow() {
+    return new SimpleDateFormat('yyyy-MM-dd HH:mm:ss').format(new Date())
+}
+
+return this
