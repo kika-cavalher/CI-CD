@@ -1,1 +1,360 @@
+package pageObject
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
+
+import org.openqa.selenium.Keys
+
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import general.WinRetry
+import internal.GlobalVariable as GlobalVariable
+
+class authentication {
+
+	private static final String EMATCH_LNK_PATH = 'D:\\RunAseMatchReq\\eMatch.lnk'
+	private static final String EMATCH_APPLICATION_PATH = '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\REC\\IXIS.Ematch.IHM.application'
+	private static final String RESOLUTION_SCRIPT_PATH = 'D:\\setResolution.ps1'
+
+	private static final String DEFAULT_WINAPPDRIVER_EXE_X86 = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+	private static final String DEFAULT_WINAPPDRIVER_EXE_X64 = 'C:\\Program Files\\Windows Application Driver\\WinAppDriver.exe'
+
+	private static final int WINDOW_ATTACH_TIMEOUT_SEC = 60
+	private static final int WINDOW_ATTACH_RETRY_SEC = 2
+	private static final int AFTER_START_DELAY_SEC = 5
+	private static final int AFTER_ENV_DROPDOWN_DELAY_SEC = 20
+	private static final int AFTER_ENV_SELECTION_DELAY_SEC = 7
+	private static final int MAIN_SCREEN_TIMEOUT_SEC = 60
+	private static final int AFTER_MAIN_SCREEN_DELAY_SEC = 10
+	private static final int AFTER_HOME_CLICK_DELAY_SEC = 5
+
+	private static final String WINAPPDRIVER_HOST = '127.0.0.1'
+	private static final int WINAPPDRIVER_PORT = 4723
+	private static final int WINAPPDRIVER_START_TIMEOUT_SEC = 20
+
+	@Keyword
+	String getCurrentWindowsUser() {
+		return (System.getProperty('user.name') ?: '').trim()
+	}
+
+	@Keyword
+	String getShortcutPath() {
+		return EMATCH_LNK_PATH
+	}
+
+	@Keyword
+	String getApplicationPath() {
+		return EMATCH_APPLICATION_PATH
+	}
+
+	@Keyword
+	String getResolutionScriptPath() {
+		return RESOLUTION_SCRIPT_PATH
+	}
+
+	@Keyword
+	String getWinAppDriverPath() {
+		String envPath = (System.getenv('WINAPPDRIVER_EXE') ?: '').trim()
+
+		if (envPath && new File(envPath).exists()) {
+			return envPath
+		}
+
+		if (new File(DEFAULT_WINAPPDRIVER_EXE_X86).exists()) {
+			return DEFAULT_WINAPPDRIVER_EXE_X86
+		}
+
+		if (new File(DEFAULT_WINAPPDRIVER_EXE_X64).exists()) {
+			return DEFAULT_WINAPPDRIVER_EXE_X64
+		}
+
+		return DEFAULT_WINAPPDRIVER_EXE_X86
+	}
+
+	@Keyword
+	String resolveWindowTitle() {
+		String version = GlobalVariable.version?.toString()?.trim()
+		String versionProd = GlobalVariable.versionProd?.toString()?.trim()
+
+		if (version) {
+			return version
+		}
+
+		if (versionProd) {
+			return versionProd
+		}
+
+		KeywordUtil.markFailedAndStop('GlobalVariable.version and GlobalVariable.versionProd are both empty.')
+		return ''
+	}
+
+	private boolean isWinAppDriverListening() {
+		Socket socket = null
+
+		try {
+			socket = new Socket()
+			socket.connect(new InetSocketAddress(WINAPPDRIVER_HOST, WINAPPDRIVER_PORT), 1000)
+			return true
+		}
+		catch (Exception ignored) {
+			return false
+		}
+		finally {
+			try {
+				socket?.close()
+			}
+			catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void ensureWinAppDriverStarted() {
+		if (isWinAppDriverListening()) {
+			KeywordUtil.logInfo("WinAppDriver already listening on ${WINAPPDRIVER_HOST}:${WINAPPDRIVER_PORT}")
+			return
+		}
+
+		String exe = getWinAppDriverPath()
+
+		if (!new File(exe).exists()) {
+			KeywordUtil.markFailedAndStop("WinAppDriver executable not found at: ${exe}")
+		}
+
+		try {
+			KeywordUtil.logInfo("Starting WinAppDriver from: ${exe}")
+			new ProcessBuilder(exe).inheritIO().start()
+		}
+		catch (Exception e) {
+			KeywordUtil.markFailedAndStop("Failed to start WinAppDriver. ${e.getClass().getName()} - ${e.getMessage()}")
+		}
+
+		int elapsed = 0
+
+		while (elapsed < WINAPPDRIVER_START_TIMEOUT_SEC) {
+			if (isWinAppDriverListening()) {
+				KeywordUtil.logInfo("WinAppDriver started successfully.")
+				return
+			}
+
+			Windows.delay(1)
+			elapsed++
+		}
+
+		KeywordUtil.markFailedAndStop("Failed to start WinAppDriver. WinAppDriver did not start listening within timeout.")
+	}
+
+	@Keyword
+	void runResolutionScriptIfAvailable() {
+		try {
+			File resolutionScript = new File(RESOLUTION_SCRIPT_PATH)
+
+			if (resolutionScript.exists()) {
+				String cmd = "Powershell.exe -executionpolicy remotesigned -File \"${RESOLUTION_SCRIPT_PATH}\""
+				Runtime.getRuntime().exec(cmd)
+				KeywordUtil.logInfo("Resolution script found. Running: ${RESOLUTION_SCRIPT_PATH}")
+			}
+			else {
+				KeywordUtil.logInfo("Resolution script not found. Skipping: ${RESOLUTION_SCRIPT_PATH}")
+			}
+		}
+		catch (Exception e) {
+			KeywordUtil.logInfo("Resolution script failed but flow will continue: ${e.getMessage()}")
+		}
+	}
+
+	@Keyword
+	void startEmatch(String currentUser, String targetWindowTitle) {
+		String safeCurrentUser = (currentUser ?: '').trim()
+		String safeGlobalUser = (GlobalVariable.username ?: '').toString().trim()
+		String shortcutPath = getShortcutPath()
+		String applicationPath = getApplicationPath()
+		String winAppDriverPath = getWinAppDriverPath()
+
+		try {
+			KeywordUtil.logInfo('================ eMatch startup context ================')
+			KeywordUtil.logInfo("Windows user     : ${safeCurrentUser}")
+			KeywordUtil.logInfo("Global username  : ${safeGlobalUser}")
+			KeywordUtil.logInfo("Window title     : ${targetWindowTitle}")
+			KeywordUtil.logInfo("Shortcut path    : ${shortcutPath}")
+			KeywordUtil.logInfo("Application path : ${applicationPath}")
+			KeywordUtil.logInfo("WinAppDriver exe : ${winAppDriverPath}")
+			KeywordUtil.logInfo('=======================================================')
+
+			if (safeCurrentUser == safeGlobalUser) {
+				KeywordUtil.logInfo("Windows user matches GlobalVariable.username. Shortcut flow will be used.")
+				runResolutionScriptIfAvailable()
+				Windows.startApplicationWithTitle(shortcutPath, targetWindowTitle)
+			}
+			else {
+				KeywordUtil.logInfo("Windows user does not match GlobalVariable.username. WinAppDriver flow will be used.")
+				ensureWinAppDriverStarted()
+				Windows.startApplication(applicationPath)
+			}
+
+			Windows.delay(AFTER_START_DELAY_SEC)
+		}
+		catch (Exception e) {
+			KeywordUtil.markFailed("Failed to start eMatch.")
+			KeywordUtil.markFailed("Exception: ${e.getClass().getName()} - ${e.getMessage()}")
+			KeywordUtil.markFailedAndStop("Stopping test case due to startup failure.")
+		}
+	}
+
+	@Keyword
+	void attachToLoginWindow(String targetWindowTitle) {
+		WindowsTestObject targetWindow = new WindowsTestObject()
+		targetWindow.setLocatorStrategy(LocatorStrategy.NAME)
+		targetWindow.setLocator(targetWindowTitle)
+
+		int elapsedTime = 0
+		boolean windowFound = false
+
+		while (elapsedTime < WINDOW_ATTACH_TIMEOUT_SEC) {
+			try {
+				Windows.switchToDesktop()
+				Windows.switchToWindow(targetWindow)
+				windowFound = true
+				break
+			}
+			catch (Exception e) {
+				Windows.delay(WINDOW_ATTACH_RETRY_SEC)
+				elapsedTime += WINDOW_ATTACH_RETRY_SEC
+			}
+		}
+
+		if (!windowFound) {
+			KeywordUtil.markFailedAndStop("Target window '${targetWindowTitle}' could not be found within ${WINDOW_ATTACH_TIMEOUT_SEC} seconds.")
+		}
+	}
+
+	@Keyword
+	void openEnvironmentDropdown() {
+		WinRetry.clickWithRetry('Login Page/optEnv', 3, 10)
+		Windows.delay(AFTER_ENV_DROPDOWN_DELAY_SEC)
+	}
+
+	@Keyword
+	int resolveEnvironmentIndex(String environment) {
+		int env = 3
+
+		switch ((environment ?: '').trim()) {
+			case 'PROD':
+				env = 1
+				break
+			case 'PREX':
+				env = 2
+				break
+			case 'REC2':
+				env = 3
+				break
+			case 'REC':
+				env = 4
+				break
+			case 'DEV2':
+				env = 5
+				break
+			case 'DEV':
+				env = 6
+				break
+		}
+
+		return env
+	}
+
+	@Keyword
+	void selectEnvironment(String environment) {
+		int env = resolveEnvironmentIndex(environment)
+
+		for (int i = 0; i < env; i++) {
+			Windows.sendKeys(findWindowsObject('Login Page/optEnv'), Keys.chord(Keys.ARROW_DOWN))
+		}
+
+		Windows.sendKeys(findWindowsObject('Login Page/optEnv'), Keys.chord(Keys.ENTER))
+		Windows.delay(AFTER_ENV_SELECTION_DELAY_SEC)
+	}
+
+	@Keyword
+	boolean isConnectButtonPresent() {
+		return Windows.verifyElementPresent(
+			findWindowsObject('Login Page/btnConnecter'),
+			1,
+			FailureHandling.OPTIONAL
+		)
+	}
+
+	@Keyword
+	void clickConnectButton() {
+		Windows.click(findWindowsObject('Login Page/btnConnecter'))
+	}
+
+	@Keyword
+	boolean waitForMainScreen() {
+		try {
+			boolean loaded = Windows.waitForElementPresent(
+				findWindowsObject('General/txtSearch'),
+				MAIN_SCREEN_TIMEOUT_SEC,
+				FailureHandling.OPTIONAL
+			)
+
+			if (loaded) {
+				Windows.delay(AFTER_MAIN_SCREEN_DELAY_SEC)
+			}
+
+			return loaded
+		}
+		catch (Exception e) {
+			return false
+		}
+	}
+
+	@Keyword
+	void activateHomeTab() {
+		String home = new File(RunConfiguration.getProjectDir(), 'Images/General/Home.PNG').getAbsolutePath()
+		String homeGrey = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeGrey.PNG').getAbsolutePath()
+		String homeWhite = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeWhite.PNG').getAbsolutePath()
+
+		try {
+			if (new File(home).exists()) {
+				WindowsImageKeywords.clickImage(home)
+				Windows.delay(AFTER_HOME_CLICK_DELAY_SEC)
+				return
+			}
+		}
+		catch (Exception ignored) {
+		}
+
+		try {
+			if (new File(homeGrey).exists()) {
+				def activeTab = WindowsImageKeywords.findImage(homeGrey)
+				if (activeTab != null) {
+					return
+				}
+			}
+		}
+		catch (Exception ignored) {
+		}
+
+		try {
+			if (new File(homeWhite).exists()) {
+				def inactiveTab = WindowsImageKeywords.findImage(homeWhite)
+				if (inactiveTab != null) {
+					Windows.click(inactiveTab)
+					Windows.delay(AFTER_HOME_CLICK_DELAY_SEC)
+					return
+				}
+			}
+		}
+		catch (Exception ignored) {
+		}
+	}
+}
