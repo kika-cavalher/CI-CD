@@ -1,1 +1,697 @@
+package pageObject
 
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.util.KeywordUtil
+import internal.GlobalVariable
+import io.appium.java_client.windows.WindowsDriver
+import org.openqa.selenium.By
+import org.openqa.selenium.Keys
+import org.openqa.selenium.WebElement
+import org.openqa.selenium.remote.DesiredCapabilities
+
+import java.net.Socket
+import java.net.URL
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.util.concurrent.TimeUnit
+
+class authentication {
+
+    private static final String WINAPPDRIVER_URL = 'http://127.0.0.1:4723'
+    private static final int SHORT_WAIT_SECONDS = 5
+    private static final int DEFAULT_WAIT_SECONDS = 60
+    private static final int APP_LAUNCH_WAIT_SECONDS = 120
+
+    private WindowsDriver<WebElement> rootDriver
+    private WindowsDriver<WebElement> sessionDriver
+
+    @Keyword
+    String getCurrentWindowsUser() {
+        return System.getProperty('user.name') ?: ''
+    }
+
+    @Keyword
+    String resolveWindowTitle() {
+        String version = ''
+        try {
+            version = (GlobalVariable.version ?: '').trim()
+        } catch (Throwable ignored) {
+        }
+
+        if (version) {
+            return "eMatch ${version}"
+        }
+
+        return 'eMatch 26.1.1.3'
+    }
+
+    @Keyword
+    String getShortcutPath() {
+        String user = getCurrentWindowsUser()
+        String env = safeEnv()
+
+        List<String> candidates = [
+            "C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch ${env}.appref-ms",
+            "C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch REC.appref-ms",
+            "C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch.appref-ms"
+        ]
+
+        return firstExisting(candidates)
+    }
+
+    @Keyword
+    String getApplicationPath() {
+        String env = safeEnv()
+
+        List<String> candidates = [
+            "\\\\cib.net\\shareparis\\Soft\\ematch\\HMI\\Livraisons\\${env}\\IXIS.eMatch.IHM.application",
+            "\\\\cib.net\\shareparis\\Soft\\ematch\\HMI\\Livraisons\\REC\\IXIS.eMatch.IHM.application"
+        ]
+
+        return firstExisting(candidates)
+    }
+
+    @Keyword
+    String getLauncherBat() {
+        String env = safeEnv()
+
+        List<String> candidates = [
+            "D:\\Projects\\eMatchStarters\\runAsEmatch${env}\\eMatch.bat",
+            "D:\\Projects\\eMatchStarters\\runAsEmatchREC\\eMatch.bat",
+            "D:\\Projects\\eMatchStarters\\eMatch.bat"
+        ]
+
+        return firstExisting(candidates)
+    }
+
+    @Keyword
+    String getResolutionScriptPath() {
+        List<String> candidates = [
+            'D:\\Projects\\eMatchStarters\\setResolution.ps1',
+            'D:\\Projects\\eMatchStarters\\resolution.ps1'
+        ]
+
+        return firstExisting(candidates)
+    }
+
+    @Keyword
+    String getWinAppDriverPath() {
+        List<String> candidates = [
+            'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe',
+            'C:\\Program Files\\Windows Application Driver\\WinAppDriver.exe'
+        ]
+
+        return firstExisting(candidates)
+    }
+
+    @Keyword
+    String getInstalledExePath() {
+        List<String> exactCandidates = [
+            System.getenv('LOCALAPPDATA') + '\\Apps\\2.0'
+        ]
+
+        for (String baseDir : exactCandidates) {
+            if (!baseDir) {
+                continue
+            }
+
+            try {
+                Path base = Paths.get(baseDir)
+                if (!Files.exists(base)) {
+                    continue
+                }
+
+                Path found = Files.walk(base)
+                    .filter { Files.isRegularFile(it) }
+                    .filter { it.fileName.toString().equalsIgnoreCase('IXIS.eMatch.IHM.exe') }
+                    .findFirst()
+                    .orElse(null)
+
+                if (found != null) {
+                    return found.toString()
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        return ''
+    }
+
+    @Keyword
+    def startMatch(String currentUser, String targetWindowTitle) {
+        KeywordUtil.logInfo("Starting eMatch for environment ${safeEnv()}")
+        KeywordUtil.logInfo("Current Windows user: ${currentUser}")
+        KeywordUtil.logInfo("Target window title: ${targetWindowTitle}")
+        KeywordUtil.logInfo("Shortcut path: ${getShortcutPath()}")
+        KeywordUtil.logInfo("Application path: ${getApplicationPath()}")
+        KeywordUtil.logInfo("Installed exe path: ${getInstalledExePath()}")
+        KeywordUtil.logInfo("Launcher bat: ${getLauncherBat()}")
+        KeywordUtil.logInfo("WinAppDriver path: ${getWinAppDriverPath()}")
+
+        closeSessionQuietly()
+        closeRootDriverQuietly()
+
+        killExistingEmatchProcesses()
+        startWinAppDriverIfNeeded()
+
+        String launchPath = resolveLaunchPath()
+        if (!launchPath) {
+            KeywordUtil.markFailedAndStop('No valid eMatch launch path was found.')
+        }
+
+        launchApplication(launchPath)
+
+        String mainHandle = waitForWindowHandleByNames(
+            [
+                targetWindowTitle,
+                'eMatch 26.1.1.3',
+                'eMatch'
+            ],
+            APP_LAUNCH_WAIT_SECONDS
+        )
+
+        if (!mainHandle) {
+            KeywordUtil.markFailedAndStop("eMatch main window was not found after launch. Expected title ${targetWindowTitle}")
+        }
+
+        KeywordUtil.logInfo("eMatch main window handle found: ${mainHandle}")
+        return true
+    }
+
+    @Keyword
+    def attachToLoginWindow(String targetWindowTitle) {
+        KeywordUtil.logInfo("Attaching to login window. Expected title ${targetWindowTitle}")
+
+        closeSessionQuietly()
+
+        String dialogHandle = waitForWindowHandleByNames(
+            [
+                'Se connecter à eMatch'
+            ],
+            SHORT_WAIT_SECONDS
+        )
+
+        if (dialogHandle) {
+            sessionDriver = createSessionFromHandle(dialogHandle)
+            if (waitForLoginDialogReady(SHORT_WAIT_SECONDS)) {
+                KeywordUtil.logInfo('Attached directly to login dialog by top level handle.')
+                return true
+            }
+            closeSessionQuietly()
+        }
+
+        String mainHandle = waitForWindowHandleByNames(
+            [
+                targetWindowTitle,
+                'eMatch 26.1.1.3',
+                'eMatch'
+            ],
+            DEFAULT_WAIT_SECONDS
+        )
+
+        if (!mainHandle) {
+            KeywordUtil.markFailedAndStop("Main eMatch window was not found for attach. Expected ${targetWindowTitle}")
+        }
+
+        WindowsDriver<WebElement> mainSession = createSessionFromHandle(mainHandle)
+
+        String childDialogHandle = waitForChildWindowHandleByName(mainSession, 'Se connecter à eMatch', SHORT_WAIT_SECONDS)
+        if (childDialogHandle) {
+            try {
+                mainSession.quit()
+            } catch (Throwable ignored) {
+            }
+
+            sessionDriver = createSessionFromHandle(childDialogHandle)
+            if (waitForLoginDialogReady(SHORT_WAIT_SECONDS)) {
+                KeywordUtil.logInfo('Attached to login dialog by child NativeWindowHandle.')
+                return true
+            }
+            closeSessionQuietly()
+        }
+
+        sessionDriver = mainSession
+
+        if (waitForLoginDialogReady(DEFAULT_WAIT_SECONDS)) {
+            KeywordUtil.logInfo('Attached to main window and login controls are available there.')
+            return true
+        }
+
+        KeywordUtil.markFailedAndStop('Could not attach to the login dialog.')
+    }
+
+    @Keyword
+    def openEnvironmentDropdown() {
+        ensureSession()
+
+        List<WebElement> combos = waitForLoginComboBoxes(DEFAULT_WAIT_SECONDS)
+        if (combos.isEmpty()) {
+            KeywordUtil.markFailedAndStop('Environment combo box was not found.')
+        }
+
+        WebElement combo = combos[0]
+        combo.click()
+        sleepSeconds(1)
+        return true
+    }
+
+    @Keyword
+    int resolveEnvironmentIndex(String envName) {
+        String env = safeUpper(envName)
+
+        switch (env) {
+            case 'PROD':
+                return 0
+            case 'PREPO':
+            case 'PREPRO':
+                return 1
+            case 'RECQ':
+                return 2
+            case 'REC':
+                return 3
+            case 'DEV2':
+                return 4
+            case 'DEV':
+                return 5
+            default:
+                return 3
+        }
+    }
+
+    @Keyword
+    def selectEnvironment(String envName) {
+        ensureSession()
+
+        List<WebElement> combos = waitForLoginComboBoxes(DEFAULT_WAIT_SECONDS)
+        if (combos.isEmpty()) {
+            KeywordUtil.markFailedAndStop('No combo box was found to select the environment.')
+        }
+
+        String displayText = environmentDisplayText(envName)
+        WebElement combo = combos[0]
+
+        combo.click()
+        sleepSeconds(1)
+        combo.sendKeys(Keys.chord(Keys.CONTROL, 'a'))
+        combo.sendKeys(displayText)
+        sleepSeconds(1)
+        combo.sendKeys(Keys.ENTER)
+        sleepSeconds(1)
+
+        KeywordUtil.logInfo("Environment selected: ${displayText}")
+        return true
+    }
+
+    @Keyword
+    boolean isConnectButtonPresent() {
+        ensureSession()
+        return findConnectButton() != null
+    }
+
+    @Keyword
+    def clickConnectButton() {
+        ensureSession()
+
+        WebElement button = findConnectButton()
+        if (button == null) {
+            KeywordUtil.markFailedAndStop('Connect button was not found.')
+        }
+
+        button.click()
+        sleepSeconds(1)
+        return true
+    }
+
+    @Keyword
+    boolean waitForMainScreen() {
+        ensureSession()
+
+        for (int attempt = 1; attempt <= APP_LAUNCH_WAIT_SECONDS; attempt++) {
+            if (findConnectButton() == null) {
+                if (hasAnyElementByName(sessionDriver, 'Accueil') ||
+                    hasAnyElementByName(sessionDriver, 'Rafraîchir') ||
+                    hasAnyElementByName(sessionDriver, 'Refresh')) {
+                    KeywordUtil.logInfo("Main screen detected at attempt ${attempt}")
+                    return true
+                }
+            }
+            sleepSeconds(1)
+        }
+
+        return false
+    }
+
+    @Keyword
+    def activateHomeTab() {
+        ensureSession()
+
+        WebElement home = findElementByPossibleNames(['Accueil', 'Home'])
+        if (home != null) {
+            home.click()
+            sleepSeconds(1)
+        }
+
+        return true
+    }
+
+    private String safeEnv() {
+        try {
+            String env = (GlobalVariable.env ?: '').trim().toUpperCase()
+            return env ? env : 'REC'
+        } catch (Throwable ignored) {
+            return 'REC'
+        }
+    }
+
+    private String safeUpper(String value) {
+        return value == null ? '' : value.trim().toUpperCase()
+    }
+
+    private String environmentDisplayText(String envName) {
+        String env = safeUpper(envName)
+
+        switch (env) {
+            case 'PROD':
+                return 'Production (PROD)'
+            case 'PREPO':
+            case 'PREPRO':
+                return 'Bench (PREPO)'
+            case 'RECQ':
+                return 'Qualification (RECQ)'
+            case 'REC':
+                return 'Recette (REC)'
+            case 'DEV2':
+                return 'Simulation (DEV2)'
+            case 'DEV':
+                return 'Development (DEV)'
+            default:
+                return 'Recette (REC)'
+        }
+    }
+
+    private String resolveLaunchPath() {
+        String installedExe = getInstalledExePath()
+        if (installedExe) {
+            return installedExe
+        }
+
+        String shortcut = getShortcutPath()
+        if (shortcut) {
+            return shortcut
+        }
+
+        String launcher = getLauncherBat()
+        if (launcher) {
+            return launcher
+        }
+
+        String application = getApplicationPath()
+        if (application) {
+            return application
+        }
+
+        return ''
+    }
+
+    private String firstExisting(List<String> candidates) {
+        for (String candidate : candidates) {
+            if (candidate && Files.exists(Paths.get(candidate))) {
+                return candidate
+            }
+        }
+        return ''
+    }
+
+    private void killExistingEmatchProcesses() {
+        List<String> commands = [
+            'taskkill /F /IM IXIS.eMatch.IHM.exe /T',
+            'taskkill /F /IM eMatch.exe /T'
+        ]
+
+        commands.each { String command ->
+            try {
+                new ProcessBuilder('cmd.exe', '/c', command).start().waitFor()
+            } catch (Throwable ignored) {
+            }
+        }
+
+        sleepSeconds(2)
+    }
+
+    private void startWinAppDriverIfNeeded() {
+        if (isPortOpen('127.0.0.1', 4723, 1000)) {
+            KeywordUtil.logInfo('WinAppDriver already running on 127.0.0.1:4723')
+            return
+        }
+
+        String path = getWinAppDriverPath()
+        if (!path) {
+            KeywordUtil.markFailedAndStop('WinAppDriver.exe was not found.')
+        }
+
+        String command = "start \"\" /min \"${path}\""
+        new ProcessBuilder('cmd.exe', '/c', command).start()
+
+        for (int attempt = 1; attempt <= 20; attempt++) {
+            if (isPortOpen('127.0.0.1', 4723, 1000)) {
+                KeywordUtil.logInfo("WinAppDriver started on attempt ${attempt}")
+                return
+            }
+            sleepSeconds(1)
+        }
+
+        KeywordUtil.markFailedAndStop('WinAppDriver did not start on port 4723.')
+    }
+
+    private void launchApplication(String path) {
+        String command = "start \"\" \"${path}\""
+        new ProcessBuilder('cmd.exe', '/c', command).start()
+        sleepSeconds(2)
+        KeywordUtil.logInfo("Launch command executed for: ${path}")
+    }
+
+    private boolean isPortOpen(String host, int port, int timeoutMillis) {
+        try {
+            Socket socket = new Socket()
+            socket.connect(new java.net.InetSocketAddress(host, port), timeoutMillis)
+            socket.close()
+            return true
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private WindowsDriver<WebElement> createRootDriver() {
+        DesiredCapabilities caps = new DesiredCapabilities()
+        caps.setCapability('app', 'Root')
+
+        WindowsDriver<WebElement> driver = new WindowsDriver<WebElement>(new URL(WINAPPDRIVER_URL), caps)
+        driver.manage().timeouts().implicitlyWait(1, TimeUnit.SECONDS)
+        return driver
+    }
+
+    private WindowsDriver<WebElement> createSessionFromHandle(String nativeHandle) {
+        String normalized = normalizeTopLevelHandle(nativeHandle)
+
+        DesiredCapabilities caps = new DesiredCapabilities()
+        caps.setCapability('appTopLevelWindow', normalized)
+        caps.setCapability('ms:waitForAppLaunch', '60')
+
+        WindowsDriver<WebElement> driver = new WindowsDriver<WebElement>(new URL(WINAPPDRIVER_URL), caps)
+        driver.manage().timeouts().implicitlyWait(1, TimeUnit.SECONDS)
+        return driver
+    }
+
+    private String normalizeTopLevelHandle(String nativeHandle) {
+        String handle = (nativeHandle ?: '').trim()
+        if (!handle) {
+            return ''
+        }
+
+        if (handle.toLowerCase().startsWith('0x')) {
+            handle = handle.substring(2)
+        } else {
+            try {
+                handle = Long.toHexString(Long.parseLong(handle))
+            } catch (Throwable ignored) {
+            }
+        }
+
+        return handle.toUpperCase()
+    }
+
+    private String waitForWindowHandleByNames(List<String> names, int maxSeconds) {
+        closeRootDriverQuietly()
+        rootDriver = createRootDriver()
+
+        for (int attempt = 1; attempt <= maxSeconds; attempt++) {
+            for (String name : names.findAll { it?.trim() }) {
+                List<WebElement> elements = findElementsSafe(rootDriver, By.name(name))
+                for (WebElement element : elements) {
+                    String handle = safeAttr(element, 'NativeWindowHandle')
+                    if (handle) {
+                        KeywordUtil.logInfo("Window handle found for '${name}' at attempt ${attempt}: ${handle}")
+                        return handle
+                    }
+                }
+            }
+            sleepSeconds(1)
+        }
+
+        return ''
+    }
+
+    private String waitForChildWindowHandleByName(WindowsDriver<WebElement> driver, String childName, int maxSeconds) {
+        for (int attempt = 1; attempt <= maxSeconds; attempt++) {
+            List<WebElement> elements = findElementsSafe(driver, By.name(childName))
+            for (WebElement element : elements) {
+                String handle = safeAttr(element, 'NativeWindowHandle')
+                if (handle) {
+                    KeywordUtil.logInfo("Child handle found for '${childName}' at attempt ${attempt}: ${handle}")
+                    return handle
+                }
+            }
+            sleepSeconds(1)
+        }
+
+        return ''
+    }
+
+    private List<WebElement> waitForLoginComboBoxes(int maxSeconds) {
+        for (int attempt = 1; attempt <= maxSeconds; attempt++) {
+            List<WebElement> combos = findComboBoxes()
+            if (!combos.isEmpty()) {
+                KeywordUtil.logInfo("Login combo boxes found at attempt ${attempt}: ${combos.size()}")
+                return combos
+            }
+            sleepSeconds(1)
+        }
+
+        return []
+    }
+
+    private boolean waitForLoginDialogReady(int maxSeconds) {
+        for (int attempt = 1; attempt <= maxSeconds; attempt++) {
+            List<WebElement> combos = findComboBoxes()
+            WebElement connectButton = findConnectButton()
+
+            if (!combos.isEmpty() && connectButton != null) {
+                KeywordUtil.logInfo("Login dialog ready at attempt ${attempt}")
+                return true
+            }
+
+            sleepSeconds(1)
+        }
+
+        return false
+    }
+
+    private List<WebElement> findComboBoxes() {
+        ensureSession()
+
+        List<WebElement> byClass = findElementsSafe(sessionDriver, By.className('ComboBox'))
+        if (!byClass.isEmpty()) {
+            return byClass
+        }
+
+        List<WebElement> byXpath = findElementsSafe(sessionDriver, By.xpath("//*[contains(@ClassName,'ComboBox')]"))
+        if (!byXpath.isEmpty()) {
+            return byXpath
+        }
+
+        return []
+    }
+
+    private WebElement findConnectButton() {
+        ensureSession()
+
+        WebElement button = findElementByPossibleNames([
+            'Se connecter',
+            'Connect',
+            'Se connecter '
+        ])
+
+        if (button != null) {
+            return button
+        }
+
+        List<WebElement> buttons = findElementsSafe(sessionDriver, By.className('Button'))
+        for (WebElement current : buttons) {
+            String name = safeAttr(current, 'Name').toLowerCase()
+            if (name.contains('connect')) {
+                return current
+            }
+        }
+
+        return null
+    }
+
+    private WebElement findElementByPossibleNames(List<String> names) {
+        ensureSession()
+
+        for (String name : names) {
+            List<WebElement> elements = findElementsSafe(sessionDriver, By.name(name))
+            if (!elements.isEmpty()) {
+                return elements[0]
+            }
+        }
+
+        return null
+    }
+
+    private boolean hasAnyElementByName(WindowsDriver<WebElement> driver, String name) {
+        return !findElementsSafe(driver, By.name(name)).isEmpty()
+    }
+
+    private List<WebElement> findElementsSafe(WindowsDriver<WebElement> driver, By by) {
+        try {
+            List<WebElement> elements = driver.findElements(by)
+            return elements == null ? [] : elements
+        } catch (Throwable ignored) {
+            return []
+        }
+    }
+
+    private String safeAttr(WebElement element, String attrName) {
+        try {
+            String value = element.getAttribute(attrName)
+            return value == null ? '' : value.trim()
+        } catch (Throwable ignored) {
+            return ''
+        }
+    }
+
+    private void ensureSession() {
+        if (sessionDriver == null) {
+            KeywordUtil.markFailedAndStop('Session driver is not initialized.')
+        }
+    }
+
+    private void closeSessionQuietly() {
+        if (sessionDriver != null) {
+            try {
+                sessionDriver.quit()
+            } catch (Throwable ignored) {
+            }
+            sessionDriver = null
+        }
+    }
+
+    private void closeRootDriverQuietly() {
+        if (rootDriver != null) {
+            try {
+                rootDriver.quit()
+            } catch (Throwable ignored) {
+            }
+            rootDriver = null
+        }
+    }
+
+    private void sleepSeconds(int seconds) {
+        try {
+            Thread.sleep(seconds * 1000L)
+        } catch (Throwable ignored) {
+        }
+    }
+}
