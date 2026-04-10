@@ -13,6 +13,8 @@ import groovy.io.FileType
 
 import com.kms.katalon.core.annotation.Keyword
 import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
 import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
 
@@ -237,6 +239,49 @@ class authentication {
 			   safeVerifyPresent('Login Page/btnConnect', 1)
 	}
 
+	private boolean isMainScreenReady() {
+		return safeVerifyPresent('Object Repository/General/txtSearch', 1) ||
+			   safeVerifyPresent('General/txtSearch', 1)
+	}
+
+	private boolean probeCurrentWindow() {
+		if (isLoginWindowReady() || isMainScreenReady()) {
+			return true
+		}
+
+		List<String> candidateObjects = [
+			'Object Repository/Login Page/optEnv',
+			'Login Page/optEnv',
+			'Object Repository/Login Page/btnConnect',
+			'Login Page/btnConnect',
+			'Object Repository/General/txtSearch',
+			'General/txtSearch'
+		]
+
+		for (String objectId : candidateObjects) {
+			try {
+				Windows.waitForElementPresent(
+					findWindowsObject(objectId),
+					2,
+					FailureHandling.OPTIONAL
+				)
+				if (safeVerifyPresent(objectId, 1)) {
+					KeywordUtil.logInfo("Current window matched by element: ${objectId}")
+					return true
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		try {
+			keyPress(KeyEvent.VK_TAB)
+			Windows.delay(1)
+		} catch (Throwable ignored) {
+		}
+
+		return isLoginWindowReady() || isMainScreenReady()
+	}
+
 	private boolean waitForLoginWindowReady(int maxSeconds) {
 		for (int i = 1; i <= maxSeconds; i++) {
 			if (isLoginWindowReady()) {
@@ -271,22 +316,39 @@ class authentication {
 		return false
 	}
 
-	private void bringWindowToFront() {
-		try {
-			Robot robot = new Robot()
-			robot.setAutoDelay(150)
-			robot.keyPress(KeyEvent.VK_ALT)
-			robot.keyPress(KeyEvent.VK_TAB)
-			robot.keyRelease(KeyEvent.VK_TAB)
-			robot.keyRelease(KeyEvent.VK_ALT)
-			Windows.delay(2)
-			robot.keyPress(KeyEvent.VK_ENTER)
-			robot.keyRelease(KeyEvent.VK_ENTER)
-			Windows.delay(2)
-			KeywordUtil.logInfo('Tried to bring eMatch window to the foreground using ALT+TAB.')
-		} catch (Throwable e) {
-			KeywordUtil.logInfo("Unable to bring window to front with keyboard: ${e.message}")
+	private boolean attachToLoginByWindowTitle(String targetWindowTitle, int maxRounds) {
+		if (!targetWindowTitle) {
+			return false
 		}
+
+		WindowsTestObject targetWindow = new WindowsTestObject()
+		targetWindow.setLocatorStrategy(LocatorStrategy.NAME)
+		targetWindow.setLocator(targetWindowTitle)
+
+		for (int round = 1; round <= maxRounds; round++) {
+			try {
+				Windows.switchToDesktop()
+				Windows.delay(1)
+				Windows.switchToWindow(targetWindow)
+				Windows.delay(1)
+
+				if (probeCurrentWindow()) {
+					KeywordUtil.logInfo("Attached to login window using title '${targetWindowTitle}' at round ${round}")
+					return true
+				}
+			} catch (Throwable e) {
+				if (isConnectionRefused(e)) {
+					KeywordUtil.logInfo("WinAppDriver connection was refused while attaching by title. Restarting service. Error: ${e.message}")
+					restartWinAppDriver()
+				} else if (round == 1 || round % 4 == 0) {
+					KeywordUtil.logInfo("Window title '${targetWindowTitle}' not attachable yet at round ${round}: ${e.message}")
+				}
+			}
+
+			Windows.delay(1)
+		}
+
+		return false
 	}
 
 	private boolean attachToLoginByWindowIndex(int maxRounds, int maxIndex) {
@@ -296,7 +358,7 @@ class authentication {
 					Windows.switchToWindowIndex(index)
 					Windows.delay(1)
 
-					if (isLoginWindowReady()) {
+					if (probeCurrentWindow()) {
 						KeywordUtil.logInfo("Attached to login window using index ${index} at round ${round}")
 						return true
 					}
@@ -310,10 +372,6 @@ class authentication {
 						KeywordUtil.logInfo("Window index ${index} not attachable yet at round ${round}: ${e.message}")
 					}
 				}
-			}
-
-			if (round == 2 || round == 4) {
-				bringWindowToFront()
 			}
 
 			Windows.delay(1)
@@ -488,9 +546,11 @@ class authentication {
 		Windows.delay(10)
 		ensureWinAppDriverStarted()
 
-		boolean attached = attachToLoginByWindowIndex(18, 7)
+		boolean attached = attachToLoginByWindowTitle(resolveWindowTitle(), 12)
 		if (!attached) {
-			bringWindowToFront()
+			attached = attachToLoginByWindowIndex(18, 7)
+		}
+		if (!attached) {
 			attached = attachToLoginByWindowIndex(8, 7)
 		}
 
@@ -501,7 +561,6 @@ class authentication {
 
 		boolean loginReady = waitForLoginWindowReady(20)
 		if (!loginReady) {
-			bringWindowToFront()
 			keyPress(KeyEvent.VK_TAB)
 			keyPress(KeyEvent.VK_TAB)
 			boolean retryReady = waitForLoginWindowReady(10)
@@ -680,7 +739,7 @@ class authentication {
 
 		ensureWinAppDriverStarted()
 
-		if (isLoginWindowReady()) {
+		if (isLoginWindowReady() || isMainScreenReady()) {
 			KeywordUtil.logInfo('Login window already available before launch.')
 			return true
 		}
@@ -725,14 +784,16 @@ class authentication {
 	boolean attachToLoginWindow(String targetWindowTitle) {
 		ensureWinAppDriverStarted()
 
-		if (isLoginWindowReady()) {
+		if (isLoginWindowReady() || isMainScreenReady()) {
 			KeywordUtil.logInfo("Login window already available for '${targetWindowTitle}'.")
 			return true
 		}
 
-		boolean attached = attachToLoginByWindowIndex(12, 7)
+		boolean attached = attachToLoginByWindowTitle(targetWindowTitle, 12)
 		if (!attached) {
-			bringWindowToFront()
+			attached = attachToLoginByWindowIndex(12, 7)
+		}
+		if (!attached) {
 			attached = attachToLoginByWindowIndex(8, 7)
 		}
 		if (!attached) {
@@ -741,7 +802,6 @@ class authentication {
 
 		boolean loginReady = waitForLoginWindowReady(15)
 		if (!loginReady) {
-			bringWindowToFront()
 			keyPress(KeyEvent.VK_TAB)
 			keyPress(KeyEvent.VK_TAB)
 			keyPress(KeyEvent.VK_ENTER)
@@ -900,89 +960,3 @@ class authentication {
 		return true
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import com.kms.katalon.core.util.KeywordUtil
-
-import internal.GlobalVariable as GlobalVariable
-
-String environment = 'REC'
-GlobalVariable.env = environment
-
-String currentUser = CustomKeywords.'pageObject.authentication.getCurrentWindowsUser'()
-String targetWindowTitle = CustomKeywords.'pageObject.authentication.resolveWindowTitle'()
-String shortcutPath = CustomKeywords.'pageObject.authentication.getShortcutPath'()
-String applicationPath = CustomKeywords.'pageObject.authentication.getApplicationPath'()
-String launcherBat = CustomKeywords.'pageObject.authentication.getLauncherBat'()
-String resolutionScriptPath = CustomKeywords.'pageObject.authentication.getResolutionScriptPath'()
-String winAppDriverPath = CustomKeywords.'pageObject.authentication.getWinAppDriverPath'()
-String installedExePath = CustomKeywords.'pageObject.authentication.getInstalledExePath'()
-
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Verify username, version and startup context')
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("environment: ${environment}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("env = ${GlobalVariable.env}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("currentUser = ${currentUser}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("targetWindowTitle = ${targetWindowTitle}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("shortcutPath = ${shortcutPath}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("applicationPath = ${applicationPath}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("installedExePath = ${installedExePath}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("launcherBat = ${launcherBat}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("resolutionScriptPath = ${resolutionScriptPath}")
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("winAppDriverPath = ${winAppDriverPath}")
-
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Starting eMatch application')
-CustomKeywords.'pageObject.authentication.startEMatch'(currentUser, targetWindowTitle)
-
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Attaching to login window')
-CustomKeywords.'pageObject.authentication.attachToLoginWindow'(targetWindowTitle)
-
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Opening environment dropdown')
-CustomKeywords.'pageObject.authentication.openEnvironmentDropdown'()
-
-int envIndex = CustomKeywords.'pageObject.authentication.resolveEnvironmentIndex'(GlobalVariable.env)
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'("Selecting environment '${GlobalVariable.env}' with index ${envIndex}")
-CustomKeywords.'pageObject.authentication.selectEnvironment'(GlobalVariable.env)
-
-boolean isButtonPresent = CustomKeywords.'pageObject.authentication.isConnectButtonPresent'()
-
-if (isButtonPresent) {
-	CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Connect button was present and will be clicked.')
-	CustomKeywords.'pageObject.authentication.clickConnectButton'()
-	KeywordUtil.logInfo('Connect button was present and was clicked.')
-} else {
-	CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Connect button was not present. Continuing test execution.')
-	KeywordUtil.logInfo('Connect button was not present. Continuing test execution.')
-}
-
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Waiting for main eMatch screen')
-boolean mainScreenLoaded = CustomKeywords.'pageObject.authentication.waitForMainScreen'()
-
-if (!mainScreenLoaded) {
-	CustomKeywords.'jiraIntegration.JiraReportSteps.note'("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
-	KeywordUtil.markFailedAndStop("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
-}
-
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Activating Home tab')
-CustomKeywords.'pageObject.authentication.activateHomeTab'()
-
-CustomKeywords.'jiraIntegration.JiraReportSteps.note'('eMatch startup flow completed successfully')
-KeywordUtil.markPassed("eMatch startup flow completed successfully for environment ${GlobalVariable.env}")
-
-
-
-
