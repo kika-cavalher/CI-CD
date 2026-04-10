@@ -1,48 +1,505 @@
+package pageObject
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.event.KeyEvent
+
+import org.openqa.selenium.Keys
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import internal.GlobalVariable
+
+class authentication {
+
+	private String gv(String name) {
+		try {
+			def value = GlobalVariable."${name}"
+			return value == null ? '' : value.toString().trim()
+		} catch (Throwable ignored) {
+			return ''
+		}
+	}
+
+	private String firstNonBlank(String... values) {
+		for (String value : values) {
+			if (value != null && value.toString().trim()) {
+				return value.toString().trim()
+			}
+		}
+		return ''
+	}
+
+	private String currentEnv() {
+		String raw = firstNonBlank(
+			gv('env'),
+			gv('environment'),
+			'REC'
+		).toUpperCase()
+
+		if (raw == 'PRD') {
+			return 'PROD'
+		}
+
+		return raw ?: 'REC'
+	}
+
+	private boolean safeVerifyPresent(String objectId, int timeoutSeconds = 1) {
+		try {
+			return Windows.verifyElementPresent(
+				findWindowsObject(objectId),
+				timeoutSeconds,
+				FailureHandling.OPTIONAL
+			)
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private boolean safeClick(String objectId, int timeoutSeconds = 2) {
+		try {
+			Windows.waitForElementPresent(
+				findWindowsObject(objectId),
+				timeoutSeconds,
+				FailureHandling.OPTIONAL
+			)
+			Windows.click(findWindowsObject(objectId))
+			return true
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private boolean processExists(String imageName) {
+		try {
+			Process process = new ProcessBuilder(
+				'cmd',
+				'/c',
+				"tasklist /FI \"IMAGENAME eq ${imageName}\""
+			).redirectErrorStream(true).start()
+
+			String output = process.inputStream.getText('CP1252')
+			process.waitFor()
+
+			return output != null && output.toLowerCase().contains(imageName.toLowerCase())
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private void killProcessIfExists(String imageName) {
+		try {
+			if (!processExists(imageName)) {
+				return
+			}
+
+			new ProcessBuilder(
+				'cmd',
+				'/c',
+				"taskkill /F /T /IM \"${imageName}\""
+			).redirectErrorStream(true).start().waitFor()
+			Windows.delay(2)
+		} catch (Throwable e) {
+			KeywordUtil.logInfo("Unable to kill process ${imageName}: ${e.message}")
+		}
+	}
+
+	private void runResolutionScriptIfNeeded() {
+		String scriptPath = getResolutionScriptPath()
+		if (!scriptPath) {
+			return
+		}
+
+		File script = new File(scriptPath)
+		if (!script.exists()) {
+			KeywordUtil.logInfo("Resolution script not found: ${scriptPath}")
+			return
+		}
+
+		try {
+			new ProcessBuilder(
+				'Powershell.exe',
+				'-executionpolicy',
+				'remotesigned',
+				'-File',
+				scriptPath
+			).redirectErrorStream(true).start()
+			Windows.delay(2)
+		} catch (Throwable e) {
+			KeywordUtil.logInfo("Unable to execute resolution script: ${e.message}")
+		}
+	}
+
+	private void startWinAppDriver() {
+		String exePath = getWinAppDriverPath()
+		if (!exePath) {
+			throw new Exception('WinAppDriver path is empty.')
+		}
+
+		File exe = new File(exePath)
+		if (!exe.exists()) {
+			throw new Exception("WinAppDriver executable not found at: ${exePath}")
+		}
+
+		try {
+			new ProcessBuilder(exePath).inheritIO().start()
+			Windows.delay(4)
+		} catch (Throwable e) {
+			throw new Exception("Unable to start WinAppDriver from: ${exePath}. Error: ${e.message}")
+		}
+	}
+
+	private boolean waitForLoginWindowObjects(int timeoutSeconds) {
+		List<String> candidateObjects = [
+			'Login Page/optEnv',
+			'Object Repository/Login Page/optEnv',
+			'Login Page/btnConnect',
+			'Object Repository/Login Page/btnConnect',
+			'Login Page/btnConnecter'
+		]
+
+		for (String objectId : candidateObjects) {
+			try {
+				Windows.waitForElementPresent(
+					findWindowsObject(objectId),
+					timeoutSeconds,
+					FailureHandling.OPTIONAL
+				)
+				if (safeVerifyPresent(objectId, 1)) {
+					KeywordUtil.logInfo("Login object detected: ${objectId}")
+					return true
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return false
+	}
+
+	private void attachWindowByTitle(String title) {
+		WindowsTestObject targetWindow = new WindowsTestObject()
+		targetWindow.setLocatorStrategy(LocatorStrategy.NAME)
+		targetWindow.setLocator(title)
+
+		Windows.switchToDesktop()
+		Windows.switchToWindow(targetWindow)
+	}
+
+	private void keyPress(int keyCode) {
+		Robot robot = new Robot()
+		robot.setAutoDelay(120)
+		robot.keyPress(keyCode)
+		robot.keyRelease(keyCode)
+	}
+
+	@Keyword
+	String getCurrentWindowsUser() {
+		return firstNonBlank(
+			System.getProperty('user.name'),
+			System.getenv('USERNAME')
+		)
+	}
+
+	@Keyword
+	String resolveWindowTitle() {
+		String title = firstNonBlank(
+			gv('version'),
+			gv('versionRec'),
+			gv('versionREC'),
+			gv('versionProd'),
+			gv('versionPRD'),
+			gv('versionPROD'),
+			gv('versionPts'),
+			gv('versionPTS')
+		)
+
+		if (!title) {
+			throw new Exception("No version variable found for environment '${currentEnv()}'.")
+		}
+
+		return title
+	}
+
+	@Keyword
+	String getShortcutPath() {
+		String env = currentEnv()
+		String user = firstNonBlank(gv('username'), getCurrentWindowsUser(), 'BGS32GG')
+
+		switch (env) {
+			case 'PROD':
+				return firstNonBlank(
+					gv('shortcutPathProd'),
+					gv('shortcutPathPRD'),
+					gv('shortcutPathPROD'),
+					"C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch PROD.appref-ms"
+				)
+			case 'PTS':
+				return firstNonBlank(
+					gv('shortcutPathPts'),
+					gv('shortcutPathPTS'),
+					"C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch PTS.appref-ms"
+				)
+			default:
+				return firstNonBlank(
+					gv('shortcutPathRec'),
+					gv('shortcutPathREC'),
+					"C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch REC.appref-ms"
+				)
+		}
+	}
+
+	@Keyword
+	String getRemoteShortcutPath() {
+		String env = currentEnv()
+
+		switch (env) {
+			case 'PROD':
+				return firstNonBlank(
+					gv('remoteShortcutPathProd'),
+					gv('remoteShortcutPathPRD'),
+					gv('remoteShortcutPathPROD'),
+					'D:\\RunAseMatchPrd\\eMatch.lnk'
+				)
+			case 'PTS':
+				return firstNonBlank(
+					gv('remoteShortcutPathPts'),
+					gv('remoteShortcutPathPTS'),
+					'D:\\RunAseMatchPts\\eMatch.lnk'
+				)
+			default:
+				return firstNonBlank(
+					gv('remoteShortcutPathRec'),
+					gv('remoteShortcutPathREC'),
+					'D:\\RunAseMatchReq\\eMatch.lnk'
+				)
+		}
+	}
+
+	@Keyword
+	String getResolutionScriptPath() {
+		return firstNonBlank(
+			gv('resolutionScriptPath'),
+			'D:\\setResolution.ps1'
+		)
+	}
+
+	@Keyword
+	String getWinAppDriverPath() {
+		return firstNonBlank(
+			gv('winAppDriverPath'),
+			'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+		)
+	}
+
+	@Keyword
+	boolean startEMatch(String currentUser, String targetWindowTitle) {
+		String localShortcutPath = getShortcutPath()
+		String remoteShortcutPath = getRemoteShortcutPath()
+		boolean localFlow = new File(localShortcutPath).exists() || currentUser.equalsIgnoreCase(gv('username'))
+
+		KeywordUtil.logInfo("Current user: ${currentUser}")
+		KeywordUtil.logInfo("Configured user: ${gv('username')}")
+		KeywordUtil.logInfo("Window title: ${targetWindowTitle}")
+		KeywordUtil.logInfo("Local shortcut: ${localShortcutPath}")
+		KeywordUtil.logInfo("Remote shortcut: ${remoteShortcutPath}")
+		KeywordUtil.logInfo("Local flow: ${localFlow}")
+
+		killProcessIfExists('IXIS.eMatch.IHM.exe')
+
+		if (localFlow) {
+			runResolutionScriptIfNeeded()
+			File localShortcut = new File(localShortcutPath)
+			if (!localShortcut.exists()) {
+				throw new Exception("Local shortcut does not exist: ${localShortcutPath}")
+			}
+
+			Windows.startApplicationWithTitle(localShortcutPath, targetWindowTitle)
+			Windows.delay(8)
+			return true
+		}
+
+		startWinAppDriver()
+
+		File remoteShortcut = new File(remoteShortcutPath)
+		if (!remoteShortcut.exists()) {
+			throw new Exception("Remote shortcut does not exist: ${remoteShortcutPath}")
+		}
+
+		new ProcessBuilder(
+			'cmd',
+			'/c',
+			"start \"\" \"${remoteShortcutPath}\""
+		).redirectErrorStream(true).start()
+
+		Windows.delay(10)
+		return true
+	}
+
+	@Keyword
+	boolean attachToLoginWindow(String targetWindowTitle) {
+		Exception lastError = null
+
+		for (int i = 1; i <= 8; i++) {
+			try {
+				attachWindowByTitle(targetWindowTitle)
+				if (waitForLoginWindowObjects(15)) {
+					KeywordUtil.logInfo("Attached to login window '${targetWindowTitle}' at attempt ${i}")
+					return true
+				}
+			} catch (Throwable e) {
+				lastError = e
+			}
+			Windows.delay(2)
+		}
+
+		throw new Exception("Unable to attach to login window '${targetWindowTitle}'. Last error: ${lastError?.message}")
+	}
+
+	@Keyword
+	boolean openEnvironmentDropdown() {
+		List<String> candidateObjects = [
+			'Login Page/optEnv',
+			'Object Repository/Login Page/optEnv'
+		]
+
+		Exception lastError = null
+		for (String objectId : candidateObjects) {
+			try {
+				Windows.click(findWindowsObject(objectId))
+				Windows.delay(1)
+				return true
+			} catch (Throwable e) {
+				lastError = e
+			}
+		}
+
+		throw new Exception("Unable to open environment dropdown. Last error: ${lastError?.message}")
+	}
+
+	@Keyword
+	int resolveEnvironmentIndex(String envName) {
+		String env = (envName ?: '').trim().toUpperCase()
+
+		switch (env) {
+			case 'PROD':
+			case 'PRD':
+				return 1
+			case 'PREX':
+			case 'PREQ':
+			case 'BENCH':
+				return 2
+			case 'REC2':
+			case 'QUAL':
+			case 'QUALIFICATION':
+				return 3
+			case 'REC':
+			case 'RECETTE':
+				return 4
+			case 'DEV2':
+			case 'SIM':
+			case 'SIMULATION':
+				return 5
+			case 'DEV':
+			case 'DEVELOPMENT':
+				return 6
+			default:
+				return 4
+		}
+	}
+
+	@Keyword
+	boolean selectEnvironment(String envName) {
+		int envIndex = resolveEnvironmentIndex(envName)
+		List<String> candidateObjects = [
+			'Login Page/optEnv',
+			'Object Repository/Login Page/optEnv'
+		]
+
+		Exception lastError = null
+		for (String objectId : candidateObjects) {
+			try {
+				for (int i = 0; i < envIndex; i++) {
+					Windows.sendKeys(findWindowsObject(objectId), Keys.chord(Keys.ARROW_DOWN))
+				}
+				Windows.sendKeys(findWindowsObject(objectId), Keys.chord(Keys.ENTER))
+				Windows.delay(2)
+				return true
+			} catch (Throwable e) {
+				lastError = e
+			}
+		}
+
+		throw new Exception("Unable to select environment '${envName}'. Last error: ${lastError?.message}")
+	}
+
+	@Keyword
+	boolean isConnectButtonPresent() {
+		return safeVerifyPresent('Login Page/btnConnecter', 1) ||
+			safeVerifyPresent('Object Repository/Login Page/btnConnect', 1) ||
+			safeVerifyPresent('Login Page/btnConnect', 1)
+	}
+
+	@Keyword
+	boolean clickConnectButton() {
+		List<String> candidateObjects = [
+			'Login Page/btnConnecter',
+			'Object Repository/Login Page/btnConnect',
+			'Login Page/btnConnect'
+		]
+
+		Exception lastError = null
+		for (String objectId : candidateObjects) {
+			try {
+				Windows.click(findWindowsObject(objectId))
+				Windows.delay(1)
+				return true
+			} catch (Throwable e) {
+				lastError = e
+			}
+		}
+
+		throw new Exception("Unable to click connect button. Last error: ${lastError?.message}")
+	}
+
+	@Keyword
+	boolean waitForMainScreen() {
+		try {
+			Windows.waitForElementPresent(findWindowsObject('General/txtSearch'), 60)
+			return true
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			Windows.waitForElementPresent(findWindowsObject('Object Repository/General/txtSearch'), 60)
+			return true
+		} catch (Throwable ignored) {
+		}
+
+		return false
+	}
+
+	@Keyword
+	boolean activateHomeTab() {
+		if (safeClick('Object Repository/General/tabHome', 2)) {
+			return true
+		}
+
+		if (safeClick('General/tabHome', 2)) {
+			return true
+		}
+
+		keyPress(KeyEvent.VK_ESCAPE)
+		return true
+	}
+}
 
 
-=============== ROOT CAUSE =====================
-Caused by: org.codehaus.groovy.runtime.InvokerInvocationException: java.lang.Exception: Remote shortcut does not exist: D:\RunAseMatchReq\eMatch.lnk
-
-For trouble shooting, please visit: https://docs.katalon.com/katalon-studio/docs/troubleshooting.html
-================================================
-
-04-10-2026 07:30:31 da tarde pageObject.authentication.startEMatch(currentUser, targetWindowTitle)
-
-Elapsed time: 4,719s
-
-Test Cases/Connection/eMatch - Login REC FAILED.
-Reason:
-com.kms.katalon.core.exception.StepErrorException: org.codehaus.groovy.runtime.InvokerInvocationException: java.lang.Exception: Remote shortcut does not exist: D:\RunAseMatchReq\eMatch.lnk
-	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.throwError(CustomKeywordDelegatingMetaClass.java:101)
-	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:73)
-	at eMatch - Login REC.run(eMatch - Login REC:26)
-	at com.kms.katalon.core.main.ScriptEngine.run(ScriptEngine.java:194)
-	at com.kms.katalon.core.main.ScriptEngine.runScriptAsRawText(ScriptEngine.java:119)
-	at com.kms.katalon.core.main.TestCaseExecutor.runScript(TestCaseExecutor.java:448)
-	at com.kms.katalon.core.main.TestCaseExecutor.doExecute(TestCaseExecutor.java:439)
-	at com.kms.katalon.core.main.TestCaseExecutor.processExecutionPhase(TestCaseExecutor.java:418)
-	at com.kms.katalon.core.main.TestCaseExecutor.accessMainPhase(TestCaseExecutor.java:410)
-	at com.kms.katalon.core.main.TestCaseExecutor.execute(TestCaseExecutor.java:285)
-	at com.kms.katalon.core.common.CommonExecutor.accessTestCaseMainPhase(CommonExecutor.java:65)
-	at com.kms.katalon.core.main.TestSuiteExecutor.accessTestSuiteMainPhase(TestSuiteExecutor.java:150)
-	at com.kms.katalon.core.main.TestSuiteExecutor.execute(TestSuiteExecutor.java:106)
-	at com.kms.katalon.core.main.TestCaseMain.startTestSuite(TestCaseMain.java:180)
-	at TempTestSuite1775845818997.run(TempTestSuite1775845818997.groovy:35)
-	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
-	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
-	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
-Caused by: org.codehaus.groovy.runtime.InvokerInvocationException: java.lang.Exception: Remote shortcut does not exist: D:\RunAseMatchReq\eMatch.lnk
-	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:55)
-	at Script1661269778913.run(Script1661269778913.groovy:26)
-	... 15 more
-Caused by: java.lang.Exception: Remote shortcut does not exist: D:\RunAseMatchReq\eMatch.lnk
-	at pageObject.authentication.startEMatch(authentication.groovy:331)
-	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
-	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
-	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
-	at com.kms.katalon.core.main.CustomKeywordDelegatingMetaClass.invokeStaticMethod(CustomKeywordDelegatingMetaClass.java:55)
-	at eMatch - Login REC.run(eMatch - Login REC:26)
-	... 15 more
 
 
 
@@ -50,6 +507,79 @@ Caused by: java.lang.Exception: Remote shortcut does not exist: D:\RunAseMatchRe
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+import com.kms.katalon.core.util.KeywordUtil
+
+import internal.GlobalVariable as GlobalVariable
+
+String environment = 'REC'
+GlobalVariable.env = environment
+
+String currentUser = CustomKeywords.'pageObject.authentication.getCurrentWindowsUser'()
+String targetWindowTitle = CustomKeywords.'pageObject.authentication.resolveWindowTitle'()
+String shortcutPath = CustomKeywords.'pageObject.authentication.getShortcutPath'()
+String remoteShortcutPath = CustomKeywords.'pageObject.authentication.getRemoteShortcutPath'()
+String resolutionScriptPath = CustomKeywords.'pageObject.authentication.getResolutionScriptPath'()
+String winAppDriverPath = CustomKeywords.'pageObject.authentication.getWinAppDriverPath'()
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Verify username, version and startup context')
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("environment: ${environment}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("env = ${GlobalVariable.env}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("currentUser = ${currentUser}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("targetWindowTitle = ${targetWindowTitle}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("shortcutPath = ${shortcutPath}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("remoteShortcutPath = ${remoteShortcutPath}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("resolutionScriptPath = ${resolutionScriptPath}")
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("winAppDriverPath = ${winAppDriverPath}")
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Starting eMatch application')
+CustomKeywords.'pageObject.authentication.startEMatch'(currentUser, targetWindowTitle)
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Attaching to login window')
+CustomKeywords.'pageObject.authentication.attachToLoginWindow'(targetWindowTitle)
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Opening environment dropdown')
+CustomKeywords.'pageObject.authentication.openEnvironmentDropdown'()
+
+int envIndex = CustomKeywords.'pageObject.authentication.resolveEnvironmentIndex'(GlobalVariable.env)
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'("Selecting environment '${GlobalVariable.env}' with index ${envIndex}")
+CustomKeywords.'pageObject.authentication.selectEnvironment'(GlobalVariable.env)
+
+boolean isButtonPresent = CustomKeywords.'pageObject.authentication.isConnectButtonPresent'()
+
+if (isButtonPresent) {
+	CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Connect button was present and will be clicked.')
+	CustomKeywords.'pageObject.authentication.clickConnectButton'()
+	KeywordUtil.logInfo('Connect button was present and was clicked.')
+} else {
+	CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Connect button was not present. Continuing test execution.')
+	KeywordUtil.logInfo('Connect button was not present. Continuing test execution.')
+}
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Waiting for main eMatch screen')
+boolean mainScreenLoaded = CustomKeywords.'pageObject.authentication.waitForMainScreen'()
+
+if (!mainScreenLoaded) {
+	CustomKeywords.'jiraIntegration.JiraReportSteps.note'("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
+	KeywordUtil.markFailedAndStop("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
+}
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('Activating Home tab')
+CustomKeywords.'pageObject.authentication.activateHomeTab'()
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'('eMatch startup flow completed successfully')
+KeywordUtil.markPassed("eMatch startup flow completed successfully for environment ${GlobalVariable.env}")
 
 
 
