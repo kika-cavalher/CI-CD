@@ -1,1 +1,521 @@
+package pageObject
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.event.KeyEvent
+import java.net.InetSocketAddress
+import java.net.Socket
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import internal.GlobalVariable
+
+class authentication {
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && value.toString().trim()) {
+                return value.toString().trim()
+            }
+        }
+        return ''
+    }
+
+    private String gv(String name) {
+        try {
+            def value = GlobalVariable."${name}"
+            return value == null ? '' : value.toString().trim()
+        } catch (Throwable ignored) {
+            return ''
+        }
+    }
+
+    private String currentEnv() {
+        return firstNonBlank(
+            gv('env'),
+            gv('environment'),
+            'REC'
+        ).toUpperCase()
+    }
+
+    private boolean isPortOpen(String host, int port, int timeoutMs = 1000) {
+        Socket socket = null
+        try {
+            socket = new Socket()
+            socket.connect(new InetSocketAddress(host, port), timeoutMs)
+            return true
+        } catch (Throwable ignored) {
+            return false
+        } finally {
+            try {
+                socket?.close()
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private boolean waitForPort(String host, int port, int maxSeconds) {
+        for (int i = 1; i <= maxSeconds; i++) {
+            if (isPortOpen(host, port, 1000)) {
+                KeywordUtil.logInfo("Port ${port} is open on ${host} at attempt ${i}")
+                return true
+            }
+            Windows.delay(1)
+        }
+        return false
+    }
+
+    private boolean processExists(String imageName) {
+        try {
+            Process process = new ProcessBuilder(
+                'cmd',
+                '/c',
+                "tasklist /FI \"IMAGENAME eq ${imageName}\""
+            ).redirectErrorStream(true).start()
+
+            String output = process.inputStream.getText('CP1252')
+            process.waitFor()
+
+            return output != null && output.toLowerCase().contains(imageName.toLowerCase())
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private boolean waitForProcess(String imageName, int maxSeconds) {
+        for (int i = 1; i <= maxSeconds; i++) {
+            if (processExists(imageName)) {
+                KeywordUtil.logInfo("Process '${imageName}' detected at attempt ${i}")
+                return true
+            }
+            Windows.delay(1)
+        }
+        return false
+    }
+
+    private void killProcessIfExists(String imageName) {
+        try {
+            if (!processExists(imageName)) {
+                return
+            }
+
+            KeywordUtil.logInfo("Killing existing process: ${imageName}")
+            new ProcessBuilder(
+                'cmd',
+                '/c',
+                "taskkill /F /T /IM \"${imageName}\""
+            ).redirectErrorStream(true).start().waitFor()
+
+            Windows.delay(2)
+        } catch (Throwable e) {
+            KeywordUtil.logInfo("Unable to kill process ${imageName}: ${e.message}")
+        }
+    }
+
+    private boolean safeVerifyPresent(String objectId, int timeoutSeconds = 1) {
+        try {
+            return Windows.verifyElementPresent(
+                findWindowsObject(objectId),
+                timeoutSeconds,
+                FailureHandling.OPTIONAL
+            )
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private boolean isLoginWindowReady() {
+        return safeVerifyPresent('Login Page/optEnv', 1) ||
+               safeVerifyPresent('Login Page/btnConnect', 1) ||
+               safeVerifyPresent('Login Page/inputLogin', 1)
+    }
+
+    private void ensureWinAppDriverStarted() {
+        if (isPortOpen('127.0.0.1', 4723, 1000)) {
+            KeywordUtil.logInfo('WinAppDriver already running on 127.0.0.1:4723')
+            return
+        }
+
+        String exePath = getWinAppDriverPath()
+        if (!exePath) {
+            throw new Exception('WinAppDriver path is empty.')
+        }
+
+        KeywordUtil.logInfo("Starting WinAppDriver from ${exePath}")
+
+        try {
+            new ProcessBuilder(
+                'cmd',
+                '/c',
+                "start \"\" /min \"${exePath}\""
+            ).redirectErrorStream(true).start()
+        } catch (Throwable e) {
+            throw new Exception("Unable to start WinAppDriver: ${e.message}")
+        }
+
+        if (!waitForPort('127.0.0.1', 4723, 10)) {
+            throw new Exception('WinAppDriver did not open port 4723.')
+        }
+
+        Windows.delay(2)
+        KeywordUtil.logInfo('WinAppDriver is ready on 127.0.0.1:4723')
+    }
+
+    private void keyPress(int keyCode) {
+        Robot robot = new Robot()
+        robot.setAutoDelay(120)
+        robot.keyPress(keyCode)
+        robot.keyRelease(keyCode)
+    }
+
+    private void keyPressMultiple(int keyCode, int times) {
+        for (int i = 0; i < times; i++) {
+            keyPress(keyCode)
+        }
+    }
+
+    @Keyword
+    String getCurrentWindowsUser() {
+        return firstNonBlank(
+            System.getProperty('user.name'),
+            System.getenv('USERNAME')
+        )
+    }
+
+    @Keyword
+    String resolveWindowTitle() {
+        String version = firstNonBlank(
+            gv('versionRec'),
+            gv('versionREC'),
+            gv('version'),
+            '26.1.1.3'
+        )
+
+        if (version.toLowerCase().startsWith('ematch')) {
+            return version
+        }
+
+        return "eMatch ${version}".trim()
+    }
+
+    @Keyword
+    String getShortcutPath() {
+        String env = currentEnv()
+        String configuredPath = ''
+
+        switch (env) {
+            case 'PROD':
+            case 'PRD':
+                configuredPath = firstNonBlank(gv('shortcutPathProd'), gv('shortcutPathPRD'), gv('shortcutPathPROD'))
+                if (configuredPath) return configuredPath
+                break
+
+            case 'PTS':
+                configuredPath = firstNonBlank(gv('shortcutPathPts'), gv('shortcutPathPTS'))
+                if (configuredPath) return configuredPath
+                break
+
+            default:
+                configuredPath = firstNonBlank(gv('shortcutPathRec'), gv('shortcutPathREC'))
+                if (configuredPath) return configuredPath
+                break
+        }
+
+        String user = getCurrentWindowsUser()
+
+        switch (env) {
+            case 'PROD':
+            case 'PRD':
+                return "C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch PROD.appref-ms"
+
+            case 'PTS':
+                return "C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch PTS.appref-ms"
+
+            default:
+                return "C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch REC.appref-ms"
+        }
+    }
+
+    @Keyword
+    String getApplicationPath() {
+        String env = currentEnv()
+
+        switch (env) {
+            case 'PROD':
+            case 'PRD':
+                return firstNonBlank(
+                    gv('applicationPathProd'),
+                    gv('applicationPathPRD'),
+                    gv('applicationPathPROD'),
+                    '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\PROD\\IXIS.eMatch.IHM.application'
+                )
+
+            case 'PTS':
+                return firstNonBlank(
+                    gv('applicationPathPts'),
+                    gv('applicationPathPTS'),
+                    '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\PTS\\IXIS.eMatch.IHM.application'
+                )
+
+            default:
+                return firstNonBlank(
+                    gv('applicationPathRec'),
+                    gv('applicationPathREC'),
+                    '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\REC\\IXIS.eMatch.IHM.application'
+                )
+        }
+    }
+
+    @Keyword
+    String getLauncherBat() {
+        String env = currentEnv()
+
+        switch (env) {
+            case 'PROD':
+            case 'PRD':
+                return firstNonBlank(
+                    gv('launcherBatProd'),
+                    gv('launcherBatPRD'),
+                    gv('launcherBatPROD'),
+                    'D:\\Projects\\eMatchStarters\\runAsEMatchPRD\\eMatch.bat'
+                )
+
+            case 'PTS':
+                return firstNonBlank(
+                    gv('launcherBatPts'),
+                    gv('launcherBatPTS'),
+                    'D:\\Projects\\eMatchStarters\\runAsEMatchPTS\\eMatch.bat'
+                )
+
+            default:
+                return firstNonBlank(
+                    gv('launcherBatRec'),
+                    gv('launcherBatREC'),
+                    'D:\\Projects\\eMatchStarters\\runAsEMatchREC\\eMatch.bat'
+                )
+        }
+    }
+
+    @Keyword
+    String getResolutionScriptPath() {
+        return firstNonBlank(
+            gv('resolutionScriptPath'),
+            'D:\\Projects\\eMatchStarters\\set-resolution.ps1'
+        )
+    }
+
+    @Keyword
+    String getWinAppDriverPath() {
+        return firstNonBlank(
+            gv('winAppDriverPath'),
+            'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+        )
+    }
+
+    @Keyword
+    String getInstalledExePath() {
+        String currentUser = getCurrentWindowsUser()
+
+        List<String> candidates = [
+            "C:\\Users\\${currentUser}\\AppData\\Local\\Apps\\2.0",
+            "C:\\Users\\${currentUser}\\AppData\\Local\\Microsoft\\Windows\\INetCache\\IE"
+        ]
+
+        for (String basePath : candidates) {
+            File baseDir = new File(basePath)
+            if (!baseDir.exists()) {
+                continue
+            }
+
+            List<File> matches = []
+            baseDir.eachFileRecurse { File file ->
+                try {
+                    if (file.isFile() && file.name.equalsIgnoreCase('IXIS.eMatch.IHM.exe')) {
+                        matches << file
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            if (!matches.isEmpty()) {
+                matches.sort { a, b -> b.lastModified() <=> a.lastModified() }
+                String resolved = matches.first().absolutePath
+                KeywordUtil.logInfo("Installed exe path resolved: ${resolved}")
+                return resolved
+            }
+        }
+
+        KeywordUtil.logInfo('Installed exe path not found')
+        return ''
+    }
+
+    @Keyword
+    boolean startEMatch(String currentUser, String targetWindowTitle) {
+        String env = currentEnv()
+        String shortcutPath = getShortcutPath()
+
+        KeywordUtil.logInfo("Starting eMatch for environment ${env}")
+        KeywordUtil.logInfo("Current Windows user ${currentUser}")
+        KeywordUtil.logInfo("Target window title ${targetWindowTitle}")
+        KeywordUtil.logInfo("Shortcut path ${shortcutPath}")
+        KeywordUtil.logInfo("Application path ${getApplicationPath()}")
+        KeywordUtil.logInfo("Installed exe path ${getInstalledExePath()}")
+
+        ensureWinAppDriverStarted()
+        killProcessIfExists('IXIS.eMatch.IHM.exe')
+
+        File shortcut = new File(shortcutPath)
+        if (!shortcut.exists()) {
+            throw new Exception("Shortcut does not exist: ${shortcutPath}")
+        }
+
+        Windows.startApplication(shortcutPath)
+
+        boolean processReady = waitForProcess('IXIS.eMatch.IHM.exe', 60)
+        if (!processReady) {
+            throw new Exception('eMatch process did not appear after launch.')
+        }
+
+        Windows.delay(6)
+        return true
+    }
+
+    @Keyword
+    boolean attachToLoginWindow(String targetWindowTitle) {
+        KeywordUtil.logInfo("Attaching to login window with title ${targetWindowTitle}")
+
+        for (int round = 1; round <= 60; round++) {
+            try {
+                Windows.switchToWindowTitle(targetWindowTitle)
+                Windows.delay(1)
+
+                if (isLoginWindowReady()) {
+                    KeywordUtil.logInfo("Attached by exact title at round ${round}")
+                    return true
+                }
+            } catch (Throwable e) {
+                KeywordUtil.logInfo("Exact title attach failed at round ${round}: ${e.message}")
+            }
+
+            for (int index = 0; index <= 5; index++) {
+                try {
+                    Windows.switchToWindowIndex(index)
+                    Windows.delay(1)
+
+                    if (isLoginWindowReady()) {
+                        KeywordUtil.logInfo("Attached by window index ${index} at round ${round}")
+                        return true
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            Windows.delay(1)
+        }
+
+        throw new Exception("eMatch opened but login window was not attached. Expected title: ${targetWindowTitle}")
+    }
+
+    @Keyword
+    boolean openEnvironmentDropdown() {
+        try {
+            Windows.click(findWindowsObject('Login Page/optEnv'))
+            Windows.delay(1)
+            return true
+        } catch (Throwable e) {
+            throw new Exception("Unable to open environment dropdown: ${e.message}")
+        }
+    }
+
+    @Keyword
+    int resolveEnvironmentIndex(String envName) {
+        String env = (envName ?: '').trim().toUpperCase()
+
+        switch (env) {
+            case 'PROD':
+            case 'PRD':
+                return 1
+            case 'PREQ':
+            case 'BENCH':
+                return 2
+            case 'QUAL':
+            case 'QUALIFICATION':
+                return 3
+            case 'REC':
+            case 'RECETTE':
+                return 4
+            case 'SIM':
+            case 'SIMULATION':
+                return 5
+            case 'DEV':
+            case 'DEVELOPMENT':
+                return 6
+            default:
+                return 4
+        }
+    }
+
+    @Keyword
+    boolean selectEnvironment(String envName) {
+        int envIndex = resolveEnvironmentIndex(envName)
+
+        KeywordUtil.logInfo("Selecting environment ${envName} with index ${envIndex}")
+
+        keyPress(KeyEvent.VK_HOME)
+        Windows.delay(1)
+
+        if (envIndex > 1) {
+            keyPressMultiple(KeyEvent.VK_DOWN, envIndex - 1)
+            Windows.delay(1)
+        }
+
+        keyPress(KeyEvent.VK_ENTER)
+        Windows.delay(1)
+
+        return true
+    }
+
+    @Keyword
+    boolean isConnectButtonPresent() {
+        return safeVerifyPresent('Login Page/btnConnect', 2)
+    }
+
+    @Keyword
+    boolean clickConnectButton() {
+        try {
+            Windows.click(findWindowsObject('Login Page/btnConnect'))
+            Windows.delay(1)
+            return true
+        } catch (Throwable e) {
+            throw new Exception("Unable to click connect button: ${e.message}")
+        }
+    }
+
+    @Keyword
+    boolean waitForMainScreen() {
+        for (int i = 1; i <= 30; i++) {
+            if (safeVerifyPresent('General/txtSearch', 1)) {
+                KeywordUtil.logInfo("Main screen detected at attempt ${i}")
+                return true
+            }
+            Windows.delay(1)
+        }
+        return false
+    }
+
+    @Keyword
+    boolean activateHomeTab() {
+        try {
+            Windows.click(findWindowsObject('General/tabHome'))
+            Windows.delay(1)
+            return true
+        } catch (Throwable ignored) {
+            KeywordUtil.logInfo('Home tab not found. Continuing.')
+            return true
+        }
+    }
+}
