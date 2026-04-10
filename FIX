@@ -1,1 +1,695 @@
+package pageObject
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.event.KeyEvent
+import java.net.InetSocketAddress
+import java.net.Socket
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import groovy.io.FileType
+import internal.GlobalVariable
+
+class authentication {
+
+    private String gv(String name) {
+        try {
+            def value = GlobalVariable."${name}"
+            return value == null ? '' : value.toString().trim()
+        } catch (Throwable ignored) {
+            return ''
+        }
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (value != null && value.toString().trim()) {
+                return value.toString().trim()
+            }
+        }
+        return ''
+    }
+
+    private String currentEnv() {
+        String raw = firstNonBlank(
+            gv('env'),
+            gv('environment'),
+            'REC'
+        ).toUpperCase()
+
+        if (raw == 'PRD') {
+            return 'PROD'
+        }
+
+        return raw ?: 'REC'
+    }
+
+    private String envFolder(String env) {
+        switch (env) {
+            case 'PROD':
+                return 'PROD'
+            case 'PTS':
+                return 'PTS'
+            default:
+                return 'REC'
+        }
+    }
+
+    private String envShortcutFileName(String env) {
+        switch (env) {
+            case 'PROD':
+                return 'eMatch PROD.appref-ms'
+            case 'PTS':
+                return 'eMatch PTS.appref-ms'
+            default:
+                return 'eMatch REC.appref-ms'
+        }
+    }
+
+    private String resolveVersionToken(String env) {
+        switch (env) {
+            case 'PROD':
+                return firstNonBlank(
+                    gv('versionProd'),
+                    gv('versionPRD'),
+                    gv('versionPROD'),
+                    gv('version')
+                )
+            case 'PTS':
+                return firstNonBlank(
+                    gv('versionPts'),
+                    gv('versionPTS'),
+                    gv('version')
+                )
+            default:
+                return firstNonBlank(
+                    gv('versionRec'),
+                    gv('versionREC'),
+                    gv('version')
+                )
+        }
+    }
+
+    private boolean isPortOpen(String host, int port, int timeoutMs = 1000) {
+        Socket socket = null
+        try {
+            socket = new Socket()
+            socket.connect(new InetSocketAddress(host, port), timeoutMs)
+            return true
+        } catch (Throwable ignored) {
+            return false
+        } finally {
+            try {
+                socket?.close()
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private boolean waitForPort(String host, int port, int maxSeconds) {
+        for (int i = 1; i <= maxSeconds; i++) {
+            if (isPortOpen(host, port, 1000)) {
+                KeywordUtil.logInfo("Port ${port} is open on ${host} at attempt ${i}")
+                return true
+            }
+            Windows.delay(1)
+        }
+        return false
+    }
+
+    private boolean safeVerifyPresent(String objectId, int timeoutSeconds = 1) {
+        try {
+            return Windows.verifyElementPresent(
+                findWindowsObject(objectId),
+                timeoutSeconds,
+                FailureHandling.OPTIONAL
+            )
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private boolean safeClick(String objectId, int timeoutSeconds = 2) {
+        try {
+            Windows.waitForElementPresent(
+                findWindowsObject(objectId),
+                timeoutSeconds,
+                FailureHandling.OPTIONAL
+            )
+            Windows.click(findWindowsObject(objectId))
+            return true
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private boolean isLoginWindowReady() {
+        return safeVerifyPresent('Object Repository/Login Page/optEnv', 1) ||
+               safeVerifyPresent('Login Page/optEnv', 1) ||
+               safeVerifyPresent('Object Repository/Login Page/btnConnect', 1) ||
+               safeVerifyPresent('Login Page/btnConnect', 1)
+    }
+
+    private boolean waitForLoginWindowReady(int maxSeconds) {
+        for (int i = 1; i <= maxSeconds; i++) {
+            if (isLoginWindowReady()) {
+                KeywordUtil.logInfo("Login window became ready at attempt ${i}")
+                return true
+            }
+            Windows.delay(1)
+        }
+        return false
+    }
+
+    private String escapeForPowerShell(String value) {
+        return value == null ? '' : value.replace("'", "''")
+    }
+
+    private boolean nativeActivateWindow(String targetWindowTitle) {
+        try {
+            String safeTitle = escapeForPowerShell(targetWindowTitle)
+
+            String script = """
+\$wshell = New-Object -ComObject WScript.Shell
+if (\$wshell.AppActivate('${safeTitle}')) {
+    Start-Sleep -Milliseconds 800
+    exit 0
+} else {
+    exit 1
+}
+"""
+
+            Process process = new ProcessBuilder(
+                'powershell',
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-Command',
+                script
+            ).redirectErrorStream(true).start()
+
+            process.waitFor()
+            return process.exitValue() == 0
+        } catch (Throwable e) {
+            KeywordUtil.logInfo("Native AppActivate failed for '${targetWindowTitle}': ${e.message}")
+            return false
+        }
+    }
+
+    private boolean attachExistingWindow(String targetWindowTitle, int maxSeconds) {
+        for (int i = 1; i <= maxSeconds; i++) {
+            try {
+                nativeActivateWindow(targetWindowTitle)
+                Windows.delay(1)
+
+                KeywordUtil.logInfo("Trying to attach existing window '${targetWindowTitle}' at attempt ${i}")
+                Windows.startExistingApplication(targetWindowTitle)
+                Windows.delay(1)
+
+                KeywordUtil.logInfo("Attached to existing window '${targetWindowTitle}' at attempt ${i}")
+                return true
+            } catch (Throwable e) {
+                if (i == 1 || i % 5 == 0) {
+                    KeywordUtil.logInfo("Existing window '${targetWindowTitle}' not attached yet at attempt ${i}: ${e.message}")
+                }
+            }
+
+            Windows.delay(1)
+        }
+
+        return false
+    }
+
+    private void keyPress(int keyCode) {
+        Robot robot = new Robot()
+        robot.setAutoDelay(120)
+        robot.keyPress(keyCode)
+        robot.keyRelease(keyCode)
+    }
+
+    private void keyPressMultiple(int keyCode, int times) {
+        for (int i = 0; i < times; i++) {
+            keyPress(keyCode)
+        }
+    }
+
+    private List<String> buildLaunchTargets() {
+        List<String> targets = []
+
+        String installedExe = getInstalledExePath()
+        String shortcut = getShortcutPath()
+        String application = getApplicationPath()
+
+        if (installedExe) {
+            targets << installedExe
+        } else if (shortcut) {
+            targets << shortcut
+        } else if (application) {
+            targets << application
+        }
+
+        return targets.findAll { it != null && it.toString().trim() }.unique()
+    }
+
+    private boolean tryStartWinAppDriver(String exePath) {
+        try {
+            KeywordUtil.logInfo("Starting WinAppDriver minimized from ${exePath}")
+            new ProcessBuilder(
+                'cmd',
+                '/c',
+                "start \"\" /min \"${exePath}\""
+            ).redirectErrorStream(true).start()
+            return true
+        } catch (Throwable firstError) {
+            KeywordUtil.logInfo("Minimized WinAppDriver start failed: ${firstError.message}")
+
+            try {
+                new ProcessBuilder(exePath)
+                    .redirectErrorStream(true)
+                    .start()
+                return true
+            } catch (Throwable secondError) {
+                KeywordUtil.logInfo("Direct WinAppDriver start failed: ${secondError.message}")
+                return false
+            }
+        }
+    }
+
+    private void ensureWinAppDriverStarted() {
+        if (isPortOpen('127.0.0.1', 4723, 1000)) {
+            KeywordUtil.logInfo('WinAppDriver already running on 127.0.0.1:4723')
+            return
+        }
+
+        String exePath = getWinAppDriverPath()
+        if (!exePath) {
+            throw new Exception('WinAppDriver path is empty.')
+        }
+
+        File exe = new File(exePath)
+        if (!exe.exists()) {
+            throw new Exception("WinAppDriver executable not found at: ${exePath}")
+        }
+
+        boolean launched = tryStartWinAppDriver(exePath)
+        if (!launched) {
+            throw new Exception("Unable to launch WinAppDriver from: ${exePath}")
+        }
+
+        boolean started = waitForPort('127.0.0.1', 4723, 10)
+        if (!started) {
+            throw new Exception("WinAppDriver did not open port 4723 after startup. Path used: ${exePath}")
+        }
+
+        Windows.delay(1)
+        KeywordUtil.logInfo('WinAppDriver is ready on 127.0.0.1:4723')
+    }
+
+    private boolean launchTargetWithShell(String launchTarget) {
+        try {
+            KeywordUtil.logInfo("Launching target with shell: ${launchTarget}")
+
+            new ProcessBuilder(
+                'cmd',
+                '/c',
+                "start \"\" \"${launchTarget}\""
+            ).redirectErrorStream(true).start()
+
+            return true
+        } catch (Throwable e) {
+            KeywordUtil.logInfo("Shell launch failed for '${launchTarget}': ${e.message}")
+            return false
+        }
+    }
+
+    @Keyword
+    String getCurrentWindowsUser() {
+        return firstNonBlank(
+            System.getProperty('user.name'),
+            System.getenv('USERNAME')
+        )
+    }
+
+    @Keyword
+    String resolveWindowTitle() {
+        String env = currentEnv()
+        String versionToken = resolveVersionToken(env)
+
+        if (!versionToken) {
+            throw new Exception("No version variable found for environment '${env}'.")
+        }
+
+        if (versionToken.toLowerCase().startsWith('ematch')) {
+            return versionToken
+        }
+
+        return "eMatch ${versionToken}".trim()
+    }
+
+    @Keyword
+    String getShortcutPath() {
+        String env = currentEnv()
+
+        String configuredPath = ''
+        switch (env) {
+            case 'PROD':
+                configuredPath = firstNonBlank(
+                    gv('shortcutPathProd'),
+                    gv('shortcutPathPRD'),
+                    gv('shortcutPathPROD')
+                )
+                break
+            case 'PTS':
+                configuredPath = firstNonBlank(
+                    gv('shortcutPathPts'),
+                    gv('shortcutPathPTS')
+                )
+                break
+            default:
+                configuredPath = firstNonBlank(
+                    gv('shortcutPathRec'),
+                    gv('shortcutPathREC')
+                )
+                break
+        }
+
+        if (configuredPath) {
+            return configuredPath
+        }
+
+        String user = getCurrentWindowsUser()
+        return "C:\\Users\\${user}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\${envShortcutFileName(env)}"
+    }
+
+    @Keyword
+    String getApplicationPath() {
+        String env = currentEnv()
+
+        String configuredPath = ''
+        switch (env) {
+            case 'PROD':
+                configuredPath = firstNonBlank(
+                    gv('applicationPathProd'),
+                    gv('applicationPathPRD'),
+                    gv('applicationPathPROD')
+                )
+                break
+            case 'PTS':
+                configuredPath = firstNonBlank(
+                    gv('applicationPathPts'),
+                    gv('applicationPathPTS')
+                )
+                break
+            default:
+                configuredPath = firstNonBlank(
+                    gv('applicationPathRec'),
+                    gv('applicationPathREC')
+                )
+                break
+        }
+
+        if (configuredPath) {
+            return configuredPath
+        }
+
+        return "\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\${envFolder(env)}\\IXIS.eMatch.IHM.application"
+    }
+
+    @Keyword
+    String getInstalledExePath() {
+        String configuredPath = firstNonBlank(
+            gv('installedExePath'),
+            gv('localInstalledExe'),
+            gv('applicationExePath')
+        )
+
+        if (configuredPath) {
+            return configuredPath
+        }
+
+        String localAppData = System.getenv('LOCALAPPDATA')
+        if (!localAppData) {
+            return ''
+        }
+
+        File root = new File(localAppData, 'Apps\\2.0')
+        if (!root.exists()) {
+            return ''
+        }
+
+        String found = ''
+        root.eachFileRecurse(FileType.FILES) { File file ->
+            if (!found && file.name.equalsIgnoreCase('IXIS.eMatch.IHM.exe')) {
+                found = file.absolutePath
+            }
+        }
+
+        return found
+    }
+
+    @Keyword
+    String getResolutionScriptPath() {
+        return firstNonBlank(
+            gv('resolutionScriptPath'),
+            'D:\\Projects\\eMatchStarters\\set-resolution.ps1'
+        )
+    }
+
+    @Keyword
+    String getWinAppDriverPath() {
+        return firstNonBlank(
+            gv('winAppDriverPath'),
+            'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+        )
+    }
+
+    @Keyword
+    String getLauncherBat() {
+        String env = currentEnv()
+
+        switch (env) {
+            case 'PROD':
+                return firstNonBlank(
+                    gv('launcherBatProd'),
+                    gv('launcherBatPRD'),
+                    gv('launcherBatPROD'),
+                    'D:\\Projects\\eMatchStarters\\runAsEMatchPRD\\eMatch.bat'
+                )
+            case 'PTS':
+                return firstNonBlank(
+                    gv('launcherBatPts'),
+                    gv('launcherBatPTS'),
+                    'D:\\Projects\\eMatchStarters\\runAsEMatchPTS\\eMatch.bat'
+                )
+            default:
+                return firstNonBlank(
+                    gv('launcherBatRec'),
+                    gv('launcherBatREC'),
+                    'D:\\Projects\\eMatchStarters\\runAsEMatchREC\\eMatch.bat'
+                )
+        }
+    }
+
+    @Keyword
+    boolean startEMatch(String currentUser, String targetWindowTitle) {
+        String env = currentEnv()
+        List<String> launchTargets = buildLaunchTargets()
+
+        KeywordUtil.logInfo("Starting eMatch for environment: ${env}")
+        KeywordUtil.logInfo("Current Windows user: ${currentUser}")
+        KeywordUtil.logInfo("Target window title: ${targetWindowTitle}")
+        KeywordUtil.logInfo("Shortcut path: ${getShortcutPath()}")
+        KeywordUtil.logInfo("Application path: ${getApplicationPath()}")
+        KeywordUtil.logInfo("Installed exe path: ${getInstalledExePath()}")
+
+        ensureWinAppDriverStarted()
+
+        if (attachExistingWindow(targetWindowTitle, 3) && waitForLoginWindowReady(3)) {
+            KeywordUtil.logInfo("eMatch already open and attached before launch.")
+            return true
+        }
+
+        if (launchTargets.isEmpty()) {
+            throw new Exception("No launch target was resolved for environment '${env}'.")
+        }
+
+        String launchTarget = launchTargets[0]
+        KeywordUtil.logInfo("Using single launch target: ${launchTarget}")
+
+        boolean launched = launchTargetWithShell(launchTarget)
+        if (!launched) {
+            throw new Exception("Failed to launch eMatch using target: ${launchTarget}")
+        }
+
+        Windows.delay(3)
+
+        if (attachExistingWindow(targetWindowTitle, 45) && waitForLoginWindowReady(15)) {
+            KeywordUtil.logInfo("eMatch login window attached successfully using '${launchTarget}'")
+            return true
+        }
+
+        throw new Exception("Unable to launch eMatch and reach login window. Target used: ${launchTarget}")
+    }
+
+    @Keyword
+    boolean attachToLoginWindow(String targetWindowTitle) {
+        ensureWinAppDriverStarted()
+
+        if (attachExistingWindow(targetWindowTitle, 30) && waitForLoginWindowReady(10)) {
+            KeywordUtil.logInfo("Attached to login window '${targetWindowTitle}'.")
+            return true
+        }
+
+        throw new Exception("Unable to attach to login window '${targetWindowTitle}'.")
+    }
+
+    @Keyword
+    boolean openEnvironmentDropdown() {
+        Exception lastError = null
+        List<String> candidateObjects = [
+            'Object Repository/Login Page/optEnv',
+            'Login Page/optEnv'
+        ]
+
+        for (String objectId : candidateObjects) {
+            try {
+                KeywordUtil.logInfo("Trying to click environment dropdown using object: ${objectId}")
+                Windows.click(findWindowsObject(objectId))
+                Windows.delay(1)
+                return true
+            } catch (Exception e) {
+                lastError = e
+                KeywordUtil.logInfo("Dropdown click failed with '${objectId}': ${e.message}")
+            }
+        }
+
+        throw new Exception("Unable to open environment dropdown. Last error: ${lastError?.message}")
+    }
+
+    @Keyword
+    int resolveEnvironmentIndex(String envName) {
+        String env = (envName ?: '').trim().toUpperCase()
+
+        switch (env) {
+            case 'PROD':
+            case 'PRD':
+                return 1
+            case 'PREQ':
+            case 'BENCH':
+                return 2
+            case 'QUAL':
+            case 'QUALIFICATION':
+                return 3
+            case 'REC':
+            case 'RECETTE':
+                return 4
+            case 'SIM':
+            case 'SIMULATION':
+                return 5
+            case 'DEV':
+            case 'DEVELOPMENT':
+                return 6
+            default:
+                return 4
+        }
+    }
+
+    @Keyword
+    boolean selectEnvironment(String envName) {
+        int envIndex = resolveEnvironmentIndex(envName)
+
+        KeywordUtil.logInfo("Selecting environment '${envName}' using index ${envIndex}")
+
+        keyPress(KeyEvent.VK_HOME)
+        Windows.delay(1)
+
+        if (envIndex > 1) {
+            keyPressMultiple(KeyEvent.VK_DOWN, envIndex - 1)
+            Windows.delay(1)
+        }
+
+        keyPress(KeyEvent.VK_ENTER)
+        Windows.delay(1)
+
+        return true
+    }
+
+    @Keyword
+    boolean isConnectButtonPresent() {
+        List<String> candidateObjects = [
+            'Object Repository/Login Page/btnConnect',
+            'Login Page/btnConnect'
+        ]
+
+        for (String objectId : candidateObjects) {
+            if (safeVerifyPresent(objectId, 2)) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    @Keyword
+    boolean clickConnectButton() {
+        Exception lastError = null
+        List<String> candidateObjects = [
+            'Object Repository/Login Page/btnConnect',
+            'Login Page/btnConnect'
+        ]
+
+        for (String objectId : candidateObjects) {
+            try {
+                Windows.click(findWindowsObject(objectId))
+                Windows.delay(1)
+                return true
+            } catch (Exception e) {
+                lastError = e
+            }
+        }
+
+        throw new Exception("Unable to click connect button. Last error: ${lastError?.message}")
+    }
+
+    @Keyword
+    boolean waitForMainScreen() {
+        List<String> candidateObjects = [
+            'Object Repository/General/txtSearch',
+            'General/txtSearch'
+        ]
+
+        for (int i = 1; i <= 30; i++) {
+            for (String objectId : candidateObjects) {
+                if (safeVerifyPresent(objectId, 1)) {
+                    KeywordUtil.logInfo("Main screen detected with object '${objectId}' at attempt ${i}")
+                    return true
+                }
+            }
+            Windows.delay(1)
+        }
+
+        return false
+    }
+
+    @Keyword
+    boolean activateHomeTab() {
+        List<String> candidateObjects = [
+            'Object Repository/General/tabHome',
+            'General/tabHome'
+        ]
+
+        for (String objectId : candidateObjects) {
+            if (safeClick(objectId, 2)) {
+                KeywordUtil.logInfo("Home tab activated with object '${objectId}'")
+                return true
+            }
+        }
+
+        KeywordUtil.logInfo('Home tab object not found. Continuing without explicit click.')
+        return true
+    }
+}
