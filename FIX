@@ -13,6 +13,8 @@ import groovy.io.FileType
 
 import com.kms.katalon.core.annotation.Keyword
 import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
 import com.kms.katalon.core.util.KeywordUtil
 import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
 
@@ -271,6 +273,43 @@ class authentication {
 		return false
 	}
 
+	private boolean attachToLoginByWindowTitle(String targetWindowTitle, int maxRounds) {
+		if (!targetWindowTitle) {
+			return false
+		}
+
+		WindowsTestObject targetWindow = new WindowsTestObject()
+		targetWindow.setLocatorStrategy(LocatorStrategy.NAME)
+		targetWindow.setLocator(targetWindowTitle)
+
+		for (int round = 1; round <= maxRounds; round++) {
+			try {
+				Windows.switchToDesktop()
+				Windows.delay(1)
+				Windows.switchToWindow(targetWindow)
+				Windows.delay(1)
+
+				if (isLoginWindowReady()) {
+					KeywordUtil.logInfo("Attached to login window using title '${targetWindowTitle}' at round ${round}")
+					return true
+				}
+
+				KeywordUtil.logInfo("Window title '${targetWindowTitle}' was found, but login objects were not detected yet.")
+			} catch (Throwable e) {
+				if (isConnectionRefused(e)) {
+					KeywordUtil.logInfo("WinAppDriver connection was refused while attaching by title. Restarting service. Error: ${e.message}")
+					restartWinAppDriver()
+				} else if (round == 1 || round % 5 == 0) {
+					KeywordUtil.logInfo("Window title '${targetWindowTitle}' not attachable yet at round ${round}: ${e.message}")
+				}
+			}
+
+			Windows.delay(1)
+		}
+
+		return false
+	}
+
 	private boolean attachToLoginByWindowIndex(int maxRounds, int maxIndex) {
 		for (int round = 1; round <= maxRounds; round++) {
 			for (int index = 0; index <= maxIndex; index++) {
@@ -450,7 +489,7 @@ class authentication {
 		return bestMatch
 	}
 
-	private boolean launchAndAttach(String launchPath, boolean executableLaunch, String sourceLabel) {
+	private boolean launchAndAttach(String launchPath, boolean executableLaunch, String sourceLabel, String targetWindowTitle) {
 		boolean launched = executableLaunch ? launchExecutable(launchPath) : launchShortcutWithShell(launchPath)
 		if (!launched) {
 			KeywordUtil.logInfo("Launch failed for ${sourceLabel}: ${launchPath}")
@@ -466,7 +505,12 @@ class authentication {
 		Windows.delay(4)
 		ensureWinAppDriverStarted()
 
-		boolean attached = attachToLoginByWindowIndex(30, 5)
+		boolean attached = attachToLoginByWindowTitle(targetWindowTitle, 20)
+		if (!attached) {
+			KeywordUtil.logInfo("Attach by title failed after ${sourceLabel} launch. Falling back to window index.")
+			attached = attachToLoginByWindowIndex(20, 5)
+		}
+
 		if (!attached) {
 			KeywordUtil.logInfo("Login window could not be attached after ${sourceLabel} launch.")
 			return false
@@ -498,11 +542,7 @@ class authentication {
 			throw new Exception("No version variable found for environment '${env}'.")
 		}
 
-		if (versionToken.toLowerCase().startsWith('ematch')) {
-			return versionToken
-		}
-
-		return "eMatch ${versionToken}".trim()
+		return versionToken.trim()
 	}
 
 	@Keyword
@@ -659,7 +699,7 @@ class authentication {
 
 			if (installedExe.exists()) {
 				KeywordUtil.logInfo('Launching eMatch from installed exe using shell/direct process, without Windows.startApplication.')
-				boolean loginReadyFromExe = launchAndAttach(installedExePath, true, 'installed exe')
+				boolean loginReadyFromExe = launchAndAttach(installedExePath, true, 'installed exe', targetWindowTitle)
 				if (loginReadyFromExe) {
 					KeywordUtil.logInfo('Login window detected after launching installed exe.')
 					return true
@@ -679,7 +719,7 @@ class authentication {
 			throw new Exception("Shortcut does not exist: ${shortcutPath}")
 		}
 
-		boolean loginReadyFromShortcut = launchAndAttach(shortcutPath, false, 'shortcut')
+		boolean loginReadyFromShortcut = launchAndAttach(shortcutPath, false, 'shortcut', targetWindowTitle)
 		if (!loginReadyFromShortcut) {
 			throw new Exception("eMatch opened but the login window could not be attached using shortcut path: ${shortcutPath}")
 		}
@@ -697,9 +737,14 @@ class authentication {
 			return true
 		}
 
-		boolean attached = attachToLoginByWindowIndex(20, 5)
+		boolean attached = attachToLoginByWindowTitle(targetWindowTitle, 15)
 		if (!attached) {
-			throw new Exception("Unable to attach to login window for '${targetWindowTitle}' using window index.")
+			KeywordUtil.logInfo("Attach by title failed for '${targetWindowTitle}'. Falling back to window index.")
+			attached = attachToLoginByWindowIndex(20, 5)
+		}
+
+		if (!attached) {
+			throw new Exception("Unable to attach to login window for '${targetWindowTitle}' using title or window index.")
 		}
 
 		boolean loginReady = waitForLoginWindowReady(10)
