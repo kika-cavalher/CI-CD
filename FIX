@@ -147,15 +147,11 @@ class authentication {
 
         KeywordUtil.logInfo("Starting WinAppDriver from ${exePath}")
 
-        try {
-            new ProcessBuilder(
-                'cmd',
-                '/c',
-                "start \"\" /min \"${exePath}\""
-            ).redirectErrorStream(true).start()
-        } catch (Throwable e) {
-            throw new Exception("Unable to start WinAppDriver: ${e.message}")
-        }
+        new ProcessBuilder(
+            'cmd',
+            '/c',
+            "start \"\" /min \"${exePath}\""
+        ).redirectErrorStream(true).start()
 
         if (!waitForPort('127.0.0.1', 4723, 10)) {
             throw new Exception('WinAppDriver did not open port 4723.')
@@ -163,6 +159,75 @@ class authentication {
 
         Windows.delay(2)
         KeywordUtil.logInfo('WinAppDriver is ready on 127.0.0.1:4723')
+    }
+
+    private void ensureDesktopSession() {
+        try {
+            KeywordUtil.logInfo('Starting Root desktop session')
+            Windows.startApplication('Root')
+            Windows.delay(2)
+        } catch (Throwable e) {
+            KeywordUtil.logInfo("Root desktop session start returned: ${e.message}")
+        }
+    }
+
+    private void launchPathWithShell(String path) {
+        if (!path?.trim()) {
+            return
+        }
+
+        KeywordUtil.logInfo("Launching through shell: ${path}")
+
+        new ProcessBuilder(
+            'cmd',
+            '/c',
+            "start \"\" \"${path}\""
+        ).redirectErrorStream(true).start()
+    }
+
+    private String readMainWindowTitle() {
+        try {
+            String command =
+                '''Get-Process IXIS.eMatch.IHM -ErrorAction SilentlyContinue | ''' +
+                '''Where-Object { $_.MainWindowTitle -and $_.MainWindowTitle.Trim().Length -gt 0 } | ''' +
+                '''Select-Object -First 1 -ExpandProperty MainWindowTitle'''
+
+            Process process = new ProcessBuilder(
+                'powershell',
+                '-NoProfile',
+                '-ExecutionPolicy',
+                'Bypass',
+                '-Command',
+                command
+            ).redirectErrorStream(true).start()
+
+            String output = process.inputStream.getText('CP1252')
+            process.waitFor()
+
+            return output == null ? '' : output.trim()
+        } catch (Throwable ignored) {
+            return ''
+        }
+    }
+
+    private String waitForMainWindowTitle(String expectedTitle, int maxSeconds) {
+        for (int i = 1; i <= maxSeconds; i++) {
+            String detectedTitle = readMainWindowTitle()
+
+            if (detectedTitle) {
+                KeywordUtil.logInfo("Detected main window title at attempt ${i}: ${detectedTitle}")
+
+                if (!expectedTitle || detectedTitle.equalsIgnoreCase(expectedTitle) || detectedTitle.toLowerCase().contains(expectedTitle.toLowerCase())) {
+                    return detectedTitle
+                }
+
+                return detectedTitle
+            }
+
+            Windows.delay(1)
+        }
+
+        return ''
     }
 
     private void keyPress(int keyCode) {
@@ -357,6 +422,7 @@ class authentication {
     boolean startEMatch(String currentUser, String targetWindowTitle) {
         String env = currentEnv()
         String shortcutPath = getShortcutPath()
+        String launcherBat = getLauncherBat()
 
         KeywordUtil.logInfo("Starting eMatch for environment ${env}")
         KeywordUtil.logInfo("Current Windows user ${currentUser}")
@@ -364,23 +430,31 @@ class authentication {
         KeywordUtil.logInfo("Shortcut path ${shortcutPath}")
         KeywordUtil.logInfo("Application path ${getApplicationPath()}")
         KeywordUtil.logInfo("Installed exe path ${getInstalledExePath()}")
+        KeywordUtil.logInfo("Launcher bat ${launcherBat}")
 
         ensureWinAppDriverStarted()
+        ensureDesktopSession()
         killProcessIfExists('IXIS.eMatch.IHM.exe')
 
-        File shortcut = new File(shortcutPath)
-        if (!shortcut.exists()) {
-            throw new Exception("Shortcut does not exist: ${shortcutPath}")
+        if (shortcutPath?.trim() && new File(shortcutPath).exists()) {
+            launchPathWithShell(shortcutPath)
+        } else if (launcherBat?.trim() && new File(launcherBat).exists()) {
+            launchPathWithShell(launcherBat)
+        } else {
+            throw new Exception("Neither shortcut nor launcher bat exists. Shortcut='${shortcutPath}' Launcher='${launcherBat}'")
         }
 
-        Windows.startApplication(shortcutPath)
-
-        boolean processReady = waitForProcess('IXIS.eMatch.IHM.exe', 60)
-        if (!processReady) {
+        if (!waitForProcess('IXIS.eMatch.IHM.exe', 60)) {
             throw new Exception('eMatch process did not appear after launch.')
         }
 
-        Windows.delay(6)
+        String detectedTitle = waitForMainWindowTitle(targetWindowTitle, 60)
+        if (!detectedTitle) {
+            throw new Exception("eMatch process started but no main window title was detected. Expected='${targetWindowTitle}'")
+        }
+
+        KeywordUtil.logInfo("Detected eMatch window title: ${detectedTitle}")
+        Windows.delay(2)
         return true
     }
 
@@ -388,20 +462,36 @@ class authentication {
     boolean attachToLoginWindow(String targetWindowTitle) {
         KeywordUtil.logInfo("Attaching to login window with title ${targetWindowTitle}")
 
-        for (int round = 1; round <= 60; round++) {
+        String detectedTitle = waitForMainWindowTitle(targetWindowTitle, 10)
+        List<String> candidateTitles = []
+
+        if (detectedTitle) {
+            candidateTitles << detectedTitle
+        }
+
+        if (targetWindowTitle?.trim()) {
+            candidateTitles << targetWindowTitle.trim()
+        }
+
+        candidateTitles = candidateTitles.findAll { it?.trim() }.unique()
+
+        for (String title : candidateTitles) {
             try {
-                Windows.switchToWindowTitle(targetWindowTitle)
+                KeywordUtil.logInfo("Trying exact title attach: ${title}")
+                Windows.switchToWindowTitle(title)
                 Windows.delay(1)
 
                 if (isLoginWindowReady()) {
-                    KeywordUtil.logInfo("Attached by exact title at round ${round}")
+                    KeywordUtil.logInfo("Attached by exact title: ${title}")
                     return true
                 }
             } catch (Throwable e) {
-                KeywordUtil.logInfo("Exact title attach failed at round ${round}: ${e.message}")
+                KeywordUtil.logInfo("Exact title attach failed for '${title}': ${e.message}")
             }
+        }
 
-            for (int index = 0; index <= 5; index++) {
+        for (int round = 1; round <= 30; round++) {
+            for (int index = 0; index <= 15; index++) {
                 try {
                     Windows.switchToWindowIndex(index)
                     Windows.delay(1)
@@ -422,13 +512,9 @@ class authentication {
 
     @Keyword
     boolean openEnvironmentDropdown() {
-        try {
-            Windows.click(findWindowsObject('Login Page/optEnv'))
-            Windows.delay(1)
-            return true
-        } catch (Throwable e) {
-            throw new Exception("Unable to open environment dropdown: ${e.message}")
-        }
+        Windows.click(findWindowsObject('Login Page/optEnv'))
+        Windows.delay(1)
+        return true
     }
 
     @Keyword
@@ -486,13 +572,9 @@ class authentication {
 
     @Keyword
     boolean clickConnectButton() {
-        try {
-            Windows.click(findWindowsObject('Login Page/btnConnect'))
-            Windows.delay(1)
-            return true
-        } catch (Throwable e) {
-            throw new Exception("Unable to click connect button: ${e.message}")
-        }
+        Windows.click(findWindowsObject('Login Page/btnConnect'))
+        Windows.delay(1)
+        return true
     }
 
     @Keyword
@@ -512,10 +594,9 @@ class authentication {
         try {
             Windows.click(findWindowsObject('General/tabHome'))
             Windows.delay(1)
-            return true
         } catch (Throwable ignored) {
             KeywordUtil.logInfo('Home tab not found. Continuing.')
-            return true
         }
+        return true
     }
 }
