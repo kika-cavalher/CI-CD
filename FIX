@@ -1,172 +1,83 @@
-// =========================================================
-// SECTION 7 - LOGIN FLOW
-// =========================================================
+1) Adiciona este import no topo
+import org.openqa.selenium.By
+2) Troca a sessão de atributos da classe
+private static final String DEFAULT_WINAPPDRIVER_PATH = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+private static final String DEFAULT_WINAPPDRIVER_URL  = 'http://127.0.0.1:4723'
+private static final String LOGIN_DIALOG_TITLE        = 'Se connecter à eMatch'
 
+private String detectedWindowTitle = ''
+private String detectedWindowHandle = ''
+private String detectedLoginDialogHandle = ''
+private Robot cachedRobot
+3) Troca a sessão inteira de attach
 @Keyword
-void openEnvironmentDropdown() {
-	KeywordUtil.logInfo("Opening environment dropdown by click")
+void attachToLoginWindow(String targetWindowTitle) {
+	String expectedTitle = normalizeTitle(safe(detectedWindowTitle) ?: safe(targetWindowTitle))
 
-	focusLoginWindow()
-	sleepMs(800)
+	KeywordUtil.logInfo("Attaching to login window. Expected title ${expectedTitle}")
 
-	WindowsTestObject combo = envComboObj()
+	ensureWinAppDriverRunning()
 
-	if (!waitPresent(combo, 5)) {
-		KeywordUtil.markFailedAndStop("Environment combo was not found")
+	Map<String, String> found = waitForWindow(expectedTitle, 45)
+	if (!safe(found.title) || !safe(found.handle)) {
+		KeywordUtil.markFailedAndStop("Could not find eMatch window with title ${expectedTitle}")
 	}
 
-	Windows.click(combo)
-	sleepMs(1200)
-}
+	detectedWindowTitle = normalizeTitle(found.title)
+	detectedWindowHandle = safe(found.handle)
 
-@Keyword
-String resolveEnvironmentDisplayValue(String env) {
-	String value = safe(env).toUpperCase()
+	KeywordUtil.logInfo("Detected main window title ${detectedWindowTitle}")
+	KeywordUtil.logInfo("Detected main window handle ${detectedWindowHandle}")
 
-	switch (value) {
-		case 'PROD':
-			return 'Production (PROD)'
-		case 'PREX':
-		case 'PREPO':
-			return 'Bench (PREX)'
-		case 'REC2':
-			return 'Qualification (REC2)'
-		case 'REC':
-			return 'Recette (REC)'
-		case 'DEV2':
-			return 'Simulation (DEV2)'
-		case 'DEV':
-			return 'Developpement (DEV)'
-		default:
-			return 'Recette (REC)'
-	}
-}
+	waitForStableMainWindow(detectedWindowTitle, detectedWindowHandle, 6)
 
-@Keyword
-void selectEnvironment(String env) {
-	String displayValue = resolveEnvironmentDisplayValue(env)
-
-	KeywordUtil.logInfo("Selecting environment by direct click: ${displayValue}")
-
-	focusLoginWindow()
-	openEnvironmentDropdown()
-
-	WindowsTestObject item = envListItemObj(displayValue)
-
-	if (!waitPresent(item, 5)) {
-		KeywordUtil.markFailedAndStop("Environment option was not found: ${displayValue}")
-	}
-
-	Windows.click(item)
+	attachExistingWindowByHandle(detectedWindowHandle)
 	sleepMs(1500)
+
+	detectedLoginDialogHandle = tryAttachLoginDialogChild()
 }
 
-@Keyword
-boolean isConnectButtonPresent() {
-	return waitPresent(connectBtnObj(), 3)
+private String tryAttachLoginDialogChild() {
+	try {
+		WebDriver rawDriver = DriverFactory.getWebDriver()
+
+		List<String> xpaths = [
+			"//*[@ClassName='#32770' and (@Name='Se connecter à eMatch' or contains(@Name,'eMatch'))]",
+			"//*[@Name='Se connecter à eMatch']"
+		]
+
+		for (String xpath : xpaths) {
+			def elements = rawDriver.findElements(By.xpath(xpath))
+			if (elements != null && !elements.isEmpty()) {
+				String handle = safe(elements[0].getAttribute('NativeWindowHandle'))
+
+				if (handle) {
+					KeywordUtil.logInfo("Detected login dialog handle ${handle}")
+					attachExistingWindowByHandle(handle)
+					sleepMs(1200)
+					KeywordUtil.logInfo("Attached directly to login dialog")
+					return handle
+				}
+			}
+		}
+	} catch (Throwable t) {
+		KeywordUtil.logInfo("Login dialog child attach skipped: ${safe(t.message)}")
+	}
+
+	KeywordUtil.logInfo("Login dialog child handle not found. Keeping main window attachment.")
+	return ''
 }
 
-@Keyword
-void clickConnectButton() {
-	KeywordUtil.logInfo("Clicking connect button")
-
-	focusLoginWindow()
-	sleepMs(500)
-
-	WindowsTestObject btn = connectBtnObj()
-
-	if (waitPresent(btn, 5)) {
-		Windows.click(btn)
-		sleepMs(1500)
+private void reattachMainWindowAfterLogin() {
+	if (!safe(detectedWindowHandle)) {
 		return
 	}
 
-	KeywordUtil.logInfo("Connect button not found. Using ENTER fallback.")
-
-	Robot r = new Robot()
-	r.setAutoDelay(100)
-	r.keyPress(KeyEvent.VK_ENTER)
-	sleepMs(150)
-	r.keyRelease(KeyEvent.VK_ENTER)
+	KeywordUtil.logInfo("Reattaching to main eMatch window after login")
+	attachExistingWindowByHandle(detectedWindowHandle)
 	sleepMs(1500)
 }
-
-@Keyword
-boolean waitForMainScreen() {
-	KeywordUtil.logInfo("Waiting for main eMatch screen")
-
-	try {
-		if (waitPresent(mainSearchObj(), 60)) {
-			return true
-		}
-	} catch (Throwable ignored) {
-	}
-
-	try {
-		if (waitPresent(homeTabObj(), 60)) {
-			return true
-		}
-	} catch (Throwable ignored) {
-	}
-
-	return false
-}
-
-@Keyword
-void activateHomeTab() {
-	try {
-		WindowsTestObject homeTab = homeTabObj()
-		if (waitPresent(homeTab, 5)) {
-			Windows.click(homeTab)
-			sleepMs(1000)
-			return
-		}
-	} catch (Throwable ignored) {
-	}
-
-	try {
-		String homeImg = new File(RunConfiguration.getProjectDir(), 'Images/General/Home.PNG').getAbsolutePath()
-		if (new File(homeImg).exists()) {
-			WindowsImageKeywords.clickImage(homeImg)
-			sleepMs(1000)
-		}
-	} catch (Throwable ignored) {
-	}
-}
-
-@Keyword
-void loginThroughNativeControls() {
-	loginThroughNativeControls(safe(GlobalVariable.env) ?: 'REC')
-}
-
-@Keyword
-void loginThroughNativeControls(String env) {
-	String resolvedEnv = safe(env) ?: safe(GlobalVariable.env) ?: 'REC'
-
-	KeywordUtil.logInfo("Logging through native controls for env ${resolvedEnv}")
-
-	focusLoginWindow()
-	selectEnvironment(resolvedEnv)
-
-	focusLoginWindow()
-	clickConnectButton()
-
-	boolean mainScreenLoaded = waitForMainScreen()
-
-	if (!mainScreenLoaded) {
-		KeywordUtil.markFailedAndStop("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
-	}
-
-	activateHomeTab()
-	KeywordUtil.logInfo("eMatch startup flow completed successfully for environment ${resolvedEnv}")
-}
-
-
-
-
-
-
-
+4) Troca a sessão inteira de objetos
 private WindowsTestObject envComboObj() {
 	try {
 		WindowsTestObject repoObj = findWindowsObject('Login Page/optEnv')
@@ -178,14 +89,14 @@ private WindowsTestObject envComboObj() {
 
 	return winObj(
 		'envCombo',
-		"(//*[@LocalizedControlType='combo box' or contains(@ClassName,'ComboBox')])[1]"
+		"(//*[@ClassName='ComboBox' or @LocalizedControlType='combo box'])[1]"
 	)
 }
 
 private WindowsTestObject envListItemObj(String visibleText) {
 	return winObj(
 		'envListItem',
-		"//*[@LocalizedControlType='list item' and @Name=${xpathLiteral(visibleText)}]"
+		"//*[@Name=${xpathLiteral(visibleText)}]"
 	)
 }
 
@@ -241,3 +152,204 @@ private WindowsTestObject homeTabObj() {
 		"//*[@Name='Accueil' or @Name='Home']"
 	)
 }
+5) Troca a sessão inteira de login
+@Keyword
+void openEnvironmentDropdown() {
+	KeywordUtil.logInfo("Opening environment dropdown")
+
+	WindowsTestObject combo = envComboObj()
+
+	if (!waitPresent(combo, 8)) {
+		KeywordUtil.markFailedAndStop("Environment combo was not found")
+	}
+
+	Windows.click(combo)
+	sleepMs(1200)
+}
+
+@Keyword
+int resolveEnvironmentLegacyIndex(String env) {
+	String value = safe(env).toUpperCase()
+
+	switch (value) {
+		case 'PROD':
+			return 1
+		case 'PREX':
+		case 'PREPO':
+			return 2
+		case 'REC2':
+			return 3
+		case 'REC':
+			return 4
+		case 'DEV2':
+			return 5
+		case 'DEV':
+			return 6
+		default:
+			return 4
+	}
+}
+
+@Keyword
+String resolveEnvironmentDisplayValue(String env) {
+	String value = safe(env).toUpperCase()
+
+	switch (value) {
+		case 'PROD':
+			return 'Production (PROD)'
+		case 'PREX':
+		case 'PREPO':
+			return 'Bench (PREX)'
+		case 'REC2':
+			return 'Qualification (REC2)'
+		case 'REC':
+			return 'Recette (REC)'
+		case 'DEV2':
+			return 'Simulation (DEV2)'
+		case 'DEV':
+			return 'Developpement (DEV)'
+		default:
+			return 'Recette (REC)'
+	}
+}
+
+@Keyword
+void selectEnvironment(String env) {
+	String displayValue = resolveEnvironmentDisplayValue(env)
+	int legacyIndex = resolveEnvironmentLegacyIndex(env)
+
+	KeywordUtil.logInfo("Selecting environment ${displayValue}")
+
+	openEnvironmentDropdown()
+
+	WindowsTestObject item = envListItemObj(displayValue)
+
+	if (waitPresent(item, 5)) {
+		Windows.click(item)
+		sleepMs(1500)
+		return
+	}
+
+	KeywordUtil.logInfo("Direct click on environment item failed. Using simple keyboard fallback.")
+
+	Robot r = robot()
+	r.keyPress(KeyEvent.VK_HOME)
+	r.keyRelease(KeyEvent.VK_HOME)
+	sleepMs(300)
+
+	for (int i = 0; i < legacyIndex; i++) {
+		r.keyPress(KeyEvent.VK_DOWN)
+		r.keyRelease(KeyEvent.VK_DOWN)
+		sleepMs(250)
+	}
+
+	r.keyPress(KeyEvent.VK_ENTER)
+	r.keyRelease(KeyEvent.VK_ENTER)
+	sleepMs(1500)
+}
+
+@Keyword
+boolean isConnectButtonPresent() {
+	return waitPresent(connectBtnObj(), 5)
+}
+
+@Keyword
+void clickConnectButton() {
+	KeywordUtil.logInfo("Clicking connect button")
+
+	WindowsTestObject btn = connectBtnObj()
+
+	if (waitPresent(btn, 5)) {
+		Windows.click(btn)
+		sleepMs(1500)
+		return
+	}
+
+	KeywordUtil.logInfo("Connect button not found. Using ENTER fallback.")
+
+	Robot r = robot()
+	r.keyPress(KeyEvent.VK_ENTER)
+	r.keyRelease(KeyEvent.VK_ENTER)
+	sleepMs(1500)
+}
+
+@Keyword
+boolean waitForMainScreen() {
+	KeywordUtil.logInfo("Waiting for main eMatch screen")
+
+	reattachMainWindowAfterLogin()
+
+	long end = System.currentTimeMillis() + 70000L
+
+	while (System.currentTimeMillis() < end) {
+		if (waitPresent(mainSearchObj(), 3)) {
+			return true
+		}
+
+		if (waitPresent(homeTabObj(), 3)) {
+			return true
+		}
+
+		sleepMs(1000)
+	}
+
+	return false
+}
+
+@Keyword
+void activateHomeTab() {
+	try {
+		WindowsTestObject homeTab = homeTabObj()
+		if (waitPresent(homeTab, 5)) {
+			Windows.click(homeTab)
+			sleepMs(1000)
+			return
+		}
+	} catch (Throwable ignored) {
+	}
+
+	try {
+		String homeImg = new File(RunConfiguration.getProjectDir(), 'Images/General/Home.PNG').getAbsolutePath()
+		if (new File(homeImg).exists()) {
+			WindowsImageKeywords.clickImage(homeImg)
+			sleepMs(1000)
+		}
+	} catch (Throwable ignored) {
+	}
+}
+
+@Keyword
+void loginThroughNativeControls() {
+	loginThroughNativeControls(safe(GlobalVariable.env) ?: 'REC')
+}
+
+@Keyword
+void loginThroughNativeControls(String env) {
+	String resolvedEnv = safe(env) ?: safe(GlobalVariable.env) ?: 'REC'
+
+	KeywordUtil.logInfo("Logging through native controls for env ${resolvedEnv}")
+
+	selectEnvironment(resolvedEnv)
+	clickConnectButton()
+
+	boolean mainScreenLoaded = waitForMainScreen()
+
+	if (!mainScreenLoaded) {
+		KeywordUtil.markFailedAndStop("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
+	}
+
+	activateHomeTab()
+	KeywordUtil.logInfo("eMatch startup flow completed successfully for environment ${resolvedEnv}")
+}
+6) Mantém esta sessão helper
+
+Se já existe, deixa. Se não existir, usa esta.
+
+private Robot robot() {
+	if (cachedRobot == null) {
+		cachedRobot = new Robot()
+		cachedRobot.setAutoDelay(100)
+	}
+	return cachedRobot
+}
+O
