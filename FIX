@@ -30,7 +30,7 @@ import io.appium.java_client.windows.WindowsDriver
 class authentication {
 
 	// =========================================================================
-	// SECTION 1 - CONSTANTS / FIELDS
+	// SESSION 1 - CONSTANTS / FIELDS
 	// =========================================================================
 
 	private static final String DEFAULT_WINAPPDRIVER_PATH = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
@@ -40,7 +40,7 @@ class authentication {
 	private Robot cachedRobot
 
 	// =========================================================================
-	// SECTION 2 - BASIC PUBLIC KEYWORDS
+	// SESSION 2 - BASIC PUBLIC KEYWORDS
 	// =========================================================================
 
 	@Keyword
@@ -105,7 +105,7 @@ if (Test-Path \$root) {
 	}
 
 	// =========================================================================
-	// SECTION 3 - START MATCH
+	// SESSION 3 - START MATCH
 	// =========================================================================
 
 	@Keyword
@@ -154,7 +154,7 @@ if (Test-Path \$root) {
 	}
 
 	// =========================================================================
-	// SECTION 4 - ATTACH TO LOGIN WINDOW
+	// SESSION 4 - ATTACH TO LOGIN WINDOW
 	// =========================================================================
 
 	@Keyword
@@ -173,9 +173,7 @@ if (Test-Path \$root) {
 		detectedWindowTitle = normalizeTitle(found.title)
 		KeywordUtil.logInfo("Detected main window title ${detectedWindowTitle}")
 
-		Object handleValue = found.handle
-		String handleDec = safe(handleValue)
-
+		String handleDec = safe(found.handle)
 		if (!handleDec) {
 			handleDec = safe(findWindowHandleByTitle(detectedWindowTitle))
 		}
@@ -189,7 +187,7 @@ if (Test-Path \$root) {
 		waitForStableMainWindow(detectedWindowTitle, handleDec, 6)
 
 		WindowsDriver driver = attachExistingWindowByHandle(handleDec)
-		sleepMs(2000)
+		sleepMs(1500)
 
 		String attachedTitle = ''
 		try {
@@ -201,135 +199,144 @@ if (Test-Path \$root) {
 
 		focusLoginWindow(detectedWindowTitle)
 
-		if (safe(attachedTitle) || waitForAnyLoginIndicator(20)) {
-			return
+		if (!waitForLoginControls(15)) {
+			KeywordUtil.markFailedAndStop("Login controls were not detected after attach for ${detectedWindowTitle}")
 		}
-
-		KeywordUtil.markFailedAndStop("Could not finish attach to login window ${detectedWindowTitle}")
 	}
 
 	// =========================================================================
-	// SECTION 5 - LOGIN FLOW
+	// SESSION 5 - LOGIN FLOW
 	// =========================================================================
 
 	@Keyword
-	void openEnvironmentDropdown() {
-		KeywordUtil.logInfo("Opening environment dropdown by click")
+	void loginThroughNativeControls() {
+		loginThroughNativeControls(safe(GlobalVariable.env) ?: 'REC')
+	}
+
+	@Keyword
+	void loginThroughNativeControls(String env) {
+		String resolvedEnv = safe(env) ?: safe(GlobalVariable.env) ?: 'REC'
+		String displayValue = resolveEnvironmentDisplayValue(resolvedEnv)
+		int legacyIndex = resolveEnvironmentIndex(resolvedEnv)
+
+		KeywordUtil.logInfo("Logging through native controls for env ${resolvedEnv}")
 
 		focusLoginWindow(detectedWindowTitle)
 
-		WindowsTestObject combo = envComboObj()
+		WindowsTestObject envCombo = envComboObj()
+		if (!waitPresent(envCombo, 10)) {
+			KeywordUtil.markFailedAndStop("Environment combo was not found")
+		}
 
-		if (waitPresent(combo, 5)) {
-			Windows.click(combo)
+		KeywordUtil.logInfo("Selecting environment ${displayValue} with index ${legacyIndex}")
+
+		boolean selected = false
+
+		// 1) click combo and use Katalon built-in selection first
+		try {
+			focusLoginWindow(detectedWindowTitle)
+			Windows.click(envCombo)
+			sleepMs(800)
+
+			Windows.selectOptionByLabel(envCombo, displayValue, 3)
 			sleepMs(1200)
-			return
+			selected = true
+			KeywordUtil.logInfo("Environment selected with selectOptionByLabel")
+		} catch (Throwable ignored) {
+			KeywordUtil.logInfo("selectOptionByLabel failed, trying list item click")
 		}
 
-		KeywordUtil.logInfo("Environment combo was not found by object. Trying keyboard fallback.")
-		robotCombo(KeyEvent.VK_ALT, KeyEvent.VK_DOWN)
-		sleepMs(1200)
-	}
-
-	@Keyword
-	int resolveEnvironmentIndex(String env) {
-		String normalized = normalizeEnvCode(env)
-
-		Map<String, Integer> indexes = [
-			'PROD' : 1,
-			'PREPO': 2,
-			'REC2' : 3,
-			'REC'  : 4,
-			'DEV2' : 5,
-			'DEV'  : 6
-		]
-
-		return indexes.containsKey(normalized) ? indexes[normalized] : 4
-	}
-
-	@Keyword
-	void selectEnvironment(String env) {
-		String displayValue = resolveEnvironmentDisplayValue(env)
-		int legacyIndex = resolveEnvironmentIndex(env)
-
-		KeywordUtil.logInfo("Selecting environment ${displayValue} with legacy logic and index ${legacyIndex}")
-
-		focusLoginWindow(detectedWindowTitle)
-
-		WindowsTestObject combo = envComboObj()
-
-		if (waitPresent(combo, 5)) {
+		// 2) direct click on visible list item
+		if (!selected) {
 			try {
-				KeywordUtil.logInfo("Focusing login window ${detectedWindowTitle}")
-				Windows.click(combo)
-				sleepMs(1000)
+				focusLoginWindow(detectedWindowTitle)
+				Windows.click(envCombo)
+				sleepMs(800)
+
+				WindowsTestObject itemObj = comboListItemObj(displayValue)
+				if (waitPresent(itemObj, 3)) {
+					Windows.click(itemObj)
+					sleepMs(1200)
+					selected = true
+					KeywordUtil.logInfo("Environment selected by direct list item click")
+				}
+			} catch (Throwable ignored) {
+				KeywordUtil.logInfo("Direct list item click failed, trying legacy keyboard flow")
+			}
+		}
+
+		// 3) old working logic
+		if (!selected) {
+			try {
+				focusLoginWindow(detectedWindowTitle)
+				Windows.click(envCombo)
+				sleepMs(800)
+
+				for (int i = 0; i < legacyIndex; i++) {
+					Windows.sendKeys(envCombo, Keys.chord(Keys.ARROW_DOWN))
+					sleepMs(300)
+				}
+				Windows.sendKeys(envCombo, Keys.chord(Keys.ENTER))
+				sleepMs(1200)
+				selected = true
+				KeywordUtil.logInfo("Environment selected with legacy sendKeys flow")
+			} catch (Throwable ignored) {
+				KeywordUtil.logInfo("Legacy sendKeys flow failed, trying Robot fallback")
+			}
+		}
+
+		// 4) last fallback with Robot
+		if (!selected) {
+			try {
+				focusLoginWindow(detectedWindowTitle)
+				Windows.click(envCombo)
+				sleepMs(800)
+
+				for (int i = 0; i < legacyIndex; i++) {
+					robotKey(KeyEvent.VK_DOWN)
+					sleepMs(300)
+				}
+				robotKey(KeyEvent.VK_ENTER)
+				sleepMs(1200)
+				selected = true
+				KeywordUtil.logInfo("Environment selected with Robot fallback")
 			} catch (Throwable ignored) {
 			}
 		}
 
-		openEnvironmentDropdown()
+		if (!selected) {
+			KeywordUtil.markFailedAndStop("Could not select environment ${displayValue}")
+		}
 
-		// 1) direct click on visible list item
-		try {
-			WindowsTestObject itemObj = comboListItemObj(displayValue)
-			if (waitPresent(itemObj, 3)) {
-				KeywordUtil.logInfo("Selecting environment by direct click ${displayValue}")
-				Windows.click(itemObj)
+		WindowsTestObject connectBtn = connectBtnObj()
+
+		if (waitPresent(connectBtn, 5)) {
+			try {
+				focusLoginWindow(detectedWindowTitle)
+				Windows.click(connectBtn)
 				sleepMs(1000)
-				return
+				KeywordUtil.logInfo("Connect button clicked")
+			} catch (Throwable ignored) {
+				focusLoginWindow(detectedWindowTitle)
+				robotKey(KeyEvent.VK_ENTER)
+				sleepMs(1000)
+				KeywordUtil.logInfo("Connect confirmed with ENTER fallback")
 			}
-		} catch (Throwable ignored) {
-		}
-
-		// 2) legacy sendKeys on combo, same spirit as old working version
-		try {
-			WindowsTestObject legacyCombo = envComboObj()
-			if (waitPresent(legacyCombo, 3)) {
-				KeywordUtil.logInfo("Selecting environment with legacy keyboard fallback")
-				for (int i = 0; i < legacyIndex; i++) {
-					Windows.sendKeys(legacyCombo, Keys.chord(Keys.ARROW_DOWN))
-					sleepMs(300)
-				}
-				Windows.sendKeys(legacyCombo, Keys.chord(Keys.ENTER))
-				sleepMs(1200)
-				return
-			}
-		} catch (Throwable ignored) {
-		}
-
-		// 3) hard fallback with Robot
-		KeywordUtil.logInfo("Pressing ARROW_DOWN ${legacyIndex} times")
-		for (int i = 0; i < legacyIndex; i++) {
-			robotKey(KeyEvent.VK_DOWN)
-			sleepMs(300)
-		}
-
-		KeywordUtil.logInfo("Confirming login with ENTER fallback")
-		robotKey(KeyEvent.VK_ENTER)
-		sleepMs(1200)
-	}
-
-	@Keyword
-	boolean isConnectButtonPresent() {
-		return waitPresent(connectBtnObj(), 5)
-	}
-
-	@Keyword
-	void clickConnectButton() {
-		KeywordUtil.logInfo("Clicking connect button")
-
-		focusLoginWindow(detectedWindowTitle)
-
-		WindowsTestObject btn = connectBtnObj()
-		if (waitPresent(btn, 8)) {
-			Windows.click(btn)
+		} else {
+			focusLoginWindow(detectedWindowTitle)
+			robotKey(KeyEvent.VK_ENTER)
 			sleepMs(1000)
-			return
+			KeywordUtil.logInfo("Connect button not present, ENTER fallback used")
 		}
 
-		KeywordUtil.logInfo("Connect button not found by object. Trying ENTER fallback.")
-		robotKey(KeyEvent.VK_ENTER)
-		sleepMs(1000)
+		boolean mainScreenLoaded = waitForMainScreen()
+
+		if (!mainScreenLoaded) {
+			KeywordUtil.markFailedAndStop("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
+		}
+
+		activateHomeTab()
+		KeywordUtil.logInfo("eMatch startup flow completed successfully for environment ${resolvedEnv}")
 	}
 
 	@Keyword
@@ -339,18 +346,19 @@ if (Test-Path \$root) {
 		long end = System.currentTimeMillis() + 60000L
 
 		while (System.currentTimeMillis() < end) {
+			// old expected success path
 			if (waitPresent(mainSearchObj(), 2)) {
 				return true
 			}
 
-			if (waitPresent(homeTabObj(), 2)) {
-				return true
+			// if login controls are still there, we are still on login
+			boolean loginStillVisible = waitPresent(envComboObj(), 1) || waitPresent(connectBtnObj(), 1)
+			if (loginStillVisible) {
+				sleepMs(1000)
+				continue
 			}
 
-			if (!waitPresent(envComboObj(), 1) && !waitPresent(connectBtnObj(), 1)) {
-				return true
-			}
-
+			// old fallback behavior after login
 			sleepMs(1000)
 		}
 
@@ -379,43 +387,8 @@ if (Test-Path \$root) {
 		}
 	}
 
-	@Keyword
-	void loginThroughNativeControls() {
-		loginThroughNativeControls(safe(GlobalVariable.env) ?: 'REC')
-	}
-
-	@Keyword
-	void loginThroughNativeControls(String env) {
-		String resolvedEnv = safe(env) ?: safe(GlobalVariable.env) ?: 'REC'
-
-		KeywordUtil.logInfo("Logging through native controls for env ${resolvedEnv}")
-
-		selectEnvironment(resolvedEnv)
-		sleepMs(1000)
-
-		boolean isButtonPresent = isConnectButtonPresent()
-
-		if (isButtonPresent) {
-			KeywordUtil.logInfo("Connect button was present and will be clicked.")
-			clickConnectButton()
-		} else {
-			KeywordUtil.logInfo("Connect button was not present. Continuing test execution.")
-			robotKey(KeyEvent.VK_ENTER)
-			sleepMs(1000)
-		}
-
-		boolean mainScreenLoaded = waitForMainScreen()
-
-		if (!mainScreenLoaded) {
-			KeywordUtil.markFailedAndStop("eMatch main screen was not loaded. Object 'General/txtSearch' not found.")
-		}
-
-		activateHomeTab()
-		KeywordUtil.logInfo("eMatch startup flow completed successfully for environment ${resolvedEnv}")
-	}
-
 	// =========================================================================
-	// SECTION 6 - LAUNCH CANDIDATES
+	// SESSION 6 - LAUNCH CANDIDATES
 	// =========================================================================
 
 	private List<Map<String, String>> buildLaunchCandidates() {
@@ -472,7 +445,7 @@ if (Test-Path \$root) {
 	}
 
 	// =========================================================================
-	// SECTION 7 - WINAPPDRIVER / PORT / WINDOW DISCOVERY
+	// SESSION 7 - WINAPPDRIVER / WINDOW DISCOVERY
 	// =========================================================================
 
 	private void ensureWinAppDriverRunning() {
@@ -600,13 +573,11 @@ if (\$p) {
 	}
 
 	// =========================================================================
-	// SECTION 8 - DRIVER ATTACH
+	// SESSION 8 - DRIVER ATTACH
 	// =========================================================================
 
-	private WindowsDriver attachExistingWindowByHandle(Object handleValue) {
-		String handleDec = safe(handleValue)
-
-		if (!handleDec) {
+	private WindowsDriver attachExistingWindowByHandle(String handleDec) {
+		if (!safe(handleDec)) {
 			KeywordUtil.markFailedAndStop("Window handle is empty")
 		}
 
@@ -650,27 +621,13 @@ if (\$p) {
 		KeywordUtil.logInfo("Windows driver registered through DriverFactory.changeWebDriver")
 	}
 
-	private boolean waitForAnyLoginIndicator(int timeoutSeconds) {
+	private boolean waitForLoginControls(int timeoutSeconds) {
 		long end = System.currentTimeMillis() + (timeoutSeconds * 1000L)
 
 		while (System.currentTimeMillis() < end) {
-			if (waitPresent(envComboObj(), 2)) {
+			if (waitPresent(envComboObj(), 2) || waitPresent(connectBtnObj(), 2)) {
 				return true
 			}
-
-			if (waitPresent(connectBtnObj(), 2)) {
-				return true
-			}
-
-			try {
-				WebDriver driver = DriverFactory.getWebDriver()
-				String title = safe(driver?.getTitle())
-				if (title) {
-					return true
-				}
-			} catch (Throwable ignored) {
-			}
-
 			sleepMs(500)
 		}
 
@@ -678,15 +635,12 @@ if (\$p) {
 	}
 
 	// =========================================================================
-	// SECTION 9 - OBJECTS
+	// SESSION 9 - OBJECTS
 	// =========================================================================
 
 	private WindowsTestObject envComboObj() {
 		WindowsTestObject repoObj = firstExistingObject([
-			'Login Page/optEnv',
-			'Connection/cmbEnvironment',
-			'General/cmbEnvironment',
-			'Login/cmbEnvironment'
+			'Login Page/optEnv'
 		])
 		if (repoObj != null) {
 			return repoObj
@@ -694,23 +648,20 @@ if (\$p) {
 
 		return winObj(
 			'envCombo',
-			"(//*[@LocalizedControlType='combo box' or contains(@ClassName,'ComboBox')])[1]"
+			"(//*[@LocalizedControlType='combo box'])[1]"
 		)
 	}
 
 	private WindowsTestObject comboListItemObj(String displayValue) {
 		return winObj(
 			'envListItem',
-			"//*[@Name=${xpathLiteral(displayValue)}]"
+			"//*[@LocalizedControlType='list item' and @Name=${xpathLiteral(displayValue)}]"
 		)
 	}
 
 	private WindowsTestObject connectBtnObj() {
 		WindowsTestObject repoObj = firstExistingObject([
-			'Login Page/btnConnecter',
-			'Connection/btnConnect',
-			'General/btnConnect',
-			'Login/btnConnect'
+			'Login Page/btnConnecter'
 		])
 		if (repoObj != null) {
 			return repoObj
@@ -718,7 +669,7 @@ if (\$p) {
 
 		return winObj(
 			'connectBtn',
-			"//*[@Name='Se connecter' or @Name='Connect' or @Name='Log in']"
+			"//*[@LocalizedControlType='button' and (@Name='Se connecter' or @Name='Connect')]"
 		)
 	}
 
@@ -780,7 +731,7 @@ if (\$p) {
 	}
 
 	// =========================================================================
-	// SECTION 10 - DATA / TITLE / ENV
+	// SESSION 10 - TITLE / ENV / DATA
 	// =========================================================================
 
 	private String resolveTargetVersion() {
@@ -863,8 +814,23 @@ if (\$p) {
 		return value
 	}
 
+	private int resolveEnvironmentIndex(String env) {
+		String normalized = normalizeEnvCode(env)
+
+		Map<String, Integer> indexes = [
+			'PROD' : 1,
+			'PREPO': 2,
+			'REC2' : 3,
+			'REC'  : 4,
+			'DEV2' : 5,
+			'DEV'  : 6
+		]
+
+		return indexes.containsKey(normalized) ? indexes[normalized] : 4
+	}
+
 	// =========================================================================
-	// SECTION 11 - POWERSHELL / SYSTEM
+	// SESSION 11 - SYSTEM / POWERSHELL
 	// =========================================================================
 
 	private boolean fileExists(String path) {
@@ -908,7 +874,7 @@ if (\$p) {
 	}
 
 	// =========================================================================
-	// SECTION 12 - ROBOT / FOCUS
+	// SESSION 12 - ROBOT / FOCUS
 	// =========================================================================
 
 	private Robot robot() {
@@ -926,15 +892,6 @@ if (\$p) {
 		sleepMs(150)
 	}
 
-	private void robotCombo(int modifierKey, int keyCode) {
-		Robot r = robot()
-		r.keyPress(modifierKey)
-		r.keyPress(keyCode)
-		r.keyRelease(keyCode)
-		r.keyRelease(modifierKey)
-		sleepMs(150)
-	}
-
 	private void focusLoginWindow(String title) {
 		String targetTitle = normalizeTitle(safe(title) ?: safe(detectedWindowTitle) ?: resolveWindowTitle())
 
@@ -944,17 +901,14 @@ if (\$p) {
 		}
 
 		try {
-			WindowsTestObject windowObj = new WindowsTestObject('loginWindow')
-			windowObj.setLocatorStrategy(LocatorStrategy.NAME)
-			windowObj.setLocator(targetTitle)
-			Windows.switchToWindow(windowObj)
+			Windows.switchToWindowTitle(targetTitle)
 			sleepMs(500)
 		} catch (Throwable ignored) {
 		}
 	}
 
 	// =========================================================================
-	// SECTION 13 - GENERIC UTILS
+	// SESSION 13 - GENERIC UTILS
 	// =========================================================================
 
 	private void sleepMs(long ms) {
