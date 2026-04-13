@@ -1,3 +1,872 @@
+package pageObject
 
+import static com.kms.katalon.core.testdata.TestDataFactory.findTestData
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.event.KeyEvent
+import java.net.InetSocketAddress
+import java.net.Socket
+
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import groovy.json.JsonSlurper
+import internal.GlobalVariable
+
+class authentication {
+
+	// =========================================================================
+	// SECTION 1 - CONSTANTS / FIELDS
+	// =========================================================================
+
+	private static final String DEFAULT_WINAPPDRIVER_PATH = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+
+	private String detectedWindowTitle = ''
+	private Robot cachedRobot
+
+	// =========================================================================
+	// SECTION 2 - BASIC PUBLIC KEYWORDS
+	// =========================================================================
+
+	@Keyword
+	String getCurrentWindowsUser() {
+		return safe(System.getProperty('user.name')) ?: safe(System.getenv('USERNAME'))
+	}
+
+	@Keyword
+	String resolveWindowTitle() {
+		String versionOrTitle = resolveTargetVersion()
+		return normalizeResolvedTitle(versionOrTitle)
+	}
+
+	@Keyword
+	String getShortcutPath() {
+		String userHome = safe(System.getProperty('user.home'))
+		String envCode = normalizeEnvCode(safe(GlobalVariable.env) ?: 'REC')
+		return "${userHome}\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\NATIXIS\\eMatch ${envCode}.appref-ms"
+	}
+
+	@Keyword
+	String getApplicationPath() {
+		String envCode = normalizeEnvCode(safe(GlobalVariable.env) ?: 'REC')
+		return "\\\\cib.net\\shareparis\\Soft\\ematch\\HIM\\Livraisons\\${envCode}\\IXIS.eMatch.HIM.application"
+	}
+
+	@Keyword
+	String getInstalledExePath() {
+		try {
+			String script = """
+\$ErrorActionPreference = 'SilentlyContinue'
+\$root = Join-Path \$env:LOCALAPPDATA 'Apps\\2.0'
+if (Test-Path \$root) {
+    \$file = Get-ChildItem -Path \$root -Recurse -Filter 'IXIS.eMatch.HIM.exe' |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if (\$file) {
+        Write-Output \$file.FullName
+    }
+}
+"""
+			return safe(runPowerShell(script))
+		} catch (Throwable ignored) {
+			return ''
+		}
+	}
+
+	@Keyword
+	String getLauncherBat() {
+		String envCode = normalizeEnvCode(safe(GlobalVariable.env) ?: 'REC')
+		return "D:\\Projects\\eMatchStarters\\runAsEMatch${envCode}\\eMatch.bat"
+	}
+
+	@Keyword
+	String getResolutionScriptPath() {
+		return "${safe(System.getProperty('user.dir'))}\\Scripts\\set_resolution.ps1"
+	}
+
+	@Keyword
+	String getWinAppDriverPath() {
+		return DEFAULT_WINAPPDRIVER_PATH
+	}
+
+	// =========================================================================
+	// SECTION 3 - IMAGE PATHS
+	// =========================================================================
+
+	@Keyword
+	String getDropdownEnvironmentImagePath() {
+		return new File(RunConfiguration.getProjectDir(), 'Images/General/dropdownEnvironment.png').getAbsolutePath()
+	}
+
+	@Keyword
+	String getRecEnvironmentImagePath() {
+		return new File(RunConfiguration.getProjectDir(), 'Images/General/recEnvironment.png').getAbsolutePath()
+	}
+
+	@Keyword
+	String getConnectButtonImagePath() {
+		return new File(RunConfiguration.getProjectDir(), 'Images/General/seconnecter.png').getAbsolutePath()
+	}
+
+	@Keyword
+	String getHomeGreyImagePath() {
+		return new File(RunConfiguration.getProjectDir(), 'Images/General/HomeGrey.png').getAbsolutePath()
+	}
+
+	private String getEnvironmentImagePath(String env) {
+		String normalized = normalizeEnvCode(env)
+
+		if (normalized == 'REC') {
+			return getRecEnvironmentImagePath()
+		}
+
+		return ''
+	}
+
+	// =========================================================================
+	// SECTION 4 - START MATCH
+	// =========================================================================
+
+	@Keyword
+	void startMatch(String currentUser, String targetWindowTitle) {
+		String expectedTitle = normalizeTitle(safe(targetWindowTitle) ?: resolveWindowTitle())
+
+		KeywordUtil.logInfo("Starting eMatch for environment ${(safe(GlobalVariable.env) ?: 'REC')}")
+		KeywordUtil.logInfo("Current Windows user ${safe(currentUser)}")
+		KeywordUtil.logInfo("Target window title ${expectedTitle}")
+
+		ensureWinAppDriverRunning()
+
+		if (attachToRunningWindow(expectedTitle, 5)) {
+			detectedWindowTitle = expectedTitle
+			KeywordUtil.logInfo("eMatch already open with title ${detectedWindowTitle}")
+			return
+		}
+
+		List<String> launchCandidates = buildLaunchCandidates()
+
+		if (launchCandidates.isEmpty()) {
+			KeywordUtil.markFailedAndStop("No valid launch candidate was found for eMatch")
+		}
+
+		for (String appPath : launchCandidates) {
+			try {
+				KeywordUtil.logInfo("Launching eMatch with Katalon: ${appPath}")
+				Windows.startApplicationWithTitle(appPath, expectedTitle)
+				sleepMs(3000)
+
+				if (attachToRunningWindow(expectedTitle, 25)) {
+					detectedWindowTitle = expectedTitle
+					KeywordUtil.logInfo("eMatch window detected during startup with title ${detectedWindowTitle}")
+					return
+				}
+			} catch (Throwable t) {
+				KeywordUtil.logInfo("Launch failed for ${appPath} :: ${safe(t.message)}")
+			}
+		}
+
+		KeywordUtil.markFailedAndStop("Could not open eMatch window ${expectedTitle}")
+	}
+
+	private List<String> buildLaunchCandidates() {
+		List<String> candidates = []
+		Set<String> seen = [] as Set<String>
+
+		addLaunchCandidate(candidates, seen, getShortcutPath())
+		addLaunchCandidate(candidates, seen, getInstalledExePath())
+		addLaunchCandidate(candidates, seen, getApplicationPath())
+
+		return candidates
+	}
+
+	private void addLaunchCandidate(List<String> candidates, Set<String> seen, String path) {
+		String resolved = safe(path)
+
+		if (!resolved) {
+			return
+		}
+
+		if (!fileExists(resolved)) {
+			return
+		}
+
+		String lower = resolved.toLowerCase()
+		if (seen.contains(lower)) {
+			return
+		}
+
+		seen << lower
+		candidates << resolved
+	}
+
+	// =========================================================================
+	// SECTION 5 - ATTACH TO LOGIN WINDOW
+	// =========================================================================
+
+	@Keyword
+	void attachToLoginWindow(String targetWindowTitle) {
+		String expectedTitle = normalizeTitle(safe(detectedWindowTitle) ?: safe(targetWindowTitle) ?: resolveWindowTitle())
+
+		KeywordUtil.logInfo("Attaching to login window. Expected title ${expectedTitle}")
+
+		ensureWinAppDriverRunning()
+
+		if (!attachToRunningWindow(expectedTitle, 30)) {
+			KeywordUtil.markFailedAndStop("Could not find eMatch window with title ${expectedTitle}")
+		}
+
+		detectedWindowTitle = expectedTitle
+		KeywordUtil.logInfo("Attached to login window ${detectedWindowTitle}")
+
+		focusLoginWindow(detectedWindowTitle)
+
+		if (waitForLoginIndicators(15)) {
+			return
+		}
+
+		KeywordUtil.logInfo("Login indicators were not confirmed by object. Continuing with image-based login flow.")
+	}
+
+	private boolean attachToRunningWindow(String expectedTitle, int timeoutSeconds) {
+		long end = System.currentTimeMillis() + (timeoutSeconds * 1000L)
+
+		while (System.currentTimeMillis() < end) {
+			try {
+				Windows.switchToDesktop()
+			} catch (Throwable ignored) {
+			}
+
+			try {
+				WindowsTestObject windowObj = appWindowObj(expectedTitle)
+				Windows.switchToWindow(windowObj)
+				sleepMs(1000)
+				return true
+			} catch (Throwable ignored) {
+			}
+
+			sleepMs(1000)
+		}
+
+		return false
+	}
+
+	private boolean waitForLoginIndicators(int timeoutSeconds) {
+		long end = System.currentTimeMillis() + (timeoutSeconds * 1000L)
+
+		while (System.currentTimeMillis() < end) {
+			try {
+				if (waitPresent(envComboObj(), 2)) {
+					return true
+				}
+			} catch (Throwable ignored) {
+			}
+
+			try {
+				if (waitPresent(connectBtnObj(), 2)) {
+					return true
+				}
+			} catch (Throwable ignored) {
+			}
+
+			sleepMs(500)
+		}
+
+		return false
+	}
+
+	// =========================================================================
+	// SECTION 6 - LOGIN FLOW
+	// =========================================================================
+
+	@Keyword
+	void openEnvironmentDropdown() {
+		KeywordUtil.logInfo("Opening environment dropdown")
+
+		focusLoginWindow(detectedWindowTitle)
+
+		String dropdownImage = getDropdownEnvironmentImagePath()
+
+		if (clickImageWithAttempts(dropdownImage, 5, 1000, "Opening environment dropdown by image")) {
+			sleepMs(1200)
+			return
+		}
+
+		WindowsTestObject combo = envComboObj()
+
+		if (waitPresent(combo, 5)) {
+			try {
+				Windows.click(combo)
+				sleepMs(1200)
+				return
+			} catch (Throwable ignored) {
+			}
+		}
+
+		KeywordUtil.markFailedAndStop("Could not open environment dropdown")
+	}
+
+	@Keyword
+	void selectEnvironment(String env) {
+		String normalizedEnv = normalizeEnvCode(env)
+		String displayValue = resolveEnvironmentDisplayValue(normalizedEnv)
+
+		KeywordUtil.logInfo("Selecting environment ${displayValue}")
+
+		focusLoginWindow(detectedWindowTitle)
+
+		openEnvironmentDropdown()
+
+		String envImage = getEnvironmentImagePath(normalizedEnv)
+
+		if (envImage && clickImageWithAttempts(envImage, 5, 1000, "Selecting ${normalizedEnv} environment by image")) {
+			sleepMs(1200)
+			return
+		}
+
+		WindowsTestObject itemObj = comboListItemObj(displayValue)
+		if (waitPresent(itemObj, 5)) {
+			try {
+				Windows.click(itemObj)
+				sleepMs(1200)
+				return
+			} catch (Throwable ignored) {
+			}
+		}
+
+		KeywordUtil.markFailedAndStop("Could not select environment ${displayValue}")
+	}
+
+	@Keyword
+	boolean isConnectButtonPresent() {
+		if (waitPresent(connectBtnObj(), 3)) {
+			return true
+		}
+
+		String connectImage = getConnectButtonImagePath()
+		return imageFileExists(connectImage)
+	}
+
+	@Keyword
+	void clickConnectButton() {
+		KeywordUtil.logInfo("Clicking connect button")
+
+		focusLoginWindow(detectedWindowTitle)
+
+		String connectImage = getConnectButtonImagePath()
+
+		if (clickImageWithAttempts(connectImage, 5, 1000, "Clicking connect button by image")) {
+			sleepMs(1500)
+			return
+		}
+
+		WindowsTestObject btn = connectBtnObj()
+		if (waitPresent(btn, 5)) {
+			try {
+				Windows.click(btn)
+				sleepMs(1500)
+				return
+			} catch (Throwable ignored) {
+			}
+		}
+
+		KeywordUtil.markFailedAndStop("Could not click connect button")
+	}
+
+	@Keyword
+	boolean waitForMainScreen() {
+		KeywordUtil.logInfo("Waiting for main eMatch screen")
+
+		long end = System.currentTimeMillis() + 60000L
+		String homeGrey = getHomeGreyImagePath()
+
+		while (System.currentTimeMillis() < end) {
+			focusLoginWindow(detectedWindowTitle)
+
+			if (clickImageWithAttempts(homeGrey, 1, 500, "Waiting for main screen using HomeGrey image")) {
+				return true
+			}
+
+			if (waitPresent(mainSearchObj(), 2)) {
+				return true
+			}
+
+			if (waitPresent(homeTabObj(), 2)) {
+				return true
+			}
+
+			sleepMs(1000)
+		}
+
+		return false
+	}
+
+	@Keyword
+	void activateHomeTab() {
+		try {
+			WindowsTestObject homeTab = homeTabObj()
+			if (waitPresent(homeTab, 5)) {
+				Windows.click(homeTab)
+				sleepMs(800)
+				return
+			}
+		} catch (Throwable ignored) {
+		}
+
+		String homeGrey = getHomeGreyImagePath()
+		clickImageWithAttempts(homeGrey, 3, 800, "Activating home tab by image")
+	}
+
+	@Keyword
+	void loginThroughNativeControls() {
+		loginThroughNativeControls(safe(GlobalVariable.env) ?: 'REC')
+	}
+
+	@Keyword
+	void loginThroughNativeControls(String env) {
+		String resolvedEnv = safe(env) ?: safe(GlobalVariable.env) ?: 'REC'
+
+		KeywordUtil.logInfo("Logging through native controls for env ${resolvedEnv}")
+
+		focusLoginWindow(detectedWindowTitle)
+
+		selectEnvironment(resolvedEnv)
+		clickConnectButton()
+
+		boolean mainScreenLoaded = waitForMainScreen()
+
+		if (!mainScreenLoaded) {
+			KeywordUtil.markFailedAndStop("eMatch main screen was not loaded")
+		}
+
+		activateHomeTab()
+		KeywordUtil.logInfo("eMatch startup flow completed successfully for environment ${resolvedEnv}")
+	}
+
+	// =========================================================================
+	// SECTION 7 - WINAPPDRIVER / WINDOW DISCOVERY
+	// =========================================================================
+
+	private void ensureWinAppDriverRunning() {
+		if (isPortOpen('127.0.0.1', 4723, 300)) {
+			KeywordUtil.logInfo("WinAppDriver already running on 127.0.0.1:4723")
+			return
+		}
+
+		String path = safe(getWinAppDriverPath())
+		if (!fileExists(path)) {
+			KeywordUtil.markFailedAndStop("WinAppDriver executable was not found at ${path}")
+		}
+
+		KeywordUtil.logInfo("Starting WinAppDriver from ${path}")
+
+		try {
+			new ProcessBuilder(path).start()
+		} catch (Throwable t) {
+			KeywordUtil.markFailedAndStop("Could not start WinAppDriver: ${safe(t.message)}")
+		}
+
+		long end = System.currentTimeMillis() + 20000L
+		while (System.currentTimeMillis() < end) {
+			if (isPortOpen('127.0.0.1', 4723, 300)) {
+				KeywordUtil.logInfo("WinAppDriver is ready on 127.0.0.1:4723")
+				return
+			}
+			sleepMs(500)
+		}
+
+		KeywordUtil.markFailedAndStop("WinAppDriver did not start on port 4723")
+	}
+
+	private Map<String, String> queryMainWindow(String expectedTitle) {
+		String exact = escapePowerShell(expectedTitle)
+
+		String script = """
+\$ErrorActionPreference = 'SilentlyContinue'
+
+\$p = Get-Process |
+    Where-Object { \$_.MainWindowTitle -and \$_.MainWindowTitle.Trim() -eq '${exact}' } |
+    Select-Object -First 1 MainWindowTitle, MainWindowHandle
+
+if (-not \$p) {
+    \$p = Get-Process |
+        Where-Object { \$_.MainWindowTitle -and \$_.MainWindowTitle.Trim() -like '*${exact}*' } |
+        Select-Object -First 1 MainWindowTitle, MainWindowHandle
+}
+
+if (\$p) {
+    [PSCustomObject]@{
+        title  = [string]\$p.MainWindowTitle
+        handle = [string]\$p.MainWindowHandle
+    } | ConvertTo-Json -Compress
+}
+"""
+
+		String output = safe(runPowerShell(script))
+		if (!output) {
+			return [title: '', handle: '']
+		}
+
+		String jsonLine = output.readLines().find { it?.trim()?.startsWith('{') && it?.trim()?.endsWith('}') }
+		if (!jsonLine) {
+			return [title: '', handle: '']
+		}
+
+		try {
+			def parsed = new JsonSlurper().parseText(jsonLine)
+			return [
+				title : safe(parsed?.title),
+				handle: safe(parsed?.handle)
+			]
+		} catch (Throwable ignored) {
+			return [title: '', handle: '']
+		}
+	}
+
+	// =========================================================================
+	// SECTION 8 - OBJECTS
+	// =========================================================================
+
+	private WindowsTestObject appWindowObj(String title) {
+		WindowsTestObject obj = new WindowsTestObject('appWindow')
+		obj.setLocatorStrategy(LocatorStrategy.NAME)
+		obj.setLocator(title)
+		return obj
+	}
+
+	private WindowsTestObject envComboObj() {
+		WindowsTestObject repoObj = firstExistingObject([
+			'Login Page/optEnv',
+			'Connection/cmbEnvironment',
+			'General/cmbEnvironment',
+			'Login/cmbEnvironment'
+		])
+
+		if (repoObj != null) {
+			return repoObj
+		}
+
+		return winObj(
+			'envCombo',
+			"(//*[@LocalizedControlType='combo box' or contains(@ClassName,'ComboBox')])[1]"
+		)
+	}
+
+	private WindowsTestObject comboListItemObj(String displayValue) {
+		return winObj(
+			'envListItem',
+			"//*[@Name=${xpathLiteral(displayValue)}]"
+		)
+	}
+
+	private WindowsTestObject connectBtnObj() {
+		WindowsTestObject repoObj = firstExistingObject([
+			'Login Page/btnConnecter',
+			'Connection/btnConnect',
+			'General/btnConnect',
+			'Login/btnConnect'
+		])
+
+		if (repoObj != null) {
+			return repoObj
+		}
+
+		return winObj(
+			'connectBtn',
+			"//*[@Name='Se connecter' or @Name='Connect' or @Name='Log in']"
+		)
+	}
+
+	private WindowsTestObject mainSearchObj() {
+		WindowsTestObject repoObj = firstExistingObject([
+			'General/txtSearch'
+		])
+
+		if (repoObj != null) {
+			return repoObj
+		}
+
+		return winObj(
+			'mainSearch',
+			"//*[@Name='Type keywords here' or contains(@Name,'keywords')]"
+		)
+	}
+
+	private WindowsTestObject homeTabObj() {
+		WindowsTestObject repoObj = firstExistingObject([
+			'General/tabHome',
+			'General/homeTab'
+		])
+
+		if (repoObj != null) {
+			return repoObj
+		}
+
+		return winObj(
+			'homeTab',
+			"//*[@Name='Accueil' or @Name='Home']"
+		)
+	}
+
+	private WindowsTestObject firstExistingObject(List<String> objectIds) {
+		for (String id : objectIds) {
+			try {
+				WindowsTestObject obj = findWindowsObject(id)
+				if (obj != null) {
+					return obj
+				}
+			} catch (Throwable ignored) {
+			}
+		}
+		return null
+	}
+
+	private WindowsTestObject winObj(String id, String xpath) {
+		WindowsTestObject obj = new WindowsTestObject(id)
+		obj.setLocatorStrategy(LocatorStrategy.XPATH)
+		obj.setLocator(xpath)
+		return obj
+	}
+
+	private boolean waitPresent(WindowsTestObject obj, int timeoutSeconds) {
+		try {
+			return obj != null && Windows.waitForElementPresent(obj, timeoutSeconds, FailureHandling.OPTIONAL)
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	// =========================================================================
+	// SECTION 9 - DATA / TITLE / ENV
+	// =========================================================================
+
+	private String resolveTargetVersion() {
+		String gv = safe(GlobalVariable.version)
+		if (gv) {
+			return gv
+		}
+
+		String envValue = normalizeEnvCode(safe(GlobalVariable.env) ?: 'REC')
+
+		try {
+			def td
+			try {
+				td = findTestData('refLogin')
+			} catch (Throwable ignored) {
+				td = findTestData('Data Files/refLogin')
+			}
+
+			if (td != null) {
+				int rows = td.getRowNumbers()
+				for (int row = 1; row <= rows; row++) {
+					String rowEnv = normalizeEnvCode(safe(td.getValue('Env 1', row)))
+					String rowVersion = safe(td.getValue('Version', row))
+
+					if (rowEnv == envValue && rowVersion) {
+						return rowVersion
+					}
+				}
+			}
+		} catch (Throwable ignored) {
+		}
+
+		return ''
+	}
+
+	private String normalizeResolvedTitle(String versionOrTitle) {
+		String value = safe(versionOrTitle)
+		if (!value) {
+			return 'eMatch'
+		}
+
+		value = value.replaceAll('\\s+', ' ').trim()
+
+		if (value.toLowerCase().startsWith('ematch ')) {
+			return normalizeTitle(value)
+		}
+
+		return normalizeTitle("eMatch ${value}")
+	}
+
+	private String resolveEnvironmentDisplayValue(String env) {
+		String normalized = normalizeEnvCode(env)
+
+		Map<String, String> displayValues = [
+			'PROD' : 'Production (PROD)',
+			'PREPO': 'Bench (PREPO)',
+			'REC2' : 'Qualification (REC2)',
+			'REC'  : 'Recette (REC)',
+			'DEV2' : 'Simulation (DEV2)',
+			'DEV'  : 'Développement (DEV)'
+		]
+
+		return displayValues.containsKey(normalized) ? displayValues[normalized] : 'Recette (REC)'
+	}
+
+	private String normalizeEnvCode(String env) {
+		String value = safe(env).toUpperCase()
+
+		if (!value) {
+			return 'REC'
+		}
+
+		if (value == 'PROD') return 'PROD'
+		if (value == 'PREPO' || value == 'PREX') return 'PREPO'
+		if (value == 'REC2') return 'REC2'
+		if (value == 'REC') return 'REC'
+		if (value == 'DEV2') return 'DEV2'
+		if (value == 'DEV') return 'DEV'
+
+		return value
+	}
+
+	// =========================================================================
+	// SECTION 10 - POWERSHELL / SYSTEM
+	// =========================================================================
+
+	private boolean fileExists(String path) {
+		String value = safe(path)
+		return value && new File(value).exists()
+	}
+
+	private boolean imageFileExists(String path) {
+		return fileExists(path)
+	}
+
+	private boolean isPortOpen(String host, int port, int timeoutMs) {
+		try {
+			Socket socket = new Socket()
+			socket.connect(new InetSocketAddress(host, port), timeoutMs)
+			socket.close()
+			return true
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private String runPowerShell(String script) {
+		Process process = new ProcessBuilder(
+			'powershell.exe',
+			'-NoProfile',
+			'-ExecutionPolicy', 'Bypass',
+			'-Command', script
+		)
+		.redirectErrorStream(true)
+		.start()
+
+		String output = process.inputStream.getText('UTF-8')
+		process.waitFor()
+		return safe(output)
+	}
+
+	// =========================================================================
+	// SECTION 11 - ROBOT / FOCUS
+	// =========================================================================
+
+	private Robot robot() {
+		if (cachedRobot == null) {
+			cachedRobot = new Robot()
+			cachedRobot.setAutoDelay(100)
+		}
+		return cachedRobot
+	}
+
+	private void robotKey(int keyCode) {
+		Robot r = robot()
+		r.keyPress(keyCode)
+		r.keyRelease(keyCode)
+		sleepMs(150)
+	}
+
+	private void focusLoginWindow(String title) {
+		String targetTitle = normalizeTitle(safe(title) ?: safe(detectedWindowTitle) ?: resolveWindowTitle())
+
+		try {
+			Windows.switchToDesktop()
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			Windows.switchToWindow(appWindowObj(targetTitle))
+			sleepMs(700)
+		} catch (Throwable ignored) {
+		}
+	}
+
+	// =========================================================================
+	// SECTION 12 - IMAGE ACTIONS
+	// =========================================================================
+
+	private boolean clickImageWithAttempts(String imagePath, int attempts, long delayMs, String actionLabel) {
+		String path = safe(imagePath)
+
+		if (!path) {
+			return false
+		}
+
+		if (!imageFileExists(path)) {
+			KeywordUtil.logInfo("Image file was not found for action: ${actionLabel} :: ${path}")
+			return false
+		}
+
+		for (int i = 1; i <= attempts; i++) {
+			try {
+				KeywordUtil.logInfo("${actionLabel}. Attempt ${i}/${attempts} using ${path}")
+				WindowsImageKeywords.clickImage(path)
+				sleepMs(delayMs)
+				return true
+			} catch (Throwable ignored) {
+				sleepMs(delayMs)
+			}
+		}
+
+		return false
+	}
+
+	// =========================================================================
+	// SECTION 13 - GENERIC UTILS
+	// =========================================================================
+
+	private void sleepMs(long ms) {
+		try {
+			Thread.sleep(ms)
+		} catch (InterruptedException ignored) {
+			Thread.currentThread().interrupt()
+		}
+	}
+
+	private String normalizeTitle(String value) {
+		return safe(value).replaceAll('\\s+', ' ').trim()
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : value.toString().trim()
+	}
+
+	private String escapePowerShell(String value) {
+		return safe(value).replace("'", "''")
+	}
+
+	private String xpathLiteral(String value) {
+		String v = safe(value)
+
+		if (!v.contains("'")) {
+			return "'${v}'"
+		}
+
+		if (!v.contains('"')) {
+			return "\"${v}\""
+		}
+
+		List<String> parts = v.split("'").collect { "'${it}'" }
+		return "concat(${parts.join(", \"'\", ")})"
+	}
+}
 
 
