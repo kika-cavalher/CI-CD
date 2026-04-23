@@ -1,166 +1,226 @@
+package pageObject
 
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
 
-set "JOB_LABEL=Archive Mode"
-set "TEST_SUITE_COLLECTION=Test Suites/Archive Mode/Archive Mode Collection"
-set "EXECUTION_PROFILE=default"
-set "BROWSER_TYPE=Windows"
+import org.openqa.selenium.Keys
 
-set "STARTER_DIR=D:\Projects\eMatchStarters"
-set "CONTEXT_FILE=%STARTER_DIR%\run-context.properties"
-set "RESULT_FILE=%STARTER_DIR%\run-result.properties"
-set "LOG_FILE=%STARTER_DIR%\logs\run-ematch-command.log"
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
 
-set "GENERIC_TASK=\eMatch Automation\RunEMatchCommand"
-set "WIN_DRIVER_TASK=startWinDriver"
+import general.WinRetry
+import internal.GlobalVariable
 
-set "WAIT_SECONDS=5"
-set "MAX_WAIT_CYCLES=720"
-set "RUN_ID=%RANDOM%%RANDOM%%RANDOM%"
-set "EXPECTED_RUN_ID=%RUN_ID%"
+class authenticationKeywords {
 
-echo.
-echo ==================================================
-echo [INFO] Starting %JOB_LABEL%
-echo [INFO] WORKSPACE=%WORKSPACE%
-echo [INFO] TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
-echo [INFO] RUN_ID=%EXPECTED_RUN_ID%
-echo ==================================================
-echo.
+	@Keyword
+	def launchApplication(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
 
-if "%WORKSPACE%"=="" (
-    echo [ERROR] WORKSPACE is empty.
-    exit /b 1
-)
+		if (System.getProperty('user.name') == GlobalVariable.username) {
+			if (environment == 'REC') {
+				String cmd = 'Powershell.exe -executionpolicy remotesigned -File D:\\setResolution.ps1'
+				Runtime.getRuntime().exec(cmd)
+			}
 
-if not exist "%STARTER_DIR%" (
-    echo [ERROR] STARTER_DIR not found: %STARTER_DIR%
-    exit /b 1
-)
+			Windows.startApplicationWithTitle(
+					getShortcutPath(environment),
+					getVersion(environment)
+					)
+		} else {
+			if (environment == 'REC') {
+				startWinAppDriver()
+			}
 
-if not exist "%STARTER_DIR%\logs" mkdir "%STARTER_DIR%\logs"
+			Windows.startApplication(getApplicationPath(environment))
+		}
+	}
 
-schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
-schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-ping -n 3 127.0.0.1 >nul
+	@Keyword
+	def switchToVersionWindow(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
 
-del /f /q "%LOG_FILE%" >nul 2>nul
+		WindowsTestObject targetWindow = new WindowsTestObject()
+		targetWindow.setLocatorStrategy(LocatorStrategy.NAME)
+		targetWindow.setLocator(getVersion(environment))
 
-> "%CONTEXT_FILE%" (
-    echo RUN_ID=%EXPECTED_RUN_ID%
-    echo JOB_LABEL=%JOB_LABEL%
-    echo WORKSPACE=%WORKSPACE%
-    echo TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
-    echo EXECUTION_PROFILE=%EXECUTION_PROFILE%
-    echo BROWSER_TYPE=%BROWSER_TYPE%
-    echo KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
-)
+		int timeoutSec = 30
+		int delayInterval = 2
+		int elapsedTime = 0
+		boolean windowFound = false
 
-> "%RESULT_FILE%" (
-    echo RUN_ID=%EXPECTED_RUN_ID%
-    echo STATUS=QUEUED
-    echo EXIT_CODE=999
-    echo UPDATED_AT=%date% %time%
-)
+		while (elapsedTime < timeoutSec) {
+			try {
+				Windows.switchToDesktop()
+				Windows.switchToWindow(targetWindow)
+				windowFound = true
+				break
+			} catch (Exception e) {
+				KeywordUtil.logInfo("Unable to switch to the window: " + e.getMessage())
+				Windows.delay(delayInterval)
+				elapsedTime += delayInterval
+			}
+		}
 
-echo [INFO] Starting WinAppDriver task...
-schtasks /run /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Could not start scheduled task "%WIN_DRIVER_TASK%".
-    exit /b 1
-)
+		if (!windowFound) {
+			KeywordUtil.markFailed("Target window '" + targetWindow.getLocator() + "' could not be found within " + timeoutSec + " seconds.")
+		}
+	}
 
-echo [INFO] Starting visible Katalon task...
-schtasks /run /tn "%GENERIC_TASK%" >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Could not start scheduled task "%GENERIC_TASK%".
-    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-    exit /b 1
-)
+	@Keyword
+	def openEnvironmentSelector(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
 
-ping -n 4 127.0.0.1 >nul
+		if (!requiresEnvironmentSelection(environment)) {
+			KeywordUtil.logInfo("Environment selector is not required for " + environment + ".")
+			return
+		}
 
-set /a WAIT_COUNT=0
-set /a PING_WAIT=%WAIT_SECONDS%+1
+		WinRetry.clickWithRetry('Login Page/optEnv', 3, 10)
+		Windows.delay(20)
+	}
 
-:waitResult
-set /a WAIT_COUNT+=1
+	@Keyword
+	def selectEnvironment(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
 
-set "FILE_RUN_ID="
-set "STATUS="
-set "EXIT_CODE="
-set "UPDATED_AT="
+		if (!requiresEnvironmentSelection(environment)) {
+			KeywordUtil.logInfo("Environment selection is not required for " + environment + ".")
+			return
+		}
 
-for /f "usebackq tokens=1,* delims==" %%A in ("%RESULT_FILE%") do (
-    if /i "%%A"=="RUN_ID" set "FILE_RUN_ID=%%B"
-    if /i "%%A"=="STATUS" set "STATUS=%%B"
-    if /i "%%A"=="EXIT_CODE" set "EXIT_CODE=%%B"
-    if /i "%%A"=="UPDATED_AT" set "UPDATED_AT=%%B"
-)
+		int env = getEnvironmentIndex(environment)
 
-if !WAIT_COUNT! EQU 1 echo [INFO] Waiting result file update...
-if !WAIT_COUNT! EQU 2 echo [INFO] Still waiting result file update...
-if !WAIT_COUNT! EQU 3 echo [INFO] Still waiting...
-if !WAIT_COUNT! EQU 4 echo [INFO] Still waiting...
-if !WAIT_COUNT! EQU 5 echo [INFO] Still waiting...
+		for (int i = 0; i < env; i++) {
+			Windows.sendKeys(findWindowsObject('Login Page/optEnv'), Keys.chord(Keys.ARROW_DOWN))
+		}
 
-if not "!FILE_RUN_ID!"=="%EXPECTED_RUN_ID%" goto keepWaiting
-if /i "!STATUS!"=="FINISHED" goto resultDone
+		Windows.sendKeys(findWindowsObject('Login Page/optEnv'), Keys.chord(Keys.ENTER))
+		Windows.delay(7)
+	}
 
-:keepWaiting
-if !WAIT_COUNT! GEQ %MAX_WAIT_CYCLES% (
-    echo [ERROR] Timeout waiting run-result.properties update.
-    echo [ERROR] FILE_RUN_ID=!FILE_RUN_ID!
-    echo [ERROR] STATUS=!STATUS!
-    echo [ERROR] EXIT_CODE=!EXIT_CODE!
+	@Keyword
+	def clickConnectIfPresent(String targetEnvironment) {
+		boolean isButtonPresent = Windows.verifyElementPresent(
+				findWindowsObject('Login Page/btnConnecter'),
+				1,
+				FailureHandling.OPTIONAL
+				)
 
-    schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
-    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+		if (isButtonPresent) {
+			Windows.click(findWindowsObject('Login Page/btnConnecter'))
+			KeywordUtil.logInfo('Connect button was present and was clicked.')
+		} else {
+			KeywordUtil.logInfo('Connect button was not present. Continuing test execution.')
+		}
+	}
 
-    if exist "%LOG_FILE%" (
-        echo.
-        echo [INFO] Last lines from run-ematch-command.log:
-        powershell -NoProfile -Command "Get-Content -Path '%LOG_FILE%' -Tail 20"
-        echo.
-    )
+	@Keyword
+	def waitForMainScreen(String targetEnvironment) {
+		try {
+			Windows.waitForElementPresent(findWindowsObject('General/txtSearch'), 60)
+		} catch (Exception e) {
+		}
 
-    exit /b 1
-)
+		Windows.delay(10)
+	}
 
-ping -n !PING_WAIT! 127.0.0.1 >nul
-goto waitResult
+	@Keyword
+	def clickHomeTab(String targetEnvironment) {
+		String home = new File(RunConfiguration.getProjectDir(), 'Images/General/Home.PNG').getAbsolutePath()
+		String homeGrey = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeGrey.PNG').getAbsolutePath()
+		String homeWhite = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeWhite.PNG').getAbsolutePath()
 
-:resultDone
-echo.
-echo [INFO] Result file updated.
-echo [INFO] RUN_ID=!FILE_RUN_ID!
-echo [INFO] STATUS=!STATUS!
-echo [INFO] EXIT_CODE=!EXIT_CODE!
-echo [INFO] UPDATED_AT=!UPDATED_AT!
-echo.
+		try {
+			def activeTab = WindowsImageKeywords.findImage(homeGrey)
+			if (activeTab != null) {
+				KeywordUtil.logInfo('Home tab is already active.')
+				return
+			}
+		} catch (Exception e) {
+		}
 
-schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+		try {
+			def inactiveTab = WindowsImageKeywords.findImage(homeWhite)
+			if (inactiveTab != null) {
+				KeywordUtil.logInfo('Inactive Home tab found. Clicking to activate.')
+				WindowsImageKeywords.clickImage(homeWhite)
+				Windows.delay(5)
+				return
+			}
+		} catch (Exception e) {
+		}
 
-if not "!EXIT_CODE!"=="0" (
-    if exist "%LOG_FILE%" (
-        echo [INFO] Last lines from run-ematch-command.log:
-        powershell -NoProfile -Command "Get-Content -Path '%LOG_FILE%' -Tail 20"
-        echo.
-    )
+		WindowsImageKeywords.clickImage(home)
+		Windows.delay(5)
+	}
 
-    exit /b !EXIT_CODE!
-)
+	private String normalizeEnvironment(String targetEnvironment) {
+		if (targetEnvironment == null || targetEnvironment.trim().isEmpty()) {
+			return 'REC'
+		}
 
-echo [INFO] %JOB_LABEL% finished successfully.
-exit /b 0
+		return targetEnvironment.trim().toUpperCase()
+	}
 
+	private boolean requiresEnvironmentSelection(String environment) {
+		return environment != 'PRD'
+	}
 
+	private int getEnvironmentIndex(String environment) {
+		switch (environment) {
+			case 'PROD':
+				return 1
+			case 'PREX':
+				return 2
+			case 'REC2':
+				return 3
+			case 'REC':
+				return 4
+			case 'DEV2':
+				return 5
+			case 'DEV':
+				return 6
+			default:
+				return 4
+		}
+	}
 
-node('GI5_SWDCFRNXGI55817') {
-    checkout scm
-    bat 'call "%WORKSPACE%\\jenkins\\ArchiveMode.cmd"'
+	private String getVersion(String environment) {
+		switch (environment) {
+			case 'PRD':
+				return GlobalVariable.versionProd
+			default:
+				return GlobalVariable.version
+		}
+	}
+
+	private String getShortcutPath(String environment) {
+		switch (environment) {
+			case 'PRD':
+				return 'D:\\RunAseMatchPRD\\eMatch.lnk'
+			default:
+				return 'D:\\RunAseMatchReq\\eMatch.lnk'
+		}
+	}
+
+	private String getApplicationPath(String environment) {
+		switch (environment) {
+			case 'PRD':
+				return '\\\\cib.net\\soft\\ematch\\IHM\\PROD\\IXIS.Ematch.IHM.application'
+			default:
+				return '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\REC\\IXIS.Ematch.IHM.application'
+		}
+	}
+
+	private void startWinAppDriver() {
+		String command = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+		ProcessBuilder builder = new ProcessBuilder(command).inheritIO()
+		builder.start()
+	}
 }
-
-
-
