@@ -1,1 +1,1112 @@
+package jiraIntegration
 
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLConnection
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.util.Locale
+
+import javax.net.ssl.HostnameVerifier
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSession
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
+
+class JiraGateway {
+
+	private final String baseUrl
+	private final String token
+
+	JiraGateway(String baseUrl, String token) {
+		this.baseUrl = safe(baseUrl).replaceAll('/+$', '')
+		this.token = safe(token)
+	}
+
+	Map searchIssuesByJql(String jql, int maxResults = 50) {
+		return doJsonRequest(
+				'GET',
+				'/rest/api/2/search',
+				null,
+				[
+					jql        : safe(jql),
+					startAt    : '0',
+					maxResults : String.valueOf(maxResults),
+					fields     : 'summary,issuetype,created'
+				]
+		)
+	}
+
+	Map getIssueByKey(String issueKey) {
+		return doJsonRequest(
+				'GET',
+				'/rest/api/2/issue/' + encodePath(issueKey),
+				null,
+				[:]
+		)
+	}
+
+	Map createTestPlan(
+			String projectKey,
+			String summary,
+			String issueTypeId,
+			String epicFieldId,
+			String epicKey,
+			String assigneeName
+	) {
+		Map fields = [
+			project   : [key: safe(projectKey)],
+			summary   : safe(summary),
+			issuetype : [id: safe(issueTypeId)]
+		]
+
+		if (!blank(epicFieldId) && !blank(epicKey)) {
+			fields[epicFieldId] = safe(epicKey)
+		}
+
+		if (!blank(assigneeName) && !isAutomaticAssignee(assigneeName)) {
+			fields.assignee = [name: safe(assigneeName)]
+		}
+
+		return doJsonRequest(
+				'POST',
+				'/rest/api/2/issue',
+				[fields: fields],
+				[:]
+		)
+	}
+
+	Map updateIssueFields(String issueKey, Map fields) {
+		return doJsonRequest(
+				'PUT',
+				'/rest/api/2/issue/' + encodePath(issueKey),
+				[fields: fields ?: [:]],
+				[:]
+		)
+	}
+
+	Map updateIssueSummary(String issueKey, String summary) {
+		return updateIssueFields(issueKey, [summary: safe(summary)])
+	}
+
+	Map importExecutionResults(File junitXmlFile, String projectKey, String testPlanKey) {
+		if (junitXmlFile == null || !junitXmlFile.exists()) {
+			return [
+				status : 0,
+				body   : 'JUnit XML file was not found.',
+				json   : null
+			]
+		}
+
+		Map query = [projectKey: safe(projectKey)]
+
+		if (!blank(testPlanKey)) {
+			query.testPlanKey = safe(testPlanKey)
+		}
+
+		Map rawResponse = doRawFileRequest(
+				'POST',
+				'/rest/raven/1.0/import/execution/junit',
+				query,
+				junitXmlFile,
+				'text/xml; charset=UTF-8',
+				[:]
+		)
+
+		if (isSuccessStatus(rawResponse.status)) {
+			return rawResponse
+		}
+
+		Map multipartResponse = doMultipartRequest(
+				'POST',
+				'/rest/raven/1.0/import/execution/junit',
+				query,
+				[
+					[fileField: 'file', file: junitXmlFile, contentType: 'application/xml']
+				],
+				[:]
+		)
+
+		if (isSuccessStatus(multipartResponse.status)) {
+			return multipartResponse
+		}
+
+		return [
+			status : multipartResponse.status ?: rawResponse.status,
+			body   : 'Raw XML response: ' + safe(rawResponse.body) + '\nMultipart fallback response: ' + safe(multipartResponse.body),
+			json   : multipartResponse.json ?: rawResponse.json
+		]
+	}
+
+	Map addExecutionToTestPlan(String testPlanKey, String executionKey) {
+		if (blank(testPlanKey) || blank(executionKey)) {
+			return [
+				status : 0,
+				body   : 'Test Plan key or Test Execution key is empty.',
+				json   : null
+			]
+		}
+
+		List<Closure<Map>> attempts = []
+
+		attempts << {
+			doJsonRequest(
+					'POST',
+					'/rest/raven/1.0/api/testplan/' + encodePath(testPlanKey) + '/testexecution',
+					[executionKey],
+					[:]
+			)
+		}
+
+		attempts << {
+			doJsonRequest(
+					'POST',
+					'/rest/raven/1.0/api/testplan/' + encodePath(testPlanKey) + '/testexecution',
+					[add: [executionKey]],
+					[:]
+			)
+		}
+
+		attempts << {
+			doJsonRequest(
+					'POST',
+					'/rest/raven/1.0/api/testplan/' + encodePath(testPlanKey) + '/testexecution/' + encodePath(executionKey),
+					null,
+					[:]
+			)
+		}
+
+		Map lastResponse = [status: 0, body: 'No attempt executed.', json: null]
+
+		for (Closure<Map> attempt : attempts) {
+			try {
+				lastResponse = attempt.call()
+				if (isSuccessStatus(lastResponse.status)) {
+					return lastResponse
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		return lastResponse
+	}
+
+	Map attachFile(String issueKey, File file) {
+		if (file == null || !file.exists()) {
+			return [
+				status : 0,
+				body   : 'Attachment file was not found.',
+				json   : null
+			]
+		}
+
+		return doMultipartRequest(
+				'POST',
+				'/rest/api/2/issue/' + encodePath(issueKey) + '/attachments',
+				[:],
+				[
+					[fileField: 'file', file: file, contentType: guessContentType(file)]
+				],
+				[
+					'X-Atlassian-Token': 'no-check'
+				]
+		)
+	}
+
+	private Map doJsonRequest(String method, String path, Object bodyObject, Map queryParams) {
+		HttpURLConnection connection = null
+
+		try {
+			connection = openConnection(method, path, queryParams)
+
+			connection.setRequestProperty('Accept', 'application/json')
+			connection.setRequestProperty('Authorization', 'Bearer ' + token)
+
+			if (bodyObject != null) {
+				connection.setDoOutput(true)
+				connection.setRequestProperty('Content-Type', 'application/json; charset=UTF-8')
+
+				byte[] payload = JsonOutput.toJson(bodyObject).getBytes(StandardCharsets.UTF_8)
+
+				connection.getOutputStream().withCloseable { OutputStream os ->
+					os.write(payload)
+					os.flush()
+				}
+			}
+
+			int status = connection.getResponseCode()
+			String body = readResponseBody(connection)
+			Object json = tryParseJson(body)
+
+			return [
+				status : status,
+				body   : body,
+				json   : json
+			]
+		} finally {
+			try {
+				connection?.disconnect()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private Map doRawFileRequest(
+			String method,
+			String path,
+			Map queryParams,
+			File file,
+			String contentType,
+			Map<String, String> extraHeaders
+	) {
+		HttpURLConnection connection = null
+
+		try {
+			connection = openConnection(method, path, queryParams)
+
+			connection.setDoOutput(true)
+			connection.setRequestProperty('Authorization', 'Bearer ' + token)
+			connection.setRequestProperty('Accept', 'application/json')
+			connection.setRequestProperty('Content-Type', blank(contentType) ? 'application/octet-stream' : contentType)
+
+			extraHeaders?.each { String key, String value ->
+				connection.setRequestProperty(key, value)
+			}
+
+			connection.getOutputStream().withCloseable { OutputStream os ->
+				file.withInputStream { InputStream is ->
+					byte[] buffer = new byte[8192]
+					int len
+					while ((len = is.read(buffer)) != -1) {
+						os.write(buffer, 0, len)
+					}
+				}
+				os.flush()
+			}
+
+			int status = connection.getResponseCode()
+			String body = readResponseBody(connection)
+			Object json = tryParseJson(body)
+
+			return [
+				status : status,
+				body   : body,
+				json   : json
+			]
+		} finally {
+			try {
+				connection?.disconnect()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private Map doMultipartRequest(
+			String method,
+			String path,
+			Map queryParams,
+			List<Map> files,
+			Map<String, String> extraHeaders
+	) {
+		HttpURLConnection connection = null
+
+		try {
+			connection = openConnection(method, path, queryParams)
+
+			String boundary = '----KatalonBoundary' + System.currentTimeMillis()
+
+			connection.setDoOutput(true)
+			connection.setRequestProperty('Authorization', 'Bearer ' + token)
+			connection.setRequestProperty('Accept', 'application/json')
+			connection.setRequestProperty('Content-Type', 'multipart/form-data; boundary=' + boundary)
+
+			extraHeaders?.each { String key, String value ->
+				connection.setRequestProperty(key, value)
+			}
+
+			connection.getOutputStream().withCloseable { OutputStream os ->
+				files?.each { Map item ->
+					File file = item.file as File
+
+					if (file != null && file.exists()) {
+						writeFilePart(
+								os,
+								boundary,
+								safe(item.fileField),
+								file,
+								safe(item.contentType)
+						)
+					}
+				}
+
+				os.write(("--${boundary}--\r\n").getBytes(StandardCharsets.UTF_8))
+				os.flush()
+			}
+
+			int status = connection.getResponseCode()
+			String body = readResponseBody(connection)
+			Object json = tryParseJson(body)
+
+			return [
+				status : status,
+				body   : body,
+				json   : json
+			]
+		} finally {
+			try {
+				connection?.disconnect()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private HttpURLConnection openConnection(String method, String path, Map queryParams) {
+		enableTrustAllSsl()
+
+		String fullUrl = buildUrl(path, queryParams)
+		HttpURLConnection connection = (HttpURLConnection) new URL(fullUrl).openConnection()
+
+		if (connection instanceof HttpsURLConnection) {
+			((HttpsURLConnection) connection).setHostnameVerifier(TRUST_ALL_HOSTNAME_VERIFIER)
+		}
+
+		connection.setRequestMethod(method)
+		connection.setUseCaches(false)
+		connection.setConnectTimeout(60000)
+		connection.setReadTimeout(120000)
+		connection.setInstanceFollowRedirects(false)
+
+		return connection
+	}
+
+	private String buildUrl(String path, Map queryParams) {
+		StringBuilder url = new StringBuilder()
+		url.append(baseUrl)
+		url.append(path.startsWith('/') ? path : '/' + path)
+
+		if (queryParams != null && !queryParams.isEmpty()) {
+			List<String> parts = []
+
+			queryParams.each { Object key, Object value ->
+				if (value != null && safe(value).length() > 0) {
+					parts << encodeQuery(key) + '=' + encodeQuery(value)
+				}
+			}
+
+			if (!parts.isEmpty()) {
+				url.append('?')
+				url.append(parts.join('&'))
+			}
+		}
+
+		return url.toString()
+	}
+
+	private void writeFilePart(OutputStream os, String boundary, String fieldName, File file, String contentType) {
+		StringBuilder sb = new StringBuilder()
+		sb.append('--').append(boundary).append('\r\n')
+		sb.append('Content-Disposition: form-data; name="').append(fieldName).append('"; filename="').append(file.getName()).append('"\r\n')
+		sb.append('Content-Type: ').append(blank(contentType) ? 'application/octet-stream' : contentType).append('\r\n\r\n')
+
+		os.write(sb.toString().getBytes(StandardCharsets.UTF_8))
+
+		file.withInputStream { InputStream is ->
+			byte[] buffer = new byte[8192]
+			int len
+
+			while ((len = is.read(buffer)) != -1) {
+				os.write(buffer, 0, len)
+			}
+		}
+
+		os.write('\r\n'.getBytes(StandardCharsets.UTF_8))
+	}
+
+	private String readResponseBody(HttpURLConnection connection) {
+		InputStream stream = null
+
+		try {
+			stream = connection.getResponseCode() >= 400 ? connection.getErrorStream() : connection.getInputStream()
+
+			if (stream == null) {
+				return ''
+			}
+
+			return stream.getText('UTF-8')
+		} catch (Exception ignored) {
+			return ''
+		} finally {
+			try {
+				stream?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private Object tryParseJson(String body) {
+		String text = safe(body)
+
+		if (text.isEmpty()) {
+			return null
+		}
+
+		try {
+			return new JsonSlurper().parseText(text)
+		} catch (Exception ignored) {
+			return null
+		}
+	}
+
+	private String guessContentType(File file) {
+		String name = safe(file?.name).toLowerCase(Locale.ENGLISH)
+
+		if (name.endsWith('.html') || name.endsWith('.htm')) return 'text/html'
+		if (name.endsWith('.xml')) return 'application/xml'
+		if (name.endsWith('.zip')) return 'application/zip'
+		if (name.endsWith('.png')) return 'image/png'
+		if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg'
+		if (name.endsWith('.json')) return 'application/json'
+		if (name.endsWith('.txt') || name.endsWith('.log')) return 'text/plain'
+		if (name.endsWith('.csv')) return 'text/csv'
+
+		String byName = URLConnection.guessContentTypeFromName(file.name)
+		return blank(byName) ? 'application/octet-stream' : byName
+	}
+
+	private String encodeQuery(Object value) {
+		return URLEncoder.encode(safe(value), 'UTF-8')
+	}
+
+	private String encodePath(Object value) {
+		return safe(value).replace(' ', '%20')
+	}
+
+	private boolean isAutomaticAssignee(String value) {
+		String text = safe(value).toLowerCase(Locale.ENGLISH)
+		return text == '-1' || text == 'automatic'
+	}
+
+	private boolean isSuccessStatus(Object status) {
+		int code = 0
+		try {
+			code = Integer.parseInt(String.valueOf(status))
+		} catch (Exception ignored) {
+			code = 0
+		}
+
+		return code >= 200 && code < 300
+	}
+
+	private boolean blank(String value) {
+		return safe(value).isEmpty()
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+
+	private static boolean SSL_READY = false
+
+	private static final HostnameVerifier TRUST_ALL_HOSTNAME_VERIFIER = new HostnameVerifier() {
+		@Override
+		boolean verify(String hostname, SSLSession session) {
+			return true
+		}
+	}
+
+	private static synchronized void enableTrustAllSsl() {
+		if (SSL_READY) {
+			return
+		}
+
+		TrustManager[] trustManagers = [
+			new X509TrustManager() {
+				@Override
+				void checkClientTrusted(X509Certificate[] chain, String authType) {
+				}
+
+				@Override
+				void checkServerTrusted(X509Certificate[] chain, String authType) {
+				}
+
+				@Override
+				X509Certificate[] getAcceptedIssuers() {
+					return new X509Certificate[0]
+				}
+			}
+		] as TrustManager[]
+
+		SSLContext sslContext = SSLContext.getInstance('TLS')
+		sslContext.init(null, trustManagers, new SecureRandom())
+
+		HttpsURLConnection.setDefaultSSLSocketFactory(sslContext.getSocketFactory())
+		HttpsURLConnection.setDefaultHostnameVerifier(TRUST_ALL_HOSTNAME_VERIFIER)
+
+		SSL_READY = true
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+import internal.GlobalVariable
+
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+class JiraFlowCoordinator {
+
+	private static final String JIRA_BASE_URL = 'https://jira-mut.d.bbg'
+	private static final String PROJECT_KEY = 'GI5PRD'
+	private static final String TEST_PLAN_ISSUE_TYPE_ID = '10604'
+	private static final String EPIC_LINK_FIELD_ID = 'customfield_10006'
+
+	private static final String DEFAULT_EPIC_KEY = 'GI5PRD-9877'
+	private static final String TEST_PLAN_ASSIGNEE = 'cavalherer'
+
+	private static final boolean FORCE_CREATE_NEW_TEST_PLAN = false
+
+	private static final String JIRA_TOKEN = ''
+
+	private static final List<String> IGNORED_REPORT_FOLDER_TOKENS = [
+		'jira import',
+		'jira integration'
+	]
+
+	@Keyword
+	String jiraImport(String epicKey = '') {
+		try {
+			KeywordUtil.logInfo('============================================================')
+			KeywordUtil.logInfo('Starting Jira import flow')
+			KeywordUtil.logInfo('============================================================')
+
+			String token = resolveToken()
+
+			if (blank(token)) {
+				throw new RuntimeException('JIRA token is empty. Fill JIRA_TOKEN or GlobalVariable.JIRA_TOKEN or env JIRA_TOKEN.')
+			}
+
+			String effectiveEpicKey = !blank(epicKey) ? safe(epicKey) : DEFAULT_EPIC_KEY
+
+			File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+			File reportFolder = locateTargetReportFolder()
+			File latestRunFolder = findLatestRunFolder(reportsRoot)
+			File junitXml = findJUnitXml(reportFolder)
+
+			if (reportFolder == null || !reportFolder.exists()) {
+				throw new RuntimeException('Could not locate the target report folder.')
+			}
+
+			if (junitXml == null || !junitXml.exists()) {
+				throw new RuntimeException('JUnit XML was not found inside the selected report folder.')
+			}
+
+			String suiteName = resolveSuiteName(reportFolder)
+			String executionTitle = buildExecutionTitle(suiteName, latestRunFolder)
+
+			KeywordUtil.logInfo('Using report folder: ' + reportFolder.absolutePath)
+			KeywordUtil.logInfo('Suite name detected from report path: ' + suiteName)
+			KeywordUtil.logInfo('Execution title used: ' + executionTitle)
+			KeywordUtil.logInfo('Test Plan title used: ' + suiteName + ' Test Plan')
+			KeywordUtil.logInfo('Epic key used: ' + effectiveEpicKey)
+			KeywordUtil.logInfo('Assignee used on Test Plan: ' + TEST_PLAN_ASSIGNEE)
+			KeywordUtil.logInfo('JUnit XML found: ' + junitXml.absolutePath)
+
+			File customReport = buildCustomHtmlReport(reportFolder, suiteName, executionTitle)
+			KeywordUtil.logInfo('Custom Jira report created: ' + customReport.absolutePath)
+
+			File resultsZip = new File(reportFolder, 'Results.zip')
+			createZipFromFolder(reportFolder, resultsZip, [
+				'Results.zip',
+				'Evidences.zip'
+			])
+			KeywordUtil.logInfo('Results ZIP created: ' + resultsZip.absolutePath)
+
+			File evidencesZip = createEvidencesZip(reportFolder)
+			if (evidencesZip != null && evidencesZip.exists()) {
+				KeywordUtil.logInfo('Evidences ZIP created: ' + evidencesZip.absolutePath)
+			}
+
+			JiraGateway gateway = new JiraGateway(JIRA_BASE_URL, token)
+
+			JiraTestPlanManager testPlanManager = new JiraTestPlanManager(
+					gateway,
+					PROJECT_KEY,
+					TEST_PLAN_ISSUE_TYPE_ID,
+					EPIC_LINK_FIELD_ID,
+					effectiveEpicKey,
+					TEST_PLAN_ASSIGNEE
+			)
+
+			String testPlanKey = testPlanManager.getOrCreateTestPlanKey(
+					suiteName,
+					'',
+					FORCE_CREATE_NEW_TEST_PLAN
+			)
+
+			List<File> attachments = []
+			attachments << customReport
+			attachments << resultsZip
+
+			if (evidencesZip != null && evidencesZip.exists()) {
+				attachments << evidencesZip
+			}
+
+			File traceLog = new File(reportFolder, '_custom_report_trace.log')
+			if (traceLog.exists()) {
+				attachments << traceLog
+			}
+
+			File legacyTraceLog = new File(reportFolder, 'custom-report-trace.log')
+			if (legacyTraceLog.exists()) {
+				attachments << legacyTraceLog
+			}
+
+			File executionLog = new File(reportFolder, 'execution0.log')
+			if (executionLog.exists()) {
+				attachments << executionLog
+			}
+
+			JiraExecutionPublisher publisher = new JiraExecutionPublisher(gateway)
+
+			Map publishResponse = publisher.publishExecution([
+				junitXml       : junitXml,
+				customReport   : customReport,
+				reportFolder   : reportFolder,
+				projectKey     : PROJECT_KEY,
+				testPlanKey    : testPlanKey,
+				executionTitle : executionTitle,
+				attachments    : attachments
+			])
+
+			String executionKey = safe(publishResponse.executionKey)
+
+			KeywordUtil.logInfo('Jira import completed successfully.')
+			KeywordUtil.logInfo('Test Plan key: ' + testPlanKey)
+			KeywordUtil.logInfo('Execution key: ' + executionKey)
+			KeywordUtil.logInfo('============================================================')
+
+			return executionKey
+		} catch (Exception e) {
+			KeywordUtil.markFailed('Jira import failed: ' + safe(e.message))
+			throw e
+		}
+	}
+
+	private File buildCustomHtmlReport(File reportFolder, String suiteName, String executionTitle) {
+		JiraReportBuilder reportBuilder = new JiraReportBuilder()
+		File customReport = reportBuilder.buildReport(reportFolder, suiteName, executionTitle)
+
+		if (customReport == null || !customReport.exists()) {
+			throw new RuntimeException('Custom HTML report was not generated.')
+		}
+
+		return customReport
+	}
+
+	private String resolveToken() {
+		if (!blank(JIRA_TOKEN)) {
+			return JIRA_TOKEN
+		}
+
+		String envToken = System.getenv('JIRA_TOKEN')
+		if (!blank(envToken)) {
+			return envToken
+		}
+
+		List<String> candidates = [
+			'JIRA_TOKEN',
+			'jiraToken',
+			'jira_token',
+			'JiraToken',
+			'TOKEN'
+		]
+
+		for (String fieldName : candidates) {
+			try {
+				def value = GlobalVariable."${fieldName}"
+				if (!blank(safe(value))) {
+					return safe(value)
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		return ''
+	}
+
+	private File locateTargetReportFolder() {
+		File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+		File latestRunFolder = findLatestRunFolder(reportsRoot)
+
+		if (latestRunFolder == null || !latestRunFolder.exists()) {
+			throw new RuntimeException('No timestamp report folder was found under Reports.')
+		}
+
+		List<File> candidates = collectCandidateReportFolders(latestRunFolder)
+
+		if (candidates.isEmpty()) {
+			candidates = collectCandidateReportFolders(reportsRoot)
+		}
+
+		if (candidates.isEmpty()) {
+			throw new RuntimeException('No main suite report folder with JUnit_Report.xml was found.')
+		}
+
+		candidates = candidates
+				.unique { File f -> f.absolutePath }
+				.sort { File a, File b ->
+					int scoreDiff = scoreReportFolder(b) <=> scoreReportFolder(a)
+					if (scoreDiff != 0) {
+						return scoreDiff
+					}
+					return b.lastModified() <=> a.lastModified()
+				}
+
+		return candidates[0]
+	}
+
+	private List<File> collectCandidateReportFolders(File searchRoot) {
+		List<File> result = []
+
+		if (searchRoot == null || !searchRoot.exists()) {
+			return result
+		}
+
+		searchRoot.eachFileRecurse { File dir ->
+			if (!dir.isDirectory()) {
+				return
+			}
+
+			if (isIgnoredReportFolder(dir)) {
+				return
+			}
+
+			if (hasDirectJUnit(dir)) {
+				result << dir
+			}
+		}
+
+		return result
+	}
+
+	private boolean hasDirectJUnit(File dir) {
+		return new File(dir, 'JUnit_Report.xml').exists() || new File(dir, 'cucumber.xml').exists()
+	}
+
+	private boolean isIgnoredReportFolder(File dir) {
+		String lowerName = safe(dir.name).toLowerCase(Locale.ENGLISH)
+		String lowerPath = safe(dir.absolutePath).toLowerCase(Locale.ENGLISH)
+
+		if (lowerName.contains('collection')) {
+			return true
+		}
+
+		return IGNORED_REPORT_FOLDER_TOKENS.any { String token ->
+			lowerName.contains(token) || lowerPath.contains(token)
+		}
+	}
+
+	private int scoreReportFolder(File dir) {
+		int score = 0
+		String lowerPath = safe(dir.absolutePath).toLowerCase(Locale.ENGLISH)
+
+		if (new File(dir, 'JUnit_Report.xml').exists()) {
+			score += 50
+		}
+		if (!lowerPath.contains('jira integration')) {
+			score += 30
+		}
+		if (!lowerPath.contains('jira import')) {
+			score += 20
+		}
+
+		return score
+	}
+
+	private String resolveSuiteName(File reportFolder) {
+		String current = safe(reportFolder?.name)
+		String parent = safe(reportFolder?.parentFile?.name)
+
+		if (!parent.isEmpty() && !looksLikeTimestamp(parent)) {
+			return parent
+		}
+
+		if (!current.isEmpty() && !looksLikeTimestamp(current)) {
+			return current
+		}
+
+		return parent
+	}
+
+	private boolean looksLikeTimestamp(String value) {
+		String text = safe(value)
+		return text.matches('\\d{8}_\\d{6}.*') || text.matches('\\d+')
+	}
+
+	private File findLatestRunFolder(File reportsRoot) {
+		if (reportsRoot == null || !reportsRoot.exists()) {
+			return null
+		}
+
+		List<File> folders = reportsRoot.listFiles()?.findAll { File file ->
+			file.isDirectory()
+		} ?: []
+
+		if (folders.isEmpty()) {
+			return null
+		}
+
+		folders = folders.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		return folders[0]
+	}
+
+	private File findJUnitXml(File reportFolder) {
+		if (reportFolder == null || !reportFolder.exists()) {
+			return null
+		}
+
+		List<File> xmls = []
+
+		reportFolder.eachFileRecurse { File file ->
+			if (file.isFile() && (
+					file.name.equalsIgnoreCase('JUnit_Report.xml') ||
+					file.name.equalsIgnoreCase('cucumber.xml')
+			)) {
+				xmls << file
+			}
+		}
+
+		if (xmls.isEmpty()) {
+			return null
+		}
+
+		xmls = xmls.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		return xmls[0]
+	}
+
+	private String buildExecutionTitle(String suiteName, File latestRunFolder) {
+		String formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(new Date())
+
+		if (latestRunFolder != null) {
+			try {
+				Date parsed = new SimpleDateFormat('yyyyMMdd_HHmmss').parse(latestRunFolder.name)
+				formattedDate = new SimpleDateFormat('yyyy-MM-dd HH.mm.ss').format(parsed)
+			} catch (Exception ignored) {
+			}
+		}
+
+		return safe(suiteName) + ' ' + formattedDate
+	}
+
+	private void createZipFromFolder(File sourceFolder, File targetZip, List<String> excludedNames) {
+		if (sourceFolder == null || !sourceFolder.exists()) {
+			return
+		}
+
+		if (targetZip.exists()) {
+			targetZip.delete()
+		}
+
+		Set<String> excluded = (excludedNames ?: [])
+				.collect { String name -> safe(name).toLowerCase(Locale.ENGLISH) } as Set<String>
+
+		ZipOutputStream zos = null
+
+		try {
+			zos = new ZipOutputStream(new FileOutputStream(targetZip))
+
+			sourceFolder.eachFileRecurse { File file ->
+				if (!file.isFile()) {
+					return
+				}
+
+				String lowerName = safe(file.name).toLowerCase(Locale.ENGLISH)
+
+				if (excluded.contains(lowerName)) {
+					return
+				}
+
+				if (safe(file.absolutePath).equalsIgnoreCase(safe(targetZip.absolutePath))) {
+					return
+				}
+
+				if (!isReadableFile(file)) {
+					KeywordUtil.logInfo('Skipping unreadable file while building Results.zip: ' + file.absolutePath)
+					return
+				}
+
+				String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+
+				try {
+					ZipEntry entry = new ZipEntry(relativePath)
+					zos.putNextEntry(entry)
+					writeFileToZip(file, zos)
+					zos.closeEntry()
+				} catch (Exception e) {
+					try {
+						zos.closeEntry()
+					} catch (Exception ignored) {
+					}
+					KeywordUtil.logInfo('Skipping file while building Results.zip: ' + file.absolutePath + ' Reason: ' + safe(e.message))
+				}
+			}
+		} finally {
+			try {
+				zos?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private File createEvidencesZip(File sourceFolder) {
+		if (sourceFolder == null || !sourceFolder.exists()) {
+			return null
+		}
+
+		List<File> filesToZip = []
+
+		sourceFolder.eachFileRecurse { File file ->
+			if (!file.isFile()) {
+				return
+			}
+
+			String name = safe(file.name).toLowerCase(Locale.ENGLISH)
+
+			boolean isImage =
+					name.endsWith('.png') ||
+					name.endsWith('.jpg') ||
+					name.endsWith('.jpeg') ||
+					name.endsWith('.gif') ||
+					name.endsWith('.bmp') ||
+					name.endsWith('.webp')
+
+			boolean isUsefulLog =
+					name == '_custom_report_trace.log' ||
+					name == 'custom-report-trace.log' ||
+					name == 'execution0.log'
+
+			if ((isImage || isUsefulLog) && isReadableFile(file)) {
+				filesToZip << file
+			}
+		}
+
+		if (filesToZip.isEmpty()) {
+			return null
+		}
+
+		File zipFile = new File(sourceFolder, 'Evidences.zip')
+
+		if (zipFile.exists()) {
+			zipFile.delete()
+		}
+
+		ZipOutputStream zos = null
+
+		try {
+			zos = new ZipOutputStream(new FileOutputStream(zipFile))
+
+			filesToZip.each { File file ->
+				if (safe(file.absolutePath).equalsIgnoreCase(safe(zipFile.absolutePath))) {
+					return
+				}
+
+				String relativePath = sourceFolder.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+
+				try {
+					ZipEntry entry = new ZipEntry(relativePath)
+					zos.putNextEntry(entry)
+					writeFileToZip(file, zos)
+					zos.closeEntry()
+				} catch (Exception e) {
+					try {
+						zos.closeEntry()
+					} catch (Exception ignored) {
+					}
+					KeywordUtil.logInfo('Skipping file while building Evidences.zip: ' + file.absolutePath + ' Reason: ' + safe(e.message))
+				}
+			}
+		} finally {
+			try {
+				zos?.close()
+			} catch (Exception ignored) {
+			}
+		}
+
+		return zipFile
+	}
+
+	private void writeFileToZip(File file, ZipOutputStream zos) {
+		file.withInputStream { input ->
+			byte[] buffer = new byte[8192]
+			int len
+			while ((len = input.read(buffer)) != -1) {
+				zos.write(buffer, 0, len)
+			}
+		}
+	}
+
+	private boolean isReadableFile(File file) {
+		if (file == null || !file.exists() || !file.isFile()) {
+			return false
+		}
+
+		FileInputStream input = null
+		try {
+			input = new FileInputStream(file)
+			return true
+		} catch (Exception ignored) {
+			return false
+		} finally {
+			try {
+				input?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private boolean blank(String value) {
+		return safe(value).isEmpty()
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
