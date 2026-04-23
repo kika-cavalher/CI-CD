@@ -1,4 +1,410 @@
 
+package jiraIntegration
+
+import java.text.DecimalFormat
+import java.text.SimpleDateFormat
+
+import com.kms.katalon.core.util.KeywordUtil
+
+import groovy.io.FileType
+import groovy.util.slurpersupport.GPathResult
+import groovy.xml.XmlSlurper
+
+class JiraGaiaReportBuilder {
+
+    JiraFlowCoordinator owner
+    JiraGaiaHtmlTemplateBuilder templateBuilder = new JiraGaiaHtmlTemplateBuilder()
+
+    JiraGaiaReportBuilder(JiraFlowCoordinator owner) {
+        this.owner = owner
+    }
+
+    String build() {
+        return buildGaiaReport()
+    }
+
+    String buildGaiaReport() {
+        File reportFolder = resolveReportFolder()
+        File junitFile = resolveJUnitReport(reportFolder)
+
+        KeywordUtil.logInfo("[GAIA-REPORT] Resolved report folder: ${reportFolder.absolutePath}")
+        KeywordUtil.logInfo("[GAIA-REPORT] Resolved JUnit report: ${junitFile.absolutePath}")
+
+        List<Map> cases = parseJUnitCases(junitFile)
+        attachEvidenceFromCurrentReportFolder(reportFolder, cases)
+
+        Map model = buildModel(reportFolder, junitFile, cases)
+
+        String html = templateBuilder.build(model)
+
+        File outputFile = new File(reportFolder, resolveOutputFileName())
+        outputFile.write(html, "UTF-8")
+
+        KeywordUtil.logInfo("[GAIA-REPORT] Custom report created: ${outputFile.absolutePath}")
+        return outputFile.absolutePath
+    }
+
+    private File resolveReportFolder() {
+        String resolvedPath = owner?.getResolvedReportFolder()
+        if (!resolvedPath?.trim()) {
+            throw new IllegalStateException("Resolved report folder is empty")
+        }
+
+        File folder = new File(resolvedPath)
+        if (!folder.exists() || !folder.isDirectory()) {
+            throw new IllegalStateException("Resolved report folder does not exist: ${resolvedPath}")
+        }
+
+        return folder
+    }
+
+    private File resolveJUnitReport(File reportFolder) {
+        List<File> candidates = []
+
+        reportFolder.eachFileRecurse(FileType.FILES) { File file ->
+            if (file.name.equalsIgnoreCase("JUnit_Report.xml")) {
+                candidates << file
+            }
+        }
+
+        if (!candidates) {
+            throw new IllegalStateException("JUnit_Report.xml was not found under: ${reportFolder.absolutePath}")
+        }
+
+        candidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
+        return candidates.first()
+    }
+
+    private String resolveOutputFileName() {
+        try {
+            def prop = owner?.metaClass?.hasProperty(owner, 'GAIA_REPORT_FILE_NAME')
+            if (prop) {
+                String value = owner?.GAIA_REPORT_FILE_NAME?.toString()
+                if (value?.trim()) {
+                    return value
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        return "MatchReport.html"
+    }
+
+    private Map buildModel(File reportFolder, File junitFile, List<Map> cases) {
+        int passed = cases.count { it.status == "Passed" }
+        int failed = cases.count { it.status == "Failed" }
+        int skipped = cases.count { it.status == "Skipped" }
+        int incomplete = cases.count { it.status == "Incomplete" }
+
+        String suiteName = extractSuiteName(junitFile, cases)
+        long totalMillis = cases.collect { (it.durationMillis ?: 0L) as long }.sum() ?: 0L
+
+        return [
+            title          : "Test report - ${suiteName}",
+            suiteName      : suiteName,
+            projectName    : "EMATCH execution overview",
+            reportFolder   : reportFolder.absolutePath,
+            generatedAt    : new SimpleDateFormat("yyyy/MM/dd HH:mm:ss").format(new Date()),
+            total          : cases.size(),
+            passed         : passed,
+            failed         : failed,
+            skipped        : skipped,
+            incomplete     : incomplete,
+            durationLabel  : formatDurationMillis(totalMillis),
+            cases          : cases
+        ]
+    }
+
+    private String extractSuiteName(File junitFile, List<Map> cases) {
+        try {
+            GPathResult xml = new XmlSlurper(false, false).parse(junitFile)
+            if (xml.name() == "testsuite") {
+                String suiteName = safeText(xml.@name)
+                if (suiteName) {
+                    return suiteName
+                }
+            }
+
+            if (xml.name() == "testsuites" && xml.testsuite?.size() > 0) {
+                String suiteName = safeText(xml.testsuite[0].@name)
+                if (suiteName) {
+                    return suiteName
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (cases && cases[0]?.suiteName) {
+            return cases[0].suiteName
+        }
+
+        return "Execution"
+    }
+
+    private List<Map> parseJUnitCases(File junitFile) {
+        GPathResult xml = new XmlSlurper(false, false).parse(junitFile)
+
+        List<GPathResult> suiteNodes = []
+        if (xml.name() == "testsuite") {
+            suiteNodes << xml
+        } else if (xml.name() == "testsuites") {
+            suiteNodes.addAll(xml.testsuite as List<GPathResult>)
+        }
+
+        List<Map> cases = []
+
+        suiteNodes.each { GPathResult suite ->
+            String suiteName = safeText(suite.@name)
+
+            suite.testcase.each { GPathResult testcase ->
+                String caseName = safeText(testcase.@name)
+                String className = safeText(testcase.@classname)
+                BigDecimal timeSeconds = parseBigDecimal(safeText(testcase.@time))
+                long durationMillis = (timeSeconds * 1000).longValue()
+
+                String status = "Passed"
+                String fullError = ""
+
+                if (testcase.failure?.size() > 0) {
+                    status = "Failed"
+                    fullError = buildFailureText(testcase.failure[0])
+                } else if (testcase.error?.size() > 0) {
+                    status = "Failed"
+                    fullError = buildFailureText(testcase.error[0])
+                } else if (testcase.skipped?.size() > 0) {
+                    status = "Skipped"
+                }
+
+                String errorPreview = extractFirstErrorLine(fullError)
+
+                cases << [
+                    suiteName      : suiteName,
+                    displayName    : caseName ?: className ?: "Unnamed test case",
+                    className      : className ?: "",
+                    fullName       : className ? "${className}" : (caseName ?: "Unnamed test case"),
+                    status         : status,
+                    durationMillis : durationMillis,
+                    durationLabel  : formatDurationMillis(durationMillis),
+                    fullError      : fullError ?: "",
+                    errorPreview   : errorPreview ?: "",
+                    evidences      : []
+                ]
+            }
+        }
+
+        return cases
+    }
+
+    private String buildFailureText(GPathResult node) {
+        List<String> parts = []
+
+        String message = safeText(node.@message)
+        String body = normalizeMultilineText(node.text())
+
+        if (message) {
+            parts << message
+        }
+
+        if (body) {
+            parts << body
+        }
+
+        return normalizeMultilineText(parts.findAll { it?.trim() }.join("\n"))
+    }
+
+    private void attachEvidenceFromCurrentReportFolder(File reportFolder, List<Map> cases) {
+        List<File> imageCandidates = collectImageCandidates(reportFolder)
+
+        KeywordUtil.logInfo("[GAIA-REPORT] Evidence candidates found in current report folder: ${imageCandidates.size()}")
+
+        List<Map> failedCases = cases.findAll { it.status == "Failed" }
+
+        failedCases.each { Map caseData ->
+            List<String> tokens = buildCaseTokens(caseData)
+            List<File> matches = imageCandidates.findAll { File image ->
+                scoreImageForCase(image, tokens) > 0
+            }.sort { a, b ->
+                int scoreCompare = scoreImageForCase(b, tokens) <=> scoreImageForCase(a, tokens)
+                if (scoreCompare != 0) {
+                    return scoreCompare
+                }
+                return b.lastModified() <=> a.lastModified()
+            }
+
+            if (!matches && failedCases.size() == 1) {
+                matches = imageCandidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
+            }
+
+            caseData.evidences = matches.take(10).collect { File image ->
+                [
+                    fileName    : image.name,
+                    absolutePath: image.absolutePath,
+                    relativePath: relativizePath(reportFolder, image)
+                ]
+            }
+        }
+    }
+
+    private List<File> collectImageCandidates(File reportFolder) {
+        List<File> candidates = []
+
+        reportFolder.eachFileRecurse(FileType.FILES) { File file ->
+            String lowerName = file.name.toLowerCase()
+            boolean isImage = lowerName.endsWith(".png") || lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") || lowerName.endsWith(".gif")
+            if (!isImage) {
+                return
+            }
+
+            String lowerPath = file.absolutePath.toLowerCase()
+
+            boolean preferred =
+                lowerPath.contains("${File.separator}evidence".toLowerCase()) ||
+                lowerName.contains("auto_failure") ||
+                lowerName.contains("failure") ||
+                lowerName.contains("screenshot")
+
+            if (preferred) {
+                candidates << file
+            }
+        }
+
+        if (!candidates) {
+            reportFolder.eachFileRecurse(FileType.FILES) { File file ->
+                String lowerName = file.name.toLowerCase()
+                boolean isImage = lowerName.endsWith(".png") || lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") || lowerName.endsWith(".gif")
+                if (isImage) {
+                    candidates << file
+                }
+            }
+        }
+
+        candidates = candidates.findAll { it.exists() }.unique { it.absolutePath }
+        candidates.sort { a, b -> b.lastModified() <=> a.lastModified() }
+        return candidates
+    }
+
+    private List<String> buildCaseTokens(Map caseData) {
+        Set<String> tokens = new LinkedHashSet<>()
+
+        [caseData.displayName, caseData.className, caseData.fullName].findAll { it }.each { String raw ->
+            String normalized = raw
+                .replace("\\", " ")
+                .replace("/", " ")
+                .replace("(", " ")
+                .replace(")", " ")
+                .replace("-", " ")
+                .replace("_", " ")
+                .replace(".", " ")
+
+            normalized.split("\\s+").each { String token ->
+                String clean = token?.trim()?.toLowerCase()
+                if (clean && clean.length() >= 4) {
+                    tokens << clean
+                }
+            }
+        }
+
+        return tokens as List<String>
+    }
+
+    private int scoreImageForCase(File image, List<String> tokens) {
+        String lowerName = image.name.toLowerCase()
+        String lowerPath = image.absolutePath.toLowerCase()
+
+        int score = 0
+
+        if (lowerPath.contains("${File.separator}evidence".toLowerCase())) {
+            score += 50
+        }
+        if (lowerName.contains("auto_failure")) {
+            score += 40
+        }
+        if (lowerName.contains("failure")) {
+            score += 20
+        }
+
+        tokens.each { String token ->
+            if (lowerName.contains(token)) {
+                score += 30
+            }
+            if (lowerPath.contains(token)) {
+                score += 10
+            }
+        }
+
+        return score
+    }
+
+    private String relativizePath(File baseFolder, File targetFile) {
+        String basePath = baseFolder.toURI().normalize().toString()
+        String targetPath = targetFile.toURI().normalize().toString()
+        String relative = baseFolder.toURI().relativize(targetFile.toURI()).getPath()
+
+        if (relative?.trim()) {
+            return relative.replace("\\", "/")
+        }
+
+        if (targetPath.startsWith(basePath)) {
+            return targetPath.substring(basePath.length()).replace("\\", "/")
+        }
+
+        return targetFile.name
+    }
+
+    private String extractFirstErrorLine(String fullError) {
+        if (!fullError?.trim()) {
+            return ""
+        }
+
+        List<String> lines = normalizeMultilineText(fullError)
+            .split("\\r?\\n")
+            .collect { it?.trim() }
+            .findAll { it }
+
+        return lines ? lines.first() : ""
+    }
+
+    private String normalizeMultilineText(String text) {
+        if (text == null) {
+            return ""
+        }
+
+        return text
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .split("\n")
+            .collect { it?.replace("\t", "    ")?.trim() == "" ? "" : it }
+            .join("\n")
+            .trim()
+    }
+
+    private BigDecimal parseBigDecimal(String value) {
+        try {
+            return value ? new BigDecimal(value) : BigDecimal.ZERO
+        } catch (Throwable ignored) {
+            return BigDecimal.ZERO
+        }
+    }
+
+    private String formatDurationMillis(long millis) {
+        long totalSeconds = Math.max(0L, millis / 1000L)
+        long hours = totalSeconds / 3600L
+        long minutes = (totalSeconds % 3600L) / 60L
+        long seconds = totalSeconds % 60L
+
+        if (hours > 0) {
+            return String.format("%02dh %02dm %02ds", hours, minutes, seconds)
+        }
+        if (minutes > 0) {
+            return String.format("%02dm %02ds", minutes, seconds)
+        }
+        return String.format("%02ds", seconds)
+    }
+
+    private String safeText(Object value) {
+        return value == null ? "" : value.toString().trim()
+    }
+}
 
 
 
@@ -10,7 +416,464 @@
 
 
 
+package jiraIntegration
 
+class JiraGaiaHtmlTemplateBuilder {
 
+    String build(Map model) {
+        return render(model)
+    }
 
+    String render(Map model) {
+        StringBuilder html = new StringBuilder()
+
+        html << "<!DOCTYPE html>\n"
+        html << "<html lang='en'>\n"
+        html << "<head>\n"
+        html << "  <meta charset='UTF-8'>\n"
+        html << "  <meta http-equiv='X-UA-Compatible' content='IE=edge'>\n"
+        html << "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+        html << "  <title>${escapeHtml(model.title ?: 'Test report')}</title>\n"
+        html << "  <style>\n"
+        html << buildCss()
+        html << "  </style>\n"
+        html << "  <script>\n"
+        html << buildJs()
+        html << "  </script>\n"
+        html << "</head>\n"
+        html << "<body>\n"
+
+        html << "  <div class='topbar'>\n"
+        html << "    <div>\n"
+        html << "      <div class='report-title'>${escapeHtml(model.title ?: 'Test report')}</div>\n"
+        html << "      <div class='report-subtitle'>${escapeHtml(model.projectName ?: '')}</div>\n"
+        html << "    </div>\n"
+        html << "    <div class='topbar-right'>\n"
+        html << "      <div>Generated ${escapeHtml(model.generatedAt ?: '')}</div>\n"
+        html << "      <div>${escapeHtml(model.reportFolder ?: '')}</div>\n"
+        html << "    </div>\n"
+        html << "  </div>\n"
+
+        html << "  <div class='page'>\n"
+
+        html << "    <aside class='sidebar'>\n"
+        html << "      <div class='sidebar-title'>Tests</div>\n"
+        html << "      <div class='sidebar-tabs'>\n"
+        html << "        <div class='tab active'>Tests</div>\n"
+        html << "        <div class='tab'>Charts</div>\n"
+        html << "      </div>\n"
+        html << "      <input id='caseFilter' class='search-box' type='text' placeholder='Search test name or status...' onkeyup='filterCases()'>\n"
+
+        (model.cases ?: []).eachWithIndex { Map caseData, int i ->
+            String statusClass = badgeClass(caseData.status)
+            html << "      <a href='#case-${i}' class='case-link' data-case-name='${escapeHtmlAttribute(caseData.displayName ?: '')}' data-case-status='${escapeHtmlAttribute(caseData.status ?: '')}'>\n"
+            html << "        <div class='case-item'>\n"
+            html << "          <div class='case-name'>${escapeHtml(caseData.displayName ?: 'Unnamed')}</div>\n"
+            html << "          <div class='case-meta'>\n"
+            html << "            <span class='badge ${statusClass}'>${escapeHtml(caseData.status ?: '')}</span>\n"
+            html << "            <span class='duration'>${escapeHtml(caseData.durationLabel ?: '')}</span>\n"
+            html << "          </div>\n"
+            html << "        </div>\n"
+            html << "      </a>\n"
+        }
+
+        html << "    </aside>\n"
+
+        html << "    <main class='content'>\n"
+
+        html << "      <div class='summary-row'>\n"
+        html << "        <div class='summary-card'>Total <strong>${escapeHtml((model.total ?: 0).toString())}</strong></div>\n"
+        html << "        <div class='summary-card'>Passed <strong>${escapeHtml((model.passed ?: 0).toString())}</strong></div>\n"
+        html << "        <div class='summary-card'>Failed <strong>${escapeHtml((model.failed ?: 0).toString())}</strong></div>\n"
+        html << "        <div class='summary-card'>Skipped <strong>${escapeHtml((model.skipped ?: 0).toString())}</strong></div>\n"
+        html << "        <div class='summary-card'>Incomplete <strong>${escapeHtml((model.incomplete ?: 0).toString())}</strong></div>\n"
+        html << "        <div class='summary-card'>Duration <strong>${escapeHtml(model.durationLabel ?: '')}</strong></div>\n"
+        html << "      </div>\n"
+
+        (model.cases ?: []).eachWithIndex { Map caseData, int i ->
+            String statusClass = badgeClass(caseData.status)
+
+            html << "      <section id='case-${i}' class='case-panel'>\n"
+            html << "        <div class='panel-header'>\n"
+            html << "          <div class='panel-title'>${escapeHtml(caseData.fullName ?: caseData.displayName ?: 'Unnamed')}</div>\n"
+            html << "          <div class='panel-badges'>\n"
+            html << "            <span class='badge ${statusClass}'>${escapeHtml(caseData.status ?: '')}</span>\n"
+            html << "            <span class='meta-chip'>Duration: ${escapeHtml(caseData.durationLabel ?: '')}</span>\n"
+            html << "          </div>\n"
+            html << "        </div>\n"
+
+            if (caseData.fullError) {
+                html << "        <div class='section-title'>Visual Error Log</div>\n"
+                html << "        <div class='error-preview-box'>${escapeHtml(caseData.errorPreview ?: '')}</div>\n"
+                html << "        <details class='expand-block'>\n"
+                html << "          <summary>View full error</summary>\n"
+                html << "          <pre class='error-full-box'>${escapeHtml(caseData.fullError ?: '')}</pre>\n"
+                html << "        </details>\n"
+            }
+
+            if (caseData.evidences && caseData.evidences.size() > 0) {
+                html << "        <div class='section-title'>Evidence</div>\n"
+                html << "        <div class='evidence-list'>\n"
+
+                caseData.evidences.each { Map evidence ->
+                    String relPath = evidence.relativePath ?: evidence.fileName ?: ""
+                    html << "          <details class='evidence-item'>\n"
+                    html << "            <summary>${escapeHtml(evidence.fileName ?: 'Evidence')}</summary>\n"
+                    html << "            <div class='evidence-body'>\n"
+                    html << "              <a class='evidence-link' href='${escapeHtmlAttribute(relPath)}' target='_blank'>Open evidence</a>\n"
+                    html << "              <img class='evidence-image' src='${escapeHtmlAttribute(relPath)}' alt='${escapeHtmlAttribute(evidence.fileName ?: 'Evidence image')}'>\n"
+                    html << "            </div>\n"
+                    html << "          </details>\n"
+                }
+
+                html << "        </div>\n"
+            }
+
+            html << "      </section>\n"
+        }
+
+        html << "    </main>\n"
+        html << "  </div>\n"
+        html << "</body>\n"
+        html << "</html>\n"
+
+        return html.toString()
+    }
+
+    private String buildCss() {
+        return """
+body {
+    margin: 0;
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f5f6fb;
+    color: #222;
+}
+.topbar {
+    background: linear-gradient(90deg, #3d1d93, #5f21d7);
+    color: #fff;
+    padding: 18px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.report-title {
+    font-size: 22px;
+    font-weight: 700;
+}
+.report-subtitle {
+    font-size: 12px;
+    margin-top: 4px;
+    opacity: 0.9;
+}
+.topbar-right {
+    text-align: right;
+    font-size: 12px;
+    line-height: 1.6;
+}
+.page {
+    display: flex;
+    min-height: calc(100vh - 86px);
+}
+.sidebar {
+    width: 320px;
+    background: #fff;
+    border-right: 1px solid #e2e5f0;
+    padding: 16px;
+    box-sizing: border-box;
+    overflow-y: auto;
+}
+.sidebar-title {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 12px;
+}
+.sidebar-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 14px;
+}
+.tab {
+    padding: 8px 12px;
+    border: 1px solid #d8dcec;
+    border-radius: 8px;
+    font-size: 12px;
+    background: #fafbff;
+    color: #555;
+}
+.tab.active {
+    background: #fff;
+    border-color: #9b8ce8;
+    color: #3d1d93;
+    font-weight: 700;
+}
+.search-box {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border: 1px solid #d8dcec;
+    border-radius: 8px;
+    margin-bottom: 14px;
+    outline: none;
+}
+.case-link {
+    text-decoration: none;
+    color: inherit;
+    display: block;
+}
+.case-item {
+    border: 1px solid #e6e8f2;
+    border-radius: 12px;
+    padding: 12px;
+    margin-bottom: 10px;
+    background: #fff;
+    transition: all 0.15s ease-in-out;
+}
+.case-item:hover {
+    border-color: #b7a8ff;
+    box-shadow: 0 3px 10px rgba(61, 29, 147, 0.08);
+}
+.case-name {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.4;
+    margin-bottom: 8px;
+}
+.case-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.duration {
+    font-size: 12px;
+    color: #666;
+}
+.content {
+    flex: 1;
+    padding: 18px;
+    box-sizing: border-box;
+    overflow-y: auto;
+}
+.summary-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 18px;
+}
+.summary-card {
+    background: #fff;
+    border: 1px solid #e6e8f2;
+    border-radius: 12px;
+    padding: 12px 14px;
+    min-width: 120px;
+    font-size: 13px;
+}
+.case-panel {
+    background: #fff;
+    border: 1px solid #e6e8f2;
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 18px;
+}
+.panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 12px;
+}
+.panel-title {
+    font-size: 20px;
+    font-weight: 700;
+    line-height: 1.35;
+}
+.panel-badges {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+.badge {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+}
+.badge-passed {
+    background: #dcf5e6;
+    color: #18854b;
+}
+.badge-failed {
+    background: #ffe1e1;
+    color: #c62828;
+}
+.badge-skipped {
+    background: #f2f2f2;
+    color: #666;
+}
+.badge-incomplete {
+    background: #fff0d8;
+    color: #b36b00;
+}
+.meta-chip {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: #f2f4fb;
+    color: #444;
+    font-weight: 600;
+}
+.section-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin-top: 16px;
+    margin-bottom: 10px;
+}
+.error-preview-box {
+    border: 1px solid #ffd0d0;
+    background: #fff7f7;
+    color: #6e2020;
+    border-radius: 10px;
+    padding: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: Consolas, Monaco, monospace;
+    font-size: 12px;
+}
+.expand-block {
+    margin-top: 10px;
+    border: 1px solid #e2e5f0;
+    border-radius: 10px;
+    overflow: hidden;
+}
+.expand-block summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 12px 14px;
+    background: #fafbff;
+    font-weight: 600;
+}
+.expand-block summary::-webkit-details-marker {
+    display: none;
+}
+.error-full-box {
+    margin: 0;
+    padding: 14px;
+    background: #fff;
+    border-top: 1px solid #eceef6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: Consolas, Monaco, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    max-height: 520px;
+    overflow: auto;
+}
+.evidence-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.evidence-item {
+    border: 1px solid #e2e5f0;
+    border-radius: 10px;
+    overflow: hidden;
+}
+.evidence-item summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 12px 14px;
+    background: #fafbff;
+    font-weight: 600;
+}
+.evidence-item summary::-webkit-details-marker {
+    display: none;
+}
+.evidence-body {
+    padding: 14px;
+    border-top: 1px solid #eceef6;
+}
+.evidence-link {
+    display: inline-block;
+    margin-bottom: 12px;
+    color: #3d1d93;
+    text-decoration: none;
+    font-weight: 600;
+}
+.evidence-image {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    border: 1px solid #e2e5f0;
+    border-radius: 8px;
+    background: #fff;
+}
+@media (max-width: 1080px) {
+    .page {
+        flex-direction: column;
+    }
+    .sidebar {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid #e2e5f0;
+    }
+    .panel-header {
+        flex-direction: column;
+    }
+    .panel-badges {
+        justify-content: flex-start;
+    }
+}
+"""
+    }
+
+    private String buildJs() {
+        return """
+function filterCases() {
+    var input = document.getElementById('caseFilter');
+    var filter = (input.value || '').toLowerCase();
+    var items = document.querySelectorAll('.case-link');
+
+    items.forEach(function(item) {
+        var name = (item.getAttribute('data-case-name') || '').toLowerCase();
+        var status = (item.getAttribute('data-case-status') || '').toLowerCase();
+        var visible = name.indexOf(filter) !== -1 || status.indexOf(filter) !== -1;
+        item.style.display = visible ? 'block' : 'none';
+    });
+}
+"""
+    }
+
+    private String badgeClass(String status) {
+        if (!status) {
+            return "badge-incomplete"
+        }
+
+        switch (status.trim().toLowerCase()) {
+            case "passed":
+                return "badge-passed"
+            case "failed":
+                return "badge-failed"
+            case "skipped":
+                return "badge-skipped"
+            default:
+                return "badge-incomplete"
+        }
+    }
+
+    private String escapeHtml(Object value) {
+        String text = value == null ? "" : value.toString()
+        return text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&#39;")
+    }
+
+    private String escapeHtmlAttribute(Object value) {
+        return escapeHtml(value)
+    }
+}
 
