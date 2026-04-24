@@ -1,1 +1,60 @@
 
+node('GI5_SWDCFRNXGI55817') {
+    def currentExitCode = 0
+    def nextBuild = null
+
+    stage('Checkout') {
+        checkout scm
+    }
+
+    stage('Run current execution') {
+        currentExitCode = bat(
+            script: "call \"%WORKSPACE%\\jenkins\\ArchiveMode.cmd\"",
+            returnStatus: true
+        )
+
+        echo "Current execution exit code: ${currentExitCode}"
+    }
+
+    stage('Cleanup before next pipeline') {
+        bat '''
+@echo off
+echo [INFO] Closing previous scheduled tasks...
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+
+echo [INFO] Waiting resources to be released...
+ping -n 6 127.0.0.1 >nul
+
+echo [INFO] Closing remaining helper processes...
+taskkill /f /im WinAppDriver.exe /t >nul 2>nul
+taskkill /f /im katalonc.exe /t >nul 2>nul
+taskkill /f /im KatalonStudio.exe /t >nul 2>nul
+
+echo [INFO] Cleanup status snapshot:
+echo [INFO] ---- startWinDriver ----
+schtasks /query /tn "startWinDriver" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:"
+echo [INFO] ---- \\eMatch Automation\\RunEMatchCommand ----
+schtasks /query /tn "\\eMatch Automation\\RunEMatchCommand" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:"
+'''
+    }
+
+    stage('Run next pipeline') {
+        nextBuild = build job: 'GI5/eMatch_Regression/Archive Mode ttttt',
+            wait: true,
+            propagate: false
+
+        echo "Next pipeline build number: ${nextBuild.number}"
+        echo "Next pipeline result: ${nextBuild.result}"
+    }
+
+    stage('Finalize') {
+        if (currentExitCode == 0) {
+            currentBuild.result = 'SUCCESS'
+            echo 'Current execution finished successfully and the next pipeline also ran.'
+        } else {
+            currentBuild.result = 'UNSTABLE'
+            echo "Current execution returned exit code ${currentExitCode}, but the next pipeline was still executed."
+        }
+    }
+}
