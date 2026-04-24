@@ -1,1 +1,1603 @@
+Keywords/jiraIntegration/JiraReportSteps.groovy
+package jiraIntegration
 
+import java.text.SimpleDateFormat
+
+import com.kms.katalon.core.annotation.Keyword
+
+class JiraReportSteps {
+
+	private static final Object LOCK = new Object()
+	private static final Map<String, Map> CASES = new LinkedHashMap<String, Map>()
+	private static final ThreadLocal<String> CURRENT_CASE = new ThreadLocal<String>()
+	private static String SUITE_NAME = ''
+
+	@Keyword
+	def reset() {
+		synchronized (LOCK) {
+			CASES.clear()
+			SUITE_NAME = ''
+			CURRENT_CASE.remove()
+		}
+	}
+
+	@Keyword
+	def setSuiteName(String suiteName) {
+		synchronized (LOCK) {
+			SUITE_NAME = safe(suiteName)
+		}
+	}
+
+	@Keyword
+	def startCase(String caseId) {
+		synchronized (LOCK) {
+			String id = safe(caseId)
+			CURRENT_CASE.set(id)
+			ensureCase(id)
+		}
+	}
+
+	@Keyword
+	def note(String message) {
+		synchronized (LOCK) {
+			String text = safe(message)
+			if (text.isEmpty()) {
+				return
+			}
+
+			Map record = ensureCase(currentCaseId())
+
+			markLastPendingAs(record, 'PASSED')
+
+			record.steps << [
+				status    : 'PENDING',
+				timestamp : timeNow(),
+				details   : text
+			]
+		}
+	}
+
+	@Keyword
+	def fail(String rawError) {
+		synchronized (LOCK) {
+			Map record = ensureCase(currentCaseId())
+
+			String fullError = normalizeFullError(record.caseId as String, rawError)
+			record.fullError = fullError
+			record.shortError = buildCompactError(fullError)
+			record.status = 'FAILED'
+
+			boolean updated = markLastPendingAs(record, 'FAILED')
+
+			if (!updated) {
+				record.steps << [
+					status    : 'FAILED',
+					timestamp : timeNow(),
+					details   : 'Execution failed'
+				]
+			}
+		}
+	}
+
+	@Keyword
+	def finishCase(String rawStatus) {
+		synchronized (LOCK) {
+			Map record = ensureCase(currentCaseId())
+
+			String requestedStatus = normalizeRequestedStatus(rawStatus)
+			String finalStatus = resolveFinalStatus(record, requestedStatus)
+
+			if ('PASSED'.equals(finalStatus)) {
+				markLastPendingAs(record, 'PASSED')
+			} else if ('FAILED'.equals(finalStatus)) {
+				if (!hasFailedStep(record)) {
+					markLastPendingAs(record, 'FAILED')
+				}
+				markAllPendingAs(record, 'BLOCKED')
+			} else {
+				markAllPendingAs(record, 'BLOCKED')
+			}
+
+			record.status = finalStatus
+			record.endedAt = System.currentTimeMillis()
+			record.endText = dateTimeNow()
+			record.durationText = formatDuration((record.endedAt as long) - (record.startedAt as long))
+		}
+	}
+
+	@Keyword
+	boolean caseHasFailure(String caseId) {
+		return caseHasFailureStatic(caseId)
+	}
+
+	@Keyword
+	def registerEvidence(String caseId, String fileName, String relativePath, String absolutePath) {
+		registerEvidenceStatic(caseId, fileName, relativePath, absolutePath)
+	}
+
+	@Keyword
+	List<Map> getCases() {
+		return snapshotCases()
+	}
+
+	@Keyword
+	Map getCase(String caseId) {
+		return snapshotCase(caseId)
+	}
+
+	@Keyword
+	String getSuiteName() {
+		return suiteNameStatic()
+	}
+
+	static boolean caseHasFailureStatic(String caseId) {
+		synchronized (LOCK) {
+			Map record = CASES[safe(caseId)]
+			return record != null && (
+				'FAILED'.equals(safe(record.status)) ||
+				hasFailedStep(record) ||
+				!safe(record.fullError).isEmpty()
+			)
+		}
+	}
+
+	static void registerEvidenceStatic(String caseId, String fileName, String relativePath, String absolutePath) {
+		synchronized (LOCK) {
+			Map record = ensureCase(safe(caseId))
+
+			record.evidence = [[
+				name         : safe(fileName),
+				relativePath : normalizePath(relativePath),
+				absolutePath : normalizePath(absolutePath)
+			]]
+		}
+	}
+
+	static List<Map> snapshotCases() {
+		synchronized (LOCK) {
+			return CASES.values().collect { Map row -> deepCopyCase(row) }
+		}
+	}
+
+	static Map snapshotCase(String caseId) {
+		synchronized (LOCK) {
+			Map record = CASES[safe(caseId)]
+			return record != null ? deepCopyCase(record) : [:]
+		}
+	}
+
+	static String suiteNameStatic() {
+		synchronized (LOCK) {
+			return SUITE_NAME
+		}
+	}
+
+	private static Map ensureCase(String caseId) {
+		String id = safe(caseId)
+
+		if (!CASES.containsKey(id)) {
+			long now = System.currentTimeMillis()
+
+			CASES[id] = [
+				caseId       : id,
+				displayName  : displayNameFromCaseId(id),
+				steps        : [],
+				evidence     : [],
+				status       : 'PASSED',
+				fullError    : '',
+				shortError   : '',
+				startedAt    : now,
+				endedAt      : now,
+				startText    : dateTimeNow(),
+				endText      : '',
+				durationText : '00h 00m 00s'
+			]
+		}
+
+		return CASES[id]
+	}
+
+	private static Map deepCopyCase(Map record) {
+		return [
+			caseId       : safe(record.caseId),
+			displayName  : safe(record.displayName),
+			steps        : (record.steps ?: []).collect { Map step ->
+				[
+					status    : safe(step.status),
+					timestamp : safe(step.timestamp),
+					details   : safe(step.details)
+				]
+			},
+			evidence     : (record.evidence ?: []).collect { Map ev ->
+				[
+					name         : safe(ev.name),
+					relativePath : safe(ev.relativePath),
+					absolutePath : safe(ev.absolutePath)
+				]
+			},
+			status       : safe(record.status),
+			fullError    : safe(record.fullError),
+			shortError   : safe(record.shortError),
+			startedAt    : record.startedAt ?: 0L,
+			endedAt      : record.endedAt ?: 0L,
+			startText    : safe(record.startText),
+			endText      : safe(record.endText),
+			durationText : safe(record.durationText)
+		]
+	}
+
+	private static String resolveFinalStatus(Map record, String requestedStatus) {
+		if (hasFailedStep(record) || !safe(record.fullError).isEmpty()) {
+			return 'FAILED'
+		}
+
+		if ('FAILED'.equals(requestedStatus)) {
+			return 'FAILED'
+		}
+
+		if ('BLOCKED'.equals(requestedStatus)) {
+			return 'BLOCKED'
+		}
+
+		return 'PASSED'
+	}
+
+	private static String normalizeRequestedStatus(String rawStatus) {
+		String upper = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+		if (upper in ['FAILED', 'FAIL', 'ERROR']) {
+			return 'FAILED'
+		}
+
+		if (upper in ['SKIPPED', 'BLOCKED']) {
+			return 'BLOCKED'
+		}
+
+		return 'PASSED'
+	}
+
+	private static boolean markLastPendingAs(Map record, String status) {
+		for (int i = (record.steps ?: []).size() - 1; i >= 0; i--) {
+			if ('PENDING'.equals(safe(record.steps[i].status))) {
+				record.steps[i].status = status
+				return true
+			}
+		}
+		return false
+	}
+
+	private static void markAllPendingAs(Map record, String status) {
+		(record.steps ?: []).each { Map step ->
+			if ('PENDING'.equals(safe(step.status))) {
+				step.status = status
+			}
+		}
+	}
+
+	private static boolean hasFailedStep(Map record) {
+		return (record.steps ?: []).any { Map step ->
+			'FAILED'.equals(safe(step.status))
+		}
+	}
+
+	private static String normalizeFullError(String caseId, String rawError) {
+		String text = safe(rawError).replace('\r\n', '\n').replace('\r', '\n').trim()
+		String header = displayNameFromCaseId(caseId) + ' FAILED.'
+
+		if (text.isEmpty()) {
+			return header + '\nReason:\nNo error message returned.'
+		}
+
+		if (!text.startsWith(header)) {
+			return header + '\nReason:\n' + text
+		}
+
+		return text
+	}
+
+	private static String buildCompactError(String fullError) {
+		List<String> lines = safe(fullError)
+			.replace('\r\n', '\n')
+			.replace('\r', '\n')
+			.readLines()
+			.collect { String line -> safe(line) }
+			.findAll { String line -> !line.isEmpty() }
+
+		if (lines.isEmpty()) {
+			return ''
+		}
+
+		List<String> compact = []
+
+		for (String line : lines) {
+			if (line.startsWith('Original error:')) {
+				break
+			}
+
+			if (line.startsWith('at ')) {
+				break
+			}
+
+			compact << line
+
+			if (line.startsWith('Expected window title:')) {
+				break
+			}
+		}
+
+		if (compact.isEmpty()) {
+			compact = lines.take(Math.min(3, lines.size()))
+		}
+
+		return compact.join('\n')
+	}
+
+	private static String currentCaseId() {
+		String caseId = CURRENT_CASE.get()
+
+		if (!safe(caseId).isEmpty()) {
+			return caseId
+		}
+
+		if (!CASES.isEmpty()) {
+			return CASES.keySet().last()
+		}
+
+		return 'Unknown Test Case'
+	}
+
+	private static String displayNameFromCaseId(String caseId) {
+		String value = safe(caseId)
+
+		if (value.isEmpty()) {
+			return 'Unknown Test Case'
+		}
+
+		return value.startsWith('Test Cases/') ? value : value
+	}
+
+	private static String dateTimeNow() {
+		return new SimpleDateFormat('dd/MM/yyyy HH:mm:ss').format(new Date())
+	}
+
+	private static String timeNow() {
+		return new SimpleDateFormat('HH:mm:ss').format(new Date())
+	}
+
+	private static String formatDuration(long millis) {
+		long totalSeconds = Math.max(0L, Math.round(millis / 1000.0d))
+		long hours = (long) (totalSeconds / 3600L)
+		long minutes = (long) ((totalSeconds % 3600L) / 60L)
+		long seconds = (long) (totalSeconds % 60L)
+
+		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+	}
+
+	private static String normalizePath(String value) {
+		return safe(value).replace('\\', '/')
+	}
+
+	private static String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
+Keywords/jiraIntegration/JiraImagesEvidence.groovy
+package jiraIntegration
+
+import java.awt.GraphicsDevice
+import java.awt.GraphicsEnvironment
+import java.awt.MouseInfo
+import java.awt.Point
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.image.BufferedImage
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.text.SimpleDateFormat
+
+import javax.imageio.ImageIO
+
+import org.openqa.selenium.OutputType
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.driver.WindowsDriverFactory
+
+class JiraImagesEvidence {
+
+	private static final String EVIDENCE_FOLDER_NAME = 'Evidences'
+
+	@Keyword
+	String autoFailure(String caseId) {
+		String effectiveCaseId = safe(caseId)
+
+		if (effectiveCaseId.isEmpty()) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] autoFailure skipped because caseId is empty.')
+			return ''
+		}
+
+		try {
+			File reportFolder = resolveReportFolder()
+			File evidenceRoot = new File(reportFolder, EVIDENCE_FOLDER_NAME)
+			File caseFolder = new File(evidenceRoot, sanitizeForPath(effectiveCaseId))
+
+			ensureFolder(evidenceRoot)
+			ensureFolder(caseFolder)
+			cleanupOldPng(caseFolder)
+
+			String timestamp = new SimpleDateFormat('yyyyMMdd_HHmmss_SSS').format(new Date())
+			String fileName = timestamp + '_' + sanitizeForPath(effectiveCaseId) + '_auto_failure.png'
+			File targetFile = new File(caseFolder, fileName)
+
+			boolean captured = false
+
+			if (!isRemoteExecution()) {
+				captured = tryDriverWindowScreenshot(targetFile)
+
+				if (!captured) {
+					captured = tryPointerMonitorScreenshot(targetFile)
+				}
+
+				if (!captured) {
+					captured = tryPrimaryMonitorScreenshot(targetFile)
+				}
+			} else {
+				captured = tryDriverWindowScreenshot(targetFile)
+
+				if (!captured) {
+					captured = tryAllMonitorsScreenshot(targetFile)
+				}
+
+				if (!captured) {
+					captured = tryPointerMonitorScreenshot(targetFile)
+				}
+			}
+
+			if (!captured || !targetFile.exists() || targetFile.length() <= 0L) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Evidence capture failed for case: ' + effectiveCaseId)
+				return ''
+			}
+
+			String relativePath = relativizePath(reportFolder, targetFile)
+
+			JiraReportSteps.registerEvidenceStatic(
+				effectiveCaseId,
+				targetFile.name,
+				relativePath,
+				targetFile.absolutePath
+			)
+
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Saved: ' + targetFile.absolutePath)
+			return targetFile.absolutePath
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] autoFailure failed: ' + safe(t.message))
+			return ''
+		}
+	}
+
+	private static boolean tryDriverWindowScreenshot(File targetFile) {
+		try {
+			def driver = WindowsDriverFactory.getWindowsDriver()
+
+			if (driver == null) {
+				return false
+			}
+
+			File temp = driver.getScreenshotAs(OutputType.FILE)
+
+			if (temp == null || !temp.exists() || temp.length() <= 0L) {
+				return false
+			}
+
+			Files.copy(temp.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+			return targetFile.exists() && targetFile.length() > 0L
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private static boolean tryPointerMonitorScreenshot(File targetFile) {
+		try {
+			GraphicsEnvironment ge = GraphicsEnvironment.localGraphicsEnvironment
+			GraphicsDevice[] devices = ge.screenDevices
+			Point pointer = MouseInfo.pointerInfo != null ? MouseInfo.pointerInfo.location : null
+
+			Rectangle bounds = null
+
+			if (pointer != null) {
+				for (GraphicsDevice device : devices) {
+					Rectangle candidate = device.defaultConfiguration.bounds
+					if (candidate != null && candidate.contains(pointer)) {
+						bounds = candidate
+						break
+					}
+				}
+			}
+
+			if (bounds == null && ge.defaultScreenDevice != null) {
+				bounds = ge.defaultScreenDevice.defaultConfiguration.bounds
+			}
+
+			return bounds != null && captureRectangle(bounds, targetFile)
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private static boolean tryPrimaryMonitorScreenshot(File targetFile) {
+		try {
+			GraphicsEnvironment ge = GraphicsEnvironment.localGraphicsEnvironment
+			GraphicsDevice device = ge.defaultScreenDevice
+
+			if (device == null || device.defaultConfiguration == null || device.defaultConfiguration.bounds == null) {
+				return false
+			}
+
+			return captureRectangle(device.defaultConfiguration.bounds, targetFile)
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private static boolean tryAllMonitorsScreenshot(File targetFile) {
+		try {
+			GraphicsEnvironment ge = GraphicsEnvironment.localGraphicsEnvironment
+			GraphicsDevice[] devices = ge.screenDevices
+
+			Rectangle union = null
+
+			for (GraphicsDevice device : devices) {
+				Rectangle bounds = device.defaultConfiguration != null ? device.defaultConfiguration.bounds : null
+
+				if (bounds == null) {
+					continue
+				}
+
+				union = union == null ? new Rectangle(bounds) : union.union(bounds)
+			}
+
+			return union != null && captureRectangle(union, targetFile)
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private static boolean captureRectangle(Rectangle bounds, File targetFile) {
+		try {
+			Robot robot = new Robot()
+			BufferedImage image = robot.createScreenCapture(bounds)
+			ImageIO.write(image, 'png', targetFile)
+			return targetFile.exists() && targetFile.length() > 0L
+		} catch (Throwable ignored) {
+			return false
+		}
+	}
+
+	private static File resolveReportFolder() {
+		String runFolder = safe(RunConfiguration.getReportFolder())
+
+		if (!runFolder.isEmpty()) {
+			File direct = new File(runFolder)
+			ensureFolder(direct)
+			return direct
+		}
+
+		File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+		ensureFolder(reportsRoot)
+
+		File latest = findLatestLeafFolder(reportsRoot)
+		if (latest != null) {
+			return latest
+		}
+
+		File fallback = new File(reportsRoot, new SimpleDateFormat('yyyyMMdd_HHmmss').format(new Date()))
+		ensureFolder(fallback)
+		return fallback
+	}
+
+	private static File findLatestLeafFolder(File root) {
+		List<File> folders = []
+
+		root.eachFileRecurse { File file ->
+			if (file.isDirectory()) {
+				folders << file
+			}
+		}
+
+		folders = folders.findAll { File folder ->
+			File[] children = folder.listFiles()
+			return children != null && children.any { File child -> child.isFile() }
+		}
+
+		if (folders.isEmpty()) {
+			return null
+		}
+
+		folders.sort { File a, File b ->
+			Long.valueOf(b.lastModified()).compareTo(Long.valueOf(a.lastModified()))
+		}
+
+		return folders[0]
+	}
+
+	private static String relativizePath(File reportFolder, File targetFile) {
+		try {
+			return reportFolder.toPath().relativize(targetFile.toPath()).toString().replace('\\', '/')
+		} catch (Throwable ignored) {
+			return targetFile.name
+		}
+	}
+
+	private static void cleanupOldPng(File caseFolder) {
+		File[] files = caseFolder.listFiles()
+
+		if (files == null) {
+			return
+		}
+
+		files.findAll { File f ->
+			f.isFile() && f.name.toLowerCase(Locale.ENGLISH).endsWith('.png')
+		}.each { File f ->
+			try {
+				f.delete()
+			} catch (Throwable ignored) {
+			}
+		}
+	}
+
+	private static boolean isRemoteExecution() {
+		Map<String, String> env = System.getenv()
+
+		return !safe(env['JENKINS_URL']).isEmpty() ||
+			   !safe(env['WORKSPACE']).isEmpty() ||
+			   !safe(env['BUILD_NUMBER']).isEmpty() ||
+			   !safe(env['NODE_NAME']).isEmpty()
+	}
+
+	private static void ensureFolder(File folder) {
+		if (folder != null && !folder.exists()) {
+			folder.mkdirs()
+		}
+	}
+
+	private static String sanitizeForPath(String value) {
+		return safe(value).replaceAll('[^A-Za-z0-9._-]+', '_')
+	}
+
+	private static String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
+Keywords/jiraIntegration/JiraReportBuilder.groovy
+package jiraIntegration
+
+import java.nio.file.Files
+import java.text.SimpleDateFormat
+import java.util.Base64
+
+import com.kms.katalon.core.configuration.RunConfiguration
+
+class JiraReportBuilder {
+
+	File buildReport() {
+		return buildReport(resolveReportFolder(), '', '')
+	}
+
+	File buildReport(String reportFolderPath) {
+		return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), '', '')
+	}
+
+	File buildReport(String reportFolderPath, String suiteName, String executionTitle) {
+		return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), suiteName, executionTitle)
+	}
+
+	File buildReport(File reportFolder) {
+		return buildReport(reportFolder, '', '')
+	}
+
+	File buildReport(File reportFolder, String suiteName, String executionTitle) {
+		File root = reportFolder ?: resolveReportFolder()
+		ensureFolder(root)
+
+		List<Map> snapshot = JiraReportSteps.snapshotCases()
+		List<Map> cases = snapshot.collect { Map row ->
+			normalizeCase(row, root)
+		}
+
+		cases = cases.sort { Map a, Map b ->
+			int byStatus = statusOrder(a.status) <=> statusOrder(b.status)
+			if (byStatus != 0) {
+				return byStatus
+			}
+			return safe(a.displayName).compareToIgnoreCase(safe(b.displayName))
+		}
+
+		String effectiveSuiteName = !safe(suiteName).isEmpty() ? safe(suiteName) : resolveSuiteName(root)
+		String effectiveTitle = !safe(executionTitle).isEmpty() ? safe(executionTitle) : effectiveSuiteName
+		String generatedAt = new SimpleDateFormat('dd/MM/yyyy HH:mm:ss').format(new Date())
+		String logoDataUri = resolveLogoDataUri()
+
+		String html = buildHtml(cases, effectiveSuiteName, effectiveTitle, generatedAt, logoDataUri)
+
+		File mainFile = new File(root, 'eMatchReport.html')
+		mainFile.setText(html, 'UTF-8')
+
+		File secondaryFile = new File(root, 'index.html')
+		secondaryFile.setText(html, 'UTF-8')
+
+		return mainFile
+	}
+
+	private Map normalizeCase(Map row, File reportFolder) {
+		List<Map> steps = (row.steps ?: []).collect { Map step ->
+			[
+				status    : normalizeStepStatus(step.status),
+				timestamp : safe(step.timestamp),
+				details   : safe(step.details)
+			]
+		}
+
+		List<Map> evidence = []
+		(row.evidence ?: []).each { Map ev ->
+			Map normalized = normalizeEvidence(ev, reportFolder)
+			if (normalized != null) {
+				evidence << normalized
+			}
+		}
+
+		String fullError = safe(row.fullError)
+		String shortError = buildCompactError(fullError)
+
+		return [
+			caseId       : safe(row.caseId),
+			displayName  : safe(row.displayName),
+			status       : normalizeCaseStatus(row.status),
+			startText    : safe(row.startText),
+			endText      : safe(row.endText),
+			durationText : safe(row.durationText),
+			steps        : steps,
+			shortError   : shortError,
+			fullError    : fullError,
+			evidence     : evidence
+		]
+	}
+
+	private Map normalizeEvidence(Map ev, File reportFolder) {
+		File source = resolveEvidenceFile(ev, reportFolder)
+
+		if (source == null || !source.exists() || !source.isFile() || source.length() <= 0L) {
+			return null
+		}
+
+		String dataUri = fileToDataUri(source)
+		if (dataUri.isEmpty()) {
+			return null
+		}
+
+		return [
+			name    : safe(ev.name).isEmpty() ? source.name : safe(ev.name),
+			openPath: dataUri,
+			preview : dataUri
+		]
+	}
+
+	private File resolveEvidenceFile(Map ev, File reportFolder) {
+		String absolutePath = safe(ev.absolutePath)
+		String relativePath = safe(ev.relativePath)
+
+		if (!absolutePath.isEmpty()) {
+			File absoluteFile = new File(absolutePath)
+			if (absoluteFile.exists()) {
+				return absoluteFile
+			}
+		}
+
+		if (!relativePath.isEmpty()) {
+			File relativeFile = new File(reportFolder, relativePath)
+			if (relativeFile.exists()) {
+				return relativeFile
+			}
+		}
+
+		return null
+	}
+
+	private String buildCompactError(String fullError) {
+		List<String> lines = safe(fullError)
+			.replace('\r\n', '\n')
+			.replace('\r', '\n')
+			.readLines()
+			.collect { String line -> safe(line) }
+			.findAll { String line -> !line.isEmpty() }
+
+		if (lines.isEmpty()) {
+			return ''
+		}
+
+		List<String> compact = []
+
+		for (String line : lines) {
+			if (line.startsWith('Original error:')) {
+				break
+			}
+
+			if (line.startsWith('at ')) {
+				break
+			}
+
+			compact << line
+
+			if (line.startsWith('Expected window title:')) {
+				break
+			}
+		}
+
+		if (compact.isEmpty()) {
+			compact = lines.take(Math.min(3, lines.size()))
+		}
+
+		return compact.join('\n')
+	}
+
+	private int statusOrder(String status) {
+		String upper = safe(status).toUpperCase(Locale.ENGLISH)
+
+		if ('FAILED'.equals(upper)) {
+			return 0
+		}
+
+		if ('BLOCKED'.equals(upper)) {
+			return 1
+		}
+
+		return 2
+	}
+
+	private String normalizeStepStatus(Object rawStatus) {
+		String upper = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+		if (upper in ['FAILED', 'FAIL']) {
+			return 'FAILED'
+		}
+
+		if (upper in ['BLOCKED', 'SKIPPED']) {
+			return 'BLOCKED'
+		}
+
+		return 'PASSED'
+	}
+
+	private String normalizeCaseStatus(Object rawStatus) {
+		String upper = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+		if (upper in ['FAILED', 'FAIL', 'ERROR']) {
+			return 'FAILED'
+		}
+
+		if (upper in ['BLOCKED', 'SKIPPED']) {
+			return 'BLOCKED'
+		}
+
+		return 'PASSED'
+	}
+
+	private File resolveReportFolder() {
+		String reportFolder = safe(RunConfiguration.getReportFolder())
+
+		if (!reportFolder.isEmpty()) {
+			File direct = new File(reportFolder)
+			ensureFolder(direct)
+			return direct
+		}
+
+		File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+		ensureFolder(reportsRoot)
+		return reportsRoot
+	}
+
+	private String resolveSuiteName(File reportFolder) {
+		String suiteName = JiraReportSteps.suiteNameStatic()
+		if (!suiteName.isEmpty()) {
+			return suiteName
+		}
+
+		File parent = reportFolder != null ? reportFolder.parentFile : null
+		return parent != null ? parent.name : 'Execution Report'
+	}
+
+	private String resolveLogoDataUri() {
+		File projectDir = new File(RunConfiguration.getProjectDir())
+
+		List<File> candidates = [
+			new File(projectDir, 'Images/General/logo.png'),
+			new File(projectDir, 'Images/logo.png'),
+			new File(projectDir, 'Images/eMatch-logo.png'),
+			new File(projectDir, 'Include/resources/logo.png')
+		]
+
+		File logo = candidates.find { File file ->
+			file.exists() && file.isFile()
+		}
+
+		return logo != null ? fileToDataUri(logo) : ''
+	}
+
+	private String fileToDataUri(File file) {
+		try {
+			byte[] bytes = Files.readAllBytes(file.toPath())
+			String base64 = Base64.encoder.encodeToString(bytes)
+			String ext = extension(file.name).toLowerCase(Locale.ENGLISH)
+
+			String mimeType = 'image/png'
+			if (ext in ['jpg', 'jpeg']) {
+				mimeType = 'image/jpeg'
+			} else if ('gif'.equals(ext)) {
+				mimeType = 'image/gif'
+			} else if ('bmp'.equals(ext)) {
+				mimeType = 'image/bmp'
+			}
+
+			return 'data:' + mimeType + ';base64,' + base64
+		} catch (Throwable ignored) {
+			return ''
+		}
+	}
+
+	private String extension(String fileName) {
+		String value = safe(fileName)
+		int idx = value.lastIndexOf('.')
+		return idx >= 0 ? value.substring(idx + 1) : ''
+	}
+
+	private void ensureFolder(File folder) {
+		if (folder != null && !folder.exists()) {
+			folder.mkdirs()
+		}
+	}
+
+	private String esc(String value) {
+		return safe(value)
+			.replace('\\', '\\\\')
+			.replace("'", "\\'")
+			.replace('\r', '')
+			.replace('\n', '\\n')
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+
+	private String buildHtml(List<Map> cases, String suiteName, String title, String generatedAt, String logoDataUri) {
+		String casesJson = groovy.json.JsonOutput.toJson(cases)
+		String suiteJson = groovy.json.JsonOutput.toJson(suiteName)
+		String titleJson = groovy.json.JsonOutput.toJson(title)
+		String generatedJson = groovy.json.JsonOutput.toJson(generatedAt)
+		String logoJson = groovy.json.JsonOutput.toJson(logoDataUri)
+
+		return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${safe(title)}</title>
+<style>
+* { box-sizing: border-box; }
+body {
+	margin: 0;
+	font-family: Arial, Helvetica, sans-serif;
+	background: #f6f7fb;
+	color: #202634;
+}
+.topbar {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 18px 22px;
+	background: linear-gradient(90deg, #4427c9, #6938ef);
+	color: #fff;
+}
+.topbar img {
+	width: 34px;
+	height: 34px;
+	object-fit: contain;
+	background: #fff;
+	border-radius: 8px;
+	padding: 4px;
+}
+.topbar-title strong {
+	display: block;
+	font-size: 20px;
+	line-height: 1.1;
+}
+.topbar-title span {
+	display: block;
+	font-size: 12px;
+	opacity: .88;
+}
+.layout {
+	display: grid;
+	grid-template-columns: 320px 1fr;
+	min-height: calc(100vh - 74px);
+}
+.sidebar {
+	background: #fff;
+	border-right: 1px solid #e4e8f1;
+	padding: 16px;
+}
+.search-box {
+	width: 100%;
+	padding: 10px 12px;
+	border: 1px solid #d8deea;
+	border-radius: 10px;
+	outline: none;
+	margin-bottom: 14px;
+}
+.case-list {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	max-height: calc(100vh - 170px);
+	overflow: auto;
+}
+.case-item {
+	border: 1px solid #e3e7f0;
+	border-radius: 12px;
+	padding: 12px;
+	background: #fff;
+	cursor: pointer;
+}
+.case-item:hover {
+	background: #fafaff;
+}
+.case-item.selected {
+	border-color: #6d46ff;
+	background: #f4f0ff;
+	box-shadow: inset 0 0 0 1px #6d46ff;
+}
+.case-item-title {
+	font-size: 13px;
+	line-height: 1.35;
+	margin-bottom: 10px;
+	word-break: break-word;
+}
+.case-item-footer {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.content {
+	padding: 20px;
+}
+.case-title {
+	margin: 0 0 12px 0;
+	font-size: 28px;
+}
+.pill-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+	margin-bottom: 18px;
+}
+.pill {
+	display: inline-flex;
+	align-items: center;
+	padding: 10px 14px;
+	border-radius: 999px;
+	font-size: 13px;
+	color: #fff;
+	background: #4f46e5;
+}
+.pill.status-PASSED { background: #2ca24f; }
+.pill.status-FAILED { background: #d64545; }
+.pill.status-BLOCKED { background: #c59c28; }
+.section-card {
+	background: #fff;
+	border: 1px solid #e4e8f1;
+	border-radius: 14px;
+	padding: 16px;
+	margin-bottom: 18px;
+}
+.section-title {
+	font-size: 20px;
+	margin: 0 0 14px 0;
+}
+table {
+	width: 100%;
+	border-collapse: collapse;
+}
+th, td {
+	text-align: left;
+	padding: 10px 8px;
+	border-bottom: 1px solid #edf1f7;
+	vertical-align: top;
+	font-size: 14px;
+}
+th {
+	font-size: 12px;
+	text-transform: uppercase;
+	color: #6b7280;
+}
+.status-badge {
+	display: inline-block;
+	min-width: 86px;
+	text-align: center;
+	padding: 8px 12px;
+	border-radius: 999px;
+	color: #fff;
+	font-size: 12px;
+	font-weight: bold;
+}
+.status-badge.PASSED { background: #2ca24f; }
+.status-badge.FAILED { background: #d64545; }
+.status-badge.BLOCKED { background: #c59c28; }
+.error-compact {
+	white-space: pre-wrap;
+	background: #fff;
+	color: #202634;
+	border: 1px solid #f0d2d2;
+	border-radius: 10px;
+	padding: 12px;
+	margin: 10px 0 0 0;
+	line-height: 1.45;
+	font-size: 14px;
+}
+details {
+	margin-top: 12px;
+}
+details summary {
+	cursor: pointer;
+	color: #2855e7;
+	font-weight: bold;
+	user-select: none;
+	margin-bottom: 10px;
+}
+.full-error {
+	background: #111827;
+	color: #f9fafb;
+	border-radius: 10px;
+	padding: 14px;
+	white-space: pre-wrap;
+	word-break: break-word;
+	max-height: 560px;
+	overflow: auto;
+	font-size: 13px;
+	line-height: 1.35;
+}
+.empty-text {
+	color: #6b7280;
+	font-size: 14px;
+}
+.evidence-list {
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+.evidence-card {
+	border: 1px solid #eceff6;
+	border-radius: 12px;
+	padding: 12px;
+}
+.evidence-name {
+	font-size: 14px;
+	word-break: break-word;
+	margin-bottom: 8px;
+}
+.evidence-link {
+	display: inline-block;
+	margin-bottom: 10px;
+	color: #2855e7;
+	text-decoration: none;
+	font-size: 14px;
+}
+.evidence-image {
+	width: 100%;
+	max-width: 980px;
+	border: 1px solid #dfe4ef;
+	border-radius: 10px;
+	display: block;
+}
+@media (max-width: 1080px) {
+	.layout { grid-template-columns: 1fr; }
+	.sidebar { border-right: none; border-bottom: 1px solid #e4e8f1; }
+	.case-list { max-height: 350px; }
+}
+</style>
+</head>
+<body>
+<div class="topbar">
+	<div id="logoWrap"></div>
+	<div class="topbar-title">
+		<strong>Test report - ${safe(title)}</strong>
+		<span>Generated ${safe(generatedAt)}</span>
+	</div>
+</div>
+
+<div class="layout">
+	<aside class="sidebar">
+		<input id="searchBox" class="search-box" type="text" placeholder="Search test name or status">
+		<div id="caseList" class="case-list"></div>
+	</aside>
+
+	<main class="content">
+		<h1 id="caseTitle" class="case-title"></h1>
+
+		<div class="pill-row">
+			<span id="suitePill" class="pill"></span>
+			<span id="statusPill" class="pill"></span>
+			<span id="startPill" class="pill"></span>
+			<span id="endPill" class="pill"></span>
+			<span id="durationPill" class="pill"></span>
+		</div>
+
+		<section class="section-card">
+			<h2 class="section-title">Steps</h2>
+			<table>
+				<thead>
+					<tr>
+						<th>Status</th>
+						<th>Timestamp</th>
+						<th>Details</th>
+					</tr>
+				</thead>
+				<tbody id="stepsBody"></tbody>
+			</table>
+		</section>
+
+		<section id="errorSection" class="section-card">
+			<h2 class="section-title">Visual Error Log</h2>
+			<pre id="compactError" class="error-compact"></pre>
+			<details id="fullErrorDetails">
+				<summary>View full error</summary>
+				<pre id="fullError" class="full-error"></pre>
+			</details>
+		</section>
+
+		<section id="evidenceSection" class="section-card">
+			<h2 class="section-title">Evidence</h2>
+			<div id="evidenceList" class="evidence-list"></div>
+		</section>
+	</main>
+</div>
+
+<script>
+const allCases = ${casesJson};
+const suiteName = ${suiteJson};
+const reportTitle = ${titleJson};
+const generatedAt = ${generatedJson};
+const logoDataUri = ${logoJson};
+
+let filteredCases = Array.isArray(allCases) ? allCases.slice() : [];
+let selectedCaseId = filteredCases.length ? filteredCases[0].caseId : null;
+
+const logoWrap = document.getElementById('logoWrap');
+const searchBox = document.getElementById('searchBox');
+const caseList = document.getElementById('caseList');
+const caseTitle = document.getElementById('caseTitle');
+const suitePill = document.getElementById('suitePill');
+const statusPill = document.getElementById('statusPill');
+const startPill = document.getElementById('startPill');
+const endPill = document.getElementById('endPill');
+const durationPill = document.getElementById('durationPill');
+const stepsBody = document.getElementById('stepsBody');
+const errorSection = document.getElementById('errorSection');
+const compactError = document.getElementById('compactError');
+const fullErrorDetails = document.getElementById('fullErrorDetails');
+const fullError = document.getElementById('fullError');
+const evidenceList = document.getElementById('evidenceList');
+
+if (logoDataUri) {
+	const logo = document.createElement('img');
+	logo.src = logoDataUri;
+	logo.alt = 'Logo';
+	logoWrap.appendChild(logo);
+}
+
+searchBox.addEventListener('input', function () {
+	const query = (this.value || '').trim().toLowerCase();
+
+	filteredCases = allCases.filter(function (item) {
+		const hay = ((item.displayName || '') + ' ' + (item.status || '')).toLowerCase();
+		return hay.indexOf(query) >= 0;
+	});
+
+	if (!filteredCases.some(function (item) { return item.caseId === selectedCaseId; })) {
+		selectedCaseId = filteredCases.length ? filteredCases[0].caseId : null;
+	}
+
+	renderCaseList();
+	renderSelectedCase();
+});
+
+function renderCaseList() {
+	caseList.innerHTML = '';
+
+	if (!filteredCases.length) {
+		const empty = document.createElement('div');
+		empty.className = 'empty-text';
+		empty.textContent = 'No matching test cases.';
+		caseList.appendChild(empty);
+		return;
+	}
+
+	filteredCases.forEach(function (item) {
+		const card = document.createElement('div');
+		card.className = 'case-item' + (item.caseId === selectedCaseId ? ' selected' : '');
+
+		const title = document.createElement('div');
+		title.className = 'case-item-title';
+		title.textContent = item.displayName || '';
+
+		const footer = document.createElement('div');
+		footer.className = 'case-item-footer';
+
+		const status = document.createElement('span');
+		status.className = 'status-badge ' + (item.status || 'PASSED');
+		status.textContent = item.status || '';
+
+		const duration = document.createElement('span');
+		duration.className = 'empty-text';
+		duration.textContent = item.durationText || '';
+
+		footer.appendChild(status);
+		footer.appendChild(duration);
+
+		card.appendChild(title);
+		card.appendChild(footer);
+
+		card.addEventListener('click', function () {
+			selectedCaseId = item.caseId;
+			renderCaseList();
+			renderSelectedCase();
+		});
+
+		caseList.appendChild(card);
+	});
+}
+
+function renderSelectedCase() {
+	if (!selectedCaseId) {
+		caseTitle.textContent = 'No test case selected';
+		stepsBody.innerHTML = '';
+		compactError.textContent = '';
+		fullError.textContent = '';
+		evidenceList.innerHTML = '<div class="empty-text">No evidence was found for this scenario.</div>';
+		return;
+	}
+
+	const item = allCases.find(function (entry) {
+		return entry.caseId === selectedCaseId;
+	});
+
+	if (!item) {
+		return;
+	}
+
+	caseTitle.textContent = item.displayName || '';
+	suitePill.textContent = 'Suite: ' + (suiteName || '');
+	statusPill.textContent = 'Status: ' + (item.status || '');
+	statusPill.className = 'pill status-' + (item.status || 'PASSED');
+	startPill.textContent = 'Start: ' + (item.startText || '');
+	endPill.textContent = 'End: ' + (item.endText || '');
+	durationPill.textContent = 'Duration: ' + (item.durationText || '');
+
+	stepsBody.innerHTML = '';
+
+	(item.steps || []).forEach(function (step) {
+		const tr = document.createElement('tr');
+
+		const tdStatus = document.createElement('td');
+		const badge = document.createElement('span');
+		badge.className = 'status-badge ' + (step.status || 'PASSED');
+		badge.textContent = step.status || '';
+		tdStatus.appendChild(badge);
+
+		const tdTime = document.createElement('td');
+		tdTime.textContent = step.timestamp || '';
+
+		const tdDetails = document.createElement('td');
+		tdDetails.textContent = step.details || '';
+
+		tr.appendChild(tdStatus);
+		tr.appendChild(tdTime);
+		tr.appendChild(tdDetails);
+
+		stepsBody.appendChild(tr);
+	});
+
+	if (item.fullError) {
+		errorSection.style.display = 'block';
+		compactError.textContent = item.shortError || '';
+		fullError.textContent = item.fullError || '';
+		fullErrorDetails.style.display = 'block';
+	} else {
+		errorSection.style.display = 'none';
+		compactError.textContent = '';
+		fullError.textContent = '';
+	}
+
+	evidenceList.innerHTML = '';
+
+	const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+
+	if (!evidence.length) {
+		evidenceList.innerHTML = '<div class="empty-text">No evidence was found for this scenario.</div>';
+		return;
+	}
+
+	evidence.forEach(function (ev) {
+		const card = document.createElement('div');
+		card.className = 'evidence-card';
+
+		const name = document.createElement('div');
+		name.className = 'evidence-name';
+		name.textContent = ev.name || 'Evidence';
+		card.appendChild(name);
+
+		const link = document.createElement('a');
+		link.className = 'evidence-link';
+		link.textContent = 'Open evidence';
+		link.href = ev.openPath || '#';
+		link.target = '_blank';
+		link.rel = 'noopener';
+		card.appendChild(link);
+
+		const img = document.createElement('img');
+		img.className = 'evidence-image';
+		img.src = ev.preview || ev.openPath || '';
+		img.alt = ev.name || 'Evidence';
+		card.appendChild(img);
+
+		evidenceList.appendChild(card);
+	});
+}
+
+renderCaseList();
+renderSelectedCase();
+</script>
+</body>
+</html>
+"""
+	}
+}
+Test Listeners/ematchReport.groovy
+import java.util.Locale
+
+import com.kms.katalon.core.annotation.AfterTestCase
+import com.kms.katalon.core.annotation.AfterTestSuite
+import com.kms.katalon.core.annotation.BeforeTestCase
+import com.kms.katalon.core.annotation.BeforeTestSuite
+import com.kms.katalon.core.context.TestCaseContext
+import com.kms.katalon.core.context.TestSuiteContext
+import com.kms.katalon.core.util.KeywordUtil
+
+class ematchReport {
+
+	private static final ThreadLocal<Boolean> TRACKING_ENABLED = new ThreadLocal<Boolean>()
+
+	@BeforeTestSuite
+	def beforeTestSuite(TestSuiteContext testSuiteContext) {
+		String suiteId = safe(testSuiteContext?.getTestSuiteId())
+		boolean skipSuite = shouldSkipSuite(suiteId)
+
+		TRACKING_ENABLED.set(!skipSuite)
+
+		if (skipSuite) {
+			KeywordUtil.logInfo('[REPORT_LISTENER] Skipping report tracking for suite: ' + suiteId)
+			return
+		}
+
+		try {
+			CustomKeywords.'jiraIntegration.JiraReportSteps.reset'()
+			CustomKeywords.'jiraIntegration.JiraReportSteps.setSuiteName'(cleanSuiteName(suiteId))
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[REPORT_LISTENER] beforeTestSuite failed: ' + safe(t.message))
+		}
+	}
+
+	@BeforeTestCase
+	def beforeTestCase(TestCaseContext testCaseContext) {
+		if (!isTrackingEnabled()) {
+			return
+		}
+
+		try {
+			String caseId = safe(testCaseContext?.getTestCaseId())
+			CustomKeywords.'jiraIntegration.JiraReportSteps.startCase'(caseId)
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[REPORT_LISTENER] beforeTestCase failed: ' + safe(t.message))
+		}
+	}
+
+	@AfterTestCase
+	def afterTestCase(TestCaseContext testCaseContext) {
+		if (!isTrackingEnabled()) {
+			return
+		}
+
+		String caseId = safe(testCaseContext?.getTestCaseId())
+		String rawStatus = safe(testCaseContext?.getTestCaseStatus())
+		String rawMessage = safe(testCaseContext?.getMessage())
+		String finalStatus = resolveFinalStatus(caseId, rawStatus, rawMessage)
+
+		try {
+			if ('FAILED'.equals(finalStatus)) {
+				CustomKeywords.'jiraIntegration.JiraReportSteps.fail'(rawMessage)
+				CustomKeywords.'jiraIntegration.JiraImagesEvidence.autoFailure'(caseId)
+			}
+
+			CustomKeywords.'jiraIntegration.JiraReportSteps.finishCase'(finalStatus)
+			new jiraIntegration.JiraReportBuilder().buildReport()
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[REPORT_LISTENER] afterTestCase failed: ' + safe(t.message))
+		}
+	}
+
+	@AfterTestSuite
+	def afterTestSuite(TestSuiteContext testSuiteContext) {
+		if (!isTrackingEnabled()) {
+			return
+		}
+
+		try {
+			new jiraIntegration.JiraReportBuilder().buildReport()
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[REPORT_LISTENER] afterTestSuite failed: ' + safe(t.message))
+		} finally {
+			TRACKING_ENABLED.remove()
+		}
+	}
+
+	private boolean isTrackingEnabled() {
+		Boolean enabled = TRACKING_ENABLED.get()
+		return enabled != null && enabled.booleanValue()
+	}
+
+	private boolean shouldSkipSuite(String suiteId) {
+		String lower = safe(suiteId).toLowerCase(Locale.ENGLISH)
+		return lower.contains('jira integration report')
+	}
+
+	private String resolveFinalStatus(String caseId, String rawStatus, String rawMessage) {
+		String upper = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+		if (upper in ['FAILED', 'FAIL', 'ERROR']) {
+			return 'FAILED'
+		}
+
+		if (upper in ['BLOCKED', 'SKIPPED']) {
+			return 'BLOCKED'
+		}
+
+		boolean storedFailure = false
+
+		try {
+			storedFailure = CustomKeywords.'jiraIntegration.JiraReportSteps.caseHasFailure'(caseId)
+		} catch (Throwable ignored) {
+			storedFailure = false
+		}
+
+		if (storedFailure) {
+			return 'FAILED'
+		}
+
+		if (!safe(rawMessage).isEmpty() && !'PASSED'.equals(upper)) {
+			return 'FAILED'
+		}
+
+		return 'PASSED'
+	}
+
+	private String cleanSuiteName(String suiteId) {
+		String value = safe(suiteId)
+		if (value.startsWith('Test Suites/')) {
+			return value.substring('Test Suites/'.length())
+		}
+		return value
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
