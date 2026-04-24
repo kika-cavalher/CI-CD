@@ -1,1 +1,299 @@
+:
 
+package jiraIntegration
+
+import java.awt.GraphicsDevice
+import java.awt.GraphicsEnvironment
+import java.awt.MouseInfo
+import java.awt.PointerInfo
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.image.BufferedImage
+import java.text.SimpleDateFormat
+
+import javax.imageio.ImageIO
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.driver.WindowsDriverFactory
+
+class JiraImagesEvidence {
+
+	private static final String EVIDENCE_ROOT_FOLDER = 'Evidences'
+	private static final String EVIDENCE_INDEX_FILE = 'jira_images_evidence.tsv'
+	private static final SimpleDateFormat FILE_STAMP = new SimpleDateFormat('yyyyMMdd_HHmmss_SSS')
+
+	private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
+
+	@Keyword
+	static void startCase(String caseId) {
+		String safeCaseId = safe(caseId)
+
+		if (safeCaseId.isEmpty()) {
+			CURRENT_CASE_ID.remove()
+			return
+		}
+
+		CURRENT_CASE_ID.set(safeCaseId)
+		ensureEvidenceRootExists()
+	}
+
+	@Keyword
+	static String autoFailure(String caseId = '') {
+		String effectiveCaseId = safe(caseId)
+
+		if (effectiveCaseId.isEmpty()) {
+			effectiveCaseId = safe(CURRENT_CASE_ID.get())
+		}
+
+		if (effectiveCaseId.isEmpty()) {
+			KeywordUtil.logInfo('JiraImagesEvidence: caseId is empty, skipping evidence capture.')
+			return ''
+		}
+
+		File reportFolder = resolveReportFolder()
+		if (reportFolder == null) {
+			KeywordUtil.logInfo('JiraImagesEvidence: report folder was not resolved, skipping evidence capture.')
+			return ''
+		}
+
+		File caseEvidenceFolder = buildCaseEvidenceFolder(reportFolder, effectiveCaseId)
+		if (!caseEvidenceFolder.exists()) {
+			caseEvidenceFolder.mkdirs()
+		}
+
+		BufferedImage capture = captureSingleMonitor()
+		if (capture == null) {
+			KeywordUtil.logInfo('JiraImagesEvidence: screen capture returned null.')
+			return ''
+		}
+
+		String fileName = FILE_STAMP.format(new Date()) + '_auto_failure.png'
+		File imageFile = new File(caseEvidenceFolder, fileName)
+
+		try {
+			ImageIO.write(capture, 'png', imageFile)
+
+			if (!imageFile.exists() || imageFile.length() <= 0L) {
+				KeywordUtil.logInfo('JiraImagesEvidence: evidence file was not created correctly.')
+				return ''
+			}
+
+			appendEvidenceIndex(reportFolder, effectiveCaseId, imageFile)
+
+			KeywordUtil.logInfo('JiraImagesEvidence: evidence saved at ' + imageFile.absolutePath)
+			return imageFile.absolutePath
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence: failed to save evidence. ' + safe(t.message))
+			return ''
+		}
+	}
+
+	@Keyword
+	static void finishCase() {
+		CURRENT_CASE_ID.remove()
+	}
+
+	private static BufferedImage captureSingleMonitor() {
+		try {
+			Rectangle captureBounds = resolveCaptureBounds()
+
+			if (captureBounds == null || captureBounds.width <= 0 || captureBounds.height <= 0) {
+				captureBounds = getPrimaryScreenBounds()
+			}
+
+			if (captureBounds == null || captureBounds.width <= 0 || captureBounds.height <= 0) {
+				captureBounds = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
+			}
+
+			Robot robot = new Robot()
+			return robot.createScreenCapture(captureBounds)
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence: failed to capture monitor. ' + safe(t.message))
+			return null
+		}
+	}
+
+	private static Rectangle resolveCaptureBounds() {
+		Rectangle appMonitorBounds = getMonitorBoundsFromAUTWindow()
+		if (appMonitorBounds != null) {
+			return appMonitorBounds
+		}
+
+		Rectangle pointerMonitorBounds = getMonitorBoundsFromMouse()
+		if (pointerMonitorBounds != null) {
+			return pointerMonitorBounds
+		}
+
+		return getPrimaryScreenBounds()
+	}
+
+	private static Rectangle getMonitorBoundsFromAUTWindow() {
+		try {
+			def driver = WindowsDriverFactory.getWindowsDriver()
+
+			if (driver == null) {
+				return null
+			}
+
+			org.openqa.selenium.Point winPosition = driver.manage().window().getPosition()
+			org.openqa.selenium.Dimension winSize = driver.manage().window().getSize()
+
+			if (winPosition == null || winSize == null) {
+				return null
+			}
+
+			int centerX = winPosition.getX() + (int) (winSize.getWidth() / 2)
+			int centerY = winPosition.getY() + (int) (winSize.getHeight() / 2)
+
+			return getMonitorBoundsContainingPoint(centerX, centerY)
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static Rectangle getMonitorBoundsFromMouse() {
+		try {
+			PointerInfo pointerInfo = MouseInfo.getPointerInfo()
+
+			if (pointerInfo == null || pointerInfo.location == null) {
+				return null
+			}
+
+			return getMonitorBoundsContainingPoint(pointerInfo.location.x, pointerInfo.location.y)
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static Rectangle getMonitorBoundsContainingPoint(int x, int y) {
+		try {
+			GraphicsEnvironment environment = GraphicsEnvironment.getLocalGraphicsEnvironment()
+			GraphicsDevice[] devices = environment.getScreenDevices()
+
+			if (devices == null || devices.length == 0) {
+				return null
+			}
+
+			for (GraphicsDevice device : devices) {
+				Rectangle bounds = device.getDefaultConfiguration().getBounds()
+
+				if (bounds != null && bounds.contains(x, y)) {
+					return bounds
+				}
+			}
+
+			return null
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static Rectangle getPrimaryScreenBounds() {
+		try {
+			GraphicsEnvironment environment = GraphicsEnvironment.getLocalGraphicsEnvironment()
+			GraphicsDevice primary = environment.getDefaultScreenDevice()
+
+			if (primary != null && primary.getDefaultConfiguration() != null) {
+				return primary.getDefaultConfiguration().getBounds()
+			}
+
+			return null
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static File resolveReportFolder() {
+		try {
+			String reportFolderPath = safe(RunConfiguration.getReportFolder())
+
+			if (!reportFolderPath.isEmpty()) {
+				File folder = new File(reportFolderPath)
+				if (!folder.exists()) {
+					folder.mkdirs()
+				}
+				return folder
+			}
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			File fallback = new File(RunConfiguration.getProjectDir(), 'Reports')
+			if (!fallback.exists()) {
+				fallback.mkdirs()
+			}
+			return fallback
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static File ensureEvidenceRootExists() {
+		File reportFolder = resolveReportFolder()
+
+		if (reportFolder == null) {
+			return null
+		}
+
+		File evidenceRoot = new File(reportFolder, EVIDENCE_ROOT_FOLDER)
+		if (!evidenceRoot.exists()) {
+			evidenceRoot.mkdirs()
+		}
+
+		return evidenceRoot
+	}
+
+	private static File buildCaseEvidenceFolder(File reportFolder, String caseId) {
+		File evidenceRoot = new File(reportFolder, EVIDENCE_ROOT_FOLDER)
+
+		String normalizedCaseId = safe(caseId).replace('\\', '/')
+		List<String> parts = normalizedCaseId.split('/') as List<String>
+
+		File current = evidenceRoot
+
+		parts.each { String part ->
+			String folderName = sanitizePathPart(part)
+
+			if (!folderName.isEmpty()) {
+				current = new File(current, folderName)
+			}
+		}
+
+		return current
+	}
+
+	private static void appendEvidenceIndex(File reportFolder, String caseId, File imageFile) {
+		try {
+			File indexFile = new File(reportFolder, EVIDENCE_INDEX_FILE)
+			String timestamp = String.valueOf(System.currentTimeMillis())
+			String escapedCaseId = safe(caseId).replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+			String escapedPath = imageFile.absolutePath.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+
+			indexFile.withWriterAppend('UTF-8') { writer ->
+				writer.writeLine(timestamp + '\t' + escapedCaseId + '\t' + escapedPath)
+			}
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence: failed to update evidence index. ' + safe(t.message))
+		}
+	}
+
+	private static String sanitizePathPart(String value) {
+		String text = safe(value)
+
+		if (text.isEmpty()) {
+			return ''
+		}
+
+		text = text.replaceAll('[\\\\/:*?"<>|]', '_')
+		text = text.replaceAll('\\s+', ' ').trim()
+
+		return text
+	}
+
+	private static String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
