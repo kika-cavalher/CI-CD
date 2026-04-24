@@ -1,1 +1,1496 @@
+Keywords/jiraIntegration/JiraReportSteps.groovy
+package jiraIntegration
 
+import java.text.SimpleDateFormat
+
+import com.kms.katalon.core.annotation.Keyword
+
+class JiraReportSteps {
+
+    private static final Object LOCK = new Object()
+    private static final Map<String, Map> CASES = new LinkedHashMap<String, Map>()
+    private static final ThreadLocal<String> CURRENT_CASE = new ThreadLocal<String>()
+    private static String SUITE_NAME = ''
+
+    @Keyword
+    def reset() {
+        synchronized (LOCK) {
+            CASES.clear()
+            SUITE_NAME = ''
+            CURRENT_CASE.remove()
+        }
+    }
+
+    @Keyword
+    def setSuiteName(String suiteName) {
+        synchronized (LOCK) {
+            SUITE_NAME = safe(suiteName)
+        }
+    }
+
+    @Keyword
+    def startCase(String caseId) {
+        synchronized (LOCK) {
+            String id = safe(caseId)
+            CURRENT_CASE.set(id)
+            ensureCase(id)
+        }
+    }
+
+    @Keyword
+    def note(String message) {
+        synchronized (LOCK) {
+            String text = safe(message)
+            if (text.isEmpty()) {
+                return
+            }
+
+            String caseId = currentCaseId()
+            Map record = ensureCase(caseId)
+
+            finalizePendingStep(record, 'PASSED')
+
+            record.steps << [
+                status   : 'PENDING',
+                timestamp: timeNow(),
+                details  : text
+            ]
+        }
+    }
+
+    @Keyword
+    def fail(String rawError) {
+        synchronized (LOCK) {
+            String caseId = currentCaseId()
+            Map record = ensureCase(caseId)
+
+            String fullError = normalizeErrorText(rawError, caseId)
+            record.fullError = fullError
+            record.shortError = buildCompactError(fullError)
+            record.status = 'FAILED'
+
+            boolean updatedPending = markLastPendingStep(record, 'FAILED')
+
+            if (!updatedPending) {
+                String fallbackStepText = record.steps ? safe(record.steps[-1].details) : 'Execution failed'
+                record.steps << [
+                    status   : 'FAILED',
+                    timestamp: timeNow(),
+                    details  : fallbackStepText
+                ]
+            }
+        }
+    }
+
+    @Keyword
+    def finishCase(String rawStatus) {
+        synchronized (LOCK) {
+            String caseId = currentCaseId()
+            Map record = ensureCase(caseId)
+
+            String requestedStatus = normalizeRequestedStatus(rawStatus)
+            String finalStatus = decideFinalStatus(record, requestedStatus)
+
+            if ('PASSED'.equals(finalStatus)) {
+                finalizePendingStep(record, 'PASSED')
+            } else if ('FAILED'.equals(finalStatus)) {
+                if (!markLastPendingStep(record, 'FAILED') && !hasFailedStep(record) && record.steps) {
+                    record.steps[-1].status = 'FAILED'
+                }
+                markAllPendingAs(record, 'BLOCKED')
+            } else {
+                markAllPendingAs(record, 'BLOCKED')
+            }
+
+            record.status = finalStatus
+            record.endedAt = System.currentTimeMillis()
+            record.endText = dateTimeNow()
+            record.durationText = formatDuration((record.endedAt as long) - (record.startedAt as long))
+        }
+    }
+
+    @Keyword
+    boolean caseHasFailure(String caseId) {
+        return caseHasFailureStatic(caseId)
+    }
+
+    @Keyword
+    def registerEvidence(String caseId, String fileName, String relativePath, String absolutePath) {
+        registerEvidenceStatic(caseId, fileName, relativePath, absolutePath)
+    }
+
+    @Keyword
+    List<Map> getCases() {
+        return snapshotCases()
+    }
+
+    @Keyword
+    Map getCase(String caseId) {
+        return snapshotCase(caseId)
+    }
+
+    @Keyword
+    String getSuiteName() {
+        return suiteNameStatic()
+    }
+
+    static boolean caseHasFailureStatic(String caseId) {
+        synchronized (LOCK) {
+            Map record = CASES[safe(caseId)]
+            return record != null && (
+                'FAILED'.equals(record.status) ||
+                hasFailedStep(record) ||
+                !safe(record.fullError).isEmpty()
+            )
+        }
+    }
+
+    static void registerEvidenceStatic(String caseId, String fileName, String relativePath, String absolutePath) {
+        synchronized (LOCK) {
+            Map record = ensureCase(safe(caseId))
+            record.evidence << [
+                name        : safe(fileName),
+                relativePath: normalizePath(relativePath),
+                absolutePath: normalizePath(absolutePath)
+            ]
+        }
+    }
+
+    static List<Map> snapshotCases() {
+        synchronized (LOCK) {
+            return CASES.values().collect { deepCopyCase(it) }
+        }
+    }
+
+    static Map snapshotCase(String caseId) {
+        synchronized (LOCK) {
+            Map record = CASES[safe(caseId)]
+            return record ? deepCopyCase(record) : [:]
+        }
+    }
+
+    static String suiteNameStatic() {
+        synchronized (LOCK) {
+            return SUITE_NAME
+        }
+    }
+
+    private static Map ensureCase(String caseId) {
+        String id = safe(caseId)
+
+        if (!CASES.containsKey(id)) {
+            long startedAt = System.currentTimeMillis()
+
+            CASES[id] = [
+                caseId      : id,
+                displayName : displayNameFromCaseId(id),
+                steps       : [],
+                evidence    : [],
+                status      : 'PASSED',
+                fullError   : '',
+                shortError  : '',
+                startedAt   : startedAt,
+                endedAt     : startedAt,
+                startText   : dateTimeNow(),
+                endText     : '',
+                durationText: '00h 00m 00s'
+            ]
+        }
+
+        return CASES[id]
+    }
+
+    private static Map deepCopyCase(Map record) {
+        return [
+            caseId      : safe(record.caseId),
+            displayName : safe(record.displayName),
+            steps       : (record.steps ?: []).collect { [status: safe(it.status), timestamp: safe(it.timestamp), details: safe(it.details)] },
+            evidence    : (record.evidence ?: []).collect { [name: safe(it.name), relativePath: safe(it.relativePath), absolutePath: safe(it.absolutePath)] },
+            status      : safe(record.status),
+            fullError   : safe(record.fullError),
+            shortError  : safe(record.shortError),
+            startedAt   : record.startedAt ?: 0L,
+            endedAt     : record.endedAt ?: 0L,
+            startText   : safe(record.startText),
+            endText     : safe(record.endText),
+            durationText: safe(record.durationText)
+        ]
+    }
+
+    private static String decideFinalStatus(Map record, String requestedStatus) {
+        if (hasFailedStep(record) || !safe(record.fullError).isEmpty()) {
+            return 'FAILED'
+        }
+
+        if ('FAILED'.equals(requestedStatus)) {
+            return 'FAILED'
+        }
+
+        if ('BLOCKED'.equals(requestedStatus)) {
+            return 'BLOCKED'
+        }
+
+        return 'PASSED'
+    }
+
+    private static String normalizeRequestedStatus(String rawStatus) {
+        String value = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+        if (value in ['FAILED', 'FAIL', 'ERROR']) {
+            return 'FAILED'
+        }
+
+        if (value in ['SKIPPED', 'BLOCKED']) {
+            return 'BLOCKED'
+        }
+
+        return 'PASSED'
+    }
+
+    private static void finalizePendingStep(Map record, String finalStatus) {
+        for (int i = record.steps.size() - 1; i >= 0; i--) {
+            if ('PENDING'.equals(record.steps[i].status)) {
+                record.steps[i].status = finalStatus
+                return
+            }
+        }
+    }
+
+    private static boolean markLastPendingStep(Map record, String finalStatus) {
+        for (int i = record.steps.size() - 1; i >= 0; i--) {
+            if ('PENDING'.equals(record.steps[i].status)) {
+                record.steps[i].status = finalStatus
+                return true
+            }
+        }
+        return false
+    }
+
+    private static void markAllPendingAs(Map record, String finalStatus) {
+        (record.steps ?: []).each { Map step ->
+            if ('PENDING'.equals(step.status)) {
+                step.status = finalStatus
+            }
+        }
+    }
+
+    private static boolean hasFailedStep(Map record) {
+        return (record.steps ?: []).any { 'FAILED'.equals(safe(it.status)) }
+    }
+
+    private static String normalizeErrorText(String rawError, String caseId) {
+        String text = safe(rawError)
+        String header = displayNameFromCaseId(caseId) + ' FAILED.'
+
+        if (text.isEmpty()) {
+            return header + '\nReason:\nNo error message was returned.'
+        }
+
+        text = text.replace('\r\n', '\n').replace('\r', '\n').trim()
+
+        if (!text.startsWith(header)) {
+            return header + '\nReason:\n' + text
+        }
+
+        return text
+    }
+
+    private static String buildCompactError(String fullError) {
+        List<String> lines = safe(fullError)
+            .replace('\r\n', '\n')
+            .replace('\r', '\n')
+            .readLines()
+            .collect { safe(it) }
+            .findAll { !it.isEmpty() }
+
+        if (lines.isEmpty()) {
+            return ''
+        }
+
+        int maxLines = Math.min(3, lines.size())
+        return lines.take(maxLines).join('\n')
+    }
+
+    private static String currentCaseId() {
+        String caseId = CURRENT_CASE.get()
+        if (!safe(caseId).isEmpty()) {
+            return caseId
+        }
+
+        if (!CASES.isEmpty()) {
+            return CASES.keySet().last()
+        }
+
+        return 'Unknown Test Case'
+    }
+
+    private static String displayNameFromCaseId(String caseId) {
+        String value = safe(caseId)
+        if (value.startsWith('Test Cases/')) {
+            return value
+        }
+        return value.isEmpty() ? 'Unknown Test Case' : value
+    }
+
+    private static String dateTimeNow() {
+        return new SimpleDateFormat('dd/MM/yyyy HH:mm:ss').format(new Date())
+    }
+
+    private static String timeNow() {
+        return new SimpleDateFormat('HH:mm:ss').format(new Date())
+    }
+
+    private static String formatDuration(long millis) {
+        long totalSeconds = Math.max(0L, Math.round(millis / 1000.0d))
+        long hours = (long) (totalSeconds / 3600)
+        long minutes = (long) ((totalSeconds % 3600) / 60)
+        long seconds = (long) (totalSeconds % 60)
+
+        return String.format('%02dh %02dm %02ds', hours, minutes, seconds)
+    }
+
+    private static String normalizePath(String path) {
+        return safe(path).replace('\\', '/')
+    }
+
+    private static String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+Keywords/jiraIntegration/JiraImagesEvidence.groovy
+package jiraIntegration
+
+import java.awt.GraphicsDevice
+import java.awt.GraphicsEnvironment
+import java.awt.MouseInfo
+import java.awt.Point
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.image.BufferedImage
+import java.text.SimpleDateFormat
+
+import javax.imageio.ImageIO
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraImagesEvidence {
+
+    private static final String EVIDENCE_FOLDER_NAME = 'evidence'
+
+    @Keyword
+    String autoFailure(String caseId) {
+        String effectiveCaseId = safe(caseId)
+        if (effectiveCaseId.isEmpty()) {
+            KeywordUtil.logInfo('[JIRA_EVIDENCE] Skipped because caseId is empty.')
+            return ''
+        }
+
+        try {
+            File reportFolder = resolveReportFolder()
+            File evidenceRoot = new File(reportFolder, EVIDENCE_FOLDER_NAME)
+            File caseFolder = new File(evidenceRoot, sanitizeForPath(effectiveCaseId))
+
+            ensureFolder(caseFolder)
+
+            String timestamp = new SimpleDateFormat('yyyyMMdd_HHmmss_SSS').format(new Date())
+            String fileName = timestamp + '_' + sanitizeForPath(effectiveCaseId) + '_auto_failure.png'
+            File targetFile = new File(caseFolder, fileName)
+
+            boolean captured = false
+
+            if (isRemoteExecution()) {
+                captured = captureAllMonitors(targetFile)
+                if (!captured) {
+                    captured = capturePointerMonitor(targetFile)
+                }
+            } else {
+                captured = capturePointerMonitor(targetFile)
+                if (!captured) {
+                    captured = capturePrimaryMonitor(targetFile)
+                }
+            }
+
+            if (!captured || !targetFile.exists() || targetFile.length() <= 0L) {
+                KeywordUtil.logInfo('[JIRA_EVIDENCE] Capture failed for case: ' + effectiveCaseId)
+                return ''
+            }
+
+            String relativePath = relativizePath(reportFolder, targetFile)
+
+            JiraReportSteps.registerEvidenceStatic(
+                effectiveCaseId,
+                targetFile.getName(),
+                relativePath,
+                targetFile.getAbsolutePath()
+            )
+
+            KeywordUtil.logInfo('[JIRA_EVIDENCE] Saved: ' + targetFile.getAbsolutePath())
+            return targetFile.getAbsolutePath()
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('[JIRA_EVIDENCE] autoFailure failed: ' + safe(t.getMessage()))
+            return ''
+        }
+    }
+
+    private static boolean capturePointerMonitor(File targetFile) {
+        try {
+            GraphicsEnvironment graphicsEnvironment = GraphicsEnvironment.localGraphicsEnvironment
+            GraphicsDevice[] devices = graphicsEnvironment.screenDevices
+            Point pointerLocation = MouseInfo.pointerInfo != null ? MouseInfo.pointerInfo.location : null
+
+            Rectangle bounds = null
+
+            if (pointerLocation != null) {
+                for (GraphicsDevice device : devices) {
+                    Rectangle candidate = device.defaultConfiguration.bounds
+                    if (candidate != null && candidate.contains(pointerLocation)) {
+                        bounds = candidate
+                        break
+                    }
+                }
+            }
+
+            if (bounds == null) {
+                GraphicsDevice defaultDevice = graphicsEnvironment.defaultScreenDevice
+                bounds = defaultDevice != null ? defaultDevice.defaultConfiguration.bounds : null
+            }
+
+            if (bounds == null) {
+                return false
+            }
+
+            return captureRectangle(bounds, targetFile)
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private static boolean capturePrimaryMonitor(File targetFile) {
+        try {
+            GraphicsEnvironment graphicsEnvironment = GraphicsEnvironment.localGraphicsEnvironment
+            GraphicsDevice defaultDevice = graphicsEnvironment.defaultScreenDevice
+            Rectangle bounds = defaultDevice != null ? defaultDevice.defaultConfiguration.bounds : null
+
+            if (bounds == null) {
+                return false
+            }
+
+            return captureRectangle(bounds, targetFile)
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private static boolean captureAllMonitors(File targetFile) {
+        try {
+            GraphicsEnvironment graphicsEnvironment = GraphicsEnvironment.localGraphicsEnvironment
+            GraphicsDevice[] devices = graphicsEnvironment.screenDevices
+
+            Rectangle union = null
+
+            for (GraphicsDevice device : devices) {
+                Rectangle bounds = device.defaultConfiguration.bounds
+                if (bounds == null) {
+                    continue
+                }
+
+                if (union == null) {
+                    union = new Rectangle(bounds)
+                } else {
+                    union = union.union(bounds)
+                }
+            }
+
+            if (union == null) {
+                return false
+            }
+
+            return captureRectangle(union, targetFile)
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private static boolean captureRectangle(Rectangle bounds, File targetFile) {
+        try {
+            Robot robot = new Robot()
+            BufferedImage image = robot.createScreenCapture(bounds)
+            ImageIO.write(image, 'png', targetFile)
+            return targetFile.exists() && targetFile.length() > 0L
+        } catch (Throwable ignored) {
+            return false
+        }
+    }
+
+    private static File resolveReportFolder() {
+        String fromRunConfiguration = safe(RunConfiguration.getReportFolder())
+        if (!fromRunConfiguration.isEmpty()) {
+            File direct = new File(fromRunConfiguration)
+            ensureFolder(direct)
+            return direct
+        }
+
+        File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+        ensureFolder(reportsRoot)
+
+        File latestLeaf = findLatestLeafFolder(reportsRoot)
+        if (latestLeaf != null) {
+            return latestLeaf
+        }
+
+        File fallback = new File(reportsRoot, new SimpleDateFormat('yyyyMMdd_HHmmss').format(new Date()))
+        ensureFolder(fallback)
+        return fallback
+    }
+
+    private static File findLatestLeafFolder(File root) {
+        List<File> folders = []
+        root.eachFileRecurse { File file ->
+            if (file.isDirectory()) {
+                folders << file
+            }
+        }
+
+        folders = folders.findAll { File folder ->
+            File[] children = folder.listFiles()
+            return children != null && children.any { File child -> child.isFile() }
+        }
+
+        if (folders.isEmpty()) {
+            return null
+        }
+
+        folders.sort { File a, File b -> Long.valueOf(b.lastModified()).compareTo(Long.valueOf(a.lastModified())) }
+        return folders[0]
+    }
+
+    private static String relativizePath(File fromFolder, File targetFile) {
+        try {
+            return fromFolder.toPath().relativize(targetFile.toPath()).toString().replace('\\', '/')
+        } catch (Throwable ignored) {
+            return targetFile.getName()
+        }
+    }
+
+    private static boolean isRemoteExecution() {
+        Map<String, String> env = System.getenv()
+        return !safe(env['JENKINS_URL']).isEmpty() ||
+               !safe(env['BUILD_NUMBER']).isEmpty() ||
+               !safe(env['WORKSPACE']).isEmpty() ||
+               !safe(env['NODE_NAME']).isEmpty()
+    }
+
+    private static void ensureFolder(File folder) {
+        if (folder != null && !folder.exists()) {
+            folder.mkdirs()
+        }
+    }
+
+    private static String sanitizeForPath(String value) {
+        return safe(value).replaceAll('[^A-Za-z0-9._-]+', '_')
+    }
+
+    private static String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+Keywords/jiraIntegration/JiraHtmlReportBuilder.groovy
+package jiraIntegration
+
+import java.nio.file.Files
+import java.text.SimpleDateFormat
+import java.util.Base64
+
+import groovy.json.JsonOutput
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+class JiraHtmlReportBuilder {
+
+    @Keyword
+    String buildReport() {
+        try {
+            File reportFolder = resolveReportFolder()
+            List<Map> cases = JiraReportSteps.snapshotCases()
+
+            if (!cases || cases.isEmpty()) {
+                KeywordUtil.logInfo('[JIRA_REPORT] No cases found to build report.')
+                return ''
+            }
+
+            List<Map> normalizedCases = sortCases(cases).collect { Map tc ->
+                return buildCasePayload(tc, reportFolder)
+            }
+
+            Map payload = [
+                suiteName  : resolveSuiteName(reportFolder),
+                generatedAt: new SimpleDateFormat('dd/MM/yyyy HH:mm:ss').format(new Date()),
+                logoDataUri: resolveLogoDataUri(),
+                cases      : normalizedCases
+            ]
+
+            String json = JsonOutput.toJson(payload).replace('</', '<\\/')
+
+            String html = buildHtml(json)
+
+            File htmlFile = new File(reportFolder, 'ematchReport.html')
+            htmlFile.setText(html, 'UTF-8')
+
+            File indexFile = new File(reportFolder, 'index.html')
+            indexFile.setText(html, 'UTF-8')
+
+            KeywordUtil.logInfo('[JIRA_REPORT] HTML generated at: ' + htmlFile.getAbsolutePath())
+            return htmlFile.getAbsolutePath()
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('[JIRA_REPORT] buildReport failed: ' + safe(t.getMessage()))
+            return ''
+        }
+    }
+
+    private static List<Map> sortCases(List<Map> cases) {
+        List<Map> copy = cases.collect { it }
+
+        copy.sort { Map a, Map b ->
+            int priorityA = statusPriority(safe(a.status))
+            int priorityB = statusPriority(safe(b.status))
+
+            if (priorityA != priorityB) {
+                return priorityA <=> priorityB
+            }
+
+            return safe(a.displayName).compareToIgnoreCase(safe(b.displayName))
+        }
+
+        return copy
+    }
+
+    private static int statusPriority(String status) {
+        String value = safe(status).toUpperCase(Locale.ENGLISH)
+        if ('FAILED'.equals(value)) {
+            return 0
+        }
+        if ('BLOCKED'.equals(value)) {
+            return 1
+        }
+        return 2
+    }
+
+    private static Map buildCasePayload(Map caseData, File reportFolder) {
+        List<Map> evidence = (caseData.evidence ?: []).collect { Map ev ->
+            return buildEvidencePayload(ev, reportFolder)
+        }.findAll { it != null }
+
+        List<Map> steps = (caseData.steps ?: []).collect { Map step ->
+            String finalStatus = normalizeStepStatus(step.status)
+            return [
+                status   : finalStatus,
+                timestamp: safe(step.timestamp),
+                details  : safe(step.details)
+            ]
+        }
+
+        return [
+            caseId      : safe(caseData.caseId),
+            displayName : safe(caseData.displayName),
+            status      : normalizeCaseStatus(caseData.status),
+            startText   : safe(caseData.startText),
+            endText     : safe(caseData.endText),
+            durationText: safe(caseData.durationText),
+            steps       : steps,
+            shortError  : safe(caseData.shortError),
+            fullError   : safe(caseData.fullError),
+            evidence    : evidence
+        ]
+    }
+
+    private static Map buildEvidencePayload(Map evidenceData, File reportFolder) {
+        String name = safe(evidenceData.name)
+        String absolutePath = safe(evidenceData.absolutePath)
+        String relativePath = safe(evidenceData.relativePath)
+
+        File sourceFile = null
+
+        if (!absolutePath.isEmpty()) {
+            File absoluteFile = new File(absolutePath)
+            if (absoluteFile.exists()) {
+                sourceFile = absoluteFile
+            }
+        }
+
+        if (sourceFile == null && !relativePath.isEmpty()) {
+            File relativeFile = new File(reportFolder, relativePath)
+            if (relativeFile.exists()) {
+                sourceFile = relativeFile
+            }
+        }
+
+        String dataUri = ''
+        if (sourceFile != null && sourceFile.exists() && sourceFile.isFile()) {
+            dataUri = fileToDataUri(sourceFile)
+        }
+
+        return [
+            name    : name,
+            openPath: dataUri,
+            preview : dataUri
+        ]
+    }
+
+    private static String normalizeStepStatus(Object rawStatus) {
+        String value = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+        if (value in ['FAILED', 'FAIL']) {
+            return 'FAILED'
+        }
+        if (value in ['BLOCKED', 'SKIPPED']) {
+            return 'BLOCKED'
+        }
+        return 'PASSED'
+    }
+
+    private static String normalizeCaseStatus(Object rawStatus) {
+        String value = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+        if (value in ['FAILED', 'FAIL', 'ERROR']) {
+            return 'FAILED'
+        }
+        if (value in ['BLOCKED', 'SKIPPED']) {
+            return 'BLOCKED'
+        }
+        return 'PASSED'
+    }
+
+    private static String resolveSuiteName(File reportFolder) {
+        String suiteName = JiraReportSteps.suiteNameStatic()
+        if (!suiteName.isEmpty()) {
+            return suiteName
+        }
+
+        File parent = reportFolder != null ? reportFolder.getParentFile() : null
+        return parent != null ? parent.getName() : 'Execution Report'
+    }
+
+    private static String resolveLogoDataUri() {
+        try {
+            File projectDir = new File(RunConfiguration.getProjectDir())
+
+            List<File> candidates = [
+                new File(projectDir, 'Images/logo.png'),
+                new File(projectDir, 'Images/logo.jpg'),
+                new File(projectDir, 'Images/logo.jpeg'),
+                new File(projectDir, 'Images/gaia-logo.png'),
+                new File(projectDir, 'Images/eMatch-logo.png'),
+                new File(projectDir, 'Include/resources/logo.png')
+            ]
+
+            File logoFile = candidates.find { File it -> it.exists() && it.isFile() }
+            if (logoFile == null) {
+                return ''
+            }
+
+            return fileToDataUri(logoFile)
+        } catch (Throwable ignored) {
+            return ''
+        }
+    }
+
+    private static String fileToDataUri(File file) {
+        try {
+            byte[] bytes = Files.readAllBytes(file.toPath())
+            String base64 = Base64.encoder.encodeToString(bytes)
+            String extension = extensionOf(file.getName()).toLowerCase(Locale.ENGLISH)
+
+            String mimeType = 'image/png'
+            if (extension == 'jpg' || extension == 'jpeg') {
+                mimeType = 'image/jpeg'
+            } else if (extension == 'gif') {
+                mimeType = 'image/gif'
+            } else if (extension == 'bmp') {
+                mimeType = 'image/bmp'
+            }
+
+            return 'data:' + mimeType + ';base64,' + base64
+        } catch (Throwable ignored) {
+            return ''
+        }
+    }
+
+    private static String extensionOf(String fileName) {
+        String name = safe(fileName)
+        int idx = name.lastIndexOf('.')
+        return idx >= 0 ? name.substring(idx + 1) : ''
+    }
+
+    private static File resolveReportFolder() {
+        String fromRunConfiguration = safe(RunConfiguration.getReportFolder())
+        if (!fromRunConfiguration.isEmpty()) {
+            File direct = new File(fromRunConfiguration)
+            ensureFolder(direct)
+            return direct
+        }
+
+        File reportsRoot = new File(RunConfiguration.getProjectDir(), 'Reports')
+        ensureFolder(reportsRoot)
+
+        File latestLeaf = findLatestLeafFolder(reportsRoot)
+        if (latestLeaf != null) {
+            return latestLeaf
+        }
+
+        File fallback = new File(reportsRoot, new SimpleDateFormat('yyyyMMdd_HHmmss').format(new Date()))
+        ensureFolder(fallback)
+        return fallback
+    }
+
+    private static File findLatestLeafFolder(File root) {
+        List<File> folders = []
+        root.eachFileRecurse { File file ->
+            if (file.isDirectory()) {
+                folders << file
+            }
+        }
+
+        folders = folders.findAll { File folder ->
+            File[] children = folder.listFiles()
+            return children != null && children.any { File child -> child.isFile() }
+        }
+
+        if (folders.isEmpty()) {
+            return null
+        }
+
+        folders.sort { File a, File b -> Long.valueOf(b.lastModified()).compareTo(Long.valueOf(a.lastModified())) }
+        return folders[0]
+    }
+
+    private static void ensureFolder(File folder) {
+        if (folder != null && !folder.exists()) {
+            folder.mkdirs()
+        }
+    }
+
+    private static String buildHtml(String json) {
+        return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Test report</title>
+<style>
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        font-family: Arial, Helvetica, sans-serif;
+        background: #f5f6fb;
+        color: #222;
+    }
+    .topbar {
+        background: linear-gradient(90deg, #4026b6, #5a2fd6);
+        color: #fff;
+        padding: 18px 22px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+    .topbar img {
+        width: 34px;
+        height: 34px;
+        object-fit: contain;
+        background: #fff;
+        border-radius: 8px;
+        padding: 4px;
+    }
+    .topbar-title {
+        display: flex;
+        flex-direction: column;
+    }
+    .topbar-title strong {
+        font-size: 20px;
+        line-height: 1.1;
+    }
+    .topbar-title span {
+        font-size: 12px;
+        opacity: 0.88;
+    }
+    .layout {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        min-height: calc(100vh - 70px);
+    }
+    .sidebar {
+        border-right: 1px solid #e0e4ef;
+        background: #fff;
+        padding: 16px;
+    }
+    .search-box {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid #d6dbe8;
+        border-radius: 10px;
+        outline: none;
+        margin-bottom: 14px;
+    }
+    .case-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-height: calc(100vh - 170px);
+        overflow: auto;
+    }
+    .case-item {
+        border: 1px solid #e2e6f0;
+        border-radius: 12px;
+        padding: 12px;
+        cursor: pointer;
+        background: #fff;
+        transition: 0.15s ease;
+    }
+    .case-item:hover {
+        background: #f8f9ff;
+    }
+    .case-item.selected {
+        border-color: #6c4bff;
+        background: #f5f2ff;
+        box-shadow: inset 0 0 0 1px #6c4bff;
+    }
+    .case-item-title {
+        font-size: 13px;
+        line-height: 1.35;
+        margin-bottom: 10px;
+        word-break: break-word;
+    }
+    .case-item-footer {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+    }
+    .content {
+        padding: 20px;
+        overflow: auto;
+    }
+    .case-title {
+        margin: 0 0 12px 0;
+        font-size: 28px;
+    }
+    .pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 18px;
+    }
+    .pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 10px 14px;
+        border-radius: 999px;
+        font-size: 13px;
+        color: #fff;
+        background: #4f46e5;
+        white-space: nowrap;
+    }
+    .pill.status-PASSED { background: #2eae52; }
+    .pill.status-FAILED { background: #d44d42; }
+    .pill.status-BLOCKED { background: #c79925; }
+    .section-card {
+        background: #fff;
+        border: 1px solid #e1e6f0;
+        border-radius: 14px;
+        padding: 16px;
+        margin-bottom: 18px;
+    }
+    .section-title {
+        font-size: 20px;
+        margin: 0 0 14px 0;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    th, td {
+        text-align: left;
+        padding: 10px 8px;
+        border-bottom: 1px solid #edf0f7;
+        vertical-align: top;
+        font-size: 14px;
+    }
+    th {
+        color: #667085;
+        font-size: 12px;
+        text-transform: uppercase;
+    }
+    .status-badge {
+        display: inline-block;
+        min-width: 84px;
+        text-align: center;
+        padding: 8px 12px;
+        border-radius: 999px;
+        color: #fff;
+        font-size: 12px;
+        font-weight: bold;
+    }
+    .status-badge.PASSED { background: #2eae52; }
+    .status-badge.FAILED { background: #d44d42; }
+    .status-badge.BLOCKED { background: #c79925; }
+    .error-compact {
+        white-space: pre-wrap;
+        background: #fff;
+        color: #222;
+        border: 1px solid #f0d0d0;
+        border-radius: 10px;
+        padding: 12px;
+        margin: 10px 0 0 0;
+        line-height: 1.45;
+        font-size: 14px;
+    }
+    details {
+        margin-top: 12px;
+    }
+    details summary {
+        cursor: pointer;
+        color: #274ee8;
+        font-weight: bold;
+        user-select: none;
+        margin-bottom: 10px;
+    }
+    .full-error {
+        background: #111827;
+        color: #f9fafb;
+        border-radius: 10px;
+        padding: 14px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 560px;
+        overflow: auto;
+        font-size: 13px;
+        line-height: 1.35;
+    }
+    .empty-text {
+        color: #667085;
+        font-size: 14px;
+    }
+    .evidence-list {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+    }
+    .evidence-card {
+        border: 1px solid #eceff6;
+        border-radius: 12px;
+        padding: 12px;
+    }
+    .evidence-name {
+        font-size: 14px;
+        word-break: break-word;
+        margin-bottom: 8px;
+    }
+    .evidence-link {
+        display: inline-block;
+        margin-bottom: 10px;
+        color: #274ee8;
+        text-decoration: none;
+        font-size: 14px;
+    }
+    .evidence-image {
+        width: 100%;
+        max-width: 980px;
+        border: 1px solid #dfe4ef;
+        border-radius: 10px;
+        display: block;
+    }
+    @media (max-width: 1080px) {
+        .layout { grid-template-columns: 1fr; }
+        .sidebar { border-right: none; border-bottom: 1px solid #e0e4ef; }
+        .case-list { max-height: 350px; }
+    }
+</style>
+</head>
+<body>
+<div class="topbar">
+    <div id="logoWrap"></div>
+    <div class="topbar-title">
+        <strong>Test report</strong>
+        <span id="suiteLabel"></span>
+    </div>
+</div>
+
+<div class="layout">
+    <aside class="sidebar">
+        <input id="searchBox" class="search-box" type="text" placeholder="Search test name or status">
+        <div id="caseList" class="case-list"></div>
+    </aside>
+
+    <main class="content">
+        <h1 id="caseTitle" class="case-title"></h1>
+
+        <div class="pill-row">
+            <span id="suitePill" class="pill"></span>
+            <span id="statusPill" class="pill"></span>
+            <span id="startPill" class="pill"></span>
+            <span id="endPill" class="pill"></span>
+            <span id="durationPill" class="pill"></span>
+        </div>
+
+        <section class="section-card">
+            <h2 class="section-title">Steps</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Status</th>
+                        <th>Timestamp</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody id="stepsBody"></tbody>
+            </table>
+        </section>
+
+        <section id="errorSection" class="section-card">
+            <h2 class="section-title">Visual Error Log</h2>
+            <pre id="compactError" class="error-compact"></pre>
+            <details id="fullErrorDetails">
+                <summary>View full error</summary>
+                <pre id="fullError" class="full-error"></pre>
+            </details>
+        </section>
+
+        <section id="evidenceSection" class="section-card">
+            <h2 class="section-title">Evidence</h2>
+            <div id="evidenceList" class="evidence-list"></div>
+        </section>
+    </main>
+</div>
+
+<script>
+const payload = ${json};
+const allCases = Array.isArray(payload.cases) ? payload.cases.slice() : [];
+let filteredCases = allCases.slice();
+let selectedCaseId = filteredCases.length ? filteredCases[0].caseId : null;
+
+const searchBox = document.getElementById('searchBox');
+const caseList = document.getElementById('caseList');
+const caseTitle = document.getElementById('caseTitle');
+const suitePill = document.getElementById('suitePill');
+const statusPill = document.getElementById('statusPill');
+const startPill = document.getElementById('startPill');
+const endPill = document.getElementById('endPill');
+const durationPill = document.getElementById('durationPill');
+const stepsBody = document.getElementById('stepsBody');
+const errorSection = document.getElementById('errorSection');
+const compactError = document.getElementById('compactError');
+const fullErrorDetails = document.getElementById('fullErrorDetails');
+const fullError = document.getElementById('fullError');
+const evidenceSection = document.getElementById('evidenceSection');
+const evidenceList = document.getElementById('evidenceList');
+const suiteLabel = document.getElementById('suiteLabel');
+const logoWrap = document.getElementById('logoWrap');
+
+suiteLabel.textContent = payload.suiteName || '';
+
+if (payload.logoDataUri) {
+    const logo = document.createElement('img');
+    logo.src = payload.logoDataUri;
+    logo.alt = 'Logo';
+    logoWrap.appendChild(logo);
+}
+
+searchBox.addEventListener('input', function () {
+    const query = this.value.trim().toLowerCase();
+
+    filteredCases = allCases.filter(function (item) {
+        const haystack = (
+            (item.displayName || '') + ' ' +
+            (item.status || '')
+        ).toLowerCase();
+
+        return haystack.indexOf(query) >= 0;
+    });
+
+    if (!filteredCases.some(function (item) { return item.caseId === selectedCaseId; })) {
+        selectedCaseId = filteredCases.length ? filteredCases[0].caseId : null;
+    }
+
+    renderCaseList();
+    renderSelectedCase();
+});
+
+function renderCaseList() {
+    caseList.innerHTML = '';
+
+    if (!filteredCases.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty-text';
+        empty.textContent = 'No matching test cases.';
+        caseList.appendChild(empty);
+        return;
+    }
+
+    filteredCases.forEach(function (item) {
+        const card = document.createElement('div');
+        card.className = 'case-item' + (item.caseId === selectedCaseId ? ' selected' : '');
+
+        const title = document.createElement('div');
+        title.className = 'case-item-title';
+        title.textContent = item.displayName || item.caseId || '';
+
+        const footer = document.createElement('div');
+        footer.className = 'case-item-footer';
+
+        const status = document.createElement('span');
+        status.className = 'status-badge ' + item.status;
+        status.textContent = item.status;
+
+        const duration = document.createElement('span');
+        duration.className = 'empty-text';
+        duration.textContent = item.durationText || '';
+
+        footer.appendChild(status);
+        footer.appendChild(duration);
+
+        card.appendChild(title);
+        card.appendChild(footer);
+
+        card.addEventListener('click', function () {
+            selectedCaseId = item.caseId;
+            renderCaseList();
+            renderSelectedCase();
+        });
+
+        caseList.appendChild(card);
+    });
+}
+
+function renderSelectedCase() {
+    if (!selectedCaseId) {
+        caseTitle.textContent = 'No test case selected';
+        stepsBody.innerHTML = '';
+        compactError.textContent = '';
+        fullError.textContent = '';
+        evidenceList.innerHTML = '<div class="empty-text">No evidence was found for this scenario.</div>';
+        return;
+    }
+
+    const item = allCases.find(function (entry) {
+        return entry.caseId === selectedCaseId;
+    });
+
+    if (!item) {
+        return;
+    }
+
+    caseTitle.textContent = item.displayName || item.caseId || '';
+    suitePill.textContent = 'Suite: ' + (payload.suiteName || '');
+    statusPill.textContent = 'Status: ' + (item.status || '');
+    statusPill.className = 'pill status-' + (item.status || 'PASSED');
+    startPill.textContent = 'Start: ' + (item.startText || '');
+    endPill.textContent = 'End: ' + (item.endText || '');
+    durationPill.textContent = 'Duration: ' + (item.durationText || '');
+
+    stepsBody.innerHTML = '';
+
+    const steps = Array.isArray(item.steps) ? item.steps : [];
+    steps.forEach(function (step) {
+        const tr = document.createElement('tr');
+
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'status-badge ' + (step.status || 'PASSED');
+        badge.textContent = step.status || '';
+        tdStatus.appendChild(badge);
+
+        const tdTime = document.createElement('td');
+        tdTime.textContent = step.timestamp || '';
+
+        const tdDetails = document.createElement('td');
+        tdDetails.textContent = step.details || '';
+
+        tr.appendChild(tdStatus);
+        tr.appendChild(tdTime);
+        tr.appendChild(tdDetails);
+
+        stepsBody.appendChild(tr);
+    });
+
+    const hasError = !!(item.shortError || item.fullError);
+
+    if (hasError) {
+        errorSection.style.display = 'block';
+        compactError.textContent = item.shortError || '';
+        fullError.textContent = item.fullError || '';
+        fullErrorDetails.style.display = item.fullError ? 'block' : 'none';
+    } else {
+        errorSection.style.display = 'none';
+        compactError.textContent = '';
+        fullError.textContent = '';
+    }
+
+    evidenceList.innerHTML = '';
+
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+
+    if (!evidence.length) {
+        evidenceList.innerHTML = '<div class="empty-text">No evidence was found for this scenario.</div>';
+        return;
+    }
+
+    evidence.forEach(function (ev) {
+        const card = document.createElement('div');
+        card.className = 'evidence-card';
+
+        const name = document.createElement('div');
+        name.className = 'evidence-name';
+        name.textContent = ev.name || 'Evidence';
+
+        card.appendChild(name);
+
+        if (ev.openPath) {
+            const link = document.createElement('a');
+            link.className = 'evidence-link';
+            link.textContent = 'Open evidence';
+            link.href = ev.openPath;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            if (ev.name) {
+                link.download = ev.name;
+            }
+            card.appendChild(link);
+
+            const img = document.createElement('img');
+            img.className = 'evidence-image';
+            img.src = ev.preview || ev.openPath;
+            img.alt = ev.name || 'Evidence';
+            card.appendChild(img);
+        } else {
+            const empty = document.createElement('div');
+            empty.className = 'empty-text';
+            empty.textContent = 'Evidence file was registered, but could not be loaded.';
+            card.appendChild(empty);
+        }
+
+        evidenceList.appendChild(card);
+    });
+}
+
+renderCaseList();
+renderSelectedCase();
+</script>
+</body>
+</html>
+"""
+    }
+
+    private static String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+Test Listeners/ematchReport.groovy
+import java.util.Locale
+
+import com.kms.katalon.core.annotation.AfterTestCase
+import com.kms.katalon.core.annotation.AfterTestSuite
+import com.kms.katalon.core.annotation.BeforeTestCase
+import com.kms.katalon.core.annotation.BeforeTestSuite
+import com.kms.katalon.core.context.TestCaseContext
+import com.kms.katalon.core.context.TestSuiteContext
+import com.kms.katalon.core.util.KeywordUtil
+
+class ematchReport {
+
+    @BeforeTestSuite
+    def beforeTestSuite(TestSuiteContext testSuiteContext) {
+        try {
+            CustomKeywords.'jiraIntegration.JiraReportSteps.reset'()
+            CustomKeywords.'jiraIntegration.JiraReportSteps.setSuiteName'(cleanSuiteName(testSuiteContext?.getTestSuiteId()))
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('[REPORT_LISTENER] beforeTestSuite failed: ' + safe(t.getMessage()))
+        }
+    }
+
+    @BeforeTestCase
+    def beforeTestCase(TestCaseContext testCaseContext) {
+        try {
+            String caseId = safe(testCaseContext?.getTestCaseId())
+            CustomKeywords.'jiraIntegration.JiraReportSteps.startCase'(caseId)
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('[REPORT_LISTENER] beforeTestCase failed: ' + safe(t.getMessage()))
+        }
+    }
+
+    @AfterTestCase
+    def afterTestCase(TestCaseContext testCaseContext) {
+        String caseId = safe(testCaseContext?.getTestCaseId())
+        String rawStatus = safe(testCaseContext?.getTestCaseStatus())
+        String rawMessage = safe(testCaseContext?.getMessage())
+        String finalStatus = normalizeStatus(caseId, rawStatus, rawMessage)
+
+        try {
+            if ('FAILED'.equals(finalStatus)) {
+                CustomKeywords.'jiraIntegration.JiraReportSteps.fail'(rawMessage)
+                CustomKeywords.'jiraIntegration.JiraImagesEvidence.autoFailure'(caseId)
+            }
+
+            CustomKeywords.'jiraIntegration.JiraReportSteps.finishCase'(finalStatus)
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('[REPORT_LISTENER] afterTestCase processing failed: ' + safe(t.getMessage()))
+        }
+
+        try {
+            CustomKeywords.'jiraIntegration.JiraHtmlReportBuilder.buildReport'()
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('[REPORT_LISTENER] HTML refresh failed: ' + safe(t.getMessage()))
+        }
+    }
+
+    @AfterTestSuite
+    def afterTestSuite(TestSuiteContext testSuiteContext) {
+        try {
+            CustomKeywords.'jiraIntegration.JiraHtmlReportBuilder.buildReport'()
+        } catch (Throwable t) {
+            KeywordUtil.logInfo('[REPORT_LISTENER] afterTestSuite failed: ' + safe(t.getMessage()))
+        }
+    }
+
+    private String normalizeStatus(String caseId, String rawStatus, String rawMessage) {
+        String status = safe(rawStatus).toUpperCase(Locale.ENGLISH)
+
+        if (status in ['FAILED', 'FAIL', 'ERROR']) {
+            return 'FAILED'
+        }
+
+        if (status in ['SKIPPED', 'BLOCKED']) {
+            return 'BLOCKED'
+        }
+
+        boolean storedFailure = false
+        try {
+            storedFailure = CustomKeywords.'jiraIntegration.JiraReportSteps.caseHasFailure'(caseId)
+        } catch (Throwable ignored) {
+            storedFailure = false
+        }
+
+        if (storedFailure) {
+            return 'FAILED'
+        }
+
+        if (!safe(rawMessage).isEmpty() && !'PASSED'.equals(status)) {
+            return 'FAILED'
+        }
+
+        return 'PASSED'
+    }
+
+    private String cleanSuiteName(String suiteId) {
+        String value = safe(suiteId)
+        if (value.startsWith('Test Suites/')) {
+            return value.substring('Test Suites/'.length())
+        }
+        return value
+    }
+
+    private String safe(Object value) {
+        return value == null ? '' : String.valueOf(value).trim()
+    }
+}
+W
