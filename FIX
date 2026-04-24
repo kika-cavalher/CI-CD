@@ -1,1 +1,455 @@
+package jiraIntegration
 
+import java.awt.GraphicsDevice
+import java.awt.GraphicsEnvironment
+import java.awt.MouseInfo
+import java.awt.PointerInfo
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.image.BufferedImage
+import java.text.SimpleDateFormat
+import java.util.Base64
+import java.util.Locale
+
+import javax.imageio.ImageIO
+
+import org.openqa.selenium.OutputType
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.driver.WindowsDriverFactory
+
+class JiraImagesEvidence {
+
+	private static final String EVIDENCE_FOLDER_NAME = 'Evidences'
+	private static final String TRACE_FILE_NAME = '_custom_report_trace.log'
+	private static final String INDEX_FILE_NAME = 'jira_images_evidence.tsv'
+	private static final SimpleDateFormat FILE_STAMP = new SimpleDateFormat('yyyyMMdd_HHmmss_SSS')
+
+	private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
+	private static final ThreadLocal<String> CURRENT_REPORT_FOLDER = new ThreadLocal<String>()
+
+	@Keyword
+	static void startCase(String caseId) {
+		String safeCaseId = safe(caseId)
+
+		if (safeCaseId.isEmpty()) {
+			CURRENT_CASE_ID.remove()
+			CURRENT_REPORT_FOLDER.remove()
+			return
+		}
+
+		File reportFolder = resolveReportFolder()
+
+		CURRENT_CASE_ID.set(safeCaseId)
+		CURRENT_REPORT_FOLDER.set(reportFolder != null ? reportFolder.absolutePath : '')
+
+		if (reportFolder != null && !reportFolder.exists()) {
+			reportFolder.mkdirs()
+		}
+
+		File evidenceFolder = buildEvidenceFolder(reportFolder)
+		if (evidenceFolder != null && !evidenceFolder.exists()) {
+			evidenceFolder.mkdirs()
+		}
+
+		KeywordUtil.logInfo('JiraImagesEvidence | startCase | caseId=' + safeCaseId)
+		KeywordUtil.logInfo('JiraImagesEvidence | startCase | reportFolder=' + (reportFolder != null ? reportFolder.absolutePath : ''))
+	}
+
+	@Keyword
+	static String autoFailure(String caseId = '') {
+		String effectiveCaseId = safe(caseId)
+
+		if (effectiveCaseId.isEmpty()) {
+			effectiveCaseId = safe(CURRENT_CASE_ID.get())
+		}
+
+		if (effectiveCaseId.isEmpty()) {
+			KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | caseId empty, skipping capture.')
+			return ''
+		}
+
+		File reportFolder = resolveReportFolderFromContext()
+
+		if (reportFolder == null) {
+			KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | could not resolve report folder.')
+			return ''
+		}
+
+		if (!reportFolder.exists()) {
+			reportFolder.mkdirs()
+		}
+
+		File evidenceFolder = buildEvidenceFolder(reportFolder)
+		if (!evidenceFolder.exists()) {
+			evidenceFolder.mkdirs()
+		}
+
+		String flatCaseName = sanitizeFileName(effectiveCaseId.replace('\\', '_').replace('/', '_'))
+		String fileName = FILE_STAMP.format(new Date()) + '__' + flatCaseName + '__auto_failure.png'
+
+		File targetFile = new File(evidenceFolder, fileName)
+
+		KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | target=' + targetFile.absolutePath)
+
+		boolean captured = false
+
+		captured = captureApplicationWindow(targetFile)
+
+		if (!captured) {
+			KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | app window capture failed, trying monitor capture.')
+			captured = captureSingleMonitor(targetFile)
+		}
+
+		if (!captured) {
+			KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | monitor capture failed, trying full desktop capture.')
+			captured = captureFullDesktop(targetFile)
+		}
+
+		if (!captured || !targetFile.exists() || targetFile.length() <= 0L) {
+			KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | direct capture failed, trying fallback search.')
+			File fallback = findRecentImage(reportFolder)
+			if (fallback != null && fallback.exists() && fallback.length() > 0L) {
+				targetFile.bytes = fallback.bytes
+				captured = targetFile.exists() && targetFile.length() > 0L
+				if (captured) {
+					KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | fallback image copied from=' + fallback.absolutePath)
+				}
+			}
+		}
+
+		if (!captured || !targetFile.exists() || targetFile.length() <= 0L) {
+			KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | FAILED. No evidence image generated for caseId=' + effectiveCaseId)
+			return ''
+		}
+
+		appendEvidenceTrace(reportFolder, effectiveCaseId, targetFile)
+		appendEvidenceIndex(reportFolder, effectiveCaseId, targetFile)
+
+		KeywordUtil.logInfo('JiraImagesEvidence | autoFailure | SUCCESS | saved=' + targetFile.absolutePath)
+		return targetFile.absolutePath
+	}
+
+	@Keyword
+	static void finishCase() {
+		CURRENT_CASE_ID.remove()
+		CURRENT_REPORT_FOLDER.remove()
+	}
+
+	private static boolean captureApplicationWindow(File targetFile) {
+		try {
+			def driver = WindowsDriverFactory.getWindowsDriver()
+
+			if (driver == null) {
+				KeywordUtil.logInfo('JiraImagesEvidence | captureApplicationWindow | driver is null.')
+				return false
+			}
+
+			File raw = driver.getScreenshotAs(OutputType.FILE)
+
+			if (raw == null || !raw.exists() || raw.length() <= 0L) {
+				KeywordUtil.logInfo('JiraImagesEvidence | captureApplicationWindow | raw screenshot empty.')
+				return false
+			}
+
+			targetFile.bytes = raw.bytes
+
+			boolean ok = targetFile.exists() && targetFile.length() > 0L
+
+			if (ok) {
+				KeywordUtil.logInfo('JiraImagesEvidence | captureApplicationWindow | success.')
+			}
+
+			return ok
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence | captureApplicationWindow | failed: ' + safe(t.message))
+			return false
+		}
+	}
+
+	private static boolean captureSingleMonitor(File targetFile) {
+		try {
+			Rectangle bounds = resolveMonitorBounds()
+
+			if (bounds == null || bounds.width <= 0 || bounds.height <= 0) {
+				return false
+			}
+
+			BufferedImage image = new Robot().createScreenCapture(bounds)
+			ImageIO.write(image, 'png', targetFile)
+
+			boolean ok = targetFile.exists() && targetFile.length() > 0L
+
+			if (ok) {
+				KeywordUtil.logInfo(
+					'JiraImagesEvidence | captureSingleMonitor | success | x=' +
+					bounds.x + ' y=' + bounds.y + ' w=' + bounds.width + ' h=' + bounds.height
+				)
+			}
+
+			return ok
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence | captureSingleMonitor | failed: ' + safe(t.message))
+			return false
+		}
+	}
+
+	private static boolean captureFullDesktop(File targetFile) {
+		try {
+			Rectangle screen = new Rectangle(Toolkit.getDefaultToolkit().getScreenSize())
+			BufferedImage image = new Robot().createScreenCapture(screen)
+			ImageIO.write(image, 'png', targetFile)
+
+			boolean ok = targetFile.exists() && targetFile.length() > 0L
+
+			if (ok) {
+				KeywordUtil.logInfo(
+					'JiraImagesEvidence | captureFullDesktop | success | w=' +
+					screen.width + ' h=' + screen.height
+				)
+			}
+
+			return ok
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence | captureFullDesktop | failed: ' + safe(t.message))
+			return false
+		}
+	}
+
+	private static Rectangle resolveMonitorBounds() {
+		Rectangle fromDriver = resolveBoundsFromDriver()
+		if (fromDriver != null) {
+			return fromDriver
+		}
+
+		Rectangle fromMouse = resolveBoundsFromMouse()
+		if (fromMouse != null) {
+			return fromMouse
+		}
+
+		return resolvePrimaryBounds()
+	}
+
+	private static Rectangle resolveBoundsFromDriver() {
+		try {
+			def driver = WindowsDriverFactory.getWindowsDriver()
+
+			if (driver == null) {
+				return null
+			}
+
+			def position = driver.manage().window().getPosition()
+			def size = driver.manage().window().getSize()
+
+			if (position == null || size == null) {
+				return null
+			}
+
+			int centerX = position.x + (int)(size.width / 2)
+			int centerY = position.y + (int)(size.height / 2)
+
+			return resolveMonitorByPoint(centerX, centerY)
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static Rectangle resolveBoundsFromMouse() {
+		try {
+			PointerInfo pointer = MouseInfo.getPointerInfo()
+			if (pointer == null || pointer.location == null) {
+				return null
+			}
+
+			return resolveMonitorByPoint(pointer.location.x, pointer.location.y)
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static Rectangle resolvePrimaryBounds() {
+		try {
+			GraphicsEnvironment env = GraphicsEnvironment.getLocalGraphicsEnvironment()
+			GraphicsDevice device = env.getDefaultScreenDevice()
+
+			if (device == null || device.defaultConfiguration == null) {
+				return null
+			}
+
+			return device.defaultConfiguration.bounds
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static Rectangle resolveMonitorByPoint(int x, int y) {
+		try {
+			GraphicsEnvironment env = GraphicsEnvironment.getLocalGraphicsEnvironment()
+			GraphicsDevice[] devices = env.getScreenDevices()
+
+			if (devices == null || devices.length == 0) {
+				return null
+			}
+
+			for (GraphicsDevice device : devices) {
+				Rectangle bounds = device.defaultConfiguration?.bounds
+				if (bounds != null && bounds.contains(x, y)) {
+					return bounds
+				}
+			}
+
+			return null
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static File findRecentImage(File reportFolder) {
+		if (reportFolder == null || !reportFolder.exists()) {
+			return null
+		}
+
+		long now = System.currentTimeMillis()
+		List<File> images = []
+
+		reportFolder.eachFileRecurse { File file ->
+			if (!file.isFile()) {
+				return
+			}
+
+			String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+
+			boolean isImage =
+				lower.endsWith('.png') ||
+				lower.endsWith('.jpg') ||
+				lower.endsWith('.jpeg') ||
+				lower.endsWith('.bmp') ||
+				lower.endsWith('.gif') ||
+				lower.endsWith('.webp')
+
+			if (!isImage) {
+				return
+			}
+
+			long age = now - file.lastModified()
+
+			if (age >= 0L && age <= 180000L && file.length() > 0L) {
+				images << file
+			}
+		}
+
+		if (images.isEmpty()) {
+			return null
+		}
+
+		images = images.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		return images[0]
+	}
+
+	private static void appendEvidenceTrace(File reportFolder, String caseId, File imageFile) {
+		try {
+			File traceFile = new File(reportFolder, TRACE_FILE_NAME)
+			long now = System.currentTimeMillis()
+			String payload = Base64.encoder.encodeToString(imageFile.absolutePath.getBytes('UTF-8'))
+
+			traceFile.withWriterAppend('UTF-8') { writer ->
+				writer.writeLine('EVIDENCE\t' + now + '\t' + safe(caseId) + '\t' + payload)
+			}
+
+			KeywordUtil.logInfo('JiraImagesEvidence | appendEvidenceTrace | ' + traceFile.absolutePath)
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence | appendEvidenceTrace | failed: ' + safe(t.message))
+		}
+	}
+
+	private static void appendEvidenceIndex(File reportFolder, String caseId, File imageFile) {
+		try {
+			File indexFile = new File(reportFolder, INDEX_FILE_NAME)
+			long now = System.currentTimeMillis()
+
+			indexFile.withWriterAppend('UTF-8') { writer ->
+				writer.writeLine(
+					now + '\t' +
+					sanitizeTsv(caseId) + '\t' +
+					sanitizeTsv(imageFile.absolutePath)
+				)
+			}
+
+			KeywordUtil.logInfo('JiraImagesEvidence | appendEvidenceIndex | ' + indexFile.absolutePath)
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('JiraImagesEvidence | appendEvidenceIndex | failed: ' + safe(t.message))
+		}
+	}
+
+	private static File resolveReportFolderFromContext() {
+		String fromThread = safe(CURRENT_REPORT_FOLDER.get())
+
+		if (!fromThread.isEmpty()) {
+			File folder = new File(fromThread)
+			if (folder.exists() || folder.mkdirs()) {
+				return folder
+			}
+		}
+
+		return resolveReportFolder()
+	}
+
+	private static File resolveReportFolder() {
+		try {
+			String reportFolder = safe(RunConfiguration.getReportFolder())
+
+			if (!reportFolder.isEmpty()) {
+				return new File(reportFolder)
+			}
+		} catch (Throwable ignored) {
+		}
+
+		try {
+			File fallback = new File(RunConfiguration.getProjectDir(), 'Reports')
+			if (!fallback.exists()) {
+				fallback.mkdirs()
+			}
+			return fallback
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private static File buildEvidenceFolder(File reportFolder) {
+		if (reportFolder == null) {
+			return null
+		}
+		return new File(reportFolder, EVIDENCE_FOLDER_NAME)
+	}
+
+	private static String sanitizeFileName(String value) {
+		String text = safe(value)
+
+		if (text.isEmpty()) {
+			return 'unknown_case'
+		}
+
+		text = text.replaceAll('[\\\\/:*?"<>|]', '_')
+		text = text.replaceAll('\\s+', ' ').trim()
+		text = text.replaceAll('[ ]+', '_')
+
+		return text
+	}
+
+	private static String sanitizeTsv(String value) {
+		return safe(value)
+			.replace('\t', ' ')
+			.replace('\r', ' ')
+			.replace('\n', ' ')
+	}
+
+	private static String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
