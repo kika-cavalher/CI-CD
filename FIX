@@ -1,1 +1,403 @@
 
+package jiraIntegration
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.driver.WindowsDriverFactory
+
+import org.openqa.selenium.Capabilities
+import org.openqa.selenium.OutputType
+import org.openqa.selenium.TakesScreenshot
+
+import java.awt.GraphicsDevice
+import java.awt.GraphicsEnvironment
+import java.awt.Rectangle
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.image.BufferedImage
+import java.text.SimpleDateFormat
+
+import javax.imageio.ImageIO
+
+class JiraImagesEvidence {
+
+	private static final ThreadLocal<String> CURRENT_CASE_ID = new ThreadLocal<String>()
+	private static final String EVIDENCE_LOG_FILE = 'jira_images_evidence.tsv'
+	private static final String EVIDENCE_FOLDER_NAME = 'Evidences'
+	private static final String FALLBACK_FOLDER_NAME = '_jiraEvidenceFallback'
+
+	@Keyword
+	String startCase(String caseId) {
+		String safeCaseId = safe(caseId)
+		if (!safeCaseId.isEmpty()) {
+			CURRENT_CASE_ID.set(safeCaseId)
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] startCase=' + safeCaseId)
+		}
+		return safeCaseId
+	}
+
+	@Keyword
+	String startCase() {
+		return safe(CURRENT_CASE_ID.get())
+	}
+
+	@Keyword
+	String autoFailure(String caseId) {
+		String effectiveCaseId = resolveCaseId(caseId)
+
+		if (effectiveCaseId.isEmpty()) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] autoFailure skipped because caseId is empty.')
+			return ''
+		}
+
+		File reportFolder = resolveReportFolder()
+		File evidenceRoot = new File(reportFolder, EVIDENCE_FOLDER_NAME)
+		File caseFolder = new File(evidenceRoot, sanitizeForPath(effectiveCaseId))
+
+		ensureFolder(caseFolder)
+		ensureFolder(evidenceRoot)
+
+		String timestamp = new SimpleDateFormat('yyyyMMdd_HHmmss_SSS').format(new Date())
+		String fileName = timestamp + '__' + sanitizeForPath(effectiveCaseId) + '__auto_failure.png'
+		File targetFile = new File(caseFolder, fileName)
+
+		KeywordUtil.logInfo('[JIRA_EVIDENCE] reportFolder=' + reportFolder.absolutePath)
+		KeywordUtil.logInfo('[JIRA_EVIDENCE] evidenceRoot=' + evidenceRoot.absolutePath)
+		KeywordUtil.logInfo('[JIRA_EVIDENCE] caseFolder=' + caseFolder.absolutePath)
+		KeywordUtil.logInfo('[JIRA_EVIDENCE] targetFile=' + targetFile.absolutePath)
+
+		boolean captured = false
+		String strategy = ''
+
+		if (tryDriverWindowScreenshot(targetFile)) {
+			captured = true
+			strategy = 'WINDOWS_DRIVER'
+		} else if (tryForegroundWindowScreenshot(targetFile)) {
+			captured = true
+			strategy = 'FOREGROUND_WINDOW'
+		} else if (tryPrimaryMonitorScreenshot(targetFile)) {
+			captured = true
+			strategy = 'PRIMARY_MONITOR'
+		}
+
+		if (!captured || !targetFile.exists() || targetFile.length() <= 0L) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Evidence capture failed for case: ' + effectiveCaseId)
+			return ''
+		}
+
+		appendEvidenceLog(reportFolder, effectiveCaseId, targetFile, strategy)
+
+		KeywordUtil.logInfo('[JIRA_EVIDENCE] Evidence saved with strategy=' + strategy)
+		KeywordUtil.logInfo('[JIRA_EVIDENCE] Evidence file=' + targetFile.absolutePath)
+		return targetFile.absolutePath
+	}
+
+	@Keyword
+	String autoFailure() {
+		return autoFailure(safe(CURRENT_CASE_ID.get()))
+	}
+
+	@Keyword
+	void finishCase() {
+		String current = safe(CURRENT_CASE_ID.get())
+		if (!current.isEmpty()) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] finishCase=' + current)
+		}
+		CURRENT_CASE_ID.remove()
+	}
+
+	private String resolveCaseId(String caseId) {
+		String text = safe(caseId)
+		if (!text.isEmpty()) {
+			CURRENT_CASE_ID.set(text)
+			return text
+		}
+		return safe(CURRENT_CASE_ID.get())
+	}
+
+	private File resolveReportFolder() {
+		String currentReportFolder = ''
+
+		try {
+			currentReportFolder = safe(RunConfiguration.getReportFolder())
+		} catch (Throwable ignored) {
+			currentReportFolder = ''
+		}
+
+		if (!currentReportFolder.isEmpty()) {
+			File reportFolder = new File(currentReportFolder)
+			ensureFolder(reportFolder)
+			return reportFolder
+		}
+
+		String projectDir = '.'
+		try {
+			projectDir = safe(RunConfiguration.getProjectDir())
+		} catch (Throwable ignored) {
+			projectDir = '.'
+		}
+
+		File fallback = new File(projectDir, 'Reports' + File.separator + FALLBACK_FOLDER_NAME)
+		ensureFolder(fallback)
+		return fallback
+	}
+
+	private boolean tryDriverWindowScreenshot(File targetFile) {
+		try {
+			def driver = WindowsDriverFactory.getWindowsDriver()
+
+			if (driver == null) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] WindowsDriver is null. Skipping driver screenshot.')
+				return false
+			}
+
+			if (!(driver instanceof TakesScreenshot)) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Driver does not support screenshot. Skipping driver screenshot.')
+				return false
+			}
+
+			Capabilities capabilities = null
+			try {
+				capabilities = driver.getCapabilities()
+			} catch (Throwable ignored) {
+				capabilities = null
+			}
+
+			String appCapability = safe(capabilities?.getCapability('app'))
+			String appTopLevelWindow = safe(capabilities?.getCapability('appTopLevelWindow'))
+
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Driver capability app=' + appCapability)
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Driver capability appTopLevelWindow=' + appTopLevelWindow)
+
+			if (appCapability.equalsIgnoreCase('Root')) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Driver is attached to Root/Desktop. Skipping driver screenshot to avoid capturing all monitors.')
+				return false
+			}
+
+			byte[] bytes = ((TakesScreenshot) driver).getScreenshotAs(OutputType.BYTES)
+			if (bytes == null || bytes.length == 0) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Driver screenshot returned empty bytes.')
+				return false
+			}
+
+			targetFile.bytes = bytes
+			return targetFile.exists() && targetFile.length() > 0L
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Driver screenshot failed: ' + safe(t.message))
+			return false
+		}
+	}
+
+	private boolean tryForegroundWindowScreenshot(File targetFile) {
+		try {
+			def foregroundRect = getForegroundWindowRectangle()
+			if (foregroundRect == null || foregroundRect.width <= 0 || foregroundRect.height <= 0) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Foreground window rectangle not available.')
+				return false
+			}
+
+			Rectangle clipped = clipToVirtualBounds(foregroundRect)
+			if (clipped == null || clipped.width <= 0 || clipped.height <= 0) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Foreground window rectangle became invalid after clip.')
+				return false
+			}
+
+			BufferedImage image = new Robot().createScreenCapture(clipped)
+			if (image == null) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Foreground window screenshot returned null image.')
+				return false
+			}
+
+			ImageIO.write(image, 'png', targetFile)
+			return targetFile.exists() && targetFile.length() > 0L
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Foreground window screenshot failed: ' + safe(t.message))
+			return false
+		}
+	}
+
+	private boolean tryPrimaryMonitorScreenshot(File targetFile) {
+		try {
+			Rectangle bounds = getPrimaryMonitorBounds()
+			if (bounds == null || bounds.width <= 0 || bounds.height <= 0) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Primary monitor bounds not available.')
+				return false
+			}
+
+			BufferedImage image = new Robot().createScreenCapture(bounds)
+			if (image == null) {
+				KeywordUtil.logInfo('[JIRA_EVIDENCE] Primary monitor screenshot returned null image.')
+				return false
+			}
+
+			ImageIO.write(image, 'png', targetFile)
+			return targetFile.exists() && targetFile.length() > 0L
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Primary monitor screenshot failed: ' + safe(t.message))
+			return false
+		}
+	}
+
+	private Rectangle getForegroundWindowRectangle() {
+		try {
+			Class user32Class = Class.forName('com.sun.jna.platform.win32.User32')
+			Class rectClass = Class.forName('com.sun.jna.platform.win32.WinDef$RECT')
+
+			def user32 = user32Class.getField('INSTANCE').get(null)
+			def hwnd = user32.GetForegroundWindow()
+
+			if (hwnd == null) {
+				return null
+			}
+
+			def rect = rectClass.newInstance()
+			boolean ok = user32.GetWindowRect(hwnd, rect)
+
+			if (!ok) {
+				return null
+			}
+
+			int left = toInt(rect.left)
+			int top = toInt(rect.top)
+			int right = toInt(rect.right)
+			int bottom = toInt(rect.bottom)
+
+			int width = Math.max(0, right - left)
+			int height = Math.max(0, bottom - top)
+
+			if (width <= 0 || height <= 0) {
+				return null
+			}
+
+			return new Rectangle(left, top, width, height)
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Could not get foreground window rectangle: ' + safe(t.message))
+			return null
+		}
+	}
+
+	private Rectangle clipToVirtualBounds(Rectangle source) {
+		if (source == null) {
+			return null
+		}
+
+		Rectangle virtualBounds = getVirtualScreenBounds()
+		if (virtualBounds == null || virtualBounds.width <= 0 || virtualBounds.height <= 0) {
+			return source
+		}
+
+		Rectangle result = source.intersection(virtualBounds)
+		if (result == null || result.width <= 0 || result.height <= 0) {
+			return null
+		}
+
+		return result
+	}
+
+	private Rectangle getVirtualScreenBounds() {
+		GraphicsDevice[] devices = GraphicsEnvironment.localGraphicsEnvironment.screenDevices
+		if (devices == null || devices.length == 0) {
+			Dimension size = Toolkit.defaultToolkit.screenSize
+			return new Rectangle(0, 0, size.width, size.height)
+		}
+
+		Rectangle union = null
+
+		for (GraphicsDevice device : devices) {
+			Rectangle bounds = device.defaultConfiguration.bounds
+			if (bounds == null) {
+				continue
+			}
+
+			if (union == null) {
+				union = new Rectangle(bounds)
+			} else {
+				union = union.union(bounds)
+			}
+		}
+
+		if (union == null) {
+			Dimension size = Toolkit.defaultToolkit.screenSize
+			return new Rectangle(0, 0, size.width, size.height)
+		}
+
+		return union
+	}
+
+	private Rectangle getPrimaryMonitorBounds() {
+		try {
+			GraphicsDevice primary = GraphicsEnvironment.localGraphicsEnvironment.defaultScreenDevice
+			if (primary != null && primary.defaultConfiguration != null && primary.defaultConfiguration.bounds != null) {
+				return primary.defaultConfiguration.bounds
+			}
+		} catch (Throwable ignored) {
+		}
+
+		Dimension size = Toolkit.defaultToolkit.screenSize
+		return new Rectangle(0, 0, size.width, size.height)
+	}
+
+	private void appendEvidenceLog(File reportFolder, String caseId, File file, String strategy) {
+		try {
+			File logFile = new File(reportFolder, EVIDENCE_LOG_FILE)
+
+			if (!logFile.exists()) {
+				logFile << 'capturedAt\tcaseId\tstrategy\tfileName\tabsolutePath\n'
+			}
+
+			String capturedAt = new SimpleDateFormat('yyyy-MM-dd HH:mm:ss.SSS').format(new Date())
+			String line =
+					capturedAt + '\t' +
+					escapeTsv(caseId) + '\t' +
+					escapeTsv(strategy) + '\t' +
+					escapeTsv(file.name) + '\t' +
+					escapeTsv(file.absolutePath) + '\n'
+
+			logFile << line
+		} catch (Throwable t) {
+			KeywordUtil.logInfo('[JIRA_EVIDENCE] Could not append evidence log: ' + safe(t.message))
+		}
+	}
+
+	private void ensureFolder(File folder) {
+		if (folder != null && !folder.exists()) {
+			folder.mkdirs()
+		}
+	}
+
+	private int toInt(Object value) {
+		try {
+			return Integer.parseInt(String.valueOf(value))
+		} catch (Throwable ignored) {
+			return 0
+		}
+	}
+
+	private String sanitizeForPath(String value) {
+		String text = safe(value)
+				.replace('\\', '_')
+				.replace('/', '_')
+				.replace(':', '_')
+				.replace('*', '_')
+				.replace('?', '_')
+				.replace('"', '_')
+				.replace('<', '_')
+				.replace('>', '_')
+				.replace('|', '_')
+				.replaceAll('\\s+', '_')
+				.replaceAll('_+', '_')
+				.replaceAll('^_+', '')
+				.replaceAll('_+$', '')
+
+		return text.isEmpty() ? 'unknown_case' : text
+	}
+
+	private String escapeTsv(String value) {
+		return safe(value).replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
