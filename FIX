@@ -1,1 +1,1461 @@
+1) jenkins/JustificationLatentInvestigations.cmd
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
 
+set "JOB_LABEL=Justification Latent - Investigations"
+set "TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Investigations/Investigations Collections"
+set "EXECUTION_PROFILE=default"
+set "BROWSER_TYPE=Windows"
+
+set "STARTER_DIR=D:\Projects\eMatchStarters"
+set "CONTEXT_FILE=%STARTER_DIR%\run-context.properties"
+set "RESULT_FILE=%STARTER_DIR%\run-result.properties"
+set "LOG_FILE=%STARTER_DIR%\logs\run-ematch-command.log"
+set "KATALON_CONSOLE_LOG=%STARTER_DIR%\logs\katalon-console.log"
+
+set "GENERIC_TASK=\eMatch Automation\RunEMatchCommand"
+set "WIN_DRIVER_TASK=startWinDriver"
+
+set "WAIT_SECONDS=5"
+set "MAX_WAIT_CYCLES=720"
+set "RUN_ID=%RANDOM%%RANDOM%%RANDOM%"
+set "EXPECTED_RUN_ID=%RUN_ID%"
+
+echo.
+echo ==================================================
+echo [INFO] Starting %JOB_LABEL%
+echo [INFO] WORKSPACE=%WORKSPACE%
+echo [INFO] TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+echo [INFO] EXECUTION_PROFILE=%EXECUTION_PROFILE%
+echo [INFO] BROWSER_TYPE=%BROWSER_TYPE%
+echo [INFO] STARTER_DIR=%STARTER_DIR%
+echo [INFO] CONTEXT_FILE=%CONTEXT_FILE%
+echo [INFO] RESULT_FILE=%RESULT_FILE%
+echo [INFO] LOG_FILE=%LOG_FILE%
+echo [INFO] KATALON_CONSOLE_LOG=%KATALON_CONSOLE_LOG%
+echo [INFO] GENERIC_TASK=%GENERIC_TASK%
+echo [INFO] WIN_DRIVER_TASK=%WIN_DRIVER_TASK%
+echo [INFO] RUN_ID=%EXPECTED_RUN_ID%
+echo ==================================================
+echo.
+
+if "%WORKSPACE%"=="" (
+    echo [ERROR] WORKSPACE is empty.
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%" (
+    echo [ERROR] STARTER_DIR not found: %STARTER_DIR%
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%\logs" mkdir "%STARTER_DIR%\logs"
+
+schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
+schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+ping -n 3 127.0.0.1 >nul
+
+del /f /q "%LOG_FILE%" >nul 2>nul
+
+> "%CONTEXT_FILE%" (
+    echo RUN_ID=%EXPECTED_RUN_ID%
+    echo JOB_LABEL=%JOB_LABEL%
+    echo WORKSPACE=%WORKSPACE%
+    echo TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+    echo EXECUTION_PROFILE=%EXECUTION_PROFILE%
+    echo BROWSER_TYPE=%BROWSER_TYPE%
+    echo KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
+)
+
+> "%RESULT_FILE%" (
+    echo RUN_ID=%EXPECTED_RUN_ID%
+    echo STATUS=QUEUED
+    echo EXIT_CODE=999
+    echo UPDATED_AT=%date% %time%
+)
+
+echo [INFO] Context file written:
+type "%CONTEXT_FILE%"
+echo.
+
+echo [INFO] Initial result file:
+type "%RESULT_FILE%"
+echo.
+
+echo [INFO] Starting WinAppDriver task...
+schtasks /run /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Could not start scheduled task "%WIN_DRIVER_TASK%".
+    call :printTaskInfo
+    exit /b 1
+)
+
+echo [INFO] Starting visible Katalon task...
+schtasks /run /tn "%GENERIC_TASK%" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Could not start scheduled task "%GENERIC_TASK%".
+    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+    call :printTaskInfo
+    exit /b 1
+)
+
+ping -n 4 127.0.0.1 >nul
+
+set /a WAIT_COUNT=0
+set /a PING_WAIT=%WAIT_SECONDS%+1
+
+:waitResult
+set /a WAIT_COUNT+=1
+
+set "FILE_RUN_ID="
+set "STATUS="
+set "EXIT_CODE="
+set "UPDATED_AT="
+
+for /f "usebackq tokens=1,* delims==" %%A in ("%RESULT_FILE%") do (
+    if /i "%%A"=="RUN_ID" set "FILE_RUN_ID=%%B"
+    if /i "%%A"=="STATUS" set "STATUS=%%B"
+    if /i "%%A"=="EXIT_CODE" set "EXIT_CODE=%%B"
+    if /i "%%A"=="UPDATED_AT" set "UPDATED_AT=%%B"
+)
+
+if !WAIT_COUNT! EQU 1 echo [INFO] Waiting result file update...
+if !WAIT_COUNT! EQU 2 echo [INFO] Still waiting result file update...
+if !WAIT_COUNT! EQU 3 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 4 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 5 echo [INFO] Still waiting...
+
+if !WAIT_COUNT! EQU 1 call :printTaskInfo
+if !WAIT_COUNT! EQU 5 call :printTaskInfo
+if !WAIT_COUNT! EQU 10 call :printTaskInfo
+if !WAIT_COUNT! EQU 20 call :printTaskInfo
+
+if not "!FILE_RUN_ID!"=="%EXPECTED_RUN_ID%" goto keepWaiting
+if /i "!STATUS!"=="FINISHED" goto resultDone
+
+:keepWaiting
+if !WAIT_COUNT! GEQ %MAX_WAIT_CYCLES% (
+    echo [ERROR] Timeout waiting run-result.properties update.
+    echo [ERROR] FILE_RUN_ID=!FILE_RUN_ID!
+    echo [ERROR] STATUS=!STATUS!
+    echo [ERROR] EXIT_CODE=!EXIT_CODE!
+    echo [ERROR] UPDATED_AT=!UPDATED_AT!
+    echo.
+
+    schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
+    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+
+    call :printTaskInfo
+    call :printResultFile
+    call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+    call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
+    call :printReportsSummary
+
+    exit /b 1
+)
+
+ping -n !PING_WAIT! 127.0.0.1 >nul
+goto waitResult
+
+:resultDone
+echo.
+echo [INFO] Result file updated.
+echo [INFO] RUN_ID=!FILE_RUN_ID!
+echo [INFO] STATUS=!STATUS!
+echo [INFO] EXIT_CODE=!EXIT_CODE!
+echo [INFO] UPDATED_AT=!UPDATED_AT!
+echo.
+
+schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+
+call :printTaskInfo
+call :printResultFile
+call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
+call :printReportsSummary
+
+if not "!EXIT_CODE!"=="0" (
+    exit /b !EXIT_CODE!
+)
+
+echo [INFO] %JOB_LABEL% finished successfully.
+exit /b 0
+
+:printTaskInfo
+echo [INFO] Scheduled task status snapshot:
+echo [INFO] ---- %WIN_DRIVER_TASK% ----
+schtasks /query /tn "%WIN_DRIVER_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
+echo [INFO] ---- %GENERIC_TASK% ----
+schtasks /query /tn "%GENERIC_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
+echo.
+goto :eof
+
+:printResultFile
+if exist "%RESULT_FILE%" (
+    echo [INFO] Current run-result.properties:
+    type "%RESULT_FILE%"
+    echo.
+) else (
+    echo [WARN] Result file not found: %RESULT_FILE%
+    echo.
+)
+goto :eof
+
+:printLog
+set "TARGET_FILE=%~1"
+set "TARGET_TITLE=%~2"
+set "TARGET_TAIL=%~3"
+
+if exist "%TARGET_FILE%" (
+    echo [INFO] Last lines from %TARGET_TITLE%:
+    powershell -NoProfile -Command "Get-Content -Path '%TARGET_FILE%' -Tail %TARGET_TAIL%"
+    echo.
+) else (
+    echo [WARN] File not found: %TARGET_FILE%
+    echo.
+)
+goto :eof
+
+:printReportsSummary
+if exist "%WORKSPACE%\Reports" (
+    echo [INFO] Reports folder found: %WORKSPACE%\Reports
+    echo [INFO] Relevant report artifacts:
+    powershell -NoProfile -Command ^
+      "$root='%WORKSPACE%\Reports';" ^
+      "$patterns=@('JUnit_Report.xml','cucumber.xml','execution0.log','*.html','*.pdf');" ^
+      "foreach($p in $patterns) { Get-ChildItem -Path $root -Recurse -File -Filter $p -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10 | ForEach-Object { Write-Host ('[REPORT] ' + $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $_.FullName) } }"
+    echo.
+) else (
+    echo [WARN] Reports folder not found: %WORKSPACE%\Reports
+    echo.
+)
+goto :eof
+2) jenkins/JustificationLatentSynthese.cmd
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+set "JOB_LABEL=Justification Latent - Synthese"
+set "TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Synthese/Synthese Collection"
+set "EXECUTION_PROFILE=default"
+set "BROWSER_TYPE=Windows"
+
+set "STARTER_DIR=D:\Projects\eMatchStarters"
+set "CONTEXT_FILE=%STARTER_DIR%\run-context.properties"
+set "RESULT_FILE=%STARTER_DIR%\run-result.properties"
+set "LOG_FILE=%STARTER_DIR%\logs\run-ematch-command.log"
+set "KATALON_CONSOLE_LOG=%STARTER_DIR%\logs\katalon-console.log"
+
+set "GENERIC_TASK=\eMatch Automation\RunEMatchCommand"
+set "WIN_DRIVER_TASK=startWinDriver"
+
+set "WAIT_SECONDS=5"
+set "MAX_WAIT_CYCLES=720"
+set "RUN_ID=%RANDOM%%RANDOM%%RANDOM%"
+set "EXPECTED_RUN_ID=%RUN_ID%"
+
+echo.
+echo ==================================================
+echo [INFO] Starting %JOB_LABEL%
+echo [INFO] WORKSPACE=%WORKSPACE%
+echo [INFO] TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+echo [INFO] EXECUTION_PROFILE=%EXECUTION_PROFILE%
+echo [INFO] BROWSER_TYPE=%BROWSER_TYPE%
+echo [INFO] STARTER_DIR=%STARTER_DIR%
+echo [INFO] CONTEXT_FILE=%CONTEXT_FILE%
+echo [INFO] RESULT_FILE=%RESULT_FILE%
+echo [INFO] LOG_FILE=%LOG_FILE%
+echo [INFO] KATALON_CONSOLE_LOG=%KATALON_CONSOLE_LOG%
+echo [INFO] GENERIC_TASK=%GENERIC_TASK%
+echo [INFO] WIN_DRIVER_TASK=%WIN_DRIVER_TASK%
+echo [INFO] RUN_ID=%EXPECTED_RUN_ID%
+echo ==================================================
+echo.
+
+if "%WORKSPACE%"=="" (
+    echo [ERROR] WORKSPACE is empty.
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%" (
+    echo [ERROR] STARTER_DIR not found: %STARTER_DIR%
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%\logs" mkdir "%STARTER_DIR%\logs"
+
+schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
+schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+ping -n 3 127.0.0.1 >nul
+
+del /f /q "%LOG_FILE%" >nul 2>nul
+
+> "%CONTEXT_FILE%" (
+    echo RUN_ID=%EXPECTED_RUN_ID%
+    echo JOB_LABEL=%JOB_LABEL%
+    echo WORKSPACE=%WORKSPACE%
+    echo TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+    echo EXECUTION_PROFILE=%EXECUTION_PROFILE%
+    echo BROWSER_TYPE=%BROWSER_TYPE%
+    echo KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
+)
+
+> "%RESULT_FILE%" (
+    echo RUN_ID=%EXPECTED_RUN_ID%
+    echo STATUS=QUEUED
+    echo EXIT_CODE=999
+    echo UPDATED_AT=%date% %time%
+)
+
+echo [INFO] Context file written:
+type "%CONTEXT_FILE%"
+echo.
+
+echo [INFO] Initial result file:
+type "%RESULT_FILE%"
+echo.
+
+echo [INFO] Starting WinAppDriver task...
+schtasks /run /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Could not start scheduled task "%WIN_DRIVER_TASK%".
+    call :printTaskInfo
+    exit /b 1
+)
+
+echo [INFO] Starting visible Katalon task...
+schtasks /run /tn "%GENERIC_TASK%" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Could not start scheduled task "%GENERIC_TASK%".
+    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+    call :printTaskInfo
+    exit /b 1
+)
+
+ping -n 4 127.0.0.1 >nul
+
+set /a WAIT_COUNT=0
+set /a PING_WAIT=%WAIT_SECONDS%+1
+
+:waitResult
+set /a WAIT_COUNT+=1
+
+set "FILE_RUN_ID="
+set "STATUS="
+set "EXIT_CODE="
+set "UPDATED_AT="
+
+for /f "usebackq tokens=1,* delims==" %%A in ("%RESULT_FILE%") do (
+    if /i "%%A"=="RUN_ID" set "FILE_RUN_ID=%%B"
+    if /i "%%A"=="STATUS" set "STATUS=%%B"
+    if /i "%%A"=="EXIT_CODE" set "EXIT_CODE=%%B"
+    if /i "%%A"=="UPDATED_AT" set "UPDATED_AT=%%B"
+)
+
+if !WAIT_COUNT! EQU 1 echo [INFO] Waiting result file update...
+if !WAIT_COUNT! EQU 2 echo [INFO] Still waiting result file update...
+if !WAIT_COUNT! EQU 3 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 4 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 5 echo [INFO] Still waiting...
+
+if !WAIT_COUNT! EQU 1 call :printTaskInfo
+if !WAIT_COUNT! EQU 5 call :printTaskInfo
+if !WAIT_COUNT! EQU 10 call :printTaskInfo
+if !WAIT_COUNT! EQU 20 call :printTaskInfo
+
+if not "!FILE_RUN_ID!"=="%EXPECTED_RUN_ID%" goto keepWaiting
+if /i "!STATUS!"=="FINISHED" goto resultDone
+
+:keepWaiting
+if !WAIT_COUNT! GEQ %MAX_WAIT_CYCLES% (
+    echo [ERROR] Timeout waiting run-result.properties update.
+    echo [ERROR] FILE_RUN_ID=!FILE_RUN_ID!
+    echo [ERROR] STATUS=!STATUS!
+    echo [ERROR] EXIT_CODE=!EXIT_CODE!
+    echo [ERROR] UPDATED_AT=!UPDATED_AT!
+    echo.
+
+    schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
+    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+
+    call :printTaskInfo
+    call :printResultFile
+    call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+    call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
+    call :printReportsSummary
+
+    exit /b 1
+)
+
+ping -n !PING_WAIT! 127.0.0.1 >nul
+goto waitResult
+
+:resultDone
+echo.
+echo [INFO] Result file updated.
+echo [INFO] RUN_ID=!FILE_RUN_ID!
+echo [INFO] STATUS=!STATUS!
+echo [INFO] EXIT_CODE=!EXIT_CODE!
+echo [INFO] UPDATED_AT=!UPDATED_AT!
+echo.
+
+schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+
+call :printTaskInfo
+call :printResultFile
+call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
+call :printReportsSummary
+
+if not "!EXIT_CODE!"=="0" (
+    exit /b !EXIT_CODE!
+)
+
+echo [INFO] %JOB_LABEL% finished successfully.
+exit /b 0
+
+:printTaskInfo
+echo [INFO] Scheduled task status snapshot:
+echo [INFO] ---- %WIN_DRIVER_TASK% ----
+schtasks /query /tn "%WIN_DRIVER_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
+echo [INFO] ---- %GENERIC_TASK% ----
+schtasks /query /tn "%GENERIC_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
+echo.
+goto :eof
+
+:printResultFile
+if exist "%RESULT_FILE%" (
+    echo [INFO] Current run-result.properties:
+    type "%RESULT_FILE%"
+    echo.
+) else (
+    echo [WARN] Result file not found: %RESULT_FILE%
+    echo.
+)
+goto :eof
+
+:printLog
+set "TARGET_FILE=%~1"
+set "TARGET_TITLE=%~2"
+set "TARGET_TAIL=%~3"
+
+if exist "%TARGET_FILE%" (
+    echo [INFO] Last lines from %TARGET_TITLE%:
+    powershell -NoProfile -Command "Get-Content -Path '%TARGET_FILE%' -Tail %TARGET_TAIL%"
+    echo.
+) else (
+    echo [WARN] File not found: %TARGET_FILE%
+    echo.
+)
+goto :eof
+
+:printReportsSummary
+if exist "%WORKSPACE%\Reports" (
+    echo [INFO] Reports folder found: %WORKSPACE%\Reports
+    echo [INFO] Relevant report artifacts:
+    powershell -NoProfile -Command ^
+      "$root='%WORKSPACE%\Reports';" ^
+      "$patterns=@('JUnit_Report.xml','cucumber.xml','execution0.log','*.html','*.pdf');" ^
+      "foreach($p in $patterns) { Get-ChildItem -Path $root -Recurse -File -Filter $p -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10 | ForEach-Object { Write-Host ('[REPORT] ' + $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $_.FullName) } }"
+    echo.
+) else (
+    echo [WARN] Reports folder not found: %WORKSPACE%\Reports
+    echo.
+)
+goto :eof
+3) jenkins/JustificationLatentTableDeLiaison.cmd
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+set "JOB_LABEL=Justification Latent - Table de Liaison"
+set "TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Table de Liaison/Table de Liaison Collection"
+set "EXECUTION_PROFILE=default"
+set "BROWSER_TYPE=Windows"
+
+set "STARTER_DIR=D:\Projects\eMatchStarters"
+set "CONTEXT_FILE=%STARTER_DIR%\run-context.properties"
+set "RESULT_FILE=%STARTER_DIR%\run-result.properties"
+set "LOG_FILE=%STARTER_DIR%\logs\run-ematch-command.log"
+set "KATALON_CONSOLE_LOG=%STARTER_DIR%\logs\katalon-console.log"
+
+set "GENERIC_TASK=\eMatch Automation\RunEMatchCommand"
+set "WIN_DRIVER_TASK=startWinDriver"
+
+set "WAIT_SECONDS=5"
+set "MAX_WAIT_CYCLES=720"
+set "RUN_ID=%RANDOM%%RANDOM%%RANDOM%"
+set "EXPECTED_RUN_ID=%RUN_ID%"
+
+echo.
+echo ==================================================
+echo [INFO] Starting %JOB_LABEL%
+echo [INFO] WORKSPACE=%WORKSPACE%
+echo [INFO] TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+echo [INFO] EXECUTION_PROFILE=%EXECUTION_PROFILE%
+echo [INFO] BROWSER_TYPE=%BROWSER_TYPE%
+echo [INFO] STARTER_DIR=%STARTER_DIR%
+echo [INFO] CONTEXT_FILE=%CONTEXT_FILE%
+echo [INFO] RESULT_FILE=%RESULT_FILE%
+echo [INFO] LOG_FILE=%LOG_FILE%
+echo [INFO] KATALON_CONSOLE_LOG=%KATALON_CONSOLE_LOG%
+echo [INFO] GENERIC_TASK=%GENERIC_TASK%
+echo [INFO] WIN_DRIVER_TASK=%WIN_DRIVER_TASK%
+echo [INFO] RUN_ID=%EXPECTED_RUN_ID%
+echo ==================================================
+echo.
+
+if "%WORKSPACE%"=="" (
+    echo [ERROR] WORKSPACE is empty.
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%" (
+    echo [ERROR] STARTER_DIR not found: %STARTER_DIR%
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%\logs" mkdir "%STARTER_DIR%\logs"
+
+schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
+schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+ping -n 3 127.0.0.1 >nul
+
+del /f /q "%LOG_FILE%" >nul 2>nul
+
+> "%CONTEXT_FILE%" (
+    echo RUN_ID=%EXPECTED_RUN_ID%
+    echo JOB_LABEL=%JOB_LABEL%
+    echo WORKSPACE=%WORKSPACE%
+    echo TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+    echo EXECUTION_PROFILE=%EXECUTION_PROFILE%
+    echo BROWSER_TYPE=%BROWSER_TYPE%
+    echo KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
+)
+
+> "%RESULT_FILE%" (
+    echo RUN_ID=%EXPECTED_RUN_ID%
+    echo STATUS=QUEUED
+    echo EXIT_CODE=999
+    echo UPDATED_AT=%date% %time%
+)
+
+echo [INFO] Context file written:
+type "%CONTEXT_FILE%"
+echo.
+
+echo [INFO] Initial result file:
+type "%RESULT_FILE%"
+echo.
+
+echo [INFO] Starting WinAppDriver task...
+schtasks /run /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Could not start scheduled task "%WIN_DRIVER_TASK%".
+    call :printTaskInfo
+    exit /b 1
+)
+
+echo [INFO] Starting visible Katalon task...
+schtasks /run /tn "%GENERIC_TASK%" >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Could not start scheduled task "%GENERIC_TASK%".
+    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+    call :printTaskInfo
+    exit /b 1
+)
+
+ping -n 4 127.0.0.1 >nul
+
+set /a WAIT_COUNT=0
+set /a PING_WAIT=%WAIT_SECONDS%+1
+
+:waitResult
+set /a WAIT_COUNT+=1
+
+set "FILE_RUN_ID="
+set "STATUS="
+set "EXIT_CODE="
+set "UPDATED_AT="
+
+for /f "usebackq tokens=1,* delims==" %%A in ("%RESULT_FILE%") do (
+    if /i "%%A"=="RUN_ID" set "FILE_RUN_ID=%%B"
+    if /i "%%A"=="STATUS" set "STATUS=%%B"
+    if /i "%%A"=="EXIT_CODE" set "EXIT_CODE=%%B"
+    if /i "%%A"=="UPDATED_AT" set "UPDATED_AT=%%B"
+)
+
+if !WAIT_COUNT! EQU 1 echo [INFO] Waiting result file update...
+if !WAIT_COUNT! EQU 2 echo [INFO] Still waiting result file update...
+if !WAIT_COUNT! EQU 3 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 4 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 5 echo [INFO] Still waiting...
+
+if !WAIT_COUNT! EQU 1 call :printTaskInfo
+if !WAIT_COUNT! EQU 5 call :printTaskInfo
+if !WAIT_COUNT! EQU 10 call :printTaskInfo
+if !WAIT_COUNT! EQU 20 call :printTaskInfo
+
+if not "!FILE_RUN_ID!"=="%EXPECTED_RUN_ID%" goto keepWaiting
+if /i "!STATUS!"=="FINISHED" goto resultDone
+
+:keepWaiting
+if !WAIT_COUNT! GEQ %MAX_WAIT_CYCLES% (
+    echo [ERROR] Timeout waiting run-result.properties update.
+    echo [ERROR] FILE_RUN_ID=!FILE_RUN_ID!
+    echo [ERROR] STATUS=!STATUS!
+    echo [ERROR] EXIT_CODE=!EXIT_CODE!
+    echo [ERROR] UPDATED_AT=!UPDATED_AT!
+    echo.
+
+    schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
+    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+
+    call :printTaskInfo
+    call :printResultFile
+    call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+    call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
+    call :printReportsSummary
+
+    exit /b 1
+)
+
+ping -n !PING_WAIT! 127.0.0.1 >nul
+goto waitResult
+
+:resultDone
+echo.
+echo [INFO] Result file updated.
+echo [INFO] RUN_ID=!FILE_RUN_ID!
+echo [INFO] STATUS=!STATUS!
+echo [INFO] EXIT_CODE=!EXIT_CODE!
+echo [INFO] UPDATED_AT=!UPDATED_AT!
+echo.
+
+schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
+
+call :printTaskInfo
+call :printResultFile
+call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
+call :printReportsSummary
+
+if not "!EXIT_CODE!"=="0" (
+    exit /b !EXIT_CODE!
+)
+
+echo [INFO] %JOB_LABEL% finished successfully.
+exit /b 0
+
+:printTaskInfo
+echo [INFO] Scheduled task status snapshot:
+echo [INFO] ---- %WIN_DRIVER_TASK% ----
+schtasks /query /tn "%WIN_DRIVER_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
+echo [INFO] ---- %GENERIC_TASK% ----
+schtasks /query /tn "%GENERIC_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
+echo.
+goto :eof
+
+:printResultFile
+if exist "%RESULT_FILE%" (
+    echo [INFO] Current run-result.properties:
+    type "%RESULT_FILE%"
+    echo.
+) else (
+    echo [WARN] Result file not found: %RESULT_FILE%
+    echo.
+)
+goto :eof
+
+:printLog
+set "TARGET_FILE=%~1"
+set "TARGET_TITLE=%~2"
+set "TARGET_TAIL=%~3"
+
+if exist "%TARGET_FILE%" (
+    echo [INFO] Last lines from %TARGET_TITLE%:
+    powershell -NoProfile -Command "Get-Content -Path '%TARGET_FILE%' -Tail %TARGET_TAIL%"
+    echo.
+) else (
+    echo [WARN] File not found: %TARGET_FILE%
+    echo.
+)
+goto :eof
+
+:printReportsSummary
+if exist "%WORKSPACE%\Reports" (
+    echo [INFO] Reports folder found: %WORKSPACE%\Reports
+    echo [INFO] Relevant report artifacts:
+    powershell -NoProfile -Command ^
+      "$root='%WORKSPACE%\Reports';" ^
+      "$patterns=@('JUnit_Report.xml','cucumber.xml','execution0.log','*.html','*.pdf');" ^
+      "foreach($p in $patterns) { Get-ChildItem -Path $root -Recurse -File -Filter $p -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10 | ForEach-Object { Write-Host ('[REPORT] ' + $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $_.FullName) } }"
+    echo.
+) else (
+    echo [WARN] Reports folder not found: %WORKSPACE%\Reports
+    echo.
+)
+goto :eof
+4) jenkins/JustificationDesComptesdeLatent.groovy
+properties([
+    disableConcurrentBuilds()
+])
+
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+
+// true = trigger the next pipeline
+// false = do not trigger any next pipeline
+def RUN_NEXT_JOB = false
+
+// Full Jenkins job path for the next pipeline
+def NEXT_JOB = ''
+
+def executionFailed = false
+
+def CLEANUP_COMMAND = '''
+@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+taskkill /f /im WinAppDriver.exe /t >nul 2>nul
+taskkill /f /im katalonc.exe /t >nul 2>nul
+taskkill /f /im KatalonStudio.exe /t >nul 2>nul
+ping -n 6 127.0.0.1 >nul
+exit /b 0
+'''
+
+node(NODE_LABEL) {
+    stage('Checkout') {
+        checkout scm
+    }
+
+    stage('Investigations Collection') {
+        try {
+            bat 'call "%WORKSPACE%\\jenkins\\JustificationLatentInvestigations.cmd"'
+        } catch (Throwable err) {
+            executionFailed = true
+            echo "Investigations execution failed: ${err}"
+        } finally {
+            bat CLEANUP_COMMAND
+        }
+    }
+
+    stage('Synthese Collection') {
+        try {
+            bat 'call "%WORKSPACE%\\jenkins\\JustificationLatentSynthese.cmd"'
+        } catch (Throwable err) {
+            executionFailed = true
+            echo "Synthese execution failed: ${err}"
+        } finally {
+            bat CLEANUP_COMMAND
+        }
+    }
+
+    stage('Table de Liaison Collection') {
+        try {
+            bat 'call "%WORKSPACE%\\jenkins\\JustificationLatentTableDeLiaison.cmd"'
+        } catch (Throwable err) {
+            executionFailed = true
+            echo "Table de Liaison execution failed: ${err}"
+        } finally {
+            bat CLEANUP_COMMAND
+        }
+    }
+}
+
+stage('Trigger next pipeline') {
+    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        build job: NEXT_JOB,
+              wait: false,
+              propagate: false
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
+return
+✅ Como configurar no Jenkins
+
+Na nova pipeline, usa:
+
+Branch Specifier: a tua branch
+Script Path:
+jenkins/JustificationDesComptesdeLatent.groovy
+✅ O que esse fluxo faz
+roda a Investigations Collection
+termina e limpa tudo
+roda a Synthese Collection
+termina e limpa tudo
+roda a Table de Liaison Collection
+termina e limpa tudo
+só depois, se quiser, chama o próximo job
+⚠️ Importante
+
+Os nomes abaixo precisam estar idênticos ao Katalon:
+
+Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Investigations/Investigations Collections
+Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Synthese/Synthese Collection
+Test Suites/Justification des Comptesde Latent/Justification des Comptes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+📘 Jenkins Visible Execution Documentation for eMatch Katalon Pipelines
+🧭 Main Overview
+Purpose
+
+This implementation was designed to run Katalon Windows desktop suites from Jenkins in a real visible desktop session, while keeping the execution stable, reusable, and easy to extend for new suites.
+
+It solves the main limitations of running Windows UI automation directly from a Jenkins service session.
+
+Core objectives
+✅ Run tests in a visible Windows desktop session
+✅ Start WinAppDriver outside the Jenkins service context
+✅ Reuse the same generic scheduled task for multiple suites
+✅ Keep one Jenkins pipeline file and one CMD file per suite
+✅ Generate reports in the workspace used by the current build
+✅ Return Jenkins result based on execution success, not test assertions
+✅ Allow one pipeline to trigger the next one
+✅ Ensure the current execution is fully stopped before the next one starts
+🏗️ Architecture Summary
+
+This implementation has 4 layers.
+
+1. Jenkins pipeline file
+
+One Groovy file per suite or suite collection.
+
+Examples:
+
+jenkins/ArchiveMode.groovy
+jenkins/ModuleDesResponsabilite.groovy
+2. Suite launcher CMD file
+
+One CMD file per suite or suite collection.
+
+Examples:
+
+jenkins/ArchiveMode.cmd
+jenkins/ModuleDesResponsabilite.cmd
+3. Generic visible execution runner
+
+A shared runner started through Task Scheduler.
+
+It is responsible for:
+
+reading the execution context
+launching Katalon visibly
+updating the result file
+writing logs
+4. Windows Scheduled Tasks
+
+Two scheduled tasks are reused by all pipelines:
+
+startWinDriver
+\eMatch Automation\RunEMatchCommand
+🔄 End to End Execution Flow
+Step 1. Jenkins starts the pipeline
+
+The pipeline checks out the repository and calls its suite specific CMD file.
+
+Example:
+
+bat 'call "%WORKSPACE%\\jenkins\\ArchiveMode.cmd"'
+Step 2. The CMD file prepares the execution context
+
+The CMD file writes execution data into a shared context file, such as:
+
+D:\Projects\eMatchStarters\run-context.properties
+
+It includes:
+
+run id
+workspace path
+suite collection path
+execution profile
+browser type
+Katalon home
+Step 3. Jenkins starts the scheduled tasks
+
+The CMD file triggers:
+
+startWinDriver
+\eMatch Automation\RunEMatchCommand
+
+This ensures the visible UI execution happens in the interactive desktop session.
+
+Step 4. The visible runner reads the context
+
+The generic scheduled task reads the context file and launches Katalon with the correct suite and workspace.
+
+Step 5. The CMD file waits for completion
+
+The CMD file monitors the shared result file:
+
+D:\Projects\eMatchStarters\run-result.properties
+
+It waits until:
+
+STATUS=FINISHED
+Step 6. Jenkins prints logs and report summary
+
+At the end, the CMD prints:
+
+task status snapshot
+result file contents
+starter logs
+Katalon console log
+reports summary
+Step 7. Jenkins stops the current execution cleanly
+
+The pipeline explicitly stops:
+
+scheduled tasks
+WinAppDriver
+Katalon processes
+
+Only after that, it may trigger the next pipeline.
+
+📄 Page 2. Scheduled Tasks
+🖥️ Task 1. startWinDriver
+Responsibility
+
+This task starts WinAppDriver in the interactive desktop session.
+
+Why it exists
+
+Jenkins running as a service cannot reliably provide the visible desktop session needed by Windows UI automation.
+WinAppDriver must be started where the UI actually exists.
+
+Expected behavior
+start before Katalon
+remain available during execution
+be stopped by the pipeline after the suite finishes
+🖥️ Task 2. \eMatch Automation\RunEMatchCommand
+Responsibility
+
+This is the generic visible runner.
+
+It reads the context file and runs the requested suite or collection without needing one dedicated scheduled task per suite.
+
+Why it exists
+
+Without this generic task, every new suite would require:
+
+a new scheduled task
+a new custom launcher
+more maintenance
+
+With this model, new suites only need:
+
+one Jenkins Groovy file
+one CMD file
+📄 Page 3. Jenkins Pipeline File Pattern
+📌 Example responsibility
+
+A Jenkins Groovy file is responsible for:
+
+selecting the node
+checking out the repository
+calling the suite CMD file
+forcing cleanup at the end
+optionally triggering the next Jenkins pipeline
+returning SUCCESS when execution completed, even if some tests failed
+✅ Standard pipeline behavior
+It should:
+use disableConcurrentBuilds()
+run on the correct Windows node
+call only its own CMD file
+stop all related processes before leaving
+trigger the next pipeline only after cleanup
+It should not:
+leave WinAppDriver alive
+leave Katalon alive
+keep the build hanging while the next job runs
+mark Jenkins as failed just because a test case failed
+🧩 Recommended Groovy pattern
+properties([
+    disableConcurrentBuilds()
+])
+
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+
+// true = trigger the next pipeline
+// false = do not trigger any next pipeline
+def RUN_NEXT_JOB = false
+
+// Full Jenkins job path for the next pipeline
+def NEXT_JOB = 'GI5/eMatch_Regression/BDR/Module des Responsabilite'
+
+def executionFailed = false
+
+stage('Run current pipeline') {
+    node(NODE_LABEL) {
+        checkout scm
+
+        try {
+            bat 'call "%WORKSPACE%\\jenkins\\ModuleDesResponsabilite.cmd"'
+        } catch (Throwable err) {
+            executionFailed = true
+            echo "Current execution failed: ${err}"
+        } finally {
+            stage('Stop current execution') {
+                bat '''
+@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+taskkill /f /im WinAppDriver.exe /t >nul 2>nul
+taskkill /f /im katalonc.exe /t >nul 2>nul
+taskkill /f /im KatalonStudio.exe /t >nul 2>nul
+ping -n 6 127.0.0.1 >nul
+exit /b 0
+'''
+            }
+        }
+    }
+}
+
+stage('Trigger next pipeline') {
+    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        build job: NEXT_JOB,
+              wait: false,
+              propagate: false
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
+return
+📄 Page 4. CMD File Pattern
+📌 CMD file responsibility
+
+The suite specific CMD file is the bridge between:
+
+Jenkins
+Task Scheduler
+visible Katalon execution
+
+It prepares the execution context and waits for completion.
+
+✅ What the CMD file controls
+Input values
+suite name
+suite collection path
+profile
+browser type
+Katalon home
+starter directory
+task names
+Runtime files
+context file
+result file
+starter log
+Katalon console log
+Final console output
+context dump
+result dump
+task status
+report summary
+🧱 Main variables
+
+Typical examples:
+
+set "JOB_LABEL=Archive Mode"
+set "TEST_SUITE_COLLECTION=Test Suites/Archive Mode/Archive Mode Collection"
+set "EXECUTION_PROFILE=default"
+set "BROWSER_TYPE=Windows"
+Shared runner files
+set "STARTER_DIR=D:\Projects\eMatchStarters"
+set "CONTEXT_FILE=%STARTER_DIR%\run-context.properties"
+set "RESULT_FILE=%STARTER_DIR%\run-result.properties"
+Scheduled tasks
+set "GENERIC_TASK=\eMatch Automation\RunEMatchCommand"
+set "WIN_DRIVER_TASK=startWinDriver"
+✅ Why the CMD file is important
+
+It guarantees that Jenkins does not directly try to control visible desktop automation.
+
+Instead, it:
+
+writes instructions
+starts the desktop tasks
+waits for completion
+reports status back to Jenkins
+📄 Page 5. Report Strategy
+🧾 Report behavior
+
+The reporting implementation was designed to support both:
+
+local execution
+remote Jenkins execution
+
+while using different report roots if necessary.
+
+Main reporting goals
+show test steps from JiraReportSteps
+keep the full stack trace only in View full error
+show only a short failure summary outside the expandable section
+attach one failure evidence image per failed test case
+resolve different report paths for local and remote runs
+keep the HTML layout stable
+✅ Rules for the HTML report
+Steps section
+
+The steps must display what was logged by JiraReportSteps.
+
+They must not display the raw exception text inside the step list.
+
+Step status rules
+passed step = green
+failed step = red
+steps not executed after a failure = blocked, yellow
+Visual Error Log rules
+
+Outside the expandable area:
+
+show only the short summary
+stop at the intended short text boundary
+
+Inside View full error:
+
+show the complete error log and stack trace
+Evidence rules
+one failure image per failed test case
+show only evidence related to the selected test case
+do not show evidence from other test cases
+support different image roots for local and remote environments
+📄 Page 6. Local and Remote Differences
+🖥️ Local environment
+
+Typical characteristics:
+
+runs from local Katalon Studio
+reports under local workspace path
+user may have multiple monitors
+screenshot should preferably capture only one relevant screen
+🖥️ Remote Jenkins environment
+
+Typical characteristics:
+
+runs through visible scheduled tasks
+reports under Jenkins workspace
+screenshot path differs from local
+full desktop capture may be acceptable when needed
+⚠️ Why path resolution matters
+
+The evidence and logo issues came from the fact that:
+
+local and remote report roots are not always identical
+the image file may exist in a different folder depending on the execution mode
+logo and evidence lookup must not assume a single fixed path
+
+That is why the report builder must resolve:
+
+current report folder
+evidence folder
+logo location
+
+based on the actual execution environment.
+
+📄 Page 7. How to Create a New Jenkins Pipeline for a New Suite
+🚀 What you need to add
+
+For each new suite or collection, create only these two files:
+
+one Groovy pipeline file in jenkins/
+one CMD launcher file in jenkins/
+✅ Example for a new suite
+Groovy file
+
+jenkins/ModuleDesResponsabilite.groovy
+
+CMD file
+
+jenkins/ModuleDesResponsabilite.cmd
+
+✅ What to change in the CMD file
+
+Update only the suite specific values:
+
+set "JOB_LABEL=Module des Responsabilite"
+set "TEST_SUITE_COLLECTION=Test Suites/BDR/Module des Responsabilite/Module des Responsabilite Collection"
+set "EXECUTION_PROFILE=default"
+set "BROWSER_TYPE=Windows"
+
+Everything else should stay aligned with the generic runner structure.
+
+✅ What to change in the Groovy file
+
+Update:
+
+node label
+CMD filename
+next pipeline toggle
+next pipeline path
+
+Example:
+
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+def RUN_NEXT_JOB = true
+def NEXT_JOB = 'GI5/eMatch_Regression/Next Job Name'
+bat 'call "%WORKSPACE%\\jenkins\\ModuleDesResponsabilite.cmd"'
+📄 Page 8. How to Configure the Jenkins Job
+⚙️ Jenkins job configuration
+
+For each suite pipeline job:
+
+Use:
+Pipeline
+Pipeline script from SCM
+correct repository URL
+correct branch
+correct script path
+
+Example script path:
+
+jenkins/ModuleDesResponsabilite.groovy
+✅ Branch and SCM example
+Repository URL
+
+Your project repository
+
+Branch Specifier
+
+The working branch, for example:
+
+*/includeNotesByReport
+Script Path
+jenkins/ArchiveMode.groovy
+
+or
+
+jenkins/ModuleDesResponsabilite.groovy
+📄 Page 9. How to Chain Pipelines Safely
+🔗 Goal
+
+One pipeline may schedule the next pipeline after finishing.
+
+Important rule
+
+The current execution must be completely stopped before the next pipeline is scheduled.
+
+That is why cleanup happens first, and only then the next job is triggered.
+
+✅ Correct approach
+First
+
+Stop:
+
+scheduled tasks
+WinAppDriver
+Katalon processes
+Then
+
+Schedule the next Jenkins job with:
+
+build job: NEXT_JOB,
+      wait: false,
+      propagate: false
+
+This means:
+
+current job does not wait for the next one to finish
+current job ends normally
+next job starts as a new separate execution
+❌ What must be avoided
+
+Do not keep the first pipeline hanging while waiting for the second.
+
+Do not trigger the next job before cleanup.
+
+Do not let both suites overlap in the same desktop session.
+
+📄 Page 10. Reusable Pattern for All Future Pipelines
+🧩 Standard file set per suite
+
+For every new suite, follow this model:
+
+Jenkins
+jenkins/<SuiteName>.groovy
+jenkins/<SuiteName>.cmd
+Scheduled tasks
+
+Reused, not duplicated:
+
+startWinDriver
+\eMatch Automation\RunEMatchCommand
+✅ Standard toggle for next job
+
+All Groovy pipeline files should include:
+
+def RUN_NEXT_JOB = false
+def NEXT_JOB = ''
+
+This makes the chaining feature available for every suite.
+
+To enable it:
+
+set RUN_NEXT_JOB = true
+fill NEXT_JOB with the full Jenkins job path
+📄 Page 11. Current Implementation Scope
+✅ What is already part of this implementation
+visible desktop execution through scheduled tasks
+generic scheduled task runner
+suite specific CMD files
+suite specific Jenkins Groovy files
+execution result based on execution success
+optional next job chaining
+controlled cleanup before next job
+report generation integrated with local and remote behavior
+report evidence support
+Jira report steps integration
+HTML report improvements for short error and full error separation
+📄 Page 12. Best Practices
+✅ Recommended practices
+keep comments in code always in English
+keep one pipeline file per suite
+keep one CMD file per suite
+reuse the same scheduled tasks
+enable next job only when truly needed
+keep cleanup mandatory
+keep Jenkins status tied to execution completion
+keep report logic separated from Jenkins launcher logic
+❌ Avoid
+creating one scheduled task per suite
+running Windows UI tests directly from Jenkins service session
+mixing suite specific logic into the generic runner
+returning Jenkins failure only because a test assertion failed
+starting the next pipeline before stopping the current one
+📄 Page 13. Quick Recipe to Add a New Suite
+✨ Minimal steps
+1. Copy an existing Groovy file
+
+Example:
+
+copy ArchiveMode.groovy
+rename to NewSuite.groovy
+2. Copy an existing CMD file
+
+Example:
+
+copy ArchiveMode.cmd
+rename to NewSuite.cmd
+3. Update only suite specific values
+
+In CMD:
+
+JOB_LABEL
+TEST_SUITE_COLLECTION
+
+In Groovy:
+
+CMD filename
+RUN_NEXT_JOB
+NEXT_JOB
+4. Create a Jenkins pipeline job
+
+Set:
+
+repository
+branch
+script path
+5. Test locally first
+
+Validate:
+
+suite path
+report generation
+evidence
+HTML output
+6. Test remotely
+
+Validate:
+
+scheduled tasks
+visible session
+workspace reports
+Jenkins console summary
+📄 Page 14. Example of a Final Reusable Groovy Structure
+properties([
+    disableConcurrentBuilds()
+])
+
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+
+// true = trigger the next pipeline
+// false = do not trigger any next pipeline
+def RUN_NEXT_JOB = false
+
+// Full Jenkins job path for the next pipeline
+def NEXT_JOB = 'GI5/eMatch_Regression/BDR/Module des Responsabilite'
+
+def executionFailed = false
+
+stage('Run current pipeline') {
+    node(NODE_LABEL) {
+        checkout scm
+
+        try {
+            bat 'call "%WORKSPACE%\\jenkins\\ArchiveMode.cmd"'
+        } catch (Throwable err) {
+            executionFailed = true
+            echo "Current execution failed: ${err}"
+        } finally {
+            stage('Stop current execution') {
+                bat '''
+@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+taskkill /f /im WinAppDriver.exe /t >nul 2>nul
+taskkill /f /im katalonc.exe /t >nul 2>nul
+taskkill /f /im KatalonStudio.exe /t >nul 2>nul
+ping -n 6 127.0.0.1 >nul
+exit /b 0
+'''
+            }
+        }
+    }
+}
+
+stage('Trigger next pipeline') {
+    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        build job: NEXT_JOB,
+              wait: false,
+              propagate: false
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
+return
+✅ Final Summary
+
+This Jenkins implementation is based on a very clear principle:
+
+One suite equals:
+one Jenkins Groovy pipeline file
+one suite specific CMD file
+Shared by all suites:
+one WinAppDriver scheduled task
+one generic visible execution scheduled task
+Main benefits:
+stable visible execution
+low duplication
+easy onboarding of new suites
+controlled cleanup
+reusable pipeline chaining
+consistent report generation
