@@ -1,256 +1,663 @@
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-
-set "JOB_LABEL=REPLACE_JOB_LABEL"
-set "TEST_SUITE_COLLECTION=REPLACE_TEST_SUITE_COLLECTION"
-set "EXECUTION_PROFILE=default"
-set "BROWSER_TYPE=Windows"
-
-set "STARTER_DIR=D:\Projects\eMatchStarters"
-set "CONTEXT_FILE=%STARTER_DIR%\run-context.properties"
-set "RESULT_FILE=%STARTER_DIR%\run-result.properties"
-set "LOG_FILE=%STARTER_DIR%\logs\run-ematch-command.log"
-set "KATALON_CONSOLE_LOG=%STARTER_DIR%\logs\katalon-console.log"
-
-set "GENERIC_TASK=\eMatch Automation\RunEMatchCommand"
-set "WIN_DRIVER_TASK=startWinDriver"
-
-set "WAIT_SECONDS=5"
-set "MAX_WAIT_CYCLES=720"
-set "RUN_ID=%RANDOM%%RANDOM%%RANDOM%"
-set "EXPECTED_RUN_ID=%RUN_ID%"
-
-echo.
-echo ==================================================
-echo [INFO] Starting %JOB_LABEL%
-echo [INFO] WORKSPACE=%WORKSPACE%
-echo [INFO] TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
-echo [INFO] EXECUTION_PROFILE=%EXECUTION_PROFILE%
-echo [INFO] BROWSER_TYPE=%BROWSER_TYPE%
-echo [INFO] STARTER_DIR=%STARTER_DIR%
-echo [INFO] CONTEXT_FILE=%CONTEXT_FILE%
-echo [INFO] RESULT_FILE=%RESULT_FILE%
-echo [INFO] LOG_FILE=%LOG_FILE%
-echo [INFO] KATALON_CONSOLE_LOG=%KATALON_CONSOLE_LOG%
-echo [INFO] GENERIC_TASK=%GENERIC_TASK%
-echo [INFO] WIN_DRIVER_TASK=%WIN_DRIVER_TASK%
-echo [INFO] RUN_ID=%EXPECTED_RUN_ID%
-echo ==================================================
-echo.
-
-if "%WORKSPACE%"=="" (
-    echo [ERROR] WORKSPACE is empty.
-    exit /b 1
-)
-
-if not exist "%STARTER_DIR%" (
-    echo [ERROR] STARTER_DIR not found: %STARTER_DIR%
-    exit /b 1
-)
-
-if not exist "%STARTER_DIR%\logs" mkdir "%STARTER_DIR%\logs"
-
-schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
-schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-ping -n 3 127.0.0.1 >nul
-
-del /f /q "%LOG_FILE%" >nul 2>nul
-del /f /q "%KATALON_CONSOLE_LOG%" >nul 2>nul
-
-> "%CONTEXT_FILE%" (
-    echo RUN_ID=%EXPECTED_RUN_ID%
-    echo JOB_LABEL=%JOB_LABEL%
-    echo WORKSPACE=%WORKSPACE%
-    echo TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
-    echo EXECUTION_PROFILE=%EXECUTION_PROFILE%
-    echo BROWSER_TYPE=%BROWSER_TYPE%
-    echo KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
-)
-
-> "%RESULT_FILE%" (
-    echo RUN_ID=%EXPECTED_RUN_ID%
-    echo STATUS=QUEUED
-    echo EXIT_CODE=999
-    echo UPDATED_AT=%date% %time%
-)
-
-echo [INFO] Context file written:
-type "%CONTEXT_FILE%"
-echo.
-
-echo [INFO] Initial result file:
-type "%RESULT_FILE%"
-echo.
-
-echo [INFO] Starting WinAppDriver task...
-schtasks /run /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Could not start scheduled task "%WIN_DRIVER_TASK%".
-    call :printTaskInfo
-    exit /b 1
-)
-
-echo [INFO] Starting visible Katalon task...
-schtasks /run /tn "%GENERIC_TASK%" >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] Could not start scheduled task "%GENERIC_TASK%".
-    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-    call :printTaskInfo
-    exit /b 1
-)
-
-ping -n 4 127.0.0.1 >nul
-
-set /a WAIT_COUNT=0
-set /a PING_WAIT=%WAIT_SECONDS%+1
-
-:waitResult
-set /a WAIT_COUNT+=1
-
-set "FILE_RUN_ID="
-set "STATUS="
-set "EXIT_CODE="
-set "UPDATED_AT="
-
-for /f "usebackq tokens=1,* delims==" %%A in ("%RESULT_FILE%") do (
-    if /i "%%A"=="RUN_ID" set "FILE_RUN_ID=%%B"
-    if /i "%%A"=="STATUS" set "STATUS=%%B"
-    if /i "%%A"=="EXIT_CODE" set "EXIT_CODE=%%B"
-    if /i "%%A"=="UPDATED_AT" set "UPDATED_AT=%%B"
-)
-
-if !WAIT_COUNT! EQU 1 echo [INFO] Waiting result file update...
-if !WAIT_COUNT! EQU 2 echo [INFO] Still waiting result file update...
-if !WAIT_COUNT! EQU 3 echo [INFO] Still waiting...
-if !WAIT_COUNT! EQU 4 echo [INFO] Still waiting...
-if !WAIT_COUNT! EQU 5 echo [INFO] Still waiting...
-
-if !WAIT_COUNT! EQU 1 call :printTaskInfo
-if !WAIT_COUNT! EQU 5 call :printTaskInfo
-if !WAIT_COUNT! EQU 10 call :printTaskInfo
-if !WAIT_COUNT! EQU 20 call :printTaskInfo
-
-if not "!FILE_RUN_ID!"=="%EXPECTED_RUN_ID%" goto keepWaiting
-if /i "!STATUS!"=="FINISHED" goto resultDone
-
-:keepWaiting
-if !WAIT_COUNT! GEQ %MAX_WAIT_CYCLES% (
-    echo [ERROR] Timeout waiting run-result.properties update.
-    echo [ERROR] FILE_RUN_ID=!FILE_RUN_ID!
-    echo [ERROR] STATUS=!STATUS!
-    echo [ERROR] EXIT_CODE=!EXIT_CODE!
-    echo [ERROR] UPDATED_AT=!UPDATED_AT!
-    echo.
-
-    schtasks /end /tn "%GENERIC_TASK%" >nul 2>nul
-    schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-
-    call :printTaskInfo
-    call :printResultFile
-    call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
-    call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
-    call :printReportsSummary
-
-    exit /b 1
-)
-
-ping -n !PING_WAIT! 127.0.0.1 >nul
-goto waitResult
-
-:resultDone
-echo.
-echo [INFO] Result file updated.
-echo [INFO] RUN_ID=!FILE_RUN_ID!
-echo [INFO] STATUS=!STATUS!
-echo [INFO] EXIT_CODE=!EXIT_CODE!
-echo [INFO] UPDATED_AT=!UPDATED_AT!
-echo.
-
-schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>nul
-
-call :printTaskInfo
-call :printResultFile
-call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
-call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 60
-call :printReportsSummary
-
-if /i "!STATUS!" NEQ "FINISHED" (
-    echo [ERROR] Execution did not finish properly.
-    exit /b 1
-)
-
-call :detectHardExecutionError
-if errorlevel 1 (
-    echo [ERROR] Hard execution error detected for %JOB_LABEL%.
-    exit /b 1
-)
-
-echo [INFO] %JOB_LABEL% execution finished successfully.
-if not "!EXIT_CODE!"=="0" (
-    echo [WARN] Katalon returned EXIT_CODE=!EXIT_CODE!, but Jenkins will keep SUCCESS because execution finished.
-)
+Skip to content
+Search (CTRL+K)
+erica.cavalher-ext@natixis.com
+
+log out
+Dashboard
+GI5
+eMatch_Regression
+Justification Latent Synthese
+#5
+Status
+Changes
+Console Output
+View as plain text
+Edit Build Information
+Delete build ‘#5’
+Timings
+Git Build Data
+
+Open Blue Ocean
+
+Embeddable Build Status
+Replay
+Pipeline Steps
+Workspaces
+Rebuild
+Previous Build
+Console Output
+Started by upstream project "GI5/eMatch_Regression/BDR_Module des Responsabilite" build number 4
+originally caused by:
+ Started by upstream project "GI5/eMatch_Regression/Archive Mode" build number 9
+ originally caused by:
+  Started by user erica.cavalher-ext@natixis.com
+Running as erica.cavalher-ext@natixis.com
+Obtained jenkinsFile/JustificationDesComptesdeLatent.groovy from git https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/ematch-nr-tests.git
+[Pipeline] Start of Pipeline
+[Pipeline] properties
+[Pipeline] node
+Running on GI5_SWDCFRNXGI55817 in D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+[Pipeline] {
+[Pipeline] stage
+[Pipeline] { (Checkout)
+[Pipeline] checkout
+The recommended git tool is: git
+using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+Fetching changes from the remote Git repository
+ > git rev-parse --resolve-git-dir D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\.git # timeout=10
+ > git config remote.origin.url https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/ematch-nr-tests.git # timeout=10
+Fetching upstream changes from https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/ematch-nr-tests.git
+ > git --version # timeout=10
+ > git --version # 'git version 2.53.0.windows.1'
+using GIT_ASKPASS to set credentials 
+ > git fetch --tags --force --progress -- https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/ematch-nr-tests.git +refs/heads/*:refs/remotes/origin/* # timeout=10
+Checking out Revision d492ac1d1a3f53b1c85454fbf1495592d92cc95b (refs/remotes/origin/includeNotesByReport)
+Commit message: "try to fix the status problem in jenkins"
+ > git rev-parse "refs/remotes/origin/includeNotesByReport^{commit}" # timeout=10
+ > git config core.sparsecheckout # timeout=10
+ > git checkout -f d492ac1d1a3f53b1c85454fbf1495592d92cc95b # timeout=10
+ > git rev-list --no-walk ea3c2aeb0ea286fd4aef5120f12affd7e1a64200 # timeout=10
+The recommended git tool is: git
+using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+The recommended git tool is: git
+using credential 965eceec-b3a3-4ec5-8820-a857c87dd80f
+[GitCheckoutListener] Recording commits of 'git https://bitbucket-mut.mycloud.intrabpce.fr/scm/gi5/ematch-nr-tests.git'
+[GitCheckoutListener] Found previous build 'GI5/eMatch_Regression/Justification Latent Synthese #4' that contains recorded Git commits
+[GitCheckoutListener] -> Starting recording of new commits since 'ea3c2ae'
+[GitCheckoutListener] -> Using head commit 'd492ac1' as starting point
+[GitCheckoutListener] -> Git commit decorator could not be created for SCM 'hudson.plugins.git.GitSCM@300110b2'
+[GitCheckoutListener] -> Recorded 4 new commits
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Investigations Collection)
+[Pipeline] timeout
+Timeout set to expire in 5 hr 0 min
+[Pipeline] {
+[Pipeline] bat
+
+D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese>call "D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\jenkins\JustificationLatentInvestigations.cmd" 
+
+==================================================
+[INFO] Starting Justification Latent - Investigations
+[INFO] WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+[INFO] TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Investigations/Investigations Collections
+[INFO] EXECUTION_PROFILE=default
+[INFO] BROWSER_TYPE=Windows
+[INFO] STARTER_DIR=D:\Projects\eMatchStarters
+[INFO] CONTEXT_FILE=D:\Projects\eMatchStarters\run-context.properties
+[INFO] RESULT_FILE=D:\Projects\eMatchStarters\run-result.properties
+[INFO] LOG_FILE=D:\Projects\eMatchStarters\logs\run-ematch-command.log
+[INFO] KATALON_CONSOLE_LOG=D:\Projects\eMatchStarters\logs\katalon-console.log
+[INFO] GENERIC_TASK=\eMatch Automation\RunEMatchCommand
+[INFO] WIN_DRIVER_TASK=startWinDriver
+[INFO] RUN_ID=82531005012886
+==================================================
+
+ > git rev-parse "HEAD^{commit}" # timeout=10
+[INFO] Context file written:
+RUN_ID=82531005012886
+JOB_LABEL=Justification Latent - Investigations
+WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Investigations/Investigations Collections
+EXECUTION_PROFILE=default
+BROWSER_TYPE=Windows
+KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
+
+[INFO] Initial result file:
+RUN_ID=82531005012886
+STATUS=QUEUED
+EXIT_CODE=999
+UPDATED_AT=27/04/2026 18:49:23,54
+
+[INFO] Starting WinAppDriver task...
+[INFO] Starting visible Katalon task...
+[INFO] Waiting result file update...
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+[INFO] Still waiting result file update...
+[INFO] Still waiting...
+[INFO] Still waiting...
+[INFO] Still waiting...
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+
+[INFO] Result file updated.
+[INFO] RUN_ID=82531005012886
+[INFO] STATUS=FINISHED
+[INFO] EXIT_CODE=2
+[INFO] UPDATED_AT=27/04/2026 18:49:57,08
+
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Ready
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Ready
+
+[INFO] Current run-result.properties:
+RUN_ID=82531005012886
+STATUS=FINISHED
+EXIT_CODE=2
+UPDATED_AT=27/04/2026 18:49:57,08
+
+[INFO] Last lines from run-ematch-command.log:
+[27/04/2026 18:49:23,72] ==================================================
+[27/04/2026 18:49:23,78] [INFO] RUN_ID=82531005012886
+[27/04/2026 18:49:23,79] [INFO] JOB_LABEL=Justification Latent - Investigations
+[27/04/2026 18:49:23,79] [INFO] WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+[27/04/2026 18:49:23,80] [INFO] PROJECT_FILE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\eMatch POC.prj
+[27/04/2026 18:49:23,81] [INFO] TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Investigations/Investigations Collections
+[27/04/2026 18:49:23,81] [INFO] EXECUTION_PROFILE=default
+[27/04/2026 18:49:23,82] [INFO] BROWSER_TYPE=Windows
+[27/04/2026 18:49:23,83] [INFO] KATALON_EXE=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\katalonc.exe
+[27/04/2026 18:49:23,83] [INFO] KATALON_CONSOLE_LOG=D:\Projects\eMatchStarters\logs\katalon-console.log
+[27/04/2026 18:49:23,84] [INFO] Launching Katalon...
+[27/04/2026 18:49:57,08] [INFO] Katalon finished with EXIT_CODE=2
+
+[INFO] Last lines from katalon-console.log:
+End getting machine ID on Windows d446187aed1d9a7de7e9745b35c81394
+INFO: Machine ID: d446187aed1d9a7de7e9745b35c81394
+INFO: Your environment is compatible with the Katalon Runtime Engine NODE-LOCKED or FLOATING license. For a fixed machine ID, use a NODE-LOCKED license; for a dynamic machine ID, use a FLOATING license.
+
+
+Activating...
+Start activating offline...
+Search for valid offline licenses in folder: C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\.katalon\license
+Start checking license: KRE_Floating_d446187aed1d9a7de7e9745b35c81394_201300.lic
+KRE_Floating_d446187aed1d9a7de7e9745b35c81394_201300.lic is valid.
+The number of valid offline licenses: 1
+The number of Runtime Engine running sessions: 1
+Delete folder: bin
+Delete folder: Libs
+Cleaning up workspace
+Opening project file: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\eMatch POC.prj
+Warning! Please run Katalon execution command outside of the project folder.
+Generating global variables...
+Parsing custom keywords...
+Project 'eMatch POC' opened
+Start reloading plugins...
+Start check license task
+
+--------------------------RETRY EXECUTION INFORMATION--------------------------
+Test Suite Collection 'Investigations Collections':
+- Test Suite 'Justification des Comptesde Latent - Investigations' runs with Immediately retry strategy and 0 retry time(s).
+- Test Suite 'Jira integration report' runs with Immediately retry strategy and 0 retry time(s).
+--------------------------------------------------------------------------------
+
+com.kms.katalon.execution.exception.ExecutionException: com.kms.katalon.dal.exception.DALException: com.kms.katalon.entity.dal.exception.FilePathTooLongException: Cannot save entity: file path length limit exceeded (258/255). You should shorten the name and try again.
+	at com.kms.katalon.execution.launcher.TestSuiteCollectionConsoleLauncher.newInstance(TestSuiteCollectionConsoleLauncher.java:95)
+	at com.kms.katalon.execution.console.entity.TestSuiteCollectionLauncherOptionParser.getConsoleLauncher(TestSuiteCollectionLauncherOptionParser.java:114)
+	at com.kms.katalon.execution.console.ConsoleExecutor.execute(ConsoleExecutor.java:74)
+	at com.kms.katalon.execution.console.ConsoleMain.launch(ConsoleMain.java:521)
+	at com.kms.katalon.console.application.ConsoleApplicationStarter.start(ConsoleApplicationStarter.java:37)
+	at com.kms.katalon.application.Application.runConsole(Application.java:125)
+	at com.kms.katalon.application.Application.start(Application.java:88)
+	at org.eclipse.equinox.internal.app.EclipseAppHandle.run(EclipseAppHandle.java:203)
+	at org.eclipse.core.runtime.internal.adaptor.EclipseAppLauncher.runApplication(EclipseAppLauncher.java:137)
+	at org.eclipse.core.runtime.internal.adaptor.EclipseAppLauncher.start(EclipseAppLauncher.java:107)
+	at org.eclipse.core.runtime.adaptor.EclipseStarter.run(EclipseStarter.java:401)
+	at org.eclipse.core.runtime.adaptor.EclipseStarter.run(EclipseStarter.java:255)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at org.eclipse.equinox.launcher.Main.invokeFramework(Main.java:657)
+	at org.eclipse.equinox.launcher.Main.basicRun(Main.java:594)
+	at org.eclipse.equinox.launcher.Main.run(Main.java:1447)
+Caused by: com.kms.katalon.dal.exception.DALException: com.kms.katalon.entity.dal.exception.FilePathTooLongException: Cannot save entity: file path length limit exceeded (258/255). You should shorten the name and try again.
+	at com.kms.katalon.dal.fileservice.dataprovider.ReportFileServiceDataProvider.updateReportCollectionEntity(ReportFileServiceDataProvider.java:245)
+	at com.kms.katalon.controller.ReportController.updateReportCollection(ReportController.java:267)
+	at com.kms.katalon.execution.launcher.TestSuiteCollectionConsoleLauncher.newInstance(TestSuiteCollectionConsoleLauncher.java:92)
+	... 18 more
+Caused by: com.kms.katalon.entity.dal.exception.FilePathTooLongException: Cannot save entity: file path length limit exceeded (258/255). You should shorten the name and try again.
+	at com.kms.katalon.dal.fileservice.EntityService.saveEntity(EntityService.java:228)
+	at com.kms.katalon.dal.fileservice.dataprovider.ReportFileServiceDataProvider.updateReportCollectionEntity(ReportFileServiceDataProvider.java:243)
+	... 20 more
+
+All launchers terminated
+
+[INFO] Reports folder found: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports
+[INFO] Relevant report artifacts:
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Synthese Collection\20260427_104313\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:35  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\execution0.log
+[REPORT] 2026-04-27 10:56:35  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\execution0.log
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\20260427_104316.html
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\eMatchReport.html
+[REPORT] 2026-04-27 10:56:40  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\eMatchReport.html
+[REPORT] 2026-04-27 10:56:32  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\20260427_104314.html
+
+[ERROR] Hard execution error detected for Justification Latent - Investigations.
+[Pipeline] }
+[Pipeline] // timeout
+[Pipeline] echo
+Investigations Collection failed: hudson.AbortException: script returned exit code 1
+[Pipeline] stage
+[Pipeline] { (Stop Investigations Collection)
+[Pipeline] bat
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Synthese Collection)
+[Pipeline] timeout
+Timeout set to expire in 5 hr 0 min
+[Pipeline] {
+[Pipeline] bat
+
+D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese>call "D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\jenkins\JustificationLatentSynthese.cmd" 
+
+==================================================
+[INFO] Starting Justification Latent - Synthese
+[INFO] WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+[INFO] TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Synthese/Synthese Collection
+[INFO] EXECUTION_PROFILE=default
+[INFO] BROWSER_TYPE=Windows
+[INFO] STARTER_DIR=D:\Projects\eMatchStarters
+[INFO] CONTEXT_FILE=D:\Projects\eMatchStarters\run-context.properties
+[INFO] RESULT_FILE=D:\Projects\eMatchStarters\run-result.properties
+[INFO] LOG_FILE=D:\Projects\eMatchStarters\logs\run-ematch-command.log
+[INFO] KATALON_CONSOLE_LOG=D:\Projects\eMatchStarters\logs\katalon-console.log
+[INFO] GENERIC_TASK=\eMatch Automation\RunEMatchCommand
+[INFO] WIN_DRIVER_TASK=startWinDriver
+[INFO] RUN_ID=84031295715438
+==================================================
+
+[INFO] Context file written:
+RUN_ID=84031295715438
+JOB_LABEL=Justification Latent - Synthese
+WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Synthese/Synthese Collection
+EXECUTION_PROFILE=default
+BROWSER_TYPE=Windows
+KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
+
+[INFO] Initial result file:
+RUN_ID=84031295715438
+STATUS=QUEUED
+EXIT_CODE=999
+UPDATED_AT=27/04/2026 18:50:09,41
+
+[INFO] Starting WinAppDriver task...
+[INFO] Starting visible Katalon task...
+[INFO] Waiting result file update...
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+[INFO] Still waiting result file update...
+[INFO] Still waiting...
+[INFO] Still waiting...
+[INFO] Still waiting...
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+
+[INFO] Result file updated.
+[INFO] RUN_ID=84031295715438
+[INFO] STATUS=FINISHED
+[INFO] EXIT_CODE=1
+[INFO] UPDATED_AT=27/04/2026 19:05:07,43
+
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Ready
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Ready
+
+[INFO] Current run-result.properties:
+RUN_ID=84031295715438
+STATUS=FINISHED
+EXIT_CODE=1
+UPDATED_AT=27/04/2026 19:05:07,43
+
+[INFO] Last lines from run-ematch-command.log:
+[27/04/2026 18:50:09,57] ==================================================
+[27/04/2026 18:50:09,63] [INFO] RUN_ID=84031295715438
+[27/04/2026 18:50:09,63] [INFO] JOB_LABEL=Justification Latent - Synthese
+[27/04/2026 18:50:09,64] [INFO] WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+[27/04/2026 18:50:09,64] [INFO] PROJECT_FILE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\eMatch POC.prj
+[27/04/2026 18:50:09,65] [INFO] TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Synthese/Synthese Collection
+[27/04/2026 18:50:09,65] [INFO] EXECUTION_PROFILE=default
+[27/04/2026 18:50:09,66] [INFO] BROWSER_TYPE=Windows
+[27/04/2026 18:50:09,66] [INFO] KATALON_EXE=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\katalonc.exe
+[27/04/2026 18:50:09,67] [INFO] KATALON_CONSOLE_LOG=D:\Projects\eMatchStarters\logs\katalon-console.log
+[27/04/2026 18:50:09,67] [INFO] Launching Katalon...
+[27/04/2026 19:05:07,43] [INFO] Katalon finished with EXIT_CODE=1
+
+[INFO] Last lines from katalon-console.log:
+
+Launcher status after execution process completed: Running
+Start writing execution.uuid file to folder: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032
+Start generating JUnit report folder at: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032...
+JUnit report were generated at folder: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032
+For real-time monitoring and better reporting capabilities please integrate this project with Katalon TestOps (more details at https://docs.katalon.com/katalon-analytics/docs/integration-with-katalon-studio.html#enable-integration)
+For real-time monitoring and better reporting capabilities please integrate this project with Katalon TestOps (more details at https://docs.katalon.com/katalon-analytics/docs/integration-with-katalon-studio.html#enable-integration)
+Running: Test Suites/Connection/Jira integration report - Windows - 20260427_185034
+INFO: KATALON_JAVA_HOME: null
+
+--------------------------------------------------------------------------------
+Test Suites/Justification des Comptesde Latent/Justification des Comptesde Laten
+t - Synthese/Synthese Collection - 20260427_185030....................11/12(92%)
+--------------------------------------------------------------------------------
+Test Suites/Justification des Comptesde Latent/Justification des Comptesde Laten
+t - Synthese/Justification des Comptesde Latent - Synthese - Windows - 20260427_
+185032...............................................................11/11(100%)
+Test Suites/Connection/Jira integration report - Windows - 20260427_185034......
+.........................................................................0/1(0%)
+--------------------------------------------------------------------------------
+
+Launcher status after execution process completed: Running
+Start writing execution.uuid file to folder: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034
+Start generating JUnit report folder at: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034...
+JUnit report were generated at folder: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034
+For real-time monitoring and better reporting capabilities please integrate this project with Katalon TestOps (more details at https://docs.katalon.com/katalon-analytics/docs/integration-with-katalon-studio.html#enable-integration)
+For real-time monitoring and better reporting capabilities please integrate this project with Katalon TestOps (more details at https://docs.katalon.com/katalon-analytics/docs/integration-with-katalon-studio.html#enable-integration)
+Preparing integration report for Katalon TestOps
+Done preparing integration report for Katalon TestOps
+Preparing integration report for Azure
+Done preparing integration report for Azure
+Preparing integration report for qTest
+Done preparing integration report for qTest
+Uploading report to Katalon TestOps...
+For real-time monitoring and better reporting capabilities please integrate this project with Katalon TestOps (more details at https://docs.katalon.com/katalon-analytics/docs/integration-with-katalon-studio.html#enable-integration)
+Report has been sent to Katalon TestOps
+Uploading report to Azure...
+Report has been sent to Azure
+Uploading report to qTest...
+Report has been sent to qTest
+
+--------------------------------------------------------------------------------
+Test Suites/Justification des Comptesde Latent/Justification des Comptesde Laten
+t - Synthese/Synthese Collection - 20260427_185030...................12/12(100%)
+--------------------------------------------------------------------------------
+Test Suites/Justification des Comptesde Latent/Justification des Comptesde Laten
+t - Synthese/Justification des Comptesde Latent - Synthese - Windows - 20260427_
+185032...............................................................11/11(100%)
+Test Suites/Connection/Jira integration report - Windows - 20260427_185034......
+.......................................................................1/1(100%)
+--------------------------------------------------------------------------------
+
+NLS missing message: ConsoleMain_MSG_NON_DEVOPS_LICENSE_COMPATIBLITY in: com.kms.katalon.execution.constants.executionMessages
+Execution completed. Exit code: 1.
+Start clean up session
+End check license task
+End clean up session
+Start release license task
+End release license task
+All launchers terminated
+
+[INFO] Reports folder found: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports
+[INFO] Relevant report artifacts:
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Synthese Collection\20260427_185030\JUnit_Report.xml
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\JUnit_Report.xml
+[REPORT] 2026-04-27 19:04:46  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Synthese Collection\20260427_104313\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:35  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\JUnit_Report.xml
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\execution0.log
+[REPORT] 2026-04-27 19:04:43  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\execution0.log
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\execution0.log
+[REPORT] 2026-04-27 10:56:35  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\execution0.log
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\20260427_185034.html
+[REPORT] 2026-04-27 19:05:04  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\eMatchReport.html
+[REPORT] 2026-04-27 19:04:53  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\eMatchReport.html
+[REPORT] 2026-04-27 19:04:41  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\20260427_185032.html
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\20260427_104316.html
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\eMatchReport.html
+[REPORT] 2026-04-27 10:56:40  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\eMatchReport.html
+[REPORT] 2026-04-27 10:56:32  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\20260427_104314.html
+
+[INFO] Justification Latent - Synthese execution finished successfully.
+[WARN] Katalon returned EXIT_CODE=1, but Jenkins will keep SUCCESS because execution finished.
+[Pipeline] echo
+Synthese Collection completed successfully.
+[Pipeline] }
+[Pipeline] // timeout
+[Pipeline] stage
+[Pipeline] { (Stop Synthese Collection)
+[Pipeline] bat
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] stage
+[Pipeline] { (Table de Liaison Collection)
+[Pipeline] timeout
+Timeout set to expire in 5 hr 0 min
+[Pipeline] {
+[Pipeline] bat
+
+D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese>call "D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\jenkins\JustificationLatentTableDeLiaison.cmd" 
+
+==================================================
+[INFO] Starting Justification Latent - Table de Liaison
+[INFO] WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+[INFO] TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Table de Liaison/Table de Liaison Collection
+[INFO] EXECUTION_PROFILE=default
+[INFO] BROWSER_TYPE=Windows
+[INFO] STARTER_DIR=D:\Projects\eMatchStarters
+[INFO] CONTEXT_FILE=D:\Projects\eMatchStarters\run-context.properties
+[INFO] RESULT_FILE=D:\Projects\eMatchStarters\run-result.properties
+[INFO] LOG_FILE=D:\Projects\eMatchStarters\logs\run-ematch-command.log
+[INFO] KATALON_CONSOLE_LOG=D:\Projects\eMatchStarters\logs\katalon-console.log
+[INFO] GENERIC_TASK=\eMatch Automation\RunEMatchCommand
+[INFO] WIN_DRIVER_TASK=startWinDriver
+[INFO] RUN_ID=114011682630748
+==================================================
+
+[INFO] Context file written:
+RUN_ID=114011682630748
+JOB_LABEL=Justification Latent - Table de Liaison
+WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Table de Liaison/Table de Liaison Collection
+EXECUTION_PROFILE=default
+BROWSER_TYPE=Windows
+KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
+
+[INFO] Initial result file:
+RUN_ID=114011682630748
+STATUS=QUEUED
+EXIT_CODE=999
+UPDATED_AT=27/04/2026 19:05:28,00
+
+[INFO] Starting WinAppDriver task...
+[INFO] Starting visible Katalon task...
+[INFO] Waiting result file update...
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+[INFO] Still waiting result file update...
+[INFO] Still waiting...
+[INFO] Still waiting...
+[INFO] Still waiting...
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Running
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Running
+
+
+[INFO] Result file updated.
+[INFO] RUN_ID=114011682630748
+[INFO] STATUS=FINISHED
+[INFO] EXIT_CODE=2
+[INFO] UPDATED_AT=27/04/2026 19:05:59,83
+
+[INFO] Scheduled task status snapshot:
+[INFO] ---- startWinDriver ----
+Status:        Ready
+[INFO] ---- \eMatch Automation\RunEMatchCommand ----
+Status:        Ready
+
+[INFO] Current run-result.properties:
+RUN_ID=114011682630748
+STATUS=FINISHED
+EXIT_CODE=2
+UPDATED_AT=27/04/2026 19:05:59,83
+
+[INFO] Last lines from run-ematch-command.log:
+[27/04/2026 19:05:28,16] ==================================================
+[27/04/2026 19:05:28,23] [INFO] RUN_ID=114011682630748
+[27/04/2026 19:05:28,24] [INFO] JOB_LABEL=Justification Latent - Table de Liaison
+[27/04/2026 19:05:28,24] [INFO] WORKSPACE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese
+[27/04/2026 19:05:28,25] [INFO] PROJECT_FILE=D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\eMatch POC.prj
+[27/04/2026 19:05:28,26] [INFO] TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Table de Liaison/Table de Liaison Collection
+[27/04/2026 19:05:28,26] [INFO] EXECUTION_PROFILE=default
+[27/04/2026 19:05:28,27] [INFO] BROWSER_TYPE=Windows
+[27/04/2026 19:05:28,27] [INFO] KATALON_EXE=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\katalonc.exe
+[27/04/2026 19:05:28,28] [INFO] KATALON_CONSOLE_LOG=D:\Projects\eMatchStarters\logs\katalon-console.log
+[27/04/2026 19:05:28,29] [INFO] Launching Katalon...
+[27/04/2026 19:05:59,83] [INFO] Katalon finished with EXIT_CODE=2
+
+[INFO] Last lines from katalon-console.log:
+End getting machine ID on Windows d446187aed1d9a7de7e9745b35c81394
+INFO: Machine ID: d446187aed1d9a7de7e9745b35c81394
+INFO: Your environment is compatible with the Katalon Runtime Engine NODE-LOCKED or FLOATING license. For a fixed machine ID, use a NODE-LOCKED license; for a dynamic machine ID, use a FLOATING license.
+
+
+Activating...
+Start activating offline...
+Search for valid offline licenses in folder: C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0\.katalon\license
+Start checking license: KRE_Floating_d446187aed1d9a7de7e9745b35c81394_201300.lic
+KRE_Floating_d446187aed1d9a7de7e9745b35c81394_201300.lic is valid.
+The number of valid offline licenses: 1
+The number of Runtime Engine running sessions: 1
+Delete folder: bin
+Delete folder: Libs
+Cleaning up workspace
+Opening project file: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\eMatch POC.prj
+Warning! Please run Katalon execution command outside of the project folder.
+Generating global variables...
+Parsing custom keywords...
+Project 'eMatch POC' opened
+Start reloading plugins...
+Start check license task
+
+--------------------------RETRY EXECUTION INFORMATION--------------------------
+Test Suite Collection 'Table de Liaison Collection':
+- Test Suite 'Justification des Comptesde Latent - Table de Liaison' runs with Immediately retry strategy and 0 retry time(s).
+- Test Suite 'Jira integration report' runs with Immediately retry strategy and 0 retry time(s).
+--------------------------------------------------------------------------------
+
+com.kms.katalon.execution.exception.ExecutionException: com.kms.katalon.dal.exception.DALException: com.kms.katalon.entity.dal.exception.FilePathTooLongException: Cannot save entity: file path length limit exceeded (261/255). You should shorten the name and try again.
+	at com.kms.katalon.execution.launcher.TestSuiteCollectionConsoleLauncher.newInstance(TestSuiteCollectionConsoleLauncher.java:95)
+	at com.kms.katalon.execution.console.entity.TestSuiteCollectionLauncherOptionParser.getConsoleLauncher(TestSuiteCollectionLauncherOptionParser.java:114)
+	at com.kms.katalon.execution.console.ConsoleExecutor.execute(ConsoleExecutor.java:74)
+	at com.kms.katalon.execution.console.ConsoleMain.launch(ConsoleMain.java:521)
+	at com.kms.katalon.console.application.ConsoleApplicationStarter.start(ConsoleApplicationStarter.java:37)
+	at com.kms.katalon.application.Application.runConsole(Application.java:125)
+	at com.kms.katalon.application.Application.start(Application.java:88)
+	at org.eclipse.equinox.internal.app.EclipseAppHandle.run(EclipseAppHandle.java:203)
+	at org.eclipse.core.runtime.internal.adaptor.EclipseAppLauncher.runApplication(EclipseAppLauncher.java:137)
+	at org.eclipse.core.runtime.internal.adaptor.EclipseAppLauncher.start(EclipseAppLauncher.java:107)
+	at org.eclipse.core.runtime.adaptor.EclipseStarter.run(EclipseStarter.java:401)
+	at org.eclipse.core.runtime.adaptor.EclipseStarter.run(EclipseStarter.java:255)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:62)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:498)
+	at org.eclipse.equinox.launcher.Main.invokeFramework(Main.java:657)
+	at org.eclipse.equinox.launcher.Main.basicRun(Main.java:594)
+	at org.eclipse.equinox.launcher.Main.run(Main.java:1447)
+Caused by: com.kms.katalon.dal.exception.DALException: com.kms.katalon.entity.dal.exception.FilePathTooLongException: Cannot save entity: file path length limit exceeded (261/255). You should shorten the name and try again.
+	at com.kms.katalon.dal.fileservice.dataprovider.ReportFileServiceDataProvider.updateReportCollectionEntity(ReportFileServiceDataProvider.java:245)
+	at com.kms.katalon.controller.ReportController.updateReportCollection(ReportController.java:267)
+	at com.kms.katalon.execution.launcher.TestSuiteCollectionConsoleLauncher.newInstance(TestSuiteCollectionConsoleLauncher.java:92)
+	... 18 more
+Caused by: com.kms.katalon.entity.dal.exception.FilePathTooLongException: Cannot save entity: file path length limit exceeded (261/255). You should shorten the name and try again.
+	at com.kms.katalon.dal.fileservice.EntityService.saveEntity(EntityService.java:228)
+	at com.kms.katalon.dal.fileservice.dataprovider.ReportFileServiceDataProvider.updateReportCollectionEntity(ReportFileServiceDataProvider.java:243)
+	... 20 more
+
+All launchers terminated
+
+[INFO] Reports folder found: D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports
+[INFO] Relevant report artifacts:
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Synthese Collection\20260427_185030\JUnit_Report.xml
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\JUnit_Report.xml
+[REPORT] 2026-04-27 19:04:46  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Synthese Collection\20260427_104313\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\JUnit_Report.xml
+[REPORT] 2026-04-27 10:56:35  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\JUnit_Report.xml
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\execution0.log
+[REPORT] 2026-04-27 19:04:43  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\execution0.log
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\execution0.log
+[REPORT] 2026-04-27 10:56:35  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\execution0.log
+[REPORT] 2026-04-27 19:05:05  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\20260427_185034.html
+[REPORT] 2026-04-27 19:05:04  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Connection\Jira integration report\20260427_185034\eMatchReport.html
+[REPORT] 2026-04-27 19:04:53  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\eMatchReport.html
+[REPORT] 2026-04-27 19:04:41  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_185030\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_185032\20260427_185032.html
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\20260427_104316.html
+[REPORT] 2026-04-27 10:56:56  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Connection\Jira integration report\20260427_104316\eMatchReport.html
+[REPORT] 2026-04-27 10:56:40  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\eMatchReport.html
+[REPORT] 2026-04-27 10:56:32  D:\jenkins\work-liberty\workspace\GI5\eMatch_Regression\Justification Latent Synthese\Reports\20260427_104313\Justification des Comptesde Latent\Justification des Comptesde Latent - Synthese\Justification des Comptesde Latent - Synthese\20260427_104314\20260427_104314.html
+
+[ERROR] Hard execution error detected for Justification Latent - Table de Liaison.
+[Pipeline] }
+[Pipeline] // timeout
+[Pipeline] echo
+Table de Liaison Collection failed: hudson.AbortException: script returned exit code 1
+[Pipeline] stage
+[Pipeline] { (Stop Table de Liaison Collection)
+[Pipeline] bat
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] }
+[Pipeline] // node
+[Pipeline] stage
+[Pipeline] { (Trigger next pipeline)
+[Pipeline] echo
+Scheduling next pipeline: GI5/eMatch_Regression/Passerelle Bilan
+[Pipeline] build (Building GI5 » eMatch_Regression » Passerelle Bilan)
+Scheduling project: GI5 » eMatch_Regression » Passerelle Bilan
+[Pipeline] }
+[Pipeline] // stage
+[Pipeline] End of Pipeline
+Finished: FAILURE
+REST API
+Jenkins 2.401.1
 
-exit /b 0
 
-:printTaskInfo
-echo [INFO] Scheduled task status snapshot:
-echo [INFO] ---- %WIN_DRIVER_TASK% ----
-schtasks /query /tn "%WIN_DRIVER_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
-echo [INFO] ---- %GENERIC_TASK% ----
-schtasks /query /tn "%GENERIC_TASK%" /fo list | findstr /i /b /c:"Status:" /c:"Last Result:" /c:"Last Run Time:"
-echo.
-goto :eof
 
-:printResultFile
-if exist "%RESULT_FILE%" (
-    echo [INFO] Current run-result.properties:
-    type "%RESULT_FILE%"
-    echo.
-) else (
-    echo [WARN] Result file not found: %RESULT_FILE%
-    echo.
-)
-goto :eof
 
-:printLog
-set "TARGET_FILE=%~1"
-set "TARGET_TITLE=%~2"
-set "TARGET_TAIL=%~3"
 
-if exist "%TARGET_FILE%" (
-    echo [INFO] Last lines from %TARGET_TITLE%:
-    powershell -NoProfile -Command "Get-Content -Path '%TARGET_FILE%' -Tail %TARGET_TAIL%"
-    echo.
-) else (
-    echo [WARN] File not found: %TARGET_FILE%
-    echo.
-)
-goto :eof
 
-:printReportsSummary
-if exist "%WORKSPACE%\Reports" (
-    echo [INFO] Reports folder found: %WORKSPACE%\Reports
-    echo [INFO] Relevant report artifacts:
-    powershell -NoProfile -Command ^
-      "$root='%WORKSPACE%\Reports';" ^
-      "$patterns=@('JUnit_Report.xml','cucumber.xml','execution0.log','*.html','*.pdf');" ^
-      "foreach($p in $patterns) { Get-ChildItem -Path $root -Recurse -File -Filter $p -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10 | ForEach-Object { Write-Host ('[REPORT] ' + $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $_.FullName) } }"
-    echo.
-) else (
-    echo [WARN] Reports folder not found: %WORKSPACE%\Reports
-    echo.
-)
-goto :eof
 
-:detectHardExecutionError
-if not exist "%KATALON_CONSOLE_LOG%" exit /b 0
 
-powershell -NoProfile -Command ^
-  "$log='%KATALON_CONSOLE_LOG%';" ^
-  "$pattern='Test suite \".*\" not found\.|There is no test suite to run|Project file .* does not exist|Cannot save entity:|Cannot open project|Execution was interrupted by exception';" ^
-  "if (Select-String -Path $log -Pattern $pattern -Quiet) { exit 1 } else { exit 0 }"
 
-exit /b !ERRORLEVEL!
 
 
 
@@ -260,503 +667,18 @@ exit /b !ERRORLEVEL!
 
 
 
-ArchiveMode.cmd
 
-* JOB_LABEL=Archive Mode
-* TEST_SUITE_COLLECTION=Test Suites/Archive Mode/Archive Mode Collection
 
-ModuleDesResponsabilite.cmd
 
-* JOB_LABEL=Module des Responsabilite
-* TEST_SUITE_COLLECTION=Test Suites/BDR/Module des Responsabilite/Module des Responsabilite Collection
 
-JustificationLatentInvestigations.cmd
 
-* JOB_LABEL=Justification Latent - Investigations
-* TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Investigations/Investigations Collections
 
-JustificationLatentSynthese.cmd
 
-* JOB_LABEL=Justification Latent - Synthese
-* TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Synthese/Synthese Collection
 
-JustificationLatentTableDeLiaison.cmd
 
-* JOB_LABEL=Justification Latent - Table de Liaison
-* TEST_SUITE_COLLECTION=Test Suites/Justification des Comptesde Latent/Justification des Comptesde Latent - Table de Liaison/Table de Liaison Collection
 
-PasserelleBilan.cmd
 
-* JOB_LABEL=Passerelle Bilan
-* TEST_SUITE_COLLECTION=Test Suites/PasserelleBilan/Passerelle Bilan H Bilan French IFRS Collection
 
-EmissionElementValorise.cmd
 
-* JOB_LABEL=Element Valorise
-* TEST_SUITE_COLLECTION=Test Suites/JV Emissions/Element Valorise/Element Valorise Collection
 
-EmissionDerive.cmd
 
-* JOB_LABEL=Emission Derive
-* TEST_SUITE_COLLECTION=Test Suites/JV Emissions/Emission Derive/Emission Derive Collection
-
-EmissionFiltre.cmd
-
-* JOB_LABEL=Emission Filtre
-* TEST_SUITE_COLLECTION=Test Suites/JV Emissions/Emission Filtre/Emission Filtre Collection
-
-EmissionValidations.cmd
-
-* JOB_LABEL=Validations
-* TEST_SUITE_COLLECTION=Test Suites/JV Emissions/Validations/Validations Collection
-
-EmissionValorisationBrute.cmd
-
-* JOB_LABEL=Valorisation Brute
-* TEST_SUITE_COLLECTION=Test Suites/JV Emissions/Valorisation Brute/Valorisation Brute Collection
-
-
-
-
-
-
-
-
-properties([
-    disableConcurrentBuilds()
-])
-
-def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
-def RUN_NEXT_JOB = true
-def NEXT_JOB = 'GI5/eMatch_Regression/BDR_Module des Responsabilite'
-
-def executionFailed = false
-def manuallyAborted = false
-
-def stopCurrentExecution = {
-    bat '''
-@echo off
-schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
-schtasks /end /tn "startWinDriver" >nul 2>nul
-taskkill /f /im WinAppDriver.exe /t >nul 2>nul
-taskkill /f /im katalonc.exe /t >nul 2>nul
-taskkill /f /im KatalonStudio.exe /t >nul 2>nul
-ping -n 6 127.0.0.1 >nul
-exit /b 0
-'''
-}
-
-def isManualAbort = { Throwable err ->
-    def text = String.valueOf(err).toLowerCase()
-    def type = err.getClass().getName()
-    return type.contains('FlowInterruptedException') && text.contains('aborted by')
-}
-
-def runCollection = { String stageName, String cmdFile ->
-    stage(stageName) {
-        try {
-            timeout(time: 5, unit: 'HOURS') {
-                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
-                echo "${stageName} completed successfully."
-            }
-        } catch (Throwable err) {
-            if (isManualAbort(err)) {
-                manuallyAborted = true
-                currentBuild.result = 'ABORTED'
-                echo "${stageName} was manually aborted."
-                throw err
-            }
-
-            executionFailed = true
-            echo "${stageName} failed: ${err}"
-        } finally {
-            stage("Stop ${stageName}") {
-                stopCurrentExecution()
-            }
-        }
-    }
-}
-
-node(NODE_LABEL) {
-    stage('Checkout') {
-        checkout scm
-    }
-
-    runCollection('Archive Mode Collection', 'ArchiveMode.cmd')
-}
-
-if (manuallyAborted) {
-    echo 'Build manually aborted. Next pipeline will not be scheduled.'
-    return
-}
-
-stage('Trigger next pipeline') {
-    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
-        echo "Scheduling next pipeline: ${NEXT_JOB}"
-        build job: NEXT_JOB,
-              wait: false,
-              propagate: false
-    } else {
-        echo 'Next pipeline disabled.'
-    }
-}
-
-currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
-return
-
-
-
-
-
-
-properties([
-    disableConcurrentBuilds()
-])
-
-def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
-def RUN_NEXT_JOB = true
-def NEXT_JOB = 'GI5/eMatch_Regression/Justification Latent Synthese'
-
-def executionFailed = false
-def manuallyAborted = false
-
-def stopCurrentExecution = {
-    bat '''
-@echo off
-schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
-schtasks /end /tn "startWinDriver" >nul 2>nul
-taskkill /f /im WinAppDriver.exe /t >nul 2>nul
-taskkill /f /im katalonc.exe /t >nul 2>nul
-taskkill /f /im KatalonStudio.exe /t >nul 2>nul
-ping -n 6 127.0.0.1 >nul
-exit /b 0
-'''
-}
-
-def isManualAbort = { Throwable err ->
-    def text = String.valueOf(err).toLowerCase()
-    def type = err.getClass().getName()
-    return type.contains('FlowInterruptedException') && text.contains('aborted by')
-}
-
-def runCollection = { String stageName, String cmdFile ->
-    stage(stageName) {
-        try {
-            timeout(time: 5, unit: 'HOURS') {
-                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
-                echo "${stageName} completed successfully."
-            }
-        } catch (Throwable err) {
-            if (isManualAbort(err)) {
-                manuallyAborted = true
-                currentBuild.result = 'ABORTED'
-                echo "${stageName} was manually aborted."
-                throw err
-            }
-
-            executionFailed = true
-            echo "${stageName} failed: ${err}"
-        } finally {
-            stage("Stop ${stageName}") {
-                stopCurrentExecution()
-            }
-        }
-    }
-}
-
-node(NODE_LABEL) {
-    stage('Checkout') {
-        checkout scm
-    }
-
-    runCollection('Module des Responsabilite Collection', 'ModuleDesResponsabilite.cmd')
-}
-
-if (manuallyAborted) {
-    echo 'Build manually aborted. Next pipeline will not be scheduled.'
-    return
-}
-
-stage('Trigger next pipeline') {
-    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
-        echo "Scheduling next pipeline: ${NEXT_JOB}"
-        build job: NEXT_JOB,
-              wait: false,
-              propagate: false
-    } else {
-        echo 'Next pipeline disabled.'
-    }
-}
-
-currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
-return
-
-
-
-
-
-
-properties([
-    disableConcurrentBuilds()
-])
-
-def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
-def RUN_NEXT_JOB = true
-def NEXT_JOB = 'GI5/eMatch_Regression/Passerelle Bilan'
-
-def executionFailed = false
-def manuallyAborted = false
-
-def stopCurrentExecution = {
-    bat '''
-@echo off
-schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
-schtasks /end /tn "startWinDriver" >nul 2>nul
-taskkill /f /im WinAppDriver.exe /t >nul 2>nul
-taskkill /f /im katalonc.exe /t >nul 2>nul
-taskkill /f /im KatalonStudio.exe /t >nul 2>nul
-ping -n 6 127.0.0.1 >nul
-exit /b 0
-'''
-}
-
-def isManualAbort = { Throwable err ->
-    def text = String.valueOf(err).toLowerCase()
-    def type = err.getClass().getName()
-    return type.contains('FlowInterruptedException') && text.contains('aborted by')
-}
-
-def runCollection = { String stageName, String cmdFile ->
-    stage(stageName) {
-        try {
-            timeout(time: 5, unit: 'HOURS') {
-                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
-                echo "${stageName} completed successfully."
-            }
-        } catch (Throwable err) {
-            if (isManualAbort(err)) {
-                manuallyAborted = true
-                currentBuild.result = 'ABORTED'
-                echo "${stageName} was manually aborted."
-                throw err
-            }
-
-            executionFailed = true
-            echo "${stageName} failed: ${err}"
-        } finally {
-            stage("Stop ${stageName}") {
-                stopCurrentExecution()
-            }
-        }
-    }
-}
-
-node(NODE_LABEL) {
-    stage('Checkout') {
-        checkout scm
-    }
-
-    runCollection('Investigations Collection', 'JustificationLatentInvestigations.cmd')
-    runCollection('Synthese Collection', 'JustificationLatentSynthese.cmd')
-    runCollection('Table de Liaison Collection', 'JustificationLatentTableDeLiaison.cmd')
-}
-
-if (manuallyAborted) {
-    echo 'Build manually aborted. Next pipeline will not be scheduled.'
-    return
-}
-
-stage('Trigger next pipeline') {
-    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
-        echo "Scheduling next pipeline: ${NEXT_JOB}"
-        build job: NEXT_JOB,
-              wait: false,
-              propagate: false
-    } else {
-        echo 'Next pipeline disabled.'
-    }
-}
-
-currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
-return
-
-
-
-
-
-
-properties([
-    disableConcurrentBuilds()
-])
-
-def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
-def RUN_NEXT_JOB = true
-def NEXT_JOB = 'GI5/eMatch_Regression/JV Emissions'
-
-def executionFailed = false
-def manuallyAborted = false
-
-def stopCurrentExecution = {
-    bat '''
-@echo off
-schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
-schtasks /end /tn "startWinDriver" >nul 2>nul
-taskkill /f /im WinAppDriver.exe /t >nul 2>nul
-taskkill /f /im katalonc.exe /t >nul 2>nul
-taskkill /f /im KatalonStudio.exe /t >nul 2>nul
-ping -n 6 127.0.0.1 >nul
-exit /b 0
-'''
-}
-
-def isManualAbort = { Throwable err ->
-    def text = String.valueOf(err).toLowerCase()
-    def type = err.getClass().getName()
-    return type.contains('FlowInterruptedException') && text.contains('aborted by')
-}
-
-def runCollection = { String stageName, String cmdFile ->
-    stage(stageName) {
-        try {
-            timeout(time: 5, unit: 'HOURS') {
-                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
-                echo "${stageName} completed successfully."
-            }
-        } catch (Throwable err) {
-            if (isManualAbort(err)) {
-                manuallyAborted = true
-                currentBuild.result = 'ABORTED'
-                echo "${stageName} was manually aborted."
-                throw err
-            }
-
-            executionFailed = true
-            echo "${stageName} failed: ${err}"
-        } finally {
-            stage("Stop ${stageName}") {
-                stopCurrentExecution()
-            }
-        }
-    }
-}
-
-node(NODE_LABEL) {
-    stage('Checkout') {
-        checkout scm
-    }
-
-    runCollection('Passerelle Bilan H Bilan French IFRS Collection', 'PasserelleBilan.cmd')
-}
-
-if (manuallyAborted) {
-    echo 'Build manually aborted. Next pipeline will not be scheduled.'
-    return
-}
-
-stage('Trigger next pipeline') {
-    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
-        echo "Scheduling next pipeline: ${NEXT_JOB}"
-        build job: NEXT_JOB,
-              wait: false,
-              propagate: false
-    } else {
-        echo 'Next pipeline disabled.'
-    }
-}
-
-currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
-return
-
-
-
-
-
-
-
-
-
-properties([
-    disableConcurrentBuilds()
-])
-
-def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
-def RUN_NEXT_JOB = false
-def NEXT_JOB = ''
-
-def executionFailed = false
-def manuallyAborted = false
-
-def stopCurrentExecution = {
-    bat '''
-@echo off
-schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
-schtasks /end /tn "startWinDriver" >nul 2>nul
-taskkill /f /im WinAppDriver.exe /t >nul 2>nul
-taskkill /f /im katalonc.exe /t >nul 2>nul
-taskkill /f /im KatalonStudio.exe /t >nul 2>nul
-ping -n 6 127.0.0.1 >nul
-exit /b 0
-'''
-}
-
-def isManualAbort = { Throwable err ->
-    def text = String.valueOf(err).toLowerCase()
-    def type = err.getClass().getName()
-    return type.contains('FlowInterruptedException') && text.contains('aborted by')
-}
-
-def runCollection = { String stageName, String cmdFile ->
-    stage(stageName) {
-        try {
-            timeout(time: 5, unit: 'HOURS') {
-                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
-                echo "${stageName} completed successfully."
-            }
-        } catch (Throwable err) {
-            if (isManualAbort(err)) {
-                manuallyAborted = true
-                currentBuild.result = 'ABORTED'
-                echo "${stageName} was manually aborted."
-                throw err
-            }
-
-            executionFailed = true
-            echo "${stageName} failed: ${err}"
-        } finally {
-            stage("Stop ${stageName}") {
-                stopCurrentExecution()
-            }
-        }
-    }
-}
-
-node(NODE_LABEL) {
-    stage('Checkout') {
-        checkout scm
-    }
-
-    runCollection('Element Valorise Collection', 'EmissionElementValorise.cmd')
-    runCollection('Emission Derive Collection', 'EmissionDerive.cmd')
-    runCollection('Emission Filtre Collection', 'EmissionFiltre.cmd')
-    runCollection('Validations Collection', 'EmissionValidations.cmd')
-    runCollection('Valorisation Brute Collection', 'EmissionValorisationBrute.cmd')
-}
-
-if (manuallyAborted) {
-    echo 'Build manually aborted. Next pipeline will not be scheduled.'
-    return
-}
-
-stage('Trigger next pipeline') {
-    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
-        echo "Scheduling next pipeline: ${NEXT_JOB}"
-        build job: NEXT_JOB,
-              wait: false,
-              propagate: false
-    } else {
-        echo 'Next pipeline disabled.'
-    }
-}
-
-currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
-return
