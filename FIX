@@ -1,1 +1,102 @@
 
+properties([
+    disableConcurrentBuilds(),
+    buildDiscarder(logRotator(numToKeepStr: '15'))
+])
+
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+def SHORT_WORKSPACE = 'D:\\jenkins\\ws\\JL_SYN'
+
+def RUN_NEXT_JOB = true
+def NEXT_JOB = 'GI5/eMatch_Regression/JV Emissions'
+
+def executionFailed = false
+def manuallyAborted = false
+
+def isInterruptedError = { Throwable err ->
+    def text = "${err?.getClass()?.getName() ?: ''}\n${err?.getCause()?.getClass()?.getName() ?: ''}\n${err?.getMessage() ?: ''}"
+    return text.contains('FlowInterruptedException') || text.contains('InterruptedException')
+}
+
+def isTimeoutError = { Throwable err ->
+    def text = "${err?.getClass()?.getName() ?: ''}\n${err?.getCause()?.getClass()?.getName() ?: ''}\n${err?.getMessage() ?: ''}".toLowerCase()
+    return text.contains('timeout') || text.contains('exceededtimeout')
+}
+
+def stopCurrentExecution = {
+    bat '''
+@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+taskkill /f /im WinAppDriver.exe /t >nul 2>nul
+taskkill /f /im katalonc.exe /t >nul 2>nul
+taskkill /f /im KatalonStudio.exe /t >nul 2>nul
+ping -n 4 127.0.0.1 >nul
+exit /b 0
+'''
+}
+
+def runCollection = { String stageName, String cmdFile ->
+    stage(stageName) {
+        try {
+            timeout(time: 5, unit: 'HOURS') {
+                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
+            }
+            echo "${stageName} completed successfully."
+        } catch (Throwable err) {
+            if (isInterruptedError(err) && !isTimeoutError(err)) {
+                manuallyAborted = true
+                executionFailed = true
+                echo "${stageName} was manually aborted."
+                throw err
+            }
+
+            executionFailed = true
+
+            if (isTimeoutError(err)) {
+                echo "${stageName} exceeded the 5 hour limit and was stopped."
+            } else {
+                echo "${stageName} failed: ${err}"
+            }
+        } finally {
+            stage("Stop ${stageName}") {
+                stopCurrentExecution()
+            }
+        }
+    }
+}
+
+node(NODE_LABEL) {
+    ws(SHORT_WORKSPACE) {
+        stage('Checkout') {
+            deleteDir()
+            checkout scm
+        }
+
+        runCollection('Investigations Collection', 'JustificationLatentInvestigations.cmd')
+        runCollection('Synthese Collection', 'JustificationLatentSynthese.cmd')
+        runCollection('Table de Liaison Collection', 'JustificationLatentTableDeLiaison.cmd')
+    }
+}
+
+if (manuallyAborted) {
+    currentBuild.result = 'ABORTED'
+    echo 'Build was manually aborted. Next pipeline will not be scheduled.'
+    return
+}
+
+stage('Trigger next pipeline') {
+    if (!executionFailed && RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        build job: NEXT_JOB,
+              wait: false,
+              propagate: false
+    } else if (executionFailed) {
+        echo 'Current pipeline failed. Next pipeline will not be scheduled.'
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
+return
