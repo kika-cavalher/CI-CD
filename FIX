@@ -1,1 +1,125 @@
+properties([
+    disableConcurrentBuilds(),
+    buildDiscarder(logRotator(numToKeepStr: '15'))
+])
 
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+def SHORT_WORKSPACE = 'D:\\jenkins\\ws\\GUI_BHV'
+
+def RUN_NEXT_JOB = false
+def NEXT_JOB = ''
+
+def executionFailed = false
+def manuallyAborted = false
+def failedStages = []
+
+def asErrorText = { Throwable err ->
+    def parts = []
+    def current = err
+    while (current != null) {
+        parts << "${current.getClass().getName()}: ${current.getMessage() ?: ''}"
+        current = current.getCause()
+    }
+    return parts.join(' | ').toLowerCase()
+}
+
+def isTimeoutError = { Throwable err ->
+    def text = asErrorText(err)
+    return text.contains('timeout') ||
+           text.contains('exceededtimeout') ||
+           text.contains('time limit')
+}
+
+def isManualAbortError = { Throwable err ->
+    def text = asErrorText(err)
+    return text.contains('flowinterruptedexception') ||
+           text.contains('aborted') ||
+           text.contains('interrupted')
+}
+
+def stopCurrentExecution = {
+    bat '''
+@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+taskkill /f /im WinAppDriver.exe >nul 2>nul
+taskkill /f /im katalonc.exe >nul 2>nul
+taskkill /f /im KatalonStudio.exe >nul 2>nul
+ping -n 3 127.0.0.1 >nul
+exit /b 0
+'''
+}
+
+def runCollection = { String stageName, String cmdFile ->
+    stage(stageName) {
+        try {
+            timeout(time: 5, unit: 'HOURS') {
+                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
+            }
+            echo "${stageName} completed successfully."
+        } catch (Throwable err) {
+            if (isManualAbortError(err) && !isTimeoutError(err)) {
+                manuallyAborted = true
+                currentBuild.result = 'ABORTED'
+                echo "${stageName} was manually aborted."
+                throw err
+            }
+
+            executionFailed = true
+            failedStages << stageName
+
+            if (isTimeoutError(err)) {
+                echo "${stageName} exceeded the 5 hour limit and was stopped."
+            } else {
+                echo "${stageName} failed: ${err}"
+            }
+        } finally {
+            stage("Stop ${stageName}") {
+                stopCurrentExecution()
+            }
+        }
+    }
+}
+
+node(NODE_LABEL) {
+    ws(SHORT_WORKSPACE) {
+        stage('Checkout') {
+            deleteDir()
+            checkout scm
+        }
+
+        runCollection('Behavior Collection', 'GuiBehavior.cmd')
+        runCollection('Group By Collection', 'GuiGroupBy.cmd')
+        runCollection('Language Behaviour Collection', 'GuiLanguageBehaviour.cmd')
+    }
+}
+
+stage('Trigger next pipeline') {
+    if (manuallyAborted) {
+        echo 'Build manually aborted. Next pipeline will not be scheduled.'
+        return
+    }
+
+    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        build job: NEXT_JOB, wait: false, propagate: false
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+stage('Execution summary') {
+    if (failedStages.isEmpty()) {
+        echo 'All GUI behavior collections finished.'
+    } else {
+        echo "Collections finished with issues, but pipeline will stay SUCCESS: ${failedStages.join(', ')}"
+    }
+}
+
+if (manuallyAborted) {
+    currentBuild.result = 'ABORTED'
+} else {
+    currentBuild.result = 'SUCCESS'
+}
+
+return
