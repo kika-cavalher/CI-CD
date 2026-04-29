@@ -1,1 +1,164 @@
+set "JOB_LABEL=Octave - Filiere J"
+set "TEST_SUITE_COLLECTION=Test Suites/Octave/Octave - Filiere J/Filiere J - Collection"
 
+
+
+
+
+set "JOB_LABEL=Octave - Funding"
+set "TEST_SUITE_COLLECTION=Test Suites/Octave/Octave - Funding/Funding - Collection"
+
+
+
+
+
+set "JOB_LABEL=Octave - INCC"
+set "TEST_SUITE_COLLECTION=Test Suites/Octave/Octave - INCC/INCC - Collection"
+
+
+
+
+
+properties([
+    disableConcurrentBuilds(),
+    buildDiscarder(logRotator(numToKeepStr: '15'))
+])
+
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+def SHORT_WORKSPACE = 'D:\\jenkins\\ws\\OCTAVE'
+
+def RUN_NEXT_JOB = false
+def NEXT_JOB = ''
+
+def executionFailed = false
+def manuallyAborted = false
+
+def asErrorText = { Throwable err ->
+    def parts = []
+    def current = err
+
+    while (current != null) {
+        def cls = current.getClass()?.getName()
+        def msg = current.getMessage()
+        parts << "${cls ?: ''} ${msg ?: ''}".trim()
+        current = current.getCause()
+    }
+
+    return parts.join(' | ').toLowerCase()
+}
+
+def isTimeoutError = { Throwable err ->
+    def text = asErrorText(err)
+    return text.contains('timeout') || text.contains('exceededtimeout')
+}
+
+def isManualAbortError = { Throwable err ->
+    def text = asErrorText(err)
+    return text.contains('flowinterruptedexception') || text.contains('aborted by')
+}
+
+def stopCurrentExecution = {
+    bat '''
+@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+taskkill /f /im WinAppDriver.exe >nul 2>nul
+taskkill /f /im katalonc.exe >nul 2>nul
+taskkill /f /im KatalonStudio.exe >nul 2>nul
+ping -n 3 127.0.0.1 >nul
+exit /b 0
+'''
+}
+
+def runCollection = { String stageName, String cmdFile ->
+    if (manuallyAborted) {
+        echo "${stageName} skipped because pipeline was manually aborted."
+        return
+    }
+
+    stage(stageName) {
+        try {
+            timeout(time: 5, unit: 'HOURS') {
+                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
+            }
+            echo "${stageName} completed successfully."
+        } catch (Throwable err) {
+            if (isManualAbortError(err)) {
+                manuallyAborted = true
+                currentBuild.result = 'ABORTED'
+                echo "${stageName} was manually aborted."
+                throw err
+            }
+
+            executionFailed = true
+
+            if (isTimeoutError(err)) {
+                echo "${stageName} exceeded the 5 hour limit and was stopped."
+            } else {
+                echo "${stageName} failed: ${err}"
+            }
+        } finally {
+            stage("Stop ${stageName}") {
+                stopCurrentExecution()
+            }
+        }
+    }
+}
+
+try {
+    node(NODE_LABEL) {
+        ws(SHORT_WORKSPACE) {
+            stage('Checkout') {
+                deleteDir()
+                checkout scm
+            }
+
+            runCollection('Filiere J Collection', 'OctaveFiliereJ.cmd')
+            runCollection('Funding Collection', 'OctaveFunding.cmd')
+            runCollection('INCC Collection', 'OctaveINCC.cmd')
+        }
+    }
+} catch (Throwable err) {
+    if (isManualAbortError(err)) {
+        manuallyAborted = true
+        currentBuild.result = 'ABORTED'
+        echo 'Pipeline was manually aborted.'
+    } else {
+        executionFailed = true
+        echo "Unexpected pipeline error: ${err}"
+    }
+}
+
+stage('Trigger next pipeline') {
+    if (manuallyAborted) {
+        echo 'Current pipeline was manually aborted. Next pipeline will not be scheduled.'
+    } else if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        build job: NEXT_JOB, wait: false, propagate: false
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+if (manuallyAborted) {
+    currentBuild.result = 'ABORTED'
+} else {
+    currentBuild.result = 'SUCCESS'
+    if (executionFailed) {
+        echo 'Pipeline finished with failed stages, but build will remain SUCCESS.'
+    } else {
+        echo 'Pipeline finished successfully.'
+    }
+}
+
+return
+
+
+
+
+
+
+
+OctaveFiliereJ.cmd
+OctaveFunding.cmd
+OctaveINCC.cmd
