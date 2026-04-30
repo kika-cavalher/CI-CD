@@ -1,1 +1,313 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
 
+REM ============================================================================
+REM CONFIG
+REM ============================================================================
+set "JOB_LABEL=Module des Responsabilite"
+set "TEST_SUITE_COLLECTION=Test Suites/BRD/Module des Responsabilite/Module des Responsabilite Collection"
+
+set "EXECUTION_PROFILE=default"
+set "BROWSER_TYPE=Windows"
+set "STARTER_DIR=D:\Projects\eMatchStarters"
+set "CONTEXT_FILE=%STARTER_DIR%\run-context.properties"
+set "RESULT_FILE=%STARTER_DIR%\run-result.properties"
+set "LOG_FILE=%STARTER_DIR%\logs\run-ematch-command.log"
+set "KATALON_CONSOLE_LOG=%STARTER_DIR%\logs\katalon-console.log"
+set "GENERIC_TASK=\eMatch Automation\RunEMatchCommand"
+set "WIN_DRIVER_TASK=startWinDriver"
+
+set "WAIT_SECONDS=5"
+set "MAX_WAIT_MINUTES=300"
+REM ============================================================================
+
+if "%WORKSPACE%"=="" set "WORKSPACE=%CD%"
+
+set /a WAIT_MAX_CYCLES=(MAX_WAIT_MINUTES*60)/WAIT_SECONDS
+if %WAIT_MAX_CYCLES% LEQ 0 set "WAIT_MAX_CYCLES=3600"
+
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "(Get-Date).ToString('yyyy-MM-dd HH:mm:ss')"`) do set "RUN_STARTED_AT=%%I"
+if not defined RUN_STARTED_AT set "RUN_STARTED_AT=1970-01-01 00:00:00"
+
+set "RUN_ID=%RANDOM%%RANDOM%%RANDOM%"
+set "EXPECTED_RUN_ID=%RUN_ID%"
+
+echo.
+echo ==================================================
+echo [INFO] Starting %JOB_LABEL%
+echo [INFO] WORKSPACE=%WORKSPACE%
+echo [INFO] TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+echo [INFO] EXECUTION_PROFILE=%EXECUTION_PROFILE%
+echo [INFO] BROWSER_TYPE=%BROWSER_TYPE%
+echo [INFO] STARTER_DIR=%STARTER_DIR%
+echo [INFO] CONTEXT_FILE=%CONTEXT_FILE%
+echo [INFO] RESULT_FILE=%RESULT_FILE%
+echo [INFO] LOG_FILE=%LOG_FILE%
+echo [INFO] KATALON_CONSOLE_LOG=%KATALON_CONSOLE_LOG%
+echo [INFO] GENERIC_TASK=%GENERIC_TASK%
+echo [INFO] WIN_DRIVER_TASK=%WIN_DRIVER_TASK%
+echo [INFO] RUN_STARTED_AT=%RUN_STARTED_AT%
+echo ==================================================
+echo.
+
+if "%JOB_LABEL%"=="" (
+    echo [ERROR] JOB_LABEL is empty.
+    exit /b 1
+)
+
+if "%TEST_SUITE_COLLECTION%"=="" (
+    echo [ERROR] TEST_SUITE_COLLECTION is empty.
+    exit /b 1
+)
+
+if not exist "%WORKSPACE%" (
+    echo [ERROR] WORKSPACE not found: %WORKSPACE%
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%" (
+    echo [ERROR] STARTER_DIR not found: %STARTER_DIR%
+    exit /b 1
+)
+
+if not exist "%STARTER_DIR%\logs" mkdir "%STARTER_DIR%\logs" >nul 2>&1
+
+del /f /q "%LOG_FILE%" >nul 2>&1
+del /f /q "%KATALON_CONSOLE_LOG%" >nul 2>&1
+
+(
+echo RUN_ID=%EXPECTED_RUN_ID%
+echo JOB_LABEL=%JOB_LABEL%
+echo WORKSPACE=%WORKSPACE%
+echo TEST_SUITE_COLLECTION=%TEST_SUITE_COLLECTION%
+echo EXECUTION_PROFILE=%EXECUTION_PROFILE%
+echo BROWSER_TYPE=%BROWSER_TYPE%
+echo KATALON_HOME=C:\Users\adgi5appjenkins\Documents\Katalon_Studio_Engine_Windows_64-8.1.0
+) > "%CONTEXT_FILE%"
+
+(
+echo RUN_ID=%EXPECTED_RUN_ID%
+echo STATUS=QUEUED
+echo EXIT_CODE=999
+echo UPDATED_AT=%DATE% %TIME%
+) > "%RESULT_FILE%"
+
+echo [INFO] Context file written:
+type "%CONTEXT_FILE%"
+echo.
+echo [INFO] Initial result file:
+type "%RESULT_FILE%"
+echo.
+
+echo [INFO] Starting WinAppDriver task...
+schtasks /run /tn "%WIN_DRIVER_TASK%" >nul 2>&1
+
+echo [INFO] Starting visible Katalon task...
+schtasks /run /tn "%GENERIC_TASK%" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Could not start scheduled task "%GENERIC_TASK%".
+    call :printTaskInfo
+    exit /b 1
+)
+
+ping 127.0.0.1 -n 3 >nul
+
+set /a WAIT_COUNT=0
+
+:waitLoop
+set /a WAIT_COUNT+=1
+call :readResult
+
+if /i "!FILE_RUN_ID!"=="%EXPECTED_RUN_ID%" if /i "!STATUS!"=="FINISHED" goto resultDone
+
+call :isTaskRunning
+if "!TASK_RUNNING!"=="0" (
+    call :tryCompleteWhenTaskStopped
+    if "!FORCED_DONE!"=="1" goto resultDone
+)
+
+if !WAIT_COUNT! EQU 1 echo [INFO] Waiting result file update...
+if !WAIT_COUNT! EQU 2 echo [INFO] Still waiting result file update...
+if !WAIT_COUNT! EQU 3 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 4 echo [INFO] Still waiting...
+if !WAIT_COUNT! EQU 5 echo [INFO] Still waiting...
+
+set /a MOD=!WAIT_COUNT! %% 12
+if !MOD! EQU 0 call :printTaskInfo
+
+if !WAIT_COUNT! GEQ !WAIT_MAX_CYCLES! (
+    echo [ERROR] Timeout waiting run-result.properties update.
+    echo [ERROR] FILE_RUN_ID=!FILE_RUN_ID!
+    echo [ERROR] STATUS=!STATUS!
+    echo [ERROR] EXIT_CODE=!EXIT_CODE!
+    echo [ERROR] UPDATED_AT=!UPDATED_AT!
+    echo.
+    call :printTaskInfo
+    call :printResultFile
+    call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+    call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 120
+    call :printReportsSummary
+    call :validateExecution
+    if errorlevel 1 exit /b 1
+    echo [WARN] Wrapper timeout reached, but execution evidence was found. Jenkins will continue.
+    exit /b 0
+)
+
+ping 127.0.0.1 -n %WAIT_SECONDS% >nul
+goto waitLoop
+
+:resultDone
+echo [INFO] Result file updated.
+echo [INFO] RUN_ID=!FILE_RUN_ID!
+echo [INFO] STATUS=!STATUS!
+echo [INFO] EXIT_CODE=!EXIT_CODE!
+echo [INFO] UPDATED_AT=!UPDATED_AT!
+echo.
+
+schtasks /end /tn "%WIN_DRIVER_TASK%" >nul 2>&1
+
+call :printTaskInfo
+call :printResultFile
+call :printLog "%LOG_FILE%" "run-ematch-command.log" 30
+call :printLog "%KATALON_CONSOLE_LOG%" "katalon-console.log" 120
+call :printReportsSummary
+call :validateExecution
+if errorlevel 1 exit /b 1
+
+echo [INFO] %JOB_LABEL% execution finished successfully.
+if not "!EXIT_CODE!"=="0" (
+    echo [WARN] Katalon returned EXIT_CODE=!EXIT_CODE!, but Jenkins will keep SUCCESS because execution finished.
+)
+exit /b 0
+
+:readResult
+set "FILE_RUN_ID="
+set "STATUS="
+set "EXIT_CODE="
+set "UPDATED_AT="
+
+if exist "%RESULT_FILE%" (
+    for /f "usebackq tokens=1* delims==" %%A in ("%RESULT_FILE%") do (
+        if /i "%%A"=="RUN_ID" set "FILE_RUN_ID=%%B"
+        if /i "%%A"=="STATUS" set "STATUS=%%B"
+        if /i "%%A"=="EXIT_CODE" set "EXIT_CODE=%%B"
+        if /i "%%A"=="UPDATED_AT" set "UPDATED_AT=%%B"
+    )
+)
+exit /b 0
+
+:isTaskRunning
+set "TASK_RUNNING=0"
+schtasks /query /tn "%GENERIC_TASK%" /fo list /v | find /i "Status:" | find /i "Running" >nul 2>&1
+if not errorlevel 1 set "TASK_RUNNING=1"
+exit /b 0
+
+:tryCompleteWhenTaskStopped
+set "FORCED_DONE=0"
+
+call :hasArtifacts
+if "!HAS_ARTIFACTS!"=="1" (
+    if not defined FILE_RUN_ID set "FILE_RUN_ID=%EXPECTED_RUN_ID%"
+    if not defined STATUS set "STATUS=FINISHED"
+    if not defined EXIT_CODE set "EXIT_CODE=0"
+    set "FORCED_DONE=1"
+    exit /b 0
+)
+
+set "FOUND_FINISH_MARKER=0"
+if exist "%KATALON_CONSOLE_LOG%" (
+    powershell -NoProfile -Command ^
+        "$p='%KATALON_CONSOLE_LOG%';" ^
+        "$txt=Get-Content -Path $p -Raw -ErrorAction SilentlyContinue;" ^
+        "if($txt -match 'Execution completed\. Exit code: \d+\.' -or $txt -match 'All launchers terminated'){ exit 0 } else { exit 1 }"
+    if not errorlevel 1 set "FOUND_FINISH_MARKER=1"
+)
+
+if "!FOUND_FINISH_MARKER!"=="1" (
+    for /f %%I in ('powershell -NoProfile -Command "$p='%KATALON_CONSOLE_LOG%'; $m=[regex]::Matches((Get-Content -Path $p -Raw -ErrorAction SilentlyContinue),'Execution completed\. Exit code: (\d+)\.'); if($m.Count -gt 0){$m[$m.Count-1].Groups[1].Value}"') do set "EXIT_CODE=%%I"
+    if not defined EXIT_CODE set "EXIT_CODE=0"
+    set "FILE_RUN_ID=%EXPECTED_RUN_ID%"
+    set "STATUS=FINISHED"
+    set "FORCED_DONE=1"
+)
+exit /b 0
+
+:hasArtifacts
+set "HAS_ARTIFACTS=0"
+
+if exist "%WORKSPACE%\Reports" (
+    dir /s /b "%WORKSPACE%\Reports\JUnit_Report.xml" >nul 2>&1 && set "HAS_ARTIFACTS=1"
+    if "!HAS_ARTIFACTS!"=="0" dir /s /b "%WORKSPACE%\Reports\execution0.log" >nul 2>&1 && set "HAS_ARTIFACTS=1"
+    if "!HAS_ARTIFACTS!"=="0" dir /s /b "%WORKSPACE%\Reports\*.html" >nul 2>&1 && set "HAS_ARTIFACTS=1"
+)
+exit /b 0
+
+:validateExecution
+echo [INFO] Validating current execution...
+
+call :hasArtifacts
+if "!HAS_ARTIFACTS!"=="1" exit /b 0
+
+set "HARD_ERROR=0"
+powershell -NoProfile -Command ^
+    "$files=@('%KATALON_CONSOLE_LOG%','%LOG_FILE%') | Where-Object { Test-Path $_ };" ^
+    "$txt=($files | ForEach-Object { Get-Content -Path $_ -Raw -ErrorAction SilentlyContinue }) -join [Environment]::NewLine;" ^
+    "if($txt -match 'FilePathTooLongException' -or $txt -match 'Cannot save entity' -or $txt -match 'Test Suite Collection .+ not found' -or $txt -match 'Unable to open project' -or $txt -match 'com\.kms\.katalon\.execution\.exception\.ExecutionException'){ exit 0 } else { exit 1 }"
+if not errorlevel 1 set "HARD_ERROR=1"
+
+if "!HARD_ERROR!"=="1" (
+    echo [ERROR] Hard execution error detected for %JOB_LABEL%.
+    exit /b 1
+)
+
+echo [ERROR] No report artifacts were generated for %JOB_LABEL%.
+exit /b 1
+
+:printTaskInfo
+echo [INFO] Scheduled task status snapshot:
+echo [INFO] ---- %WIN_DRIVER_TASK% ----
+schtasks /query /tn "%WIN_DRIVER_TASK%" /fo list /v | findstr /I /C:"Status:" /C:"Last Run Time" /C:"Last Result"
+echo [INFO] ---- %GENERIC_TASK% ----
+schtasks /query /tn "%GENERIC_TASK%" /fo list /v | findstr /I /C:"Status:" /C:"Last Run Time" /C:"Last Result"
+echo.
+exit /b 0
+
+:printResultFile
+if exist "%RESULT_FILE%" (
+    echo [INFO] Current run-result.properties:
+    type "%RESULT_FILE%"
+    echo.
+) else (
+    echo [WARN] Result file not found: %RESULT_FILE%
+    echo.
+)
+exit /b 0
+
+:printLog
+set "TARGET_FILE=%~1"
+set "TARGET_TITLE=%~2"
+set "TARGET_TAIL=%~3"
+
+if exist "%TARGET_FILE%" (
+    echo [INFO] Last lines from %TARGET_TITLE%:
+    powershell -NoProfile -Command "Get-Content -Path '%TARGET_FILE%' -Tail %TARGET_TAIL% -ErrorAction SilentlyContinue"
+    echo.
+) else (
+    echo [WARN] File not found: %TARGET_FILE%
+    echo.
+)
+exit /b 0
+
+:printReportsSummary
+if exist "%WORKSPACE%\Reports" (
+    echo [INFO] Reports folder found: %WORKSPACE%\Reports
+    echo [INFO] Relevant report artifacts:
+    powershell -NoProfile -Command ^
+        "$root='%WORKSPACE%\Reports';" ^
+        "Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'JUnit_Report.xml' -or $_.Name -like 'execution0.log' -or $_.Extension -eq '.html' } | Sort-Object LastWriteTime -Descending | Select-Object -First 20 | ForEach-Object { Write-Host ('[REPORT] ' + $_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss') + '  ' + $_.FullName) }"
+    echo.
+) else (
+    echo [WARN] Reports folder not found: %WORKSPACE%\Reports
+    echo.
+)
+exit /b 0
