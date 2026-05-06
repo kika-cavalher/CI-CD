@@ -1,1 +1,182 @@
+properties([
+    disableConcurrentBuilds(),
+    buildDiscarder(logRotator(numToKeepStr: '15'))
+])
 
+/*
+ * ============================================================================
+ * CONFIG - CHANGE ONLY THIS BLOCK FOR EACH PIPELINE
+ * ============================================================================
+ */
+def NODE_LABEL = 'GI5_SWDCFRNXGI55817'
+def SHORT_WORKSPACE = 'D:\\jenkins\\ws\\ARCH_MD'
+def RUN_NEXT_JOB = true
+def NEXT_JOB = 'GI5/eMatch_Regression/BDR Module des Responsabilite'
+def STAGE_TIMEOUT_HOURS = 5
+
+def COLLECTIONS = [
+    [
+        stageName: 'Archive Mode Collection',
+        cmdFile  : 'ArchiveMode.cmd',
+        stopName : 'Archive Mode Collection'
+    ]
+]
+/*
+ * ============================================================================
+ * END CONFIG
+ * ============================================================================
+ */
+
+def executionInvalid = false
+def manualAborted = false
+def invalidStages = []
+
+def asErrorText = { Throwable err ->
+    def parts = []
+    def current = err
+
+    while (current != null) {
+        parts << "${current.getClass().getName()}: ${current.getMessage()}"
+        current = current.getCause()
+    }
+
+    return parts.join(' | ')
+}
+
+def isTimeoutError = { Throwable err ->
+    def text = asErrorText(err).toLowerCase()
+    return text.contains('timeout') || text.contains('exceededtimeout')
+}
+
+def isManualAbortError = { Throwable err ->
+    def text = asErrorText(err)
+    return text.contains('FlowInterruptedException') && !isTimeoutError(err)
+}
+
+def stopCurrentExecution = {
+    bat(
+        returnStatus: true,
+        script: '''@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>&1
+schtasks /end /tn "startWinDriver" >nul 2>&1
+taskkill /f /im WinAppDriver.exe /t >nul 2>&1
+taskkill /f /im katalonc.exe /t >nul 2>&1
+taskkill /f /im KatalonStudio.exe /t >nul 2>&1
+ping 127.0.0.1 -n 3 >nul
+exit /b 0
+'''
+    )
+}
+
+def executeCollection = { Map cfg ->
+    Throwable abortErr = null
+
+    stage(cfg.stageName) {
+        try {
+            timeout(time: STAGE_TIMEOUT_HOURS, unit: 'HOURS') {
+                int rc = bat(
+                    label: cfg.cmdFile,
+                    returnStatus: true,
+                    script: """@echo off
+call "${env.WORKSPACE}\\jenkins\\${cfg.cmdFile}"
+exit /b %ERRORLEVEL%
+"""
+                )
+
+                if (rc == 0) {
+                    echo "${cfg.stageName} completed successfully."
+                } else {
+                    executionInvalid = true
+                    invalidStages << "${cfg.stageName} -> cmd exit code ${rc}"
+                    echo "${cfg.stageName} finished with invalid execution. Exit code: ${rc}"
+                }
+            }
+        } catch (Throwable err) {
+            if (isManualAbortError(err)) {
+                manualAborted = true
+                abortErr = err
+                echo "${cfg.stageName} was manually aborted."
+            } else if (isTimeoutError(err)) {
+                executionInvalid = true
+                invalidStages << "${cfg.stageName} -> wrapper timeout reached before valid execution was confirmed"
+                echo "${cfg.stageName} failed: wrapper timeout reached before valid execution was confirmed."
+            } else {
+                executionInvalid = true
+                invalidStages << "${cfg.stageName} -> ${asErrorText(err)}"
+                echo "${cfg.stageName} failed: ${asErrorText(err)}"
+            }
+        }
+    }
+
+    stage("Stop ${cfg.stopName}") {
+        stopCurrentExecution()
+    }
+
+    if (abortErr != null) {
+        throw abortErr
+    }
+}
+
+try {
+    node(NODE_LABEL) {
+        ws(SHORT_WORKSPACE) {
+            timestamps {
+                ansiColor('xterm') {
+                    stage('Checkout') {
+                        deleteDir()
+                        checkout scm
+                    }
+
+                    COLLECTIONS.each { cfg ->
+                        executeCollection(cfg)
+                    }
+
+                    stage('Execution summary') {
+                        if (invalidStages.isEmpty()) {
+                            echo '[SUMMARY] All configured collections produced valid execution evidence.'
+                        } else {
+                            echo '[SUMMARY] Some collections were invalid:'
+                            invalidStages.each { item ->
+                                echo "[SUMMARY] ${item}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+} catch (Throwable err) {
+    if (manualAborted || isManualAbortError(err)) {
+        currentBuild.result = 'ABORTED'
+        throw err
+    }
+
+    executionInvalid = true
+    invalidStages << "Pipeline -> unexpected error: ${asErrorText(err)}"
+    echo "[SUMMARY] Unexpected pipeline error: ${asErrorText(err)}"
+}
+
+stage('Trigger next pipeline') {
+    if (!manualAborted && RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        try {
+            build job: NEXT_JOB, wait: false, propagate: false
+        } catch (Throwable err) {
+            echo "Could not schedule next pipeline: ${asErrorText(err)}"
+        }
+    } else if (manualAborted) {
+        echo 'Build was manually aborted. Next pipeline will not be scheduled.'
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+if (manualAborted) {
+    currentBuild.result = 'ABORTED'
+} else if (executionInvalid) {
+    currentBuild.result = 'FAILURE'
+} else {
+    currentBuild.result = 'SUCCESS'
+}
+
+return
