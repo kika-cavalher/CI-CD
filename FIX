@@ -1,1 +1,129 @@
+properties([
+    disableConcurrentBuilds(),
+    buildDiscarder(logRotator(numToKeepStr: '15'))
+])
 
+/* ============================================================================
+   FIXED LOGIC
+   ============================================================================ */
+
+def executionFailed = false
+def manualAborted  = false
+
+def asErrorText = { Throwable err ->
+    def parts = []
+    def current = err
+
+    while (current != null) {
+        parts << "${current.getClass().getName()}: ${current.getMessage() ?: ''}"
+        current = current.getCause()
+    }
+
+    return parts.join(' | ').toLowerCase()
+}
+
+def isTimeoutError = { Throwable err ->
+    def text = asErrorText(err)
+    return text.contains('timeout')
+}
+
+def isManualAbortError = { Throwable err ->
+    def text = asErrorText(err)
+    return text.contains('flowinterruptedexception') && text.contains('aborted')
+}
+
+def stopCurrentExecution = {
+    bat '''
+@echo off
+schtasks /end /tn "\\eMatch Automation\\RunEMatchCommand" >nul 2>nul
+schtasks /end /tn "startWinDriver" >nul 2>nul
+taskkill /f /im WinAppDriver.exe >nul 2>nul
+taskkill /f /im katalonc.exe >nul 2>nul
+taskkill /f /im KatalonStudio.exe >nul 2>nul
+ping -n 3 127.0.0.1 >nul
+exit /b 0
+'''
+}
+
+def runCollection = { String stageName, String cmdFile ->
+    if (manualAborted) {
+        echo "${stageName} skipped because build was manually aborted."
+        return
+    }
+
+    stage(stageName) {
+        try {
+            timeout(time: 5, unit: 'HOURS') {
+                bat "call \"${env.WORKSPACE}\\jenkins\\${cmdFile}\""
+            }
+
+            echo "${stageName} completed successfully."
+        } catch (Throwable err) {
+            if (isManualAbortError(err) && !isTimeoutError(err)) {
+                manualAborted = true
+                currentBuild.result = 'ABORTED'
+                echo "${stageName} was manually aborted."
+                throw err
+            }
+
+            executionFailed = true
+
+            if (isTimeoutError(err)) {
+                echo "${stageName} reached the 5 hour limit and was stopped."
+            } else {
+                echo "${stageName} failed: ${err}"
+            }
+        } finally {
+            stage("Stop ${stageName}") {
+                stopCurrentExecution()
+            }
+        }
+    }
+}
+
+/* ============================================================================
+   PIPELINE EXECUTION
+   ============================================================================ */
+
+node(NODE_LABEL) {
+    ws(SHORT_WORKSPACE) {
+        timestamps {
+            ansiColor('xterm') {
+                stage('Checkout') {
+                    deleteDir()
+                    checkout scm
+                }
+
+                COLLECTIONS.each { item ->
+                    runCollection(item.stage as String, item.cmd as String)
+                }
+            }
+        }
+    }
+}
+
+/* ============================================================================
+   TRIGGER NEXT JOB
+   ============================================================================ */
+
+if (manualAborted) {
+    currentBuild.result = 'ABORTED'
+    echo 'Build was manually aborted. Next pipeline will not be scheduled.'
+    return
+}
+
+stage('Trigger next pipeline') {
+    if (RUN_NEXT_JOB && NEXT_JOB?.trim()) {
+        echo "Scheduling next pipeline: ${NEXT_JOB}"
+        build job: NEXT_JOB, wait: false, propagate: false
+    } else {
+        echo 'Next pipeline disabled.'
+    }
+}
+
+/* ============================================================================
+   FINAL RESULT
+   ============================================================================ */
+
+currentBuild.result = executionFailed ? 'FAILURE' : 'SUCCESS'
+return
