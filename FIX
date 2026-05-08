@@ -1,1 +1,600 @@
+package pageObject
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
+
+import org.openqa.selenium.Keys
+
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import general.WinRetry
+import internal.GlobalVariable
+
+class authenticationKeywords {
+
+	@Keyword
+	def launchApplication(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
+
+		if (System.getProperty('user.name') == GlobalVariable.username) {
+			if (environment == 'REC') {
+				String cmd = 'Powershell.exe -executionpolicy remotesigned -File D:\\setResolution.ps1'
+				Runtime.getRuntime().exec(cmd)
+			}
+
+			Windows.startApplicationWithTitle(
+					getShortcutPath(environment),
+					getVersion(environment)
+					)
+		} else {
+			if (environment == 'REC') {
+				startWinAppDriver()
+			}
+
+			Windows.startApplication(getApplicationPath(environment))
+		}
+	}
+
+	@Keyword
+	def switchToVersionWindow(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
+
+		WindowsTestObject targetWindow = new WindowsTestObject()
+		targetWindow.setLocatorStrategy(LocatorStrategy.NAME)
+		targetWindow.setLocator(getVersion(environment))
+
+		try {
+			Windows.switchToDesktop()
+			Windows.switchToWindow(targetWindow)
+
+			KeywordUtil.logInfo("Successfully switched to window: " + targetWindow.getLocator())
+			return true
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop(
+					"Target window '" + targetWindow.getLocator() + "' was not found.\n" +
+					"Check if the selected environment/version is correct.\n" +
+					"Environment received: " + targetEnvironment + "\n" +
+					"Normalized environment: " + environment + "\n" +
+					"Expected window title: " + targetWindow.getLocator() + "\n" +
+					"Original error: " + e.getMessage()
+					)
+			return false
+		}
+	}
+
+	@Keyword
+	def openEnvironmentSelector(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
+
+		if (!requiresEnvironmentSelection(environment)) {
+			KeywordUtil.logInfo("Environment selector is not required for " + environment + ".")
+			return
+		}
+
+		focusApplicationWindow(targetEnvironment)
+
+		// Important:
+		// This step only gives focus to the login form.
+		// The real environment selection is done in selectEnvironment().
+		try {
+			Windows.click(findWindowsObject('Login Page/optEnv'), FailureHandling.OPTIONAL)
+			Windows.delay(1)
+			KeywordUtil.logInfo("Environment selector was focused.")
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Could not focus environment selector using Windows.click. Continuing with coordinate mode.")
+		}
+	}
+
+	@Keyword
+	def selectEnvironment(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
+
+		if (!requiresEnvironmentSelection(environment)) {
+			KeywordUtil.logInfo("Environment selection is not required for " + environment + ".")
+			return
+		}
+
+		try {
+			focusApplicationWindow(targetEnvironment)
+
+			KeywordUtil.logInfo("Selecting environment using coordinate mode: " + environment)
+
+			WindowsTestObject envCombo = findWindowsObject('Login Page/optEnv')
+
+			// Primary strategy: real mouse click on dropdown item.
+			selectFirstEnvironmentComboByCoordinates(envCombo, environment)
+
+			Windows.delay(2)
+
+			KeywordUtil.logInfo("Environment selection command executed: " + environment)
+
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop(
+					"Failed to select environment: " + environment + "\n" +
+					"Reason: " + e.getMessage()
+					)
+		}
+	}
+
+	@Keyword
+	def clickConnectIfPresent(String targetEnvironment) {
+		focusApplicationWindow(targetEnvironment)
+
+		WindowsTestObject connectButton = findWindowsObject('Login Page/btnConnecter')
+
+		boolean isButtonPresent = Windows.verifyElementPresent(
+				connectButton,
+				5,
+				FailureHandling.OPTIONAL
+				)
+
+		if (!isButtonPresent) {
+			KeywordUtil.logInfo('Connect button was not present. Continuing test execution.')
+			return
+		}
+
+		try {
+			clickElementCenterByCoordinates(connectButton)
+			KeywordUtil.logInfo('Connect button click executed using coordinate mode.')
+			Windows.delay(7)
+		} catch (Exception e) {
+			KeywordUtil.logInfo('Coordinate click failed. Trying normal click and ENTER fallback. Reason: ' + e.getMessage())
+
+			try {
+				Windows.click(connectButton, FailureHandling.OPTIONAL)
+				Windows.delay(2)
+			} catch (Exception ignored) {
+			}
+
+			pressKey(KeyEvent.VK_ENTER)
+			Windows.delay(7)
+		}
+	}
+
+	@Keyword
+	def waitForMainScreen(String targetEnvironment) {
+		KeywordUtil.logInfo("Waiting for main screen after login.")
+
+		boolean isMainScreenVisible = waitMainScreen(60)
+
+		if (isMainScreenVisible) {
+			KeywordUtil.logInfo("Main screen loaded successfully.")
+			Windows.delay(10)
+			return
+		}
+
+		String environment = normalizeEnvironment(targetEnvironment)
+
+		KeywordUtil.logInfo("Main screen was not loaded. Starting login recovery strategies.")
+
+		if (isStillOnLoginScreen()) {
+			if (tryLoginRecovery(targetEnvironment, environment, "FIRST_COMBO_COORDINATE")) {
+				return
+			}
+
+			if (tryLoginRecovery(targetEnvironment, environment, "FIRST_COMBO_TYPE")) {
+				return
+			}
+
+			if (tryLoginRecovery(targetEnvironment, environment, "FIRST_COMBO_ARROW")) {
+				return
+			}
+
+			if (tryLoginRecovery(targetEnvironment, environment, "SECOND_COMBO_COORDINATE")) {
+				return
+			}
+
+			if (tryLoginRecovery(targetEnvironment, environment, "SECOND_COMBO_ARROW")) {
+				return
+			}
+		}
+
+		KeywordUtil.markFailedAndStop(
+				"Main screen was not loaded after all login attempts.\n" +
+				"The application is still on the login screen or the environment was not applied.\n" +
+				"Expected element was not found: General/txtSearch"
+				)
+	}
+
+	@Keyword
+	def clickHomeTab(String targetEnvironment) {
+		String home = new File(RunConfiguration.getProjectDir(), 'Images/General/Home.PNG').getAbsolutePath()
+		String homeGrey = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeGrey.PNG').getAbsolutePath()
+		String homeWhite = new File(RunConfiguration.getProjectDir(), 'Images/General/HomeWhite.PNG').getAbsolutePath()
+
+		try {
+			def activeTab = WindowsImageKeywords.findImage(homeGrey)
+			if (activeTab != null) {
+				KeywordUtil.logInfo('Home tab is already active.')
+				return
+			}
+		} catch (Exception e) {
+		}
+
+		try {
+			def inactiveTab = WindowsImageKeywords.findImage(homeWhite)
+			if (inactiveTab != null) {
+				KeywordUtil.logInfo('Inactive Home tab found. Clicking to activate.')
+				WindowsImageKeywords.clickImage(homeWhite)
+				Windows.delay(5)
+				return
+			}
+		} catch (Exception e) {
+		}
+
+		WindowsImageKeywords.clickImage(home)
+		Windows.delay(5)
+	}
+
+	private boolean tryLoginRecovery(String targetEnvironment, String environment, String strategy) {
+		try {
+			KeywordUtil.logInfo("Login recovery strategy: " + strategy)
+
+			focusApplicationWindow(targetEnvironment)
+
+			WindowsTestObject envCombo = findWindowsObject('Login Page/optEnv')
+
+			switch (strategy) {
+				case "FIRST_COMBO_COORDINATE":
+					selectFirstEnvironmentComboByCoordinates(envCombo, environment)
+					break
+
+				case "FIRST_COMBO_TYPE":
+					selectFirstEnvironmentComboByTyping(envCombo, environment)
+					break
+
+				case "FIRST_COMBO_ARROW":
+					selectFirstEnvironmentComboByArrows(envCombo, environment)
+					break
+
+				case "SECOND_COMBO_COORDINATE":
+					selectSecondEnvironmentComboByCoordinates(envCombo, environment)
+					break
+
+				case "SECOND_COMBO_ARROW":
+					selectSecondEnvironmentComboByArrows(envCombo, environment)
+					break
+
+				default:
+					KeywordUtil.logInfo("Unknown login recovery strategy: " + strategy)
+					return false
+			}
+
+			Windows.delay(2)
+
+			clickConnectIfPresent(targetEnvironment)
+
+			boolean isMainScreenVisible = waitMainScreen(25)
+
+			if (isMainScreenVisible) {
+				KeywordUtil.logInfo("Main screen loaded successfully after strategy: " + strategy)
+				Windows.delay(10)
+				return true
+			}
+
+			KeywordUtil.logInfo("Strategy did not open the main screen: " + strategy)
+			return false
+
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Strategy failed: " + strategy + ". Reason: " + e.getMessage())
+			return false
+		}
+	}
+
+	private void selectFirstEnvironmentComboByCoordinates(WindowsTestObject comboObject, String environment) {
+		def rect = Windows.getElementRect(comboObject)
+
+		int envIndex = getEnvironmentIndex(environment)
+		int rowHeight = getSafeHeight(rect)
+		int comboLeftX = rect.getX()
+		int comboTopY = rect.getY()
+		int comboWidth = rect.getWidth()
+		int comboHeight = getSafeHeight(rect)
+
+		int arrowX = comboLeftX + comboWidth - 6
+		int comboCenterY = comboTopY + Math.floor(comboHeight / 2).intValue()
+
+		// Close any previous dropdown state.
+		pressKey(KeyEvent.VK_ESCAPE)
+		sleepMillis(300)
+
+		// Open dropdown using real mouse click.
+		mouseClick(arrowX, comboCenterY)
+		sleepMillis(700)
+
+		// Click the expected item based on the original order:
+		// 1 PROD, 2 PREX, 3 REC2, 4 REC, 5 DEV2, 6 DEV.
+		int itemX = comboLeftX + Math.floor(comboWidth / 2).intValue()
+		int dropdownTopY = comboTopY + comboHeight
+		int itemY = dropdownTopY + Math.round(rowHeight * (envIndex - 0.5D)).intValue()
+
+		mouseClick(itemX, itemY)
+		sleepMillis(700)
+
+		pressKey(KeyEvent.VK_TAB)
+		sleepMillis(500)
+	}
+
+	private void selectFirstEnvironmentComboByTyping(WindowsTestObject comboObject, String environment) {
+		def rect = Windows.getElementRect(comboObject)
+
+		int arrowX = rect.getX() + rect.getWidth() - 6
+		int comboCenterY = rect.getY() + Math.floor(getSafeHeight(rect) / 2).intValue()
+
+		pressKey(KeyEvent.VK_ESCAPE)
+		sleepMillis(300)
+
+		mouseClick(arrowX, comboCenterY)
+		sleepMillis(500)
+
+		typeText(environment)
+		sleepMillis(500)
+
+		pressKey(KeyEvent.VK_ENTER)
+		sleepMillis(500)
+
+		pressKey(KeyEvent.VK_TAB)
+		sleepMillis(500)
+	}
+
+	private void selectFirstEnvironmentComboByArrows(WindowsTestObject comboObject, String environment) {
+		def rect = Windows.getElementRect(comboObject)
+
+		int envIndex = getEnvironmentIndex(environment)
+		int arrowX = rect.getX() + rect.getWidth() - 6
+		int comboCenterY = rect.getY() + Math.floor(getSafeHeight(rect) / 2).intValue()
+
+		pressKey(KeyEvent.VK_ESCAPE)
+		sleepMillis(300)
+
+		mouseClick(arrowX, comboCenterY)
+		sleepMillis(500)
+
+		// Keep the original logic:
+		// REC = 4 means four ARROW_DOWN from the empty/current first position.
+		for (int i = 0; i < envIndex; i++) {
+			pressKey(KeyEvent.VK_DOWN)
+			sleepMillis(250)
+		}
+
+		pressKey(KeyEvent.VK_ENTER)
+		sleepMillis(500)
+
+		pressKey(KeyEvent.VK_TAB)
+		sleepMillis(500)
+	}
+
+	private void selectSecondEnvironmentComboByCoordinates(WindowsTestObject firstComboObject, String environment) {
+		def rect = Windows.getElementRect(firstComboObject)
+
+		int envIndex = getEnvironmentIndex(environment)
+		int rowHeight = getSafeHeight(rect)
+		int comboLeftX = rect.getX()
+		int comboWidth = rect.getWidth()
+		int comboHeight = getSafeHeight(rect)
+
+		// The second combo is directly below the first one.
+		int secondComboTopY = rect.getY() + comboHeight + 4
+		int arrowX = comboLeftX + comboWidth - 6
+		int comboCenterY = secondComboTopY + Math.floor(comboHeight / 2).intValue()
+
+		pressKey(KeyEvent.VK_ESCAPE)
+		sleepMillis(300)
+
+		mouseClick(arrowX, comboCenterY)
+		sleepMillis(700)
+
+		int itemX = comboLeftX + Math.floor(comboWidth / 2).intValue()
+		int dropdownTopY = secondComboTopY + comboHeight
+		int itemY = dropdownTopY + Math.round(rowHeight * (envIndex - 0.5D)).intValue()
+
+		mouseClick(itemX, itemY)
+		sleepMillis(700)
+
+		pressKey(KeyEvent.VK_TAB)
+		sleepMillis(500)
+	}
+
+	private void selectSecondEnvironmentComboByArrows(WindowsTestObject firstComboObject, String environment) {
+		def rect = Windows.getElementRect(firstComboObject)
+
+		int envIndex = getEnvironmentIndex(environment)
+		int comboHeight = getSafeHeight(rect)
+
+		int secondComboTopY = rect.getY() + comboHeight + 4
+		int arrowX = rect.getX() + rect.getWidth() - 6
+		int comboCenterY = secondComboTopY + Math.floor(comboHeight / 2).intValue()
+
+		pressKey(KeyEvent.VK_ESCAPE)
+		sleepMillis(300)
+
+		mouseClick(arrowX, comboCenterY)
+		sleepMillis(500)
+
+		for (int i = 0; i < envIndex; i++) {
+			pressKey(KeyEvent.VK_DOWN)
+			sleepMillis(250)
+		}
+
+		pressKey(KeyEvent.VK_ENTER)
+		sleepMillis(500)
+
+		pressKey(KeyEvent.VK_TAB)
+		sleepMillis(500)
+	}
+
+	private void clickElementCenterByCoordinates(WindowsTestObject object) {
+		def rect = Windows.getElementRect(object)
+
+		int x = rect.getX() + Math.floor(rect.getWidth() / 2).intValue()
+		int y = rect.getY() + Math.floor(getSafeHeight(rect) / 2).intValue()
+
+		mouseClick(x, y)
+	}
+
+	private boolean waitMainScreen(int timeout) {
+		return Windows.waitForElementPresent(
+				findWindowsObject('General/txtSearch'),
+				timeout,
+				FailureHandling.OPTIONAL
+				)
+	}
+
+	private boolean isStillOnLoginScreen() {
+		return Windows.verifyElementPresent(
+				findWindowsObject('Login Page/btnConnecter'),
+				2,
+				FailureHandling.OPTIONAL
+				)
+	}
+
+	private void focusApplicationWindow(String targetEnvironment) {
+		String environment = normalizeEnvironment(targetEnvironment)
+
+		WindowsTestObject targetWindow = new WindowsTestObject()
+		targetWindow.setLocatorStrategy(LocatorStrategy.NAME)
+		targetWindow.setLocator(getVersion(environment))
+
+		try {
+			Windows.switchToDesktop()
+			Windows.switchToWindow(targetWindow)
+			Windows.delay(1)
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop(
+					"Could not focus application window.\n" +
+					"Expected window title: " + getVersion(environment) + "\n" +
+					"Reason: " + e.getMessage()
+					)
+		}
+	}
+
+	private int getSafeHeight(def rect) {
+		int height = rect.getHeight()
+
+		if (height <= 0) {
+			return 20
+		}
+
+		return height
+	}
+
+	private void pressKey(int keyCode) {
+		Robot robot = new Robot()
+		robot.setAutoDelay(120)
+
+		robot.keyPress(keyCode)
+		robot.keyRelease(keyCode)
+	}
+
+	private void typeText(String text) {
+		Robot robot = new Robot()
+		robot.setAutoDelay(120)
+
+		for (char character : text.toUpperCase().toCharArray()) {
+			int keyCode = KeyEvent.getExtendedKeyCodeForChar(character)
+
+			if (keyCode == KeyEvent.VK_UNDEFINED) {
+				KeywordUtil.logInfo("Could not type character: " + character)
+				continue
+			}
+
+			robot.keyPress(keyCode)
+			robot.keyRelease(keyCode)
+		}
+	}
+
+	private void mouseClick(int x, int y) {
+		Robot robot = new Robot()
+		robot.setAutoDelay(120)
+
+		robot.mouseMove(x, y)
+		sleepMillis(100)
+
+		robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
+		sleepMillis(100)
+		robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
+
+		sleepMillis(200)
+	}
+
+	private void sleepMillis(long millis) {
+		try {
+			Thread.sleep(millis)
+		} catch (Exception ignored) {
+		}
+	}
+
+	private String normalizeEnvironment(String targetEnvironment) {
+		if (targetEnvironment == null || targetEnvironment.trim().isEmpty()) {
+			return 'REC'
+		}
+
+		return targetEnvironment.trim().toUpperCase()
+	}
+
+	private boolean requiresEnvironmentSelection(String environment) {
+		return environment != 'PRD'
+	}
+
+	private int getEnvironmentIndex(String environment) {
+		switch (environment) {
+			case 'PROD':
+				return 1
+			case 'PREX':
+				return 2
+			case 'REC2':
+				return 3
+			case 'REC':
+				return 4
+			case 'DEV2':
+				return 5
+			case 'DEV':
+				return 6
+			default:
+				return 4
+		}
+	}
+
+	private String getVersion(String environment) {
+		switch (environment) {
+			case 'PRD':
+				return GlobalVariable.versionProd
+			default:
+				return GlobalVariable.version
+		}
+	}
+
+	private String getShortcutPath(String environment) {
+		switch (environment) {
+			case 'PRD':
+				return 'D:\\RunAseMatchPRD\\eMatch.lnk'
+			default:
+				return 'D:\\RunAseMatchReq\\eMatch.lnk'
+		}
+	}
+
+	private String getApplicationPath(String environment) {
+		switch (environment) {
+			case 'PRD':
+				return '\\\\cib.net\\soft\\ematch\\IHM\\PROD\\IXIS.Ematch.IHM.application'
+			default:
+				return '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\REC\\IXIS.Ematch.IHM.application'
+		}
+	}
+
+	private void startWinAppDriver() {
+		String command = 'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+		ProcessBuilder builder = new ProcessBuilder(command).inheritIO()
+		builder.start()
+	}
+}
