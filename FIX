@@ -1,1 +1,592 @@
+package commands
 
+import java.io.File
+import java.io.FileInputStream
+import java.text.SimpleDateFormat
+
+import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.CellType
+import org.apache.poi.ss.usermodel.Row
+import org.apache.poi.ss.usermodel.Sheet
+import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import com.katalon.ematch.helper.EmatchHelper
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import internal.GlobalVariable
+
+class ExportFile {
+
+	@Keyword
+	String downloadFromOutilsAndRegister(Integer intervalSeconds, Integer maxTimes, String exportLabel) {
+		String currentEnvironment = getCurrentEnvironment()
+		ArrayList compareFiles = getCompareFiles()
+
+		Integer beforeDownloadSize = compareFiles.size()
+
+		String downloadedFile = new EmatchHelper().downloadFileFromOutils(
+			intervalSeconds,
+			maxTimes
+		)
+
+		validateDownloadedFileName(downloadedFile, exportLabel)
+
+		compareFiles.add(downloadedFile)
+		GlobalVariable.compareFiles = compareFiles
+
+		validateDownloadWasRegistered(
+			beforeDownloadSize,
+			compareFiles.size(),
+			downloadedFile,
+			exportLabel,
+			currentEnvironment
+		)
+
+		validateDownloadedFileExists(downloadedFile, exportLabel)
+
+		return downloadedFile
+	}
+
+	@Keyword
+	String validateRecProdExcelFiles(
+		Integer threshold,
+		String closingDate,
+		List<Integer> historicalColumns,
+		List<Integer> currentYearColumns,
+		List<String> columnLabels
+	) {
+		ArrayList files = getCompareFiles()
+
+		if (files == null || files.size() < 2) {
+			KeywordUtil.markFailedAndStop(
+				'REC and PROD files were not found in GlobalVariable.compareFiles.'
+			)
+		}
+
+		Map dateInfo = getClosingDateInfo(closingDate)
+
+		String evidencePath = RunConfiguration.getReportFolder() + '\\Evidences\\'
+		String fileRec = evidencePath + files.get(0)
+		String fileProd = evidencePath + files.get(1)
+
+		validateFileExists(fileRec, 'REC')
+		validateFileExists(fileProd, 'PROD')
+
+		Workbook workbookRec = null
+		Workbook workbookProd = null
+
+		String errors = ''
+
+		try {
+			workbookRec = WorkbookFactory.create(new FileInputStream(fileRec))
+			workbookProd = WorkbookFactory.create(new FileInputStream(fileProd))
+
+			Sheet sheetRec = workbookRec.getSheetAt(0)
+			Sheet sheetProd = workbookProd.getSheetAt(0)
+
+			errors += compareHeaderRows(sheetRec, sheetProd)
+			errors += compareDataRows(
+				sheetRec,
+				sheetProd,
+				dateInfo.year as Integer,
+				dateInfo.trimester as Integer,
+				threshold,
+				historicalColumns,
+				currentYearColumns,
+				columnLabels
+			)
+
+			return errors
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop(
+				'Unexpected error while comparing REC and PROD Excel files.\n' +
+				'REC file: ' + fileRec + '\n' +
+				'PROD file: ' + fileProd + '\n' +
+				'Reason: ' + e.getMessage()
+			)
+		} finally {
+			closeWorkbook(workbookRec)
+			closeWorkbook(workbookProd)
+		}
+
+		return errors
+	}
+
+	@Keyword
+	String getCurrentEnvironment() {
+		String envImagePath = new File(
+			RunConfiguration.getProjectDir(),
+			'Images/General/envImage.png'
+		).getAbsolutePath()
+
+		File envImageFile = new File(envImagePath)
+
+		if (!envImageFile.exists()) {
+			KeywordUtil.markFailedAndStop(
+				'Environment image was not found.\n' +
+				'Expected path: ' + envImagePath
+			)
+		}
+
+		if (isEnvironmentRecByImage(envImagePath, 15)) {
+			KeywordUtil.logInfo('Current environment detected by env image: REC')
+			return 'Rec'
+		}
+
+		String environmentFromKnownGroups = tryResolveEnvironmentFromKnownImageGroups()
+
+		if (environmentFromKnownGroups != null) {
+			KeywordUtil.logInfo('Current environment detected by visible image groups: ' + environmentFromKnownGroups)
+			return environmentFromKnownGroups
+		}
+
+		KeywordUtil.markFailedAndStop(
+			'Could not identify current environment by image.\n' +
+			'Tried image: ' + envImagePath + '\n' +
+			'Tried visible REC/PROD image groups as fallback.\n' +
+			'The execution was stopped to avoid assuming the wrong environment.'
+		)
+
+		return null
+	}
+
+	@Keyword
+	String getImageGroupByCurrentEnvironment(String imageGroupPrefix) {
+		String currentEnvironment = getCurrentEnvironment()
+		return imageGroupPrefix + '_' + currentEnvironment
+	}
+
+	@Keyword
+	void validateDownloadedFileExists(String fileName, String exportLabel) {
+		String filePath = getEvidenceFilePath(fileName)
+		File exportedFile = new File(filePath)
+
+		if (!exportedFile.exists()) {
+			KeywordUtil.markFailedAndStop(
+				exportLabel + ' file was registered but does not exist in Evidences folder.\n' +
+				'Expected file: ' + filePath
+			)
+		}
+
+		if (exportedFile.length() <= 0) {
+			KeywordUtil.markFailedAndStop(
+				exportLabel + ' file exists but is empty.\n' +
+				'File: ' + filePath
+			)
+		}
+
+		KeywordUtil.logInfo(exportLabel + ' file exists and is not empty: ' + filePath)
+	}
+
+	private ArrayList getCompareFiles() {
+		ArrayList compareFiles = GlobalVariable.compareFiles as ArrayList
+
+		if (compareFiles == null) {
+			compareFiles = []
+			GlobalVariable.compareFiles = compareFiles
+		}
+
+		return compareFiles
+	}
+
+	private void validateDownloadedFileName(String downloadedFile, String exportLabel) {
+		if (downloadedFile == null || downloadedFile.trim().isEmpty()) {
+			KeywordUtil.markFailedAndStop(
+				exportLabel + ' file was not downloaded correctly. Downloaded file name is empty.'
+			)
+		}
+	}
+
+	private void validateDownloadWasRegistered(
+		Integer beforeDownloadSize,
+		Integer afterDownloadSize,
+		String downloadedFile,
+		String exportLabel,
+		String currentEnvironment
+	) {
+		if (afterDownloadSize <= beforeDownloadSize) {
+			KeywordUtil.markFailedAndStop(
+				exportLabel + ' file was not registered correctly.\n' +
+				'Environment: ' + currentEnvironment + '\n' +
+				'Downloaded file: ' + downloadedFile
+			)
+		}
+
+		KeywordUtil.markPassed(
+			exportLabel + ' file downloaded and registered correctly: ' + downloadedFile
+		)
+	}
+
+	private String getEvidenceFilePath(String fileName) {
+		String evidenceDir = RunConfiguration.getReportFolder() + '\\Evidences\\'
+
+		if (fileName.toLowerCase().endsWith('.xlsx') || fileName.toLowerCase().endsWith('.csv')) {
+			return evidenceDir + fileName
+		}
+
+		return evidenceDir + fileName + '.xlsx'
+	}
+
+	private Map getClosingDateInfo(String closingDate) {
+		if (closingDate == null || closingDate.trim().isEmpty()) {
+			KeywordUtil.markFailedAndStop('Closing date is empty.')
+		}
+
+		try {
+			SimpleDateFormat dateFormat = new SimpleDateFormat('dd-MM-yyyy')
+			Calendar calendar = Calendar.getInstance()
+			Date date = dateFormat.parse(closingDate)
+
+			calendar.setTime(date)
+
+			Integer month = calendar.get(Calendar.MONTH) + 1
+			Integer year = calendar.get(Calendar.YEAR)
+			Integer trimester = Math.ceil(month / 3D) as Integer
+
+			return [
+				year     : year,
+				month    : month,
+				trimester: trimester
+			]
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop(
+				'Closing date was not parsed correctly.\n' +
+				'Closing date: ' + closingDate + '\n' +
+				'Expected format: dd-MM-yyyy\n' +
+				'Reason: ' + e.getMessage()
+			)
+		}
+
+		return null
+	}
+
+	private void validateFileExists(String filePath, String environment) {
+		File file = new File(filePath)
+
+		if (!file.exists()) {
+			KeywordUtil.markFailedAndStop(
+				environment + ' export file was not found.\n' +
+				'Expected path: ' + filePath
+			)
+		}
+
+		if (file.length() <= 0) {
+			KeywordUtil.markFailedAndStop(
+				environment + ' export file exists but is empty.\n' +
+				'File path: ' + filePath
+			)
+		}
+	}
+
+	private String compareHeaderRows(Sheet sheetRec, Sheet sheetProd) {
+		String errors = ''
+
+		Row recHeaderRow1 = sheetRec.getRow(0)
+		Row prodHeaderRow1 = sheetProd.getRow(0)
+
+		Row recHeaderRow2 = sheetRec.getRow(1)
+		Row prodHeaderRow2 = sheetProd.getRow(1)
+
+		errors += compareRowStructure(recHeaderRow1, prodHeaderRow1, 'first header row')
+		errors += compareRowStructure(recHeaderRow2, prodHeaderRow2, 'second header row')
+
+		errors += compareHeaderValues(recHeaderRow1, prodHeaderRow1, 'first header row')
+		errors += compareHeaderValues(recHeaderRow2, prodHeaderRow2, 'second header row')
+
+		return errors
+	}
+
+	private String compareRowStructure(Row rowRec, Row rowProd, String rowLabel) {
+		String errors = ''
+
+		if (rowRec == null || rowProd == null) {
+			return '\n[ERROR] Missing ' + rowLabel + ' in REC or PROD file.'
+		}
+
+		if (rowRec.getPhysicalNumberOfCells() != rowProd.getPhysicalNumberOfCells()) {
+			errors += '\n[ERROR] Files have different number of table headers in ' + rowLabel
+		}
+
+		if (rowRec.getLastCellNum() != rowProd.getLastCellNum()) {
+			errors += '\n[ERROR] Files have different number of columns in ' + rowLabel
+		}
+
+		return errors
+	}
+
+	private String compareHeaderValues(Row rowRec, Row rowProd, String rowLabel) {
+		String errors = ''
+
+		if (rowRec == null || rowProd == null) {
+			return errors
+		}
+
+		for (Cell recCell in rowRec) {
+			Integer columnIndex = recCell.getColumnIndex()
+
+			String recValue = getCellValueAsString(recCell)
+			String prodValue = getCellValueAsString(rowProd.getCell(columnIndex))
+
+			if (recValue != prodValue) {
+				errors += '\n[ERROR] Header mismatch in ' + rowLabel + ', column ' + columnIndex +
+					'. REC=' + recValue + ', PROD=' + prodValue
+			}
+		}
+
+		return errors
+	}
+
+	private String compareDataRows(
+		Sheet sheetRec,
+		Sheet sheetProd,
+		Integer year,
+		Integer trimester,
+		Integer threshold,
+		List<Integer> historicalColumns,
+		List<Integer> currentYearColumns,
+		List<String> columnLabels
+	) {
+		String errors = ''
+		Integer actualTrimesterValidated = 1
+		Boolean inQuarter = false
+
+		for (Row rowRec in sheetRec) {
+			if (rowRec == null || rowRec.getRowNum() <= 2) {
+				continue
+			}
+
+			Row rowProd = sheetProd.getRow(rowRec.getRowNum())
+
+			if (rowProd == null) {
+				errors += '\n[ERROR] PROD row not found for REC row ' + (rowRec.getRowNum() + 1)
+				continue
+			}
+
+			Cell referenceCell = rowRec.getCell(1)
+
+			if (referenceCell == null) {
+				continue
+			}
+
+			if (referenceCell.getCellTypeEnum() == CellType.NUMERIC) {
+				if (referenceCell.getNumericCellValue() < year) {
+					errors += compareExactNumericCell(rowRec, rowProd, 1, 'Year', rowRec.getRowNum())
+
+					for (Integer i = 0; i < historicalColumns.size(); i++) {
+						errors += compareNumericCell(
+							rowRec,
+							rowProd,
+							historicalColumns[i],
+							threshold,
+							getColumnLabel(columnLabels, i),
+							rowRec.getRowNum()
+						)
+					}
+				}
+			} else {
+				String recReference = getCellValueAsString(referenceCell)
+				String prodReference = getCellValueAsString(rowProd.getCell(1))
+
+				if (actualTrimesterValidated < trimester && inQuarter) {
+					for (Integer i = 0; i < currentYearColumns.size(); i++) {
+						errors += compareNumericCell(
+							rowRec,
+							rowProd,
+							currentYearColumns[i],
+							threshold,
+							getColumnLabel(columnLabels, i),
+							rowRec.getRowNum()
+						)
+					}
+
+					actualTrimesterValidated++
+				} else {
+					inQuarter = false
+				}
+
+				if (recReference == 'Total ' + year && prodReference == 'Total ' + year) {
+					inQuarter = true
+				}
+			}
+		}
+
+		return errors
+	}
+
+	private String compareExactNumericCell(Row rowRec, Row rowProd, Integer columnIndex, String columnName, Integer rowIndex) {
+		Cell recCell = rowRec.getCell(columnIndex)
+		Cell prodCell = rowProd.getCell(columnIndex)
+
+		if (recCell == null || prodCell == null) {
+			return '\n[ERROR] Missing value in column ' + columnName + ' at row ' + (rowIndex + 1)
+		}
+
+		try {
+			Double recValue = recCell.getNumericCellValue()
+			Double prodValue = prodCell.getNumericCellValue()
+
+			if (recValue != prodValue) {
+				return '\n[ERROR] ' + columnName + ' column has a difference between REC and PROD at row ' +
+					(rowIndex + 1) + '. REC=' + recValue + ', PROD=' + prodValue
+			}
+		} catch (Exception e) {
+			return '\n[ERROR] Could not compare numeric column ' + columnName +
+				' at row ' + (rowIndex + 1) + '. Reason: ' + e.getMessage()
+		}
+
+		return ''
+	}
+
+	private String compareNumericCell(
+		Row rowRec,
+		Row rowProd,
+		Integer columnIndex,
+		Integer allowedDifference,
+		String columnName,
+		Integer rowIndex
+	) {
+		Cell recCell = rowRec.getCell(columnIndex)
+		Cell prodCell = rowProd.getCell(columnIndex)
+
+		if (recCell == null || prodCell == null) {
+			return '\n[ERROR] Missing value in column ' + columnName + ' at row ' + (rowIndex + 1)
+		}
+
+		try {
+			Double recValue = recCell.getNumericCellValue()
+			Double prodValue = prodCell.getNumericCellValue()
+			Double difference = Math.abs(recValue - prodValue)
+
+			if (difference >= allowedDifference) {
+				return '\n[ERROR] ' + columnName + ' column has a difference greater than ' +
+					allowedDifference + ' between REC and PROD at row ' + (rowIndex + 1) +
+					'. REC=' + recValue + ', PROD=' + prodValue
+			}
+		} catch (Exception e) {
+			return '\n[ERROR] Could not compare numeric column ' + columnName +
+				' at row ' + (rowIndex + 1) + '. Reason: ' + e.getMessage()
+		}
+
+		return ''
+	}
+
+	private String getColumnLabel(List<String> columnLabels, Integer index) {
+		if (columnLabels != null && index < columnLabels.size()) {
+			return columnLabels[index]
+		}
+
+		return 'Column index ' + index
+	}
+
+	private String getCellValueAsString(Cell cell) {
+		if (cell == null) {
+			return ''
+		}
+
+		return cell.toString()
+	}
+
+	private boolean isEnvironmentRecByImage(String envImagePath, Integer timeoutSeconds) {
+		int elapsedSeconds = 0
+		int safeTimeout = timeoutSeconds == null || timeoutSeconds <= 0 ? 15 : timeoutSeconds
+
+		while (elapsedSeconds < safeTimeout) {
+			try {
+				def imageFound = WindowsImageKeywords.findImage(envImagePath)
+
+				if (imageFound != null && imageFound != false) {
+					KeywordUtil.logInfo('REC environment image found: ' + envImagePath)
+					return true
+				}
+			} catch (Exception e) {
+				KeywordUtil.logInfo(
+					'REC environment image not visible yet.\n' +
+					'Path: ' + envImagePath + '\n' +
+					'Reason: ' + e.getMessage()
+				)
+			}
+
+			Windows.delay(1)
+			elapsedSeconds = elapsedSeconds + 1
+		}
+
+		return false
+	}
+
+	private String tryResolveEnvironmentFromKnownImageGroups() {
+		Integer recScore = 0
+		Integer prodScore = 0
+
+		recScore += countVisibleImagesFromGroup('ModuleDesResponsabiliteExport_Rec', [
+			'allRow',
+			'isAllOpen',
+			'totalCurrentYear'
+		])
+
+		prodScore += countVisibleImagesFromGroup('ModuleDesResponsabiliteExport_PROD', [
+			'allRow',
+			'isAllOpen',
+			'totalCurrentYear'
+		])
+
+		recScore += countVisibleImagesFromGroup('ModuleDesResponsabiliteDimensions_Rec', [
+			'startOfDimensions',
+			'firstPageRef',
+			'secondPageRef',
+			'thirdPageRef'
+		])
+
+		prodScore += countVisibleImagesFromGroup('ModuleDesResponsabiliteDimensions_PROD', [
+			'startOfDimensions',
+			'firstPageRef',
+			'secondPageRef',
+			'thirdPageRef'
+		])
+
+		KeywordUtil.logInfo(
+			'Environment fallback score by image groups.\n' +
+			'REC score: ' + recScore + '\n' +
+			'PROD score: ' + prodScore
+		)
+
+		if (recScore > prodScore && recScore > 0) {
+			return 'Rec'
+		}
+
+		if (prodScore > recScore && prodScore > 0) {
+			return 'PROD'
+		}
+
+		return null
+	}
+
+	private Integer countVisibleImagesFromGroup(String imageGroup, List<String> imageKeys) {
+		Integer score = 0
+		ImageLoader imageLoader = new ImageLoader()
+
+		for (String imageKey : imageKeys) {
+			try {
+				if (imageLoader.isVisible(imageGroup, imageKey)) {
+					score = score + 1
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		return score
+	}
+
+	private void closeWorkbook(Workbook workbook) {
+		try {
+			if (workbook != null) {
+				workbook.close()
+			}
+		} catch (Exception ignored) {
+		}
+	}
+}
