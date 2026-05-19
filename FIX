@@ -1,1 +1,393 @@
+package commands
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
+
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.driver.WindowsDriverFactory
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+import com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper
+
+class MenuNavigator {
+
+	private ImageLoader imageLoader = new ImageLoader()
+
+	@Keyword
+	boolean searchAndOpenMenu(String menuName, String imageGroup, int timeoutSeconds) {
+		return searchAndOpenMenu(menuName, imageGroup, '', timeoutSeconds)
+	}
+
+	@Keyword
+	boolean searchAndOpenMenu(String menuName, String imageGroup, String expectedObjectPath, int timeoutSeconds) {
+		int effectiveTimeout = timeoutSeconds <= 0 ? 20 : timeoutSeconds
+		int maxAttempts = 3
+
+		KeywordUtil.logInfo(
+			'Searching and opening menu.\n' +
+			'Menu name: ' + menuName + '\n' +
+			'Image group: ' + imageGroup + '\n' +
+			'Expected object path: ' + expectedObjectPath + '\n' +
+			'Timeout per attempt: ' + effectiveTimeout + ' seconds\n' +
+			'Max attempts: ' + maxAttempts
+		)
+
+		imageLoader.validateGroupImagesExist(imageGroup)
+
+		Map<String, String> images = imageLoader.getImages(imageGroup)
+
+		if (!images.containsKey('menuImage')) {
+			KeywordUtil.markFailedAndStop(
+				'Image group does not contain required key menuImage.\n' +
+				'Image group: ' + imageGroup + '\n' +
+				'Available keys: ' + images.keySet()
+			)
+		}
+
+		String menuImagePath = images['menuImage']
+		String openedTabImagePath = images.containsKey('openedTab') ? images['openedTab'] : ''
+
+		WindowsTestObject searchBox = resolveSearchBox()
+
+		for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+			KeywordUtil.logInfo('Starting menu open attempt ' + attempt + ' of ' + maxAttempts + '.')
+
+			clickElementCenterByCoordinates(searchBox)
+			Windows.delay(1)
+
+			clearFocusedField()
+			pasteText(menuName)
+			Windows.delay(2)
+
+			if (isMenuOpened(expectedObjectPath, openedTabImagePath, 2)) {
+				KeywordUtil.logInfo('Menu is already open.')
+				return true
+			}
+
+			boolean openedByObject = tryOpenByObject(expectedObjectPath, openedTabImagePath)
+
+			if (openedByObject) {
+				KeywordUtil.logInfo('Menu opened successfully by Object Repository.')
+				return true
+			}
+
+			boolean openedByImage = tryOpenByImage(menuImagePath, expectedObjectPath, openedTabImagePath, effectiveTimeout)
+
+			if (openedByImage) {
+				KeywordUtil.logInfo('Menu opened successfully by image.')
+				return true
+			}
+
+			KeywordUtil.logInfo(
+				'Attempt finished and menu is still not open.\n' +
+				'Attempt: ' + attempt + '/' + maxAttempts
+			)
+		}
+
+		takeEvidence('MenuNotOpened.png')
+
+		KeywordUtil.markFailedAndStop(
+			'Menu was not opened after maximum retry attempts.\n' +
+			'Menu name: ' + menuName + '\n' +
+			'Image group: ' + imageGroup + '\n' +
+			'Menu image path: ' + menuImagePath + '\n' +
+			'Opened tab image path: ' + openedTabImagePath + '\n' +
+			'Expected object path: ' + expectedObjectPath + '\n' +
+			'Attempts: ' + maxAttempts
+		)
+
+		return false
+	}
+
+	private boolean tryOpenByObject(String expectedObjectPath, String openedTabImagePath) {
+		if (expectedObjectPath == null || expectedObjectPath.trim().isEmpty()) {
+			KeywordUtil.logInfo('Expected object path not provided. Skipping Object Repository click.')
+			return false
+		}
+
+		String cleanPath = expectedObjectPath
+			.replace('Object Repository/', '')
+			.replace('Object Repository\\', '')
+
+		try {
+			WindowsTestObject targetObject = findWindowsObject(cleanPath)
+
+			boolean isPresent = Windows.verifyElementPresent(
+				targetObject,
+				3,
+				FailureHandling.OPTIONAL
+			)
+
+			if (!isPresent) {
+				KeywordUtil.logInfo('Expected object was not visible for click: ' + cleanPath)
+				return false
+			}
+
+			KeywordUtil.logInfo('Expected object found. Trying normal click: ' + cleanPath)
+
+			try {
+				Windows.click(targetObject, FailureHandling.OPTIONAL)
+			} catch (Exception clickError) {
+				KeywordUtil.logInfo('Normal object click failed. Trying coordinate click. Reason: ' + clickError.getMessage())
+				clickElementCenterByCoordinates(targetObject)
+			}
+
+			Windows.delay(3)
+
+			if (isMenuOpened(expectedObjectPath, openedTabImagePath, 8)) {
+				return true
+			}
+
+			KeywordUtil.logInfo('Object click executed, but menu is still not open.')
+			return false
+		} catch (Exception e) {
+			KeywordUtil.logInfo(
+				'Object Repository click failed.\n' +
+				'Object: ' + cleanPath + '\n' +
+				'Reason: ' + e.getMessage()
+			)
+			return false
+		}
+	}
+
+	private boolean tryOpenByImage(String menuImagePath, String expectedObjectPath, String openedTabImagePath, int timeoutSeconds) {
+		int elapsedSeconds = 0
+
+		while (elapsedSeconds < timeoutSeconds) {
+			try {
+				def imageFound = WindowsImageKeywords.findImage(menuImagePath)
+
+				if (imageFound != null && imageFound != false) {
+					KeywordUtil.logInfo(
+						'Menu image found.\n' +
+						'Image path: ' + menuImagePath + '\n' +
+						'Elapsed seconds: ' + elapsedSeconds
+					)
+
+					try {
+						WindowsImageKeywords.clickImage(menuImagePath)
+						KeywordUtil.logInfo('clickImage executed on menu image.')
+						Windows.delay(3)
+
+						if (isMenuOpened(expectedObjectPath, openedTabImagePath, 8)) {
+							return true
+						}
+					} catch (Exception clickError) {
+						KeywordUtil.logInfo('clickImage failed. Reason: ' + clickError.getMessage())
+					}
+
+					try {
+						WindowsImageKeywords.doubleClickImage(menuImagePath)
+						KeywordUtil.logInfo('doubleClickImage executed on menu image.')
+						Windows.delay(4)
+
+						if (isMenuOpened(expectedObjectPath, openedTabImagePath, 10)) {
+							return true
+						}
+					} catch (Exception doubleClickError) {
+						KeywordUtil.logInfo('doubleClickImage failed. Reason: ' + doubleClickError.getMessage())
+					}
+
+					return false
+				}
+			} catch (Exception imageError) {
+				KeywordUtil.logInfo(
+					'Image search attempt failed.\n' +
+					'Reason: ' + imageError.getMessage()
+				)
+			}
+
+			Windows.delay(1)
+			elapsedSeconds = elapsedSeconds + 1
+		}
+
+		KeywordUtil.logInfo('Menu image was not visible before timeout: ' + menuImagePath)
+		return false
+	}
+
+	private boolean isMenuOpened(String expectedObjectPath, String openedTabImagePath, int timeoutSeconds) {
+		int elapsedSeconds = 0
+
+		while (elapsedSeconds < timeoutSeconds) {
+			if (openedTabImagePath != null && !openedTabImagePath.trim().isEmpty()) {
+				try {
+					def openedTabFound = WindowsImageKeywords.findImage(openedTabImagePath)
+
+					if (openedTabFound != null && openedTabFound != false) {
+						KeywordUtil.logInfo('Opened tab image is visible: ' + openedTabImagePath)
+						return true
+					}
+				} catch (Exception e) {
+					KeywordUtil.logInfo(
+						'Opened tab image not visible yet.\n' +
+						'Image path: ' + openedTabImagePath + '\n' +
+						'Reason: ' + e.getMessage()
+					)
+				}
+			}
+
+			if ((openedTabImagePath == null || openedTabImagePath.trim().isEmpty()) &&
+				expectedObjectPath != null && !expectedObjectPath.trim().isEmpty()) {
+
+				String cleanPath = expectedObjectPath
+					.replace('Object Repository/', '')
+					.replace('Object Repository\\', '')
+
+				try {
+					boolean isPresent = Windows.verifyElementPresent(
+						findWindowsObject(cleanPath),
+						1,
+						FailureHandling.OPTIONAL
+					)
+
+					if (isPresent) {
+						KeywordUtil.logInfo('Expected object is visible: ' + cleanPath)
+						return true
+					}
+				} catch (Exception ignored) {
+				}
+			}
+
+			Windows.delay(1)
+			elapsedSeconds = elapsedSeconds + 1
+		}
+
+		return false
+	}
+
+	private WindowsTestObject resolveSearchBox() {
+		List<WindowsTestObject> candidates = []
+
+		try {
+			candidates.add(findWindowsObject('General/txtSearch'))
+		} catch (Exception ignored) {
+		}
+
+		candidates.add(buildXpathObject("//*[contains(@Name,'Type keywords here')]"))
+		candidates.add(buildXpathObject("//*[contains(@Name,'Type keywords')]"))
+		candidates.add(buildXpathObject("//*[@LocalizedControlType='combo box' and contains(@Name,'Type')]"))
+		candidates.add(buildXpathObject("//*[@LocalizedControlType='edit' and contains(@Name,'Type')]"))
+		candidates.add(buildXpathObject("//*[contains(@ClassName,'ComboBox') and contains(@Name,'Type')]"))
+
+		for (WindowsTestObject candidate : candidates) {
+			try {
+				boolean isPresent = Windows.verifyElementPresent(
+					candidate,
+					2,
+					FailureHandling.OPTIONAL
+				)
+
+				if (isPresent) {
+					KeywordUtil.logInfo('Search field found.')
+					return candidate
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		takeEvidence('SearchFieldNotFound.png')
+
+		KeywordUtil.markFailedAndStop(
+			'Search field was not found.\n' +
+			'Tried Object Repository: General/txtSearch\n' +
+			'Tried fallback XPath candidates.'
+		)
+
+		return null
+	}
+
+	private WindowsTestObject buildXpathObject(String xpath) {
+		WindowsTestObject object = new WindowsTestObject()
+		object.setLocatorStrategy(LocatorStrategy.XPATH)
+		object.setLocator(xpath)
+		return object
+	}
+
+	private void clickElementCenterByCoordinates(WindowsTestObject object) {
+		def rect = Windows.getElementRect(object)
+
+		int x = rect.getX() + Math.floor(rect.getWidth() / 2).intValue()
+		int y = rect.getY() + Math.floor(getSafeHeight(rect) / 2).intValue()
+
+		mouseClick(x, y)
+	}
+
+	private void clearFocusedField() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
+
+		Windows.delay(1)
+
+		robot.keyPress(KeyEvent.VK_BACK_SPACE)
+		robot.keyRelease(KeyEvent.VK_BACK_SPACE)
+	}
+
+	private void pasteText(String text) {
+		StringSelection selection = new StringSelection(text)
+		Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, null)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
+
+		Windows.delay(1)
+	}
+
+	private void mouseClick(int x, int y) {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.mouseMove(x, y)
+		Thread.sleep(150)
+
+		robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
+		Thread.sleep(150)
+		robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
+
+		Thread.sleep(300)
+	}
+
+	private int getSafeHeight(def rect) {
+		int height = rect.getHeight()
+
+		if (height <= 0) {
+			return 20
+		}
+
+		return height
+	}
+
+	private void takeEvidence(String fileName) {
+		try {
+			String evidenceDir = RunConfiguration.getReportFolder() + '\\Evidences\\'
+			new File(evidenceDir).mkdirs()
+
+			WindowsActionHelper
+				.create(WindowsDriverFactory.getWindowsSession())
+				.takeScreenshot(evidenceDir + fileName)
+
+			KeywordUtil.logInfo('Evidence captured: ' + evidenceDir + fileName)
+		} catch (Exception e) {
+			KeywordUtil.logInfo('Could not capture evidence: ' + e.getMessage())
+		}
+	}
+}
