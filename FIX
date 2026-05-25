@@ -1,1 +1,332 @@
+package pageObject
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.ConditionType
+import com.kms.katalon.core.testobject.TestObject
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords as WebUI
+
+import cucumber.api.java.en.And
+import cucumber.api.java.en.Given
+import cucumber.api.java.en.Then
+import cucumber.api.java.en.When
+import internal.GlobalVariable
+
+class Login {
+
+	private static final String CHROME_PROFILE_DIR = 'C:/KatalonChromeProfile'
+	private static final int DEFAULT_TIMEOUT = 60
+
+	@Keyword
+	@Given("user opens DEV login page")
+	def userOpensHueLoginPage() {
+		KeywordUtil.logInfo("Opening DEV login page")
+		KeywordUtil.logInfo("DEV_URL = " + GlobalVariable.DEV_URL)
+
+		configureChromeForHueAutomation()
+
+		WebUI.openBrowser('')
+		WebUI.maximizeWindow()
+		WebUI.navigateToUrl(GlobalVariable.DEV_URL)
+
+		waitForPageToBeReady(DEFAULT_TIMEOUT)
+		waitForLoginOrHueApplication(DEFAULT_TIMEOUT)
+	}
+
+	@Keyword
+	@When("the user logs in with the correct profile credentials.")
+	def userLogsInWithDefaultProfileCredentials() {
+		KeywordUtil.logInfo("Checking if login is required")
+
+		boolean loginVisible = isObjectVisible('Login/input_Username', 8)
+
+		if (!loginVisible) {
+			KeywordUtil.logInfo("Login screen was not displayed. User is probably already authenticated.")
+			waitForHueApplicationReady(DEFAULT_TIMEOUT)
+			return
+		}
+
+		KeywordUtil.logInfo("Login screen is visible. Filling login credentials.")
+
+		WebUI.setText(findTestObject('Login/input_Username'), GlobalVariable.DEV_USERNAME)
+		WebUI.setEncryptedText(findTestObject('Login/input_Password'), GlobalVariable.DEV_PASSWORD)
+
+		WebUI.click(findTestObject('Login/button_SignIn'))
+
+		WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+		waitForPageToBeReady(DEFAULT_TIMEOUT)
+		waitForHueApplicationReady(DEFAULT_TIMEOUT)
+	}
+
+	@Keyword
+	@Then("editor should be opened")
+	def hueEditorShouldBeOpened() {
+		KeywordUtil.logInfo("Verifying Hue editor was opened")
+
+		waitForPageToBeReady(DEFAULT_TIMEOUT)
+		waitForHueApplicationReady(DEFAULT_TIMEOUT)
+
+		String currentUrl = WebUI.getUrl()
+		KeywordUtil.logInfo("Current URL before editor validation: " + currentUrl)
+
+		if (!currentUrl.contains('/hue/editor')) {
+			KeywordUtil.logInfo("Hue editor is not opened yet. Trying to open it from the left menu.")
+
+			boolean editorClicked = clickEditorMenuIfAvailable()
+
+			if (!editorClicked) {
+				String editorUrl = buildEditorUrl(currentUrl)
+				KeywordUtil.logInfo("Editor menu was not available. Navigating directly to: " + editorUrl)
+				WebUI.navigateToUrl(editorUrl)
+			}
+		}
+
+		WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+		waitForPageToBeReady(DEFAULT_TIMEOUT)
+
+		boolean editorOpened = waitUntilUrlContains('/hue/editor', DEFAULT_TIMEOUT)
+
+		if (!editorOpened) {
+			KeywordUtil.markFailedAndStop("Hue editor was not opened. Current URL: " + WebUI.getUrl())
+		}
+
+		KeywordUtil.logInfo("Hue editor was opened successfully")
+	}
+
+	@Keyword
+	@And("default database should be selected")
+	def hiveEditorShouldBeSelectedByDefault() {
+		KeywordUtil.logInfo("Verifying default database was loaded and selected")
+
+		waitForPageToBeReady(DEFAULT_TIMEOUT)
+		waitForHueApplicationReady(DEFAULT_TIMEOUT)
+
+		String currentUrl = WebUI.getUrl()
+		KeywordUtil.logInfo("Current URL: " + currentUrl)
+
+		WebUI.verifyMatch(
+			currentUrl,
+			".*" + GlobalVariable.EXPECTED_DEFAULT_TYPE + ".*",
+			true,
+			FailureHandling.STOP_ON_FAILURE
+		)
+
+		waitForDefaultDatabaseToLoad()
+
+		String actualDatabase = WebUI.getText(findTestObject('Home/dropdown_DefaultDatabase')).trim()
+		String expectedDatabase = GlobalVariable.EXPECTED_DATABASE.toString().trim()
+
+		KeywordUtil.logInfo("Expected database: " + expectedDatabase)
+		KeywordUtil.logInfo("Actual database: " + actualDatabase)
+
+		if (!actualDatabase.equals(expectedDatabase)) {
+			KeywordUtil.markFailedAndStop("Wrong default database selected. Expected: " + expectedDatabase + " | Actual: " + actualDatabase)
+		}
+
+		KeywordUtil.logInfo("Default database was selected successfully")
+	}
+
+	private void configureChromeForHueAutomation() {
+		KeywordUtil.logInfo("Configuring Chrome profile for Hue automation")
+
+		List<String> chromeArguments = [
+			'--start-maximized',
+			'--disable-blink-features=AutomationControlled',
+			'--ignore-certificate-errors',
+			'--allow-running-insecure-content',
+			'--disable-popup-blocking',
+			'--disable-notifications',
+			'--user-data-dir=' + CHROME_PROFILE_DIR,
+			'--profile-directory=Default'
+		]
+
+		RunConfiguration.setWebDriverPreferencesProperty('args', chromeArguments)
+	}
+
+	private void waitForLoginOrHueApplication(int timeoutInSeconds) {
+		KeywordUtil.logInfo("Waiting for login screen or Hue application")
+
+		for (int i = 0; i < timeoutInSeconds; i++) {
+			boolean loginVisible = isObjectVisible('Login/input_Username', 1)
+			boolean hueVisible = isTestObjectVisible(getHueApplicationMarker(), 1)
+
+			if (loginVisible) {
+				KeywordUtil.logInfo("Login screen was found")
+				return
+			}
+
+			if (hueVisible) {
+				KeywordUtil.logInfo("Hue application was found")
+				return
+			}
+
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.markFailedAndStop("Neither login screen nor Hue application was found after opening DEV URL. Current URL: " + WebUI.getUrl())
+	}
+
+	private void waitForHueApplicationReady(int timeoutInSeconds) {
+		KeywordUtil.logInfo("Waiting for Hue application to be ready")
+
+		for (int i = 0; i < timeoutInSeconds; i++) {
+			boolean hueVisible = isTestObjectVisible(getHueApplicationMarker(), 1)
+
+			if (hueVisible) {
+				KeywordUtil.logInfo("Hue application is visible")
+				return
+			}
+
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.markFailedAndStop("Hue application was not loaded. Current URL: " + WebUI.getUrl())
+	}
+
+	private void waitForDefaultDatabaseToLoad() {
+		int maxAttempts = 3
+
+		for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+			KeywordUtil.logInfo("Waiting for default database. Attempt " + attempt + " of " + maxAttempts)
+
+			boolean databaseDropdownVisible = isObjectVisible('Home/dropdown_DefaultDatabase', 30)
+
+			if (databaseDropdownVisible) {
+				String actualDatabase = WebUI.getText(findTestObject('Home/dropdown_DefaultDatabase')).trim()
+
+				KeywordUtil.logInfo("Database dropdown text: " + actualDatabase)
+
+				if (actualDatabase != null && actualDatabase.length() > 0 && !actualDatabase.equalsIgnoreCase('Databases (0)')) {
+					return
+				}
+			}
+
+			if (attempt < maxAttempts) {
+				KeywordUtil.logInfo("Default database was not loaded yet. Refreshing Hue page.")
+				WebUI.refresh()
+				WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+				waitForPageToBeReady(DEFAULT_TIMEOUT)
+				waitForHueApplicationReady(DEFAULT_TIMEOUT)
+			}
+		}
+
+		KeywordUtil.markFailedAndStop("Hue opened, but the default database/tables were not loaded. This usually means the Hue backend/session/API did not load correctly in the automated Chrome session.")
+	}
+
+	private boolean clickEditorMenuIfAvailable() {
+		TestObject editorMenu = createXpathObject(
+			'Hue/editor_Menu',
+			"//*[normalize-space()='Editor' or contains(@href, '/hue/editor')]"
+		)
+
+		boolean editorVisible = isTestObjectVisible(editorMenu, 10)
+
+		if (!editorVisible) {
+			return false
+		}
+
+		WebUI.click(editorMenu)
+		return true
+	}
+
+	private boolean waitUntilUrlContains(String expectedValue, int timeoutInSeconds) {
+		for (int i = 0; i < timeoutInSeconds; i++) {
+			String currentUrl = WebUI.getUrl()
+			KeywordUtil.logInfo("Current URL: " + currentUrl)
+
+			if (currentUrl.contains(expectedValue)) {
+				return true
+			}
+
+			WebUI.delay(1)
+		}
+
+		return false
+	}
+
+	private String buildEditorUrl(String currentUrl) {
+		if (currentUrl.contains('/hue/home')) {
+			return currentUrl.replaceAll('/hue/home.*', '/hue/editor/')
+		}
+
+		if (currentUrl.contains('/hue/documents')) {
+			return currentUrl.replaceAll('/hue/documents.*', '/hue/editor/')
+		}
+
+		if (currentUrl.contains('/hue/')) {
+			return currentUrl.replaceAll('/hue/.*', '/hue/editor/')
+		}
+
+		if (GlobalVariable.DEV_URL.toString().contains('/hue/')) {
+			return GlobalVariable.DEV_URL.toString().replaceAll('/hue/.*', '/hue/editor/')
+		}
+
+		return GlobalVariable.DEV_URL.toString()
+	}
+
+	private void waitForPageToBeReady(int timeoutInSeconds) {
+		for (int i = 0; i < timeoutInSeconds; i++) {
+			try {
+				String readyState = WebUI.executeJavaScript('return document.readyState', null)
+
+				if (readyState == 'complete') {
+					return
+				}
+			} catch (Exception ignored) {
+				KeywordUtil.logInfo("Page ready state is not available yet")
+			}
+
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.logInfo("Page ready state did not become complete within timeout")
+	}
+
+	private boolean isObjectVisible(String objectPath, int timeoutInSeconds) {
+		try {
+			return WebUI.verifyElementVisible(
+				findTestObject(objectPath),
+				FailureHandling.OPTIONAL
+			)
+		} catch (Exception ignored) {
+			try {
+				return WebUI.verifyElementPresent(
+					findTestObject(objectPath),
+					timeoutInSeconds,
+					FailureHandling.OPTIONAL
+				)
+			} catch (Exception secondIgnored) {
+				return false
+			}
+		}
+	}
+
+	private boolean isTestObjectVisible(TestObject testObject, int timeoutInSeconds) {
+		try {
+			return WebUI.verifyElementPresent(
+				testObject,
+				timeoutInSeconds,
+				FailureHandling.OPTIONAL
+			)
+		} catch (Exception ignored) {
+			return false
+		}
+	}
+
+	private TestObject getHueApplicationMarker() {
+		return createXpathObject(
+			'Hue/application_Marker',
+			"//*[normalize-space()='Editor' or normalize-space()='Documents' or normalize-space()='Databases' or contains(normalize-space(.), 'My documents') or contains(normalize-space(.), 'Tables')]"
+		)
+	}
+
+	private TestObject createXpathObject(String objectName, String xpath) {
+		TestObject testObject = new TestObject(objectName)
+		testObject.addProperty('xpath', ConditionType.EQUALS, xpath)
+		return testObject
+	}
+}
