@@ -1,1 +1,688 @@
+package common
 
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
+import java.net.URLEncoder
+import java.util.Arrays
+
+import org.openqa.selenium.Keys
+import org.openqa.selenium.WebElement
+import org.openqa.selenium.interactions.Actions
+
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.ConditionType
+import com.kms.katalon.core.testobject.TestObject
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webui.driver.DriverFactory
+import com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords as WebUI
+
+import cucumber.api.java.en.And
+import cucumber.api.java.en.Given
+import cucumber.api.java.en.Then
+import cucumber.api.java.en.When
+import internal.GlobalVariable
+
+class Navigation {
+
+	private static final int DEFAULT_TIMEOUT = 60
+	private static final int SHORT_TIMEOUT = 10
+	private static final int SCREEN_READY_DELAY = 5
+	private static final int MAX_ATTEMPTS = 3
+
+	private static String currentDatabaseName = ''
+	private static String currentFileBrowserPath = ''
+
+	@Given("Hue home is opened")
+	def hueHomeIsOpenedStep() {
+		confirmHueHomePosition()
+	}
+
+	@When('^user searches for database "([^"]*)"$')
+	def userSearchesForDatabaseStep(String databaseName) {
+		searchDatabase(databaseName)
+	}
+
+	@When("user searches for the configured default database")
+	def userSearchesForConfiguredDefaultDatabaseStep() {
+		String databaseName = GlobalVariable.EXPECTED_DATABASE == null ? '' : GlobalVariable.EXPECTED_DATABASE.toString()
+		searchDatabase(databaseName)
+	}
+
+	@And("user selects database")
+	def userSelectsDatabaseStep() {
+		selectFirstDatabaseResult()
+	}
+
+	@And("user selects the first database result")
+	def userSelectsFirstDatabaseResultStep() {
+		selectFirstDatabaseResult()
+	}
+
+	@And('^user selects database "([^"]*)"$')
+	def userSelectsDatabaseWithTextStep(String databaseName) {
+		currentDatabaseName = normalizeDatabaseName(databaseName)
+		selectFirstDatabaseResult()
+	}
+
+	@Then("selected database title should be displayed")
+	def selectedDatabaseTitleShouldBeDisplayedStep() {
+		validateSelectedDatabaseTitle(currentDatabaseName)
+	}
+
+	@Then('^selected database title should be "([^"]*)"$')
+	def selectedDatabaseTitleShouldBeStep(String databaseName) {
+		validateSelectedDatabaseTitle(databaseName)
+	}
+
+	@Given('^database menu "([^"]*)" is selected$')
+	def databaseMenuIsSelectedStep(String databaseName) {
+		databaseName = normalizeDatabaseName(databaseName)
+
+		KeywordUtil.logInfo("Starting database menu flow for: " + databaseName)
+
+		confirmHueHomePosition()
+		searchDatabase(databaseName)
+		selectFirstDatabaseResult()
+		validateSelectedDatabaseTitle(databaseName)
+
+		KeywordUtil.logInfo("Database menu flow finished successfully for: " + databaseName)
+	}
+
+	@When("user opens Files from side menu")
+	def userOpensFilesFromSideMenuStep() {
+		openFilesFromSideMenu()
+	}
+
+	@And('^user opens file browser path "([^"]*)"$')
+	def userOpensFileBrowserPathStep(String fileBrowserPath) {
+		openFileBrowserPath(fileBrowserPath)
+	}
+
+	@Then("file browser files should be loaded")
+	def fileBrowserFilesShouldBeLoadedStep() {
+		waitUntilFileBrowserFilesAreLoaded()
+	}
+
+	@Given('^file browser path "([^"]*)" is opened$')
+	def fileBrowserPathIsOpenedStep(String fileBrowserPath) {
+		fileBrowserPath = normalizePath(fileBrowserPath)
+
+		KeywordUtil.logInfo("Starting File Browser flow for path: " + fileBrowserPath)
+
+		confirmHueHomePosition()
+		openFilesFromSideMenu()
+		openFileBrowserPath(fileBrowserPath)
+		waitUntilFileBrowserFilesAreLoaded()
+
+		KeywordUtil.logInfo("File Browser flow finished successfully for path: " + fileBrowserPath)
+	}
+
+	private void confirmHueHomePosition() {
+		KeywordUtil.logInfo("Waiting before checking Hue breadcrumb position")
+
+		WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+		WebUI.delay(SCREEN_READY_DELAY)
+
+		for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			KeywordUtil.logInfo("Checking breadcrumb position. Attempt: " + attempt + "/" + MAX_ATTEMPTS)
+
+			boolean defaultBreadcrumbVisible = isObjectPresent('BREADCRUMB_DEFAULT', SHORT_TIMEOUT)
+
+			if (defaultBreadcrumbVisible) {
+				KeywordUtil.logInfo("Default breadcrumb was found. Returning to Hive.")
+
+				clickBreadcrumbBack()
+
+				boolean hiveAfterBackVisible = isObjectPresent('BREADCRUMB_HIVE', DEFAULT_TIMEOUT)
+
+				if (hiveAfterBackVisible) {
+					KeywordUtil.logInfo("Hive breadcrumb was found after clicking back")
+					return
+				}
+
+				KeywordUtil.logInfo("Hive breadcrumb was not found after clicking back. Retrying.")
+				WebUI.delay(1)
+				continue
+			}
+
+			KeywordUtil.logInfo("Default breadcrumb was not found. Validating Hive breadcrumb.")
+
+			boolean hiveBreadcrumbVisible = isObjectPresent('BREADCRUMB_HIVE', SHORT_TIMEOUT)
+
+			if (hiveBreadcrumbVisible) {
+				KeywordUtil.logInfo("Hive breadcrumb is visible. Continuing test.")
+				return
+			}
+
+			KeywordUtil.logInfo("Hive breadcrumb was not found yet. Retrying.")
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.markFailedAndStop("Hue breadcrumb was not in default or Hive after " + MAX_ATTEMPTS + " attempts.")
+	}
+
+	private void clickBreadcrumbBack() {
+		TestObject breadcrumbBack = getNavigationObject('BREADCRUMB_BACK')
+
+		WebUI.waitForElementVisible(
+				breadcrumbBack,
+				DEFAULT_TIMEOUT,
+				FailureHandling.STOP_ON_FAILURE
+		)
+
+		try {
+			WebUI.waitForElementClickable(
+					breadcrumbBack,
+					SHORT_TIMEOUT,
+					FailureHandling.STOP_ON_FAILURE
+			)
+
+			WebUI.click(breadcrumbBack)
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Normal breadcrumb back click failed. Trying JavaScript click.")
+
+			WebUI.executeJavaScript(
+					"arguments[0].click();",
+					Arrays.asList(WebUI.findWebElement(breadcrumbBack, DEFAULT_TIMEOUT))
+			)
+		}
+
+		WebUI.delay(2)
+		WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+	}
+
+	private void searchDatabase(String databaseName) {
+		databaseName = normalizeDatabaseName(databaseName)
+		currentDatabaseName = databaseName
+
+		KeywordUtil.logInfo("Searching database: " + currentDatabaseName)
+
+		for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			KeywordUtil.logInfo("Search database attempt: " + attempt + "/" + MAX_ATTEMPTS)
+
+			WebElement searchInputElement = getDatabaseSearchInputElement()
+
+			boolean inputFilled = pasteDatabaseTextIntoInput(searchInputElement, currentDatabaseName)
+
+			if (!inputFilled) {
+				KeywordUtil.logInfo("Database input was not filled on attempt: " + attempt)
+				WebUI.delay(1)
+				continue
+			}
+
+			boolean resultVisible = isDatabaseResultVisible(currentDatabaseName, SHORT_TIMEOUT)
+
+			if (resultVisible) {
+				KeywordUtil.logInfo("Database search result was found: " + currentDatabaseName)
+				return
+			}
+
+			KeywordUtil.logInfo("Database search result was not found on attempt: " + attempt)
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.markFailedAndStop("Database search result was not found after " + MAX_ATTEMPTS + " attempts. Database: " + currentDatabaseName)
+	}
+
+	private boolean pasteDatabaseTextIntoInput(WebElement searchInputElement, String databaseName) {
+		KeywordUtil.logInfo("Clicking search input and pasting database text: " + databaseName)
+
+		searchInputElement.click()
+		WebUI.delay(1)
+
+		copyTextToClipboard(databaseName)
+
+		Actions actions = new Actions(DriverFactory.getWebDriver())
+
+		actions
+				.keyDown(Keys.CONTROL)
+				.sendKeys("a")
+				.keyUp(Keys.CONTROL)
+				.sendKeys(Keys.DELETE)
+				.perform()
+
+		WebUI.delay(1)
+
+		actions
+				.keyDown(Keys.CONTROL)
+				.sendKeys("v")
+				.keyUp(Keys.CONTROL)
+				.perform()
+
+		WebUI.delay(2)
+
+		String actualValue = getInputValue(searchInputElement)
+
+		if (actualValue.contains(databaseName)) {
+			KeywordUtil.logInfo("Database search input value after clipboard paste: " + actualValue)
+			return true
+		}
+
+		KeywordUtil.logInfo("Clipboard paste did not update input. Trying JavaScript paste event.")
+
+		WebUI.executeJavaScript(
+				"""
+				const input = arguments[0];
+				const value = arguments[1];
+
+				input.focus();
+
+				const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+
+				nativeInputValueSetter.call(input, '');
+				input.dispatchEvent(new Event('input', { bubbles: true }));
+				input.dispatchEvent(new Event('change', { bubbles: true }));
+
+				nativeInputValueSetter.call(input, value);
+				input.dispatchEvent(new Event('input', { bubbles: true }));
+				input.dispatchEvent(new Event('paste', { bubbles: true }));
+				input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'v' }));
+				input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'v' }));
+				input.dispatchEvent(new Event('change', { bubbles: true }));
+				""",
+				Arrays.asList(searchInputElement, databaseName)
+		)
+
+		WebUI.delay(2)
+
+		actualValue = getInputValue(searchInputElement)
+
+		if (actualValue.contains(databaseName)) {
+			KeywordUtil.logInfo("Database search input value after JavaScript paste: " + actualValue)
+			return true
+		}
+
+		KeywordUtil.logInfo("Database search input was not filled. Actual value: " + actualValue)
+		return false
+	}
+
+	private void selectFirstDatabaseResult() {
+		String databaseName = normalizeDatabaseName(currentDatabaseName)
+
+		KeywordUtil.logInfo("Selecting first database result for: " + databaseName)
+
+		for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			KeywordUtil.logInfo("Select database result attempt: " + attempt + "/" + MAX_ATTEMPTS)
+
+			TestObject databaseResult = getDatabaseResultObject(databaseName)
+
+			WebUI.waitForElementVisible(
+					databaseResult,
+					DEFAULT_TIMEOUT,
+					FailureHandling.STOP_ON_FAILURE
+			)
+
+			try {
+				WebUI.waitForElementClickable(
+						databaseResult,
+						SHORT_TIMEOUT,
+						FailureHandling.STOP_ON_FAILURE
+				)
+
+				WebUI.click(databaseResult)
+			} catch (Exception e) {
+				KeywordUtil.logInfo("Normal click failed. Trying JavaScript click.")
+
+				WebUI.executeJavaScript(
+						"arguments[0].click();",
+						Arrays.asList(WebUI.findWebElement(databaseResult, DEFAULT_TIMEOUT))
+				)
+			}
+
+			WebUI.delay(2)
+			WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+
+			if (isSelectedDatabaseTitleVisible(databaseName, SHORT_TIMEOUT)) {
+				KeywordUtil.logInfo("First database result was selected")
+				return
+			}
+
+			KeywordUtil.logInfo("Selected database breadcrumb was not visible after click. Retrying.")
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.markFailedAndStop("Database result was not selected after " + MAX_ATTEMPTS + " attempts. Database: " + databaseName)
+	}
+
+	private void validateSelectedDatabaseTitle(String databaseName) {
+		databaseName = normalizeDatabaseName(databaseName)
+		currentDatabaseName = databaseName
+
+		KeywordUtil.logInfo("Validating selected database breadcrumb")
+		KeywordUtil.logInfo("Expected database: " + databaseName)
+
+		TestObject selectedDatabaseTitle = getSelectedDatabaseTitleObject(databaseName)
+
+		WebUI.waitForElementVisible(
+				selectedDatabaseTitle,
+				DEFAULT_TIMEOUT,
+				FailureHandling.STOP_ON_FAILURE
+		)
+
+		String actualTitle = WebUI.getAttribute(selectedDatabaseTitle, 'title')
+
+		if (actualTitle == null || actualTitle.trim().length() == 0) {
+			actualTitle = WebUI.getText(selectedDatabaseTitle)
+		}
+
+		actualTitle = actualTitle == null ? '' : actualTitle.trim()
+
+		KeywordUtil.logInfo("Actual selected database title: " + actualTitle)
+
+		if (!actualTitle.contains(databaseName)) {
+			KeywordUtil.markFailedAndStop(
+					"Wrong selected database. Expected: " + databaseName + " | Actual: " + actualTitle
+			)
+		}
+
+		KeywordUtil.logInfo("Selected database breadcrumb was validated successfully")
+	}
+
+	private void openFilesFromSideMenu() {
+		KeywordUtil.logInfo("Opening Files from side menu")
+
+		TestObject sideMenuFiles = getNavigationObject('SIDE_MENU_FILES')
+
+		WebUI.waitForElementVisible(
+				sideMenuFiles,
+				DEFAULT_TIMEOUT,
+				FailureHandling.STOP_ON_FAILURE
+		)
+
+		try {
+			WebUI.waitForElementClickable(
+					sideMenuFiles,
+					SHORT_TIMEOUT,
+					FailureHandling.STOP_ON_FAILURE
+			)
+
+			WebUI.click(sideMenuFiles)
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Normal Files menu click failed. Trying JavaScript click.")
+
+			WebUI.executeJavaScript(
+					"arguments[0].click();",
+					Arrays.asList(WebUI.findWebElement(sideMenuFiles, DEFAULT_TIMEOUT))
+			)
+		}
+
+		WebUI.delay(2)
+		WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+
+		waitUntilFileBrowserIsOpened()
+	}
+
+	private void waitUntilFileBrowserIsOpened() {
+		KeywordUtil.logInfo("Waiting until File Browser is opened")
+
+		for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			KeywordUtil.logInfo("File Browser validation attempt: " + attempt + "/" + MAX_ATTEMPTS)
+
+			boolean fileBrowserTitleVisible = isObjectPresent('FILE_BROWSER_TITLE', SHORT_TIMEOUT)
+
+			if (fileBrowserTitleVisible) {
+				KeywordUtil.logInfo("File Browser title is visible")
+				return
+			}
+
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.markFailedAndStop("File Browser was not opened after clicking Files menu.")
+	}
+
+	private void openFileBrowserPath(String fileBrowserPath) {
+		fileBrowserPath = normalizePath(fileBrowserPath)
+		currentFileBrowserPath = fileBrowserPath
+
+		KeywordUtil.logInfo("Opening File Browser path by changing current URL: " + currentFileBrowserPath)
+
+		for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			KeywordUtil.logInfo("Open File Browser path by URL attempt: " + attempt + "/" + MAX_ATTEMPTS)
+
+			boolean urlChanged = openFileBrowserPathByCurrentUrl(currentFileBrowserPath)
+
+			if (urlChanged) {
+				KeywordUtil.logInfo("File Browser path was opened by URL: " + currentFileBrowserPath)
+				return
+			}
+
+			KeywordUtil.logInfo("File Browser URL was not changed correctly on attempt: " + attempt)
+			WebUI.delay(2)
+		}
+
+		KeywordUtil.markFailedAndStop("File Browser path was not opened after " + MAX_ATTEMPTS + " attempts. Path: " + currentFileBrowserPath)
+	}
+
+	private boolean openFileBrowserPathByCurrentUrl(String fileBrowserPath) {
+		KeywordUtil.logInfo("Changing current File Browser URL to path: " + fileBrowserPath)
+
+		String currentUrl = WebUI.getUrl()
+		KeywordUtil.logInfo("Current URL before change: " + currentUrl)
+
+		String encodedPath = URLEncoder.encode(fileBrowserPath, "UTF-8").replace("+", "%20")
+		String targetUrl = buildFileBrowserUrl(currentUrl, encodedPath)
+
+		KeywordUtil.logInfo("Target URL: " + targetUrl)
+
+		WebUI.navigateToUrl(targetUrl)
+		WebUI.waitForPageLoad(DEFAULT_TIMEOUT)
+		WebUI.delay(15)
+
+		String urlAfterChange = WebUI.getUrl()
+		KeywordUtil.logInfo("Current URL after change: " + urlAfterChange)
+
+		boolean encodedPathIsInUrl = urlAfterChange.contains(encodedPath)
+		boolean decodedPathIsInUrl = urlAfterChange.contains(fileBrowserPath)
+
+		if (!encodedPathIsInUrl && !decodedPathIsInUrl) {
+			KeywordUtil.logInfo("File Browser URL was not changed correctly. Expected encoded path: " + encodedPath + " | Actual URL: " + urlAfterChange)
+			return false
+		}
+
+		KeywordUtil.logInfo("File Browser URL was changed successfully")
+		return true
+	}
+
+	private String buildFileBrowserUrl(String currentUrl, String encodedPath) {
+		if (currentUrl != null && currentUrl.contains('/filebrowser/view=')) {
+			String baseCurrentUrl = currentUrl.substring(0, currentUrl.indexOf('/filebrowser/view='))
+			return baseCurrentUrl + '/filebrowser/view=' + encodedPath
+		}
+
+		String baseUrl = GlobalVariable.DEV_URL == null ? '' : GlobalVariable.DEV_URL.toString().trim()
+
+		if (baseUrl.length() == 0) {
+			KeywordUtil.markFailedAndStop("GlobalVariable.DEV_URL is empty")
+		}
+
+		if (baseUrl.endsWith('/')) {
+			baseUrl = baseUrl.substring(0, baseUrl.length() - 1)
+		}
+
+		if (baseUrl.contains('/hue/hue/editor')) {
+			baseUrl = baseUrl.substring(0, baseUrl.indexOf('/hue/hue/editor')) + '/hue/hue'
+		} else if (baseUrl.contains('/hue/editor')) {
+			baseUrl = baseUrl.substring(0, baseUrl.indexOf('/hue/editor')) + '/hue'
+		} else if (baseUrl.contains('/hue/hue/')) {
+			baseUrl = baseUrl.substring(0, baseUrl.indexOf('/hue/hue/')) + '/hue/hue'
+		} else if (baseUrl.endsWith('/hue/hue')) {
+			baseUrl = baseUrl
+		} else if (baseUrl.endsWith('/hue')) {
+			baseUrl = baseUrl + '/hue'
+		} else {
+			baseUrl = baseUrl + '/hue/hue'
+		}
+
+		return baseUrl + '/filebrowser/view=' + encodedPath
+	}
+
+	private void waitUntilFileBrowserFilesAreLoaded() {
+		KeywordUtil.logInfo("Waiting until File Browser files are loaded")
+
+		for (int attempt = 1; attempt <= DEFAULT_TIMEOUT; attempt++) {
+			boolean fileBrowserTitleVisible = isObjectPresent('FILE_BROWSER_TITLE', 1)
+			boolean fileRowVisible = isFileBrowserAnyRowPresent(1)
+
+			if (fileBrowserTitleVisible && fileRowVisible) {
+				KeywordUtil.logInfo("File Browser files were loaded")
+				return
+			}
+
+			WebUI.delay(1)
+		}
+
+		KeywordUtil.markFailedAndStop("File Browser files were not loaded after " + DEFAULT_TIMEOUT + " seconds.")
+	}
+
+	private boolean isFileBrowserAnyRowPresent(int timeoutInSeconds) {
+		try {
+			TestObject fileRow = new TestObject('Dynamic_Navigation_FileBrowserAnyFileRow')
+
+			fileRow.addProperty(
+					'xpath',
+					ConditionType.EQUALS,
+					"(//table//tr[.//td and not(contains(normalize-space(.),'No matching'))])[1]"
+			)
+
+			return WebUI.verifyElementPresent(
+					fileRow,
+					timeoutInSeconds,
+					FailureHandling.OPTIONAL
+			)
+		} catch (Exception ignored) {
+			return false
+		}
+	}
+
+	private WebElement getDatabaseSearchInputElement() {
+		TestObject searchInput = getNavigationObject('DATABASE_SEARCH')
+
+		try {
+			return WebUI.findWebElement(searchInput, SHORT_TIMEOUT)
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Object Repository input was not found. Trying fallback XPath.")
+
+			return WebUI.findWebElement(getFallbackDatabaseSearchInputObject(), DEFAULT_TIMEOUT)
+		}
+	}
+
+	private TestObject getFallbackDatabaseSearchInputObject() {
+		TestObject fallbackInput = new TestObject('Dynamic_Navigation_InputDatabaseSearch')
+
+		fallbackInput.addProperty(
+				'xpath',
+				ConditionType.EQUALS,
+				"//input[contains(@placeholder,'Filter')]"
+		)
+
+		return fallbackInput
+	}
+
+	private boolean isDatabaseResultVisible(String databaseName, int timeoutInSeconds) {
+		try {
+			TestObject databaseResult = getDatabaseResultObject(databaseName)
+
+			return WebUI.verifyElementPresent(
+					databaseResult,
+					timeoutInSeconds,
+					FailureHandling.OPTIONAL
+			)
+		} catch (Exception ignored) {
+			return false
+		}
+	}
+
+	private boolean isSelectedDatabaseTitleVisible(String databaseName, int timeoutInSeconds) {
+		try {
+			TestObject selectedDatabaseTitle = getSelectedDatabaseTitleObject(databaseName)
+
+			return WebUI.verifyElementPresent(
+					selectedDatabaseTitle,
+					timeoutInSeconds,
+					FailureHandling.OPTIONAL
+			)
+		} catch (Exception ignored) {
+			return false
+		}
+	}
+
+	private TestObject getDatabaseResultObject(String databaseName) {
+		try {
+			return HueObjectRepository.navigation('DATABASE_RESULT', [('databaseName') : databaseName])
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop("Object Repository item was not found: DATABASE_RESULT")
+			return null
+		}
+	}
+
+	private TestObject getSelectedDatabaseTitleObject(String databaseName) {
+		try {
+			return HueObjectRepository.navigation('SELECTED_DATABASE_TITLE', [('databaseName') : databaseName])
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop("Object Repository item was not found: SELECTED_DATABASE_TITLE")
+			return null
+		}
+	}
+
+	private TestObject getNavigationObject(String objectKey) {
+		try {
+			return HueObjectRepository.navigation(objectKey)
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop("Object Repository item was not found for key: " + objectKey)
+			return null
+		}
+	}
+
+	private boolean isObjectPresent(String objectKey, int timeoutInSeconds) {
+		try {
+			TestObject testObject = getNavigationObject(objectKey)
+
+			if (testObject == null) {
+				return false
+			}
+
+			return WebUI.verifyElementPresent(
+					testObject,
+					timeoutInSeconds,
+					FailureHandling.OPTIONAL
+			)
+		} catch (Exception ignored) {
+			return false
+		}
+	}
+
+	private String getInputValue(WebElement inputElement) {
+		try {
+			String value = inputElement.getAttribute('value')
+			return value == null ? '' : value.trim()
+		} catch (Exception ignored) {
+			return ''
+		}
+	}
+
+	private void copyTextToClipboard(String text) {
+		StringSelection stringSelection = new StringSelection(text)
+		Toolkit.getDefaultToolkit().getSystemClipboard().setContents(stringSelection, null)
+	}
+
+	private String normalizeDatabaseName(String databaseName) {
+		String normalizedDatabaseName = databaseName == null ? '' : databaseName.trim()
+
+		if (normalizedDatabaseName.length() == 0) {
+			KeywordUtil.markFailedAndStop("Database name is empty")
+		}
+
+		return normalizedDatabaseName
+	}
+
+	private String normalizePath(String path) {
+		String normalizedPath = path == null ? '' : path.trim()
+
+		if (normalizedPath.length() == 0) {
+			KeywordUtil.markFailedAndStop("File Browser path is empty")
+		}
+
+		return normalizedPath
+	}
+}
