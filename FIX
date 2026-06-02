@@ -1,526 +1,76 @@
-package jiraIntegration
-
-import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
-
-import java.io.File
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-import java.util.ArrayList
-import java.util.List
-
-import com.kms.katalon.core.testobject.ConditionType
-import com.kms.katalon.core.testobject.FormDataBodyParameter
-import com.kms.katalon.core.testobject.RequestObject
-import com.kms.katalon.core.testobject.ResponseObject
-import com.kms.katalon.core.testobject.RestRequestObjectBuilder
-import com.kms.katalon.core.testobject.TestObjectProperty
-import com.kms.katalon.core.testobject.impl.HttpTextBodyContent
-import com.kms.katalon.core.util.KeywordUtil
-import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
-
-import groovy.json.JsonBuilder
-import groovy.json.JsonSlurper
-import internal.GlobalVariable
-
-class JiraGateway {
-
-	JiraFlowCoordinator owner
-	JsonSlurper jsonSlurper = new JsonSlurper()
-
-	JiraGateway(JiraFlowCoordinator owner) {
-		this.owner = owner
-	}
-
-	void validateRequiredConfiguration() {
-		List<String> missing = []
-
-		if (owner.isBlank(resolveToken())) {
-			missing << 'JIRA token'
-		}
-		if (owner.isBlank(owner.PROJECT_KEY)) {
-			missing << 'PROJECT_KEY'
-		}
-		if (owner.isBlank(owner.JIRA_BASE_URL)) {
-			missing << 'JIRA_BASE_URL'
-		}
-
-		if (!missing.isEmpty()) {
-			KeywordUtil.markFailedAndStop('Missing Jira configuration: ' + missing.join(', '))
-		}
-	}
-
-	String importExecutionResults(String xmlPath) {
-		if (owner.isBlank(xmlPath)) {
-			return 'ERROR: XML path is empty'
-		}
-
-		File xmlFile = new File(xmlPath)
-		if (!xmlFile.exists() || !xmlFile.isFile() || xmlFile.length() <= 0) {
-			return 'ERROR: XML file not found or empty'
-		}
-
-		try {
-			ResponseObject response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
-				('filePath') : xmlPath,
-				('project')  : owner.PROJECT_KEY,
-				('baseUrl')  : owner.JIRA_BASE_URL,
-				('token')    : resolveToken()
-			]))
-
-			int status = response.getStatusCode()
-			String body = safeBody(response)
-
-			KeywordUtil.logInfo("Import Results status: ${status}")
-			KeywordUtil.logInfo("Import Results response: ${body}")
-
-			if (status < 200 || status >= 300) {
-				return "ERROR: import execution failed with status ${status}"
-			}
-
-			def parsed = parseJson(body)
-			String key = owner.safe(parsed?.testExecIssue?.key)
-
-			if (owner.isBlank(key)) {
-				return 'ERROR: execution key not found in import response'
-			}
-
-			return key
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Import Results request failed: ${e.message}")
-			return "ERROR: import execution request failed - ${e.message}"
-		}
-	}
-
-	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
-		if (owner.isBlank(testPlanKey) || owner.isBlank(executionKey)) {
-			return 0
-		}
-
-		Map payload = [
-			add: [executionKey]
-		]
-
-		RequestObject request = new RequestObject('Runtime Add Execution To Test Plan')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/raven/2.0/api/testplan/' + encode(testPlanKey) + '/testexecution')
-		request.setRestRequestMethod('POST')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody(payload))
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-
-		KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
-		KeywordUtil.logInfo("Add execution to Test Plan response: ${safeBody(response)}")
-
-		return status
-	}
-
-	int updateTestExecution(String issueKey, String summary, String labels, String environment) {
-		if (owner.isBlank(issueKey)) {
-			return 0
-		}
-
-		List<String> labelList = []
-		if (!owner.isBlank(labels)) {
-			def flowRef = owner
-			labelList = labels
-					.split(',')
-					.collect { item -> flowRef.safe(item) }
-					.findAll { item -> !flowRef.isBlank(item) }
-		}
-
-		Map fields = [
-			summary: owner.safe(summary),
-			labels : labelList
-		]
-
-		if (!owner.isBlank(environment)) {
-			fields.environment = owner.safe(environment)
-		}
-
-		RequestObject request = new RequestObject('Runtime Update Test Execution')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey))
-		request.setRestRequestMethod('PUT')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody([fields: fields]))
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-
-		KeywordUtil.logInfo("Update Test Execution status: ${status}")
-		KeywordUtil.logInfo("Update Test Execution response: ${safeBody(response)}")
-
-		return status
-	}
-
-	int uploadAttachment(String issueKey, String filePath) {
-		if (owner.isBlank(issueKey) || owner.isBlank(filePath)) {
-			KeywordUtil.logInfo("Skipping attachment upload because issue key or file path is empty.")
-			return 0
-		}
-
-		File file = new File(filePath)
-		if (!file.exists() || !file.isFile() || file.length() <= 0) {
-			KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
-			return 0
-		}
-
-		try {
-			KeywordUtil.logInfo("Uploading attachment using Katalon multipart builder: ${file.absolutePath}")
-			KeywordUtil.logInfo("Attachment target issue: ${issueKey}")
-			KeywordUtil.logInfo("Attachment file name: ${file.name}")
-			KeywordUtil.logInfo("Attachment size bytes: ${file.length()}")
-
-			List<FormDataBodyParameter> parameters = new ArrayList<FormDataBodyParameter>()
-			parameters.add(new FormDataBodyParameter(
-					'file',
-					file.absolutePath,
-					FormDataBodyParameter.PARAM_TYPE_FILE,
-					resolveContentType(file.name)
-					))
-
-			RequestObject request = new RestRequestObjectBuilder()
-					.withRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey) + '/attachments')
-					.withRestRequestMethod('POST')
-					.withHttpHeaders(attachmentHeaders())
-					.withMultipartFormDataBodyContent(parameters)
-					.build()
-
-			ResponseObject response = WS.sendRequest(request)
-
-			int status = response.getStatusCode()
-			String body = safeBody(response)
-
-			KeywordUtil.logInfo("Upload attachment status (${filePath}): ${status}")
-			KeywordUtil.logInfo("Upload attachment response: ${body}")
-
-			return status
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Upload attachment request failed: ${e.message}")
-			return 0
-		}
-	}
-
-	String createTestPlan(String summary, String epicKey) {
-		String epicFieldId = resolveEpicFieldId()
-
-		Map fields = [
-			project  : [key: owner.PROJECT_KEY],
-			summary  : owner.safe(summary),
-			issuetype: [name: 'Test Plan']
-		]
-
-		if (!owner.isBlank(epicKey) && !owner.isBlank(epicFieldId)) {
-			fields[epicFieldId] = owner.safe(epicKey)
-		}
-
-		RequestObject request = new RequestObject('Runtime Create Test Plan')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue')
-		request.setRestRequestMethod('POST')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody([fields: fields]))
-
-		ResponseObject response = WS.sendRequest(request)
-
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Create Test Plan status: ${status}")
-		KeywordUtil.logInfo("Create Test Plan response: ${body}")
-
-		if (status < 200 || status >= 300) {
-			return "ERROR: create test plan failed with status ${status}"
-		}
-
-		def parsed = parseJson(body)
-		String key = owner.safe(parsed?.key)
-
-		if (owner.isBlank(key)) {
-			return 'ERROR: created Test Plan key not found in response'
-		}
-
-		return key
-	}
-
-	Map searchTestPlans(String summary, String epicKey) {
-		String jql =
-				'project = "' + owner.PROJECT_KEY + '" ' +
-				'AND issuetype = "Test Plan" ' +
-				'ORDER BY created DESC'
-
-		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
-		KeywordUtil.logInfo("Expected Test Plan summary: ${summary}")
-		KeywordUtil.logInfo("Expected Epic key: ${epicKey}")
-
-		String url =
-				owner.JIRA_BASE_URL +
-				'/rest/api/2/search' +
-				'?jql=' + encode(jql) +
-				'&maxResults=200' +
-				'&fields=' + encode(buildTestPlanReadFields())
-
-		RequestObject request = new RequestObject('Runtime Search Test Plan')
-		request.setRestUrl(url)
-		request.setRestRequestMethod('GET')
-		request.setHttpHeaderProperties(defaultGetHeaders())
-
-		ResponseObject response = WS.sendRequest(request)
-
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Get Test Plan status: ${status}")
-		KeywordUtil.logInfo("Get Test Plan response: ${body}")
-
-		def parsed = parseJson(body)
-
-		return [
-			statusCode: status,
-			body      : body,
-			issues    : parsed?.issues instanceof List ? parsed.issues : []
-		]
-	}
-
-	Map getIssueByKey(String issueKey) {
-		if (owner.isBlank(issueKey)) {
-			return [statusCode: 0, issue: null, body: '']
-		}
-
-		String url =
-				owner.JIRA_BASE_URL +
-				'/rest/api/2/issue/' + encode(issueKey) +
-				'?fields=' + encode(buildTestPlanReadFields())
-
-		RequestObject request = new RequestObject('Runtime Get Issue By Key')
-		request.setRestUrl(url)
-		request.setRestRequestMethod('GET')
-		request.setHttpHeaderProperties(defaultGetHeaders())
-
-		ResponseObject response = WS.sendRequest(request)
-
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Get Issue By Key status: ${status}")
-		KeywordUtil.logInfo("Get Issue By Key response: ${body}")
-
-		def parsed = parseJson(body)
-
-		return [
-			statusCode: status,
-			body      : body,
-			issue     : parsed
-		]
-	}
-
-	boolean isIssueLinkedToEpic(String issueKey, String expectedEpicKey) {
-		if (owner.isBlank(expectedEpicKey)) {
-			return true
-		}
-
-		if (owner.isBlank(issueKey)) {
-			return false
-		}
-
-		Map result = getIssueByKey(issueKey)
-		int statusCode = (result?.statusCode ?: 0) as int
-
-		if (statusCode != 200) {
-			KeywordUtil.logInfo("Could not validate Epic link for issue ${issueKey}. Status: ${statusCode}")
-			return false
-		}
-
-		return isIssueDataLinkedToEpic(result?.issue, expectedEpicKey)
-	}
-
-	boolean isIssueDataLinkedToEpic(def issue, String expectedEpicKey) {
-		if (owner.isBlank(expectedEpicKey)) {
-			return true
-		}
-
-		String issueKey = owner.safe(issue?.key)
-		String actualEpicKey = resolveIssueEpicKey(issue)
-
-		if (owner.safe(actualEpicKey).equalsIgnoreCase(owner.safe(expectedEpicKey))) {
-			KeywordUtil.logInfo("Issue ${issueKey} is linked to expected Epic: ${expectedEpicKey}")
-			return true
-		}
-
-		KeywordUtil.logInfo("Issue ${issueKey} is not linked to expected Epic. Expected: ${expectedEpicKey} | Actual: ${owner.isBlank(actualEpicKey) ? 'EMPTY' : actualEpicKey}")
-		return false
-	}
-
-	private String resolveIssueEpicKey(def issue) {
-		try {
-			def fields = issue?.fields
-			if (fields == null) {
-				return ''
-			}
-
-			String epicFieldId = resolveEpicFieldId()
-			def epicFieldValue = fields[epicFieldId]
-			String epicFromCustomField = extractIssueKeyFromValue(epicFieldValue)
-
-			if (!owner.isBlank(epicFromCustomField)) {
-				return epicFromCustomField
-			}
-
-			def parent = fields?.parent
-			String parentKey = owner.safe(parent?.key)
-
-			if (!owner.isBlank(parentKey)) {
-				return parentKey
-			}
-
-			def epic = fields?.epic
-			String epicKey = extractIssueKeyFromValue(epic)
-
-			if (!owner.isBlank(epicKey)) {
-				return epicKey
-			}
-
-			return ''
-		} catch (Exception ignored) {
-			return ''
-		}
-	}
-
-	private String extractIssueKeyFromValue(def value) {
-		if (value == null) {
-			return ''
-		}
-
-		if (value instanceof Map) {
-			String keyValue = owner.safe(value?.key)
-			if (!owner.isBlank(keyValue)) {
-				return keyValue
-			}
-
-			String valueField = owner.safe(value?.value)
-			if (!owner.isBlank(valueField)) {
-				return valueField
-			}
-
-			String nameField = owner.safe(value?.name)
-			if (!owner.isBlank(nameField)) {
-				return nameField
-			}
-
-			return ''
-		}
-
-		if (value instanceof Collection) {
-			for (def item : value) {
-				String extracted = extractIssueKeyFromValue(item)
-				if (!owner.isBlank(extracted)) {
-					return extracted
-				}
-			}
-
-			return ''
-		}
-
-		return owner.safe(value)
-	}
-
-	private String buildTestPlanReadFields() {
-		return 'summary,created,issuetype,' + resolveEpicFieldId() + ',parent'
-	}
-
-	private String resolveContentType(String fileName) {
-		String lower = owner.safe(fileName).toLowerCase()
-
-		if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'text/html'
-		if (lower.endsWith('.zip')) return 'application/zip'
-		if (lower.endsWith('.xml')) return 'application/xml'
-		if (lower.endsWith('.json')) return 'application/json'
-		if (lower.endsWith('.png')) return 'image/png'
-		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
-		if (lower.endsWith('.gif')) return 'image/gif'
-		if (lower.endsWith('.webp')) return 'image/webp'
-		if (lower.endsWith('.bmp')) return 'image/bmp'
-		if (lower.endsWith('.txt') || lower.endsWith('.log')) return 'text/plain'
-
-		return 'application/octet-stream'
-	}
-
-	private String resolveToken() {
-		try {
-			def direct = GlobalVariable.JIRA_TOKEN
-			if (!owner.isBlank(direct)) {
-				return owner.safe(direct)
-			}
-		} catch (Exception ignored) {
-		}
-
-		try {
-			def fallback = GlobalVariable.token
-			if (!owner.isBlank(fallback)) {
-				return owner.safe(fallback)
-			}
-		} catch (Exception ignored) {
-		}
-
-		return owner.safe(owner.JIRA_TOKEN)
-	}
-
-	private String resolveEpicFieldId() {
-		return 'customfield_10006'
-	}
-
-	private List<TestObjectProperty> defaultGetHeaders() {
-		return [
-			header('Authorization', 'Bearer ' + resolveToken()),
-			header('Accept', 'application/json')
-		]
-	}
-
-	private List<TestObjectProperty> attachmentHeaders() {
-		return [
-			header('Authorization', 'Bearer ' + resolveToken()),
-			header('Accept', 'application/json'),
-			header('X-Atlassian-Token', 'no-check')
-		]
-	}
-
-	private List<TestObjectProperty> jsonHeaders() {
-		return [
-			header('Authorization', 'Bearer ' + resolveToken()),
-			header('Accept', 'application/json'),
-			header('Content-Type', 'application/json')
-		]
-	}
-
-	private TestObjectProperty header(String name, String value) {
-		return new TestObjectProperty(name, ConditionType.EQUALS, value)
-	}
-
-	private HttpTextBodyContent jsonBody(Object payload) {
-		String text = new JsonBuilder(payload).toString()
-		return new HttpTextBodyContent(text, 'UTF-8', 'application/json')
-	}
-
-	private Object parseJson(String body) {
-		if (owner.isBlank(body)) {
-			return [:]
-		}
-
-		try {
-			return jsonSlurper.parseText(body)
-		} catch (Exception ignored) {
-			return [:]
-		}
-	}
-
-	private String safeBody(ResponseObject response) {
-		try {
-			return owner.safe(response?.getResponseBodyContent())
-		} catch (Exception ignored) {
-			return ''
-		}
-	}
-
-	private String encode(String value) {
-		return URLEncoder.encode(owner.safe(value), StandardCharsets.UTF_8.toString())
-	}
-}
+1 -
+jiraIntegration.JiraIntegration.jiraImport("L96B2C-8234")
+6.667s
+============================================================
+Starting Jira import flow
+============================================================
+Using report folder: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829
+Suite name detected from report path: Connection
+Execution title used: Connection 2026-06-02 11.38.47
+Test Plan title used: Connection Test Plan
+XML file found: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\cucumber_report\1780396714174\cucumber.xml
+Failure images found: 0
+HTML report created: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\ZimReport.html
+HAR: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\requests\main\null_0.har
+cURL Command: curl \ --location \ --header 'Authorization: Bearer NDc2MDkyMTEwMDk3OlfPJNqcMkCEAEYDQBp8G7/DuaQa' \ --header 'Accept: application/json' \ 'https://jira-mut.d.bbg/rest/api/2/issue/L96B2C-8671?fields=summary%2Ccreated%2Cissuetype%2Ccustomfield_10006%2Cparent'
+Get Issue By Key status: 200
+Get Issue By Key response: {"expand":"renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations","id":"2845442","self":"https://jira-mut.d.bbg/rest/api/2/issue/2845442","key":"L96B2C-8671","fields":{"summary":"Connection Test Plan","issuetype":{"self":"https://jira-mut.d.bbg/rest/api/2/issuetype/10604","id":"10604","description":"Represents a Test Plan","iconUrl":"https://jira-mut.d.bbg/download/resources/com.xpandit.plugins.xray/images/test-plan.png","name":"Test Plan","subtask":false},"customfield_10006":"L96B2C-8234","created":"2026-06-02T12:10:15.000+0200"},"renderedFields":null}
+Issue L96B2C-8671 is linked to expected Epic: L96B2C-8234
+Using saved Test Plan key for suite Connection: L96B2C-8671
+HAR: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\requests\main\Import-Results_1.har
+cURL Command: curl \ --location \ --request POST \ --header 'Content-Type: multipart/form-data' \ --header 'Authorization: Bearer NDc2MDkyMTEwMDk3OlfPJNqcMkCEAEYDQBp8G7/DuaQa' \ 'https://jira-mut.d.bbg/rest/raven/1.0/import/execution/junit?projectKey=L96B2C'
+Import Results status: 200
+Import Results response: {"testExecIssue":{"id":"2845454","key":"L96B2C-8673","self":"https://jira-mut.d.bbg/rest/api/2/issue/2845454"},"infoMessages":["Could not make transition from workflow status <b>New</b> to workflow status <b>Done</b>."],"testIssues":{"success":[{"id":"2844278","key":"L96B2C-8667","self":"https://jira-mut.d.bbg/rest/api/2/issue/2844278","testVersionId":286196}]}}
+HAR: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\requests\main\null_2.har
+cURL Command: curl \ --location \ --request POST \ --data '{"add":["L96B2C-8673"]}' \ --header 'Authorization: Bearer NDc2MDkyMTEwMDk3OlfPJNqcMkCEAEYDQBp8G7/DuaQa' \ --header 'Accept: application/json' \ --header 'Content-Type: application/json' \ 'https://jira-mut.d.bbg/rest/raven/2.0/api/testplan/L96B2C-8671/testexecution'
+Add execution to Test Plan status: 200
+Add execution to Test Plan response: []
+HAR: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\requests\main\null_3.har
+cURL Command: curl \ --location \ --request PUT \ --data '{"fields":{"summary":"Connection 2026-06-02 11.38.47","labels":["automate"],"environment":"REC"}}' \ --header 'Authorization: Bearer NDc2MDkyMTEwMDk3OlfPJNqcMkCEAEYDQBp8G7/DuaQa' \ --header 'Accept: application/json' \ --header 'Content-Type: application/json' \ 'https://jira-mut.d.bbg/rest/api/2/issue/L96B2C-8673'
+Update Test Execution status: 204
+Update Test Execution response:
+Evidence ZIP skipped. Folder not found: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\evidence
+Adding file to ZIP: console0.log
+Adding file to ZIP: cucumber_report/1780396714174/cucumber.json
+Adding file to ZIP: cucumber_report/1780396714174/cucumber.xml
+Adding file to ZIP: cucumber_report/1780396714174/html/formatter.js
+Adding file to ZIP: cucumber_report/1780396714174/html/index.html
+Adding file to ZIP: cucumber_report/1780396714174/html/jquery-1.8.2.min.js
+Adding file to ZIP: cucumber_report/1780396714174/html/report.js
+Adding file to ZIP: cucumber_report/1780396714174/html/style.css
+Adding file to ZIP: cucumber_report/1780396714174/k-cucumber.json
+Adding file to ZIP: execution.properties
+Adding file to ZIP: execution0.log
+Adding file to ZIP: testCaseBinding
+Report ZIP created successfully: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\Results.zip
+Uploading HTML report attachment: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\ZimReport.html
+Uploading attachment using Katalon multipart builder: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\ZimReport.html
+Attachment target issue: L96B2C-8673
+Attachment file name: ZimReport.html
+Attachment size bytes: 16979
+HAR: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\requests\main\null_4.har
+cURL Command: curl \ --location \ --request POST \ --header 'Authorization: Bearer NDc2MDkyMTEwMDk3OlfPJNqcMkCEAEYDQBp8G7/DuaQa' \ --header 'Accept: application/json' \ --header 'X-Atlassian-Token: no-check' \ 'https://jira-mut.d.bbg/rest/api/2/issue/L96B2C-8673/attachments'
+Upload attachment status (C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\ZimReport.html): 415
+Upload attachment response: {"message":"HTTP 415 Unsupported Media Type","status-code":415}
+Evidences ZIP attachment skipped.
+Uploading Results ZIP attachment: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\Results.zip
+Uploading attachment using Katalon multipart builder: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\Results.zip
+Attachment target issue: L96B2C-8673
+Attachment file name: Results.zip
+Attachment size bytes: 53997
+HAR: C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\requests\main\null_5.har
+cURL Command: curl \ --location \ --request POST \ --header 'Authorization: Bearer NDc2MDkyMTEwMDk3OlfPJNqcMkCEAEYDQBp8G7/DuaQa' \ --header 'Accept: application/json' \ --header 'X-Atlassian-Token: no-check' \ 'https://jira-mut.d.bbg/rest/api/2/issue/L96B2C-8673/attachments'
+Upload attachment status (C:\Users\BGS32GG\workspace\zimProject\Reports\20260602_113829\Connection\Connection\20260602_113829\Results.zip): 415
+Upload attachment response: {"message":"HTTP 415 Unsupported Media Type","status-code":415}
+============================================================
+Jira import finished
+============================================================
+Execution key: L96B2C-8673
+Execution title used: Connection 2026-06-02 11.38.47
+Test Plan key: L96B2C-8671
+Test Plan title used: Connection Test Plan
+HTML report attachment status: 415
+Evidences.zip attachment status: 0
+Results.zip attachment status: 415
+Add execution to Test Plan status: 200
+Update Test Execution status: 204
