@@ -1,639 +1,1250 @@
-
 package jiraIntegration
 
-import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+import java.util.Locale
 
-import java.io.DataOutputStream
-import java.io.File
-import java.io.FileInputStream
-import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
-import java.util.List
+class JiraHtmlTemplateBuilder {
 
-import javax.net.ssl.HostnameVerifier
-import javax.net.ssl.HttpsURLConnection
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLSession
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
+	String build(Map model) {
+		Map summary = model?.summary instanceof Map ? model.summary as Map : [:]
+		List<Map> scenarios = model?.scenarios instanceof List ? model.scenarios as List<Map> : []
 
-import com.kms.katalon.core.testobject.RequestObject
-import com.kms.katalon.core.testobject.ResponseObject
-import com.kms.katalon.core.testobject.TestObjectProperty
-import com.kms.katalon.core.testobject.ConditionType
-import com.kms.katalon.core.testobject.impl.HttpTextBodyContent
-import com.kms.katalon.core.util.KeywordUtil
-import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+		StringBuilder html = new StringBuilder()
 
-import groovy.json.JsonBuilder
-import groovy.json.JsonSlurper
-import internal.GlobalVariable
+		html << '<!DOCTYPE html>'
+		html << '<html lang="en">'
+		html << '<head>'
+		html << '<meta charset="UTF-8">'
+		html << '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+		html << '<title>' << escape(model?.reportTitle ?: 'Test report') << '</title>'
+		html << buildStyle()
+		html << '</head>'
+		html << '<body>'
 
-class JiraGateway {
+		html << '<main class="app-shell">'
+		html << buildSidebar(model, scenarios)
+		html << '<section class="content-area">'
+		html << buildHeader(model)
+		html << buildSummary(summary)
+		html << buildScenarioContent(scenarios)
+		html << '</section>'
+		html << '</main>'
 
-	JiraFlowCoordinator owner
-	JsonSlurper jsonSlurper = new JsonSlurper()
+		html << '</body>'
+		html << '</html>'
 
-	JiraGateway(JiraFlowCoordinator owner) {
-		this.owner = owner
+		return html.toString()
 	}
 
-	void validateRequiredConfiguration() {
-		List<String> missing = []
+	private String buildSidebar(Map model, List<Map> scenarios) {
+		StringBuilder html = new StringBuilder()
 
-		if (owner.isBlank(resolveToken())) {
-			missing << 'JIRA token'
-		}
-		if (owner.isBlank(owner.PROJECT_KEY)) {
-			missing << 'PROJECT_KEY'
-		}
-		if (owner.isBlank(owner.JIRA_BASE_URL)) {
-			missing << 'JIRA_BASE_URL'
-		}
+		String suiteName = safe(model?.suiteName ?: 'Execution')
+		String generatedAt = safe(model?.generatedAt)
+		String logoSrc = safe(model?.logoSrc)
 
-		if (!missing.isEmpty()) {
-			KeywordUtil.markFailedAndStop('Missing Jira configuration: ' + missing.join(', '))
-		}
-	}
+		html << '<aside class="sidebar">'
+		html << '<div class="brand-block">'
 
-	String importExecutionResults(String xmlPath) {
-		if (owner.isBlank(xmlPath)) {
-			return 'ERROR: XML path is empty'
+		if (!isBlank(logoSrc)) {
+			html << '<img class="brand-logo-img" src="' << attr(logoSrc) << '" alt="Project logo">'
+		} else {
+			html << '<div class="brand-logo-text">Hue</div>'
 		}
 
-		File xmlFile = new File(xmlPath)
-		if (!xmlFile.exists() || !xmlFile.isFile() || xmlFile.length() <= 0) {
-			return 'ERROR: XML file not found or empty'
-		}
+		html << '<div class="brand-info">'
+		html << '<strong>' << escape(suiteName) << '</strong>'
+		html << '<span>Automated report</span>'
+		html << '</div>'
+		html << '</div>'
 
-		try {
-			ResponseObject response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
-				('filePath') : xmlPath,
-				('project')  : owner.PROJECT_KEY,
-				('baseUrl')  : owner.JIRA_BASE_URL,
-				('token')    : resolveToken()
-			]))
+		html << '<div class="sidebar-section">'
+		html << '<div class="sidebar-title">Execution</div>'
+		html << '<div class="sidebar-meta">'
+		html << '<span>Generated</span>'
+		html << '<strong>' << escape(generatedAt) << '</strong>'
+		html << '</div>'
+		html << '</div>'
 
-			int status = response.getStatusCode()
-			String body = safeBody(response)
+		html << '<div class="sidebar-section">'
+		html << '<div class="sidebar-title">Tests</div>'
+		html << '<div class="test-list">'
 
-			KeywordUtil.logInfo("Import Results status: ${status}")
-			KeywordUtil.logInfo("Import Results response: ${body}")
-
-			if (status < 200 || status >= 300) {
-				return "ERROR: import execution failed with status ${status}"
-			}
-
-			def parsed = parseJson(body)
-			String key = owner.safe(parsed?.testExecIssue?.key)
-
-			if (owner.isBlank(key)) {
-				return 'ERROR: execution key not found in import response'
-			}
-
-			return key
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Import Results request failed: ${e.message}")
-			return "ERROR: import execution request failed - ${e.message}"
-		}
-	}
-
-	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
-		if (owner.isBlank(testPlanKey) || owner.isBlank(executionKey)) {
-			return 0
-		}
-
-		Map payload = [
-			add: [executionKey]
-		]
-
-		RequestObject request = new RequestObject('Runtime Add Execution To Test Plan')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/raven/2.0/api/testplan/' + encode(testPlanKey) + '/testexecution')
-		request.setRestRequestMethod('POST')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody(payload))
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-
-		KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
-		KeywordUtil.logInfo("Add execution to Test Plan response: ${safeBody(response)}")
-
-		return status
-	}
-
-	int updateTestExecution(String issueKey, String summary, String labels, String environment) {
-		if (owner.isBlank(issueKey)) {
-			return 0
-		}
-
-		List<String> labelList = []
-		if (!owner.isBlank(labels)) {
-			def flowRef = owner
-			labelList = labels
-					.split(',')
-					.collect { item -> flowRef.safe(item) }
-					.findAll { item -> !flowRef.isBlank(item) }
-		}
-
-		Map fields = [
-			summary: owner.safe(summary),
-			labels : labelList
-		]
-
-		if (!owner.isBlank(environment)) {
-			fields.environment = owner.safe(environment)
-		}
-
-		RequestObject request = new RequestObject('Runtime Update Test Execution')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey))
-		request.setRestRequestMethod('PUT')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody([fields: fields]))
-
-		ResponseObject response = WS.sendRequest(request)
-		int status = response.getStatusCode()
-
-		KeywordUtil.logInfo("Update Test Execution status: ${status}")
-		KeywordUtil.logInfo("Update Test Execution response: ${safeBody(response)}")
-
-		return status
-	}
-
-	int uploadAttachment(String issueKey, String filePath) {
-		if (owner.isBlank(issueKey) || owner.isBlank(filePath)) {
-			KeywordUtil.logInfo("Skipping attachment upload because issue key or file path is empty.")
-			return 0
-		}
-
-		File file = new File(filePath)
-		if (!file.exists() || !file.isFile() || file.length() <= 0) {
-			KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
-			return 0
-		}
-
-		HttpURLConnection connection = null
-		DataOutputStream output = null
-		FileInputStream input = null
-
-		try {
-			String endpoint = owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey) + '/attachments'
-			String boundary = '----KatalonJiraAttachmentBoundary' + System.currentTimeMillis()
-
-			KeywordUtil.logInfo("Uploading attachment using manual multipart request: ${file.absolutePath}")
-			KeywordUtil.logInfo("Attachment target issue: ${issueKey}")
-			KeywordUtil.logInfo("Attachment file name: ${file.name}")
-			KeywordUtil.logInfo("Attachment size bytes: ${file.length()}")
-			KeywordUtil.logInfo("Attachment endpoint: ${endpoint}")
-
-			URL url = new URL(endpoint)
-			connection = (HttpURLConnection) url.openConnection()
-
-			if (connection instanceof HttpsURLConnection) {
-				configurePermissiveSsl((HttpsURLConnection) connection)
-			}
-
-			connection.setRequestMethod('POST')
-			connection.setDoOutput(true)
-			connection.setDoInput(true)
-			connection.setUseCaches(false)
-			connection.setConnectTimeout(60000)
-			connection.setReadTimeout(120000)
-			connection.setRequestProperty('Authorization', 'Bearer ' + resolveToken())
-			connection.setRequestProperty('Accept', 'application/json')
-			connection.setRequestProperty('X-Atlassian-Token', 'no-check')
-			connection.setRequestProperty('Content-Type', 'multipart/form-data; boundary=' + boundary)
-			connection.setRequestProperty('Connection', 'Keep-Alive')
-			connection.setChunkedStreamingMode(8192)
-
-			output = new DataOutputStream(connection.getOutputStream())
-
-			writeText(output, '--' + boundary + '\r\n')
-			writeText(output, 'Content-Disposition: form-data; name="file"; filename="' + sanitizeHeaderValue(file.name) + '"\r\n')
-			writeText(output, 'Content-Type: ' + resolveContentType(file.name) + '\r\n')
-			writeText(output, 'Content-Transfer-Encoding: binary\r\n')
-			writeText(output, '\r\n')
-
-			input = new FileInputStream(file)
-
-			byte[] buffer = new byte[8192]
-			int readBytes = 0
-
-			while ((readBytes = input.read(buffer)) != -1) {
-				output.write(buffer, 0, readBytes)
-			}
-
-			writeText(output, '\r\n')
-			writeText(output, '--' + boundary + '--\r\n')
-			output.flush()
-
-			int status = connection.getResponseCode()
-			String body = readConnectionBody(connection, status)
-
-			KeywordUtil.logInfo("Upload attachment status (${filePath}): ${status}")
-			KeywordUtil.logInfo("Upload attachment response: ${body}")
-
-			return status
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Upload attachment request failed: ${e.message}")
-			return 0
-		} finally {
-			try {
-				input?.close()
-			} catch (Exception ignored) {
-			}
-			try {
-				output?.close()
-			} catch (Exception ignored) {
-			}
-			try {
-				connection?.disconnect()
-			} catch (Exception ignored) {
+		if (scenarios == null || scenarios.isEmpty()) {
+			html << '<div class="test-list-empty">No tests found</div>'
+		} else {
+			scenarios.eachWithIndex { Map scenario, int index ->
+				html << buildSidebarScenarioItem(scenario, index + 1)
 			}
 		}
+
+		html << '</div>'
+		html << '</div>'
+
+		html << '</aside>'
+
+		return html.toString()
 	}
 
-	String createTestPlan(String summary, String epicKey) {
-		String epicFieldId = resolveEpicFieldId()
+	private String buildSidebarScenarioItem(Map scenario, int index) {
+		StringBuilder html = new StringBuilder()
 
-		Map fields = [
-			project  : [key: owner.PROJECT_KEY],
-			summary  : owner.safe(summary),
-			issuetype: [name: 'Test Plan']
-		]
+		String status = normalizeStatus(scenario?.status)
+		String title = safe(scenario?.title)
+		String duration = safe(scenario?.durationLabel)
 
-		if (!owner.isBlank(epicKey) && !owner.isBlank(epicFieldId)) {
-			fields[epicFieldId] = owner.safe(epicKey)
+		html << '<a class="test-list-item ' << attr(status) << '" href="#scenario-' << index << '">'
+		html << '<div>'
+		html << '<strong>' << escape(title) << '</strong>'
+		if (!isBlank(duration)) {
+			html << '<span>' << escape(duration) << '</span>'
 		}
+		html << '</div>'
+		html << '<em class="' << attr(status) << '">' << escape(status) << '</em>'
+		html << '</a>'
 
-		RequestObject request = new RequestObject('Runtime Create Test Plan')
-		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue')
-		request.setRestRequestMethod('POST')
-		request.setHttpHeaderProperties(jsonHeaders())
-		request.setBodyContent(jsonBody([fields: fields]))
-
-		ResponseObject response = WS.sendRequest(request)
-
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Create Test Plan status: ${status}")
-		KeywordUtil.logInfo("Create Test Plan response: ${body}")
-
-		if (status < 200 || status >= 300) {
-			return "ERROR: create test plan failed with status ${status}"
-		}
-
-		def parsed = parseJson(body)
-		String key = owner.safe(parsed?.key)
-
-		if (owner.isBlank(key)) {
-			return 'ERROR: created Test Plan key not found in response'
-		}
-
-		return key
+		return html.toString()
 	}
 
-	Map searchTestPlans(String summary, String epicKey) {
-		String jql =
-				'project = "' + owner.PROJECT_KEY + '" ' +
-				'AND issuetype = "Test Plan" ' +
-				'ORDER BY created DESC'
+	private String buildHeader(Map model) {
+		StringBuilder html = new StringBuilder()
 
-		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
-		KeywordUtil.logInfo("Expected Test Plan summary: ${summary}")
-		KeywordUtil.logInfo("Expected Epic key: ${epicKey}")
+		String reportTitle = safe(model?.reportTitle ?: 'Test report')
+		String subtitle = safe(model?.subtitle ?: 'Execution overview')
+		String reportFolder = safe(model?.reportFolder)
 
-		String url =
-				owner.JIRA_BASE_URL +
-				'/rest/api/2/search' +
-				'?jql=' + encode(jql) +
-				'&maxResults=200' +
-				'&fields=' + encode(buildTestPlanReadFields())
+		html << '<header class="hero-banner">'
+		html << '<div class="hero-content">'
+		html << '<div class="hero-kicker">'
+		html << '<span class="hue-dot"></span>'
+		html << '<span>Hue automation report</span>'
+		html << '</div>'
+		html << '<h1>' << escape(reportTitle) << '</h1>'
+		html << '<p>' << escape(subtitle) << '</p>'
+		html << '</div>'
 
-		RequestObject request = new RequestObject('Runtime Search Test Plan')
-		request.setRestUrl(url)
-		request.setRestRequestMethod('GET')
-		request.setHttpHeaderProperties(defaultGetHeaders())
+		if (!isBlank(reportFolder)) {
+			html << '<div class="hero-folder">'
+			html << '<span>Report folder</span>'
+			html << '<strong>' << escape(reportFolder) << '</strong>'
+			html << '</div>'
+		}
 
-		ResponseObject response = WS.sendRequest(request)
+		html << '</header>'
 
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Get Test Plan status: ${status}")
-		KeywordUtil.logInfo("Get Test Plan response: ${body}")
-
-		def parsed = parseJson(body)
-
-		return [
-			statusCode: status,
-			body      : body,
-			issues    : parsed?.issues instanceof List ? parsed.issues : []
-		]
+		return html.toString()
 	}
 
-	Map getIssueByKey(String issueKey) {
-		if (owner.isBlank(issueKey)) {
-			return [statusCode: 0, issue: null, body: '']
-		}
+	private String buildSummary(Map summary) {
+		StringBuilder html = new StringBuilder()
 
-		String url =
-				owner.JIRA_BASE_URL +
-				'/rest/api/2/issue/' + encode(issueKey) +
-				'?fields=' + encode(buildTestPlanReadFields())
+		html << '<section class="summary-grid">'
+		html << buildSummaryCard('Total tests', summary?.total, 'total')
+		html << buildSummaryCard('Passed', summary?.passed, 'passed')
+		html << buildSummaryCard('Failed', summary?.failed, 'failed')
+		html << buildSummaryCard('Skipped', summary?.skipped, 'skipped')
+		html << buildSummaryCard('Duration', summary?.durationLabel, 'duration')
+		html << buildSummaryCard('Start', summary?.startLabel, 'start')
+		html << buildSummaryCard('End', summary?.endLabel, 'end')
+		html << '</section>'
 
-		RequestObject request = new RequestObject('Runtime Get Issue By Key')
-		request.setRestUrl(url)
-		request.setRestRequestMethod('GET')
-		request.setHttpHeaderProperties(defaultGetHeaders())
-
-		ResponseObject response = WS.sendRequest(request)
-
-		int status = response.getStatusCode()
-		String body = safeBody(response)
-
-		KeywordUtil.logInfo("Get Issue By Key status: ${status}")
-		KeywordUtil.logInfo("Get Issue By Key response: ${body}")
-
-		def parsed = parseJson(body)
-
-		return [
-			statusCode: status,
-			body      : body,
-			issue     : parsed
-		]
+		return html.toString()
 	}
 
-	boolean isIssueLinkedToEpic(String issueKey, String expectedEpicKey) {
-		if (owner.isBlank(expectedEpicKey)) {
-			return true
+	private String buildSummaryCard(String label, def value, String type) {
+		String displayValue = safe(value)
+
+		if (isBlank(displayValue)) {
+			displayValue = '0'
 		}
 
-		if (owner.isBlank(issueKey)) {
-			return false
-		}
+		StringBuilder html = new StringBuilder()
+		html << '<article class="summary-card ' << attr(type) << '">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << escape(displayValue) << '</strong>'
+		html << '</article>'
 
-		Map result = getIssueByKey(issueKey)
-		int statusCode = (result?.statusCode ?: 0) as int
-
-		if (statusCode != 200) {
-			KeywordUtil.logInfo("Could not validate Epic link for issue ${issueKey}. Status: ${statusCode}")
-			return false
-		}
-
-		return isIssueDataLinkedToEpic(result?.issue, expectedEpicKey)
+		return html.toString()
 	}
 
-	boolean isIssueDataLinkedToEpic(def issue, String expectedEpicKey) {
-		if (owner.isBlank(expectedEpicKey)) {
-			return true
-		}
+	private String buildScenarioContent(List<Map> scenarios) {
+		StringBuilder html = new StringBuilder()
 
-		String issueKey = owner.safe(issue?.key)
-		String actualEpicKey = resolveIssueEpicKey(issue)
+		html << '<section class="section-heading">'
+		html << '<div>'
+		html << '<span>Execution details</span>'
+		html << '<h2>Tests</h2>'
+		html << '</div>'
+		html << '</section>'
 
-		if (owner.safe(actualEpicKey).equalsIgnoreCase(owner.safe(expectedEpicKey))) {
-			KeywordUtil.logInfo("Issue ${issueKey} is linked to expected Epic: ${expectedEpicKey}")
-			return true
-		}
+		html << '<section class="scenario-list">'
 
-		KeywordUtil.logInfo("Issue ${issueKey} is not linked to expected Epic. Expected: ${expectedEpicKey} | Actual: ${owner.isBlank(actualEpicKey) ? 'EMPTY' : actualEpicKey}")
-		return false
-	}
-
-	private String resolveIssueEpicKey(def issue) {
-		try {
-			def fields = issue?.fields
-			if (fields == null) {
-				return ''
+		if (scenarios == null || scenarios.isEmpty()) {
+			html << '<article class="empty-state">'
+			html << '<h3>No scenarios were found</h3>'
+			html << '<p>The report could not read scenarios from the execution log or XML result.</p>'
+			html << '</article>'
+		} else {
+			scenarios.eachWithIndex { Map scenario, int index ->
+				html << buildScenarioCard(scenario, index + 1)
 			}
-
-			String epicFieldId = resolveEpicFieldId()
-			def epicFieldValue = fields[epicFieldId]
-			String epicFromCustomField = extractIssueKeyFromValue(epicFieldValue)
-
-			if (!owner.isBlank(epicFromCustomField)) {
-				return epicFromCustomField
-			}
-
-			def parent = fields?.parent
-			String parentKey = owner.safe(parent?.key)
-
-			if (!owner.isBlank(parentKey)) {
-				return parentKey
-			}
-
-			def epic = fields?.epic
-			String epicKey = extractIssueKeyFromValue(epic)
-
-			if (!owner.isBlank(epicKey)) {
-				return epicKey
-			}
-
-			return ''
-		} catch (Exception ignored) {
-			return ''
 		}
+
+		html << '</section>'
+
+		return html.toString()
 	}
 
-	private String extractIssueKeyFromValue(def value) {
-		if (value == null) {
+	private String buildScenarioCard(Map scenario, int index) {
+		StringBuilder html = new StringBuilder()
+
+		String status = normalizeStatus(scenario?.status)
+		String title = safe(scenario?.title)
+		String duration = safe(scenario?.durationLabel)
+		String start = safe(scenario?.startLabel)
+		String end = safe(scenario?.endLabel)
+		String errorShort = safe(scenario?.errorShort)
+		String errorFull = safe(scenario?.errorFull)
+
+		List<Map> steps = scenario?.steps instanceof List ? scenario.steps as List<Map> : []
+		List<Map> evidences = scenario?.evidences instanceof List ? scenario.evidences as List<Map> : []
+
+		html << '<article id="scenario-' << index << '" class="scenario-card ' << attr(status) << '">'
+
+		html << '<div class="scenario-header">'
+		html << '<div>'
+		html << '<div class="scenario-number">Scenario #' << index << '</div>'
+		html << '<h3>' << escape(title) << '</h3>'
+		html << '</div>'
+		html << '<span class="status-pill ' << attr(status) << '">' << escape(statusIcon(status) + ' ' + status.toUpperCase(Locale.ENGLISH)) << '</span>'
+		html << '</div>'
+
+		html << '<div class="scenario-pills">'
+		html << buildScenarioPill('Suite', safe(scenario?.suiteName), 'suite')
+		html << buildScenarioPill('Status', status.toUpperCase(Locale.ENGLISH), status)
+		html << buildScenarioPill('Start', start, 'start')
+		html << buildScenarioPill('End', end, 'end')
+		html << buildScenarioPill('Duration', duration, 'duration')
+		html << '</div>'
+
+		if (!isBlank(errorShort)) {
+			html << '<div class="error-box">'
+			html << '<strong>Error summary</strong>'
+			html << '<p>' << escape(errorShort) << '</p>'
+			html << '</div>'
+		}
+
+		if (!isBlank(errorFull)) {
+			html << '<details class="details-box">'
+			html << '<summary>Full error details</summary>'
+			html << '<pre>' << escape(errorFull) << '</pre>'
+			html << '</details>'
+		}
+
+		html << buildEvidenceBlock(evidences)
+		html << buildStepsBlock(steps)
+
+		html << '</article>'
+
+		return html.toString()
+	}
+
+	private String buildScenarioPill(String label, String value, String type) {
+		if (isBlank(value)) {
 			return ''
 		}
 
-		if (value instanceof Map) {
-			String keyValue = owner.safe(value?.key)
-			if (!owner.isBlank(keyValue)) {
-				return keyValue
-			}
+		StringBuilder html = new StringBuilder()
+		html << '<div class="scenario-pill ' << attr(type) << '">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << escape(value) << '</strong>'
+		html << '</div>'
 
-			String valueField = owner.safe(value?.value)
-			if (!owner.isBlank(valueField)) {
-				return valueField
-			}
+		return html.toString()
+	}
 
-			String nameField = owner.safe(value?.name)
-			if (!owner.isBlank(nameField)) {
-				return nameField
-			}
-
+	private String buildEvidenceBlock(List<Map> evidences) {
+		if (evidences == null || evidences.isEmpty()) {
 			return ''
 		}
 
-		if (value instanceof Collection) {
-			for (def item : value) {
-				String extracted = extractIssueKeyFromValue(item)
-				if (!owner.isBlank(extracted)) {
-					return extracted
-				}
+		StringBuilder html = new StringBuilder()
+
+		html << '<div class="evidence-section">'
+		html << '<h4>Visual evidence</h4>'
+		html << '<div class="evidence-grid">'
+
+		evidences.each { Map evidence ->
+			html << buildEvidenceItem(evidence)
+		}
+
+		html << '</div>'
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildEvidenceItem(Map evidence) {
+		StringBuilder html = new StringBuilder()
+
+		String name = safe(evidence?.name ?: evidence?.fileName ?: 'Evidence')
+		String href = safe(evidence?.href)
+		String imgSrc = safe(evidence?.imgSrc ?: evidence?.imageSrc ?: evidence?.imageDataUri)
+
+		html << '<figure class="evidence-item">'
+
+		if (!isBlank(href)) {
+			html << '<a href="' << attr(href) << '" target="_blank">'
+		}
+
+		if (!isBlank(imgSrc)) {
+			html << '<img src="' << attr(imgSrc) << '" alt="' << attr(name) << '">'
+		} else {
+			html << '<div class="evidence-placeholder">Image evidence</div>'
+		}
+
+		if (!isBlank(href)) {
+			html << '</a>'
+		}
+
+		html << '<figcaption>' << escape(name) << '</figcaption>'
+		html << '</figure>'
+
+		return html.toString()
+	}
+
+	private String buildStepsBlock(List<Map> steps) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<div class="steps-section">'
+		html << '<h4>Steps</h4>'
+
+		if (steps == null || steps.isEmpty()) {
+			html << '<p class="muted">No step details were found.</p>'
+		} else {
+			html << '<div class="steps-table">'
+			html << '<div class="steps-table-header">'
+			html << '<span>Status</span>'
+			html << '<span>Timestamp</span>'
+			html << '<span>Details</span>'
+			html << '</div>'
+
+			steps.eachWithIndex { Map step, int index ->
+				html << buildStepRow(step, index + 1)
 			}
 
-			return ''
+			html << '</div>'
 		}
 
-		return owner.safe(value)
+		html << '</div>'
+
+		return html.toString()
 	}
 
-	private void configurePermissiveSsl(HttpsURLConnection connection) {
-		try {
-			TrustManager[] trustAllCertificates = [
-				new X509TrustManager() {
-					X509Certificate[] getAcceptedIssuers() {
-						return new X509Certificate[0]
-					}
+	private String buildStepRow(Map step, int index) {
+		StringBuilder html = new StringBuilder()
 
-					void checkClientTrusted(X509Certificate[] certificates, String authType) {
-					}
+		String status = normalizeStatus(step?.status)
+		String title = safe(step?.title)
+		String emoji = safe(step?.emoji)
+		String time = safe(step?.timeLabel)
+		String duration = safe(step?.durationLabel)
+		String shortError = safe(step?.shortError)
+		String detailText = safe(step?.detailText)
+		String errorFull = safe(step?.errorFull)
 
-					void checkServerTrusted(X509Certificate[] certificates, String authType) {
-					}
-				}
-			] as TrustManager[]
+		if (isBlank(emoji)) {
+			emoji = '🔹'
+		}
 
-			SSLContext sslContext = SSLContext.getInstance('TLS')
-			sslContext.init(null, trustAllCertificates, new SecureRandom())
+		html << '<div class="steps-table-row ' << attr(status) << '">'
+		html << '<div>'
+		html << '<span class="row-status ' << attr(status) << '">' << escape(status) << '</span>'
+		html << '</div>'
 
-			connection.setSSLSocketFactory(sslContext.getSocketFactory())
-			connection.setHostnameVerifier(new HostnameVerifier() {
-				boolean verify(String hostname, SSLSession session) {
-					return true
-				}
-			})
+		html << '<div class="row-time">'
+		html << escape(time)
+		if (!isBlank(duration)) {
+			html << '<small>' << escape(duration) << '</small>'
+		}
+		html << '</div>'
 
-			KeywordUtil.logInfo('Permissive SSL enabled only for Jira attachment upload.')
-		} catch (Exception e) {
-			KeywordUtil.logInfo("Could not configure permissive SSL for attachment upload: ${e.message}")
+		html << '<div class="row-details">'
+		html << '<strong>' << escape(emoji) << ' ' << index << '. ' << escape(title) << '</strong>'
+
+		if (!isBlank(shortError)) {
+			html << '<p class="step-error">' << escape(shortError) << '</p>'
+		}
+
+		if (!isBlank(errorFull)) {
+			html << '<details class="step-details">'
+			html << '<summary>Error details</summary>'
+			html << '<pre>' << escape(errorFull) << '</pre>'
+			html << '</details>'
+		} else if (!isBlank(detailText)) {
+			html << '<details class="step-details">'
+			html << '<summary>Step details</summary>'
+			html << '<pre>' << escape(detailText) << '</pre>'
+			html << '</details>'
+		}
+
+		html << '</div>'
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String normalizeStatus(def value) {
+		String status = safe(value).toLowerCase(Locale.ENGLISH)
+
+		if (status == 'passed') return 'passed'
+		if (status == 'failed') return 'failed'
+		if (status == 'skipped') return 'skipped'
+		if (status == 'info') return 'info'
+
+		return 'skipped'
+	}
+
+	private String statusIcon(String status) {
+		if (status == 'passed') return '✓'
+		if (status == 'failed') return '✕'
+		if (status == 'skipped') return '↷'
+		if (status == 'info') return 'i'
+		return 'i'
+	}
+
+	private String safe(def value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+
+	private boolean isBlank(def value) {
+		return safe(value).isEmpty()
+	}
+
+	private String escape(def value) {
+		String text = safe(value)
+		return text
+				.replace('&', '&amp;')
+				.replace('<', '&lt;')
+				.replace('>', '&gt;')
+				.replace('"', '&quot;')
+				.replace("'", '&#39;')
+	}
+
+	private String attr(def value) {
+		return escape(value)
+	}
+
+	private String buildStyle() {
+		return '''
+<style>
+	:root {
+		--hue-bg: #f4f7f8;
+		--hue-sidebar: #263238;
+		--hue-sidebar-dark: #1f2a30;
+		--hue-panel: #ffffff;
+		--hue-text: #1f2933;
+		--hue-muted: #6b7c86;
+		--hue-border: #d9e2e7;
+		--hue-blue: #00a6c8;
+		--hue-blue-dark: #007c96;
+		--hue-blue-soft: #e1f7fb;
+		--hue-green: #57a639;
+		--hue-green-soft: #e5f5df;
+		--hue-red: #c94444;
+		--hue-red-soft: #fde7e7;
+		--hue-yellow: #d79a21;
+		--hue-yellow-soft: #fff2d8;
+		--hue-purple: #514082;
+		--hue-shadow: 0 18px 45px rgba(31, 41, 51, 0.10);
+		--hue-radius: 18px;
+	}
+
+	* {
+		box-sizing: border-box;
+	}
+
+	html {
+		scroll-behavior: smooth;
+	}
+
+	body {
+		margin: 0;
+		background: var(--hue-bg);
+		color: var(--hue-text);
+		font-family: Arial, Helvetica, sans-serif;
+		line-height: 1.5;
+	}
+
+	.app-shell {
+		display: grid;
+		grid-template-columns: 300px 1fr;
+		min-height: 100vh;
+	}
+
+	.sidebar {
+		position: sticky;
+		top: 0;
+		height: 100vh;
+		background:
+			linear-gradient(160deg, rgba(0, 166, 200, 0.18), transparent 38%),
+			linear-gradient(180deg, var(--hue-sidebar), var(--hue-sidebar-dark));
+		color: #ffffff;
+		overflow-y: auto;
+		padding: 24px 18px;
+	}
+
+	.brand-block {
+		display: flex;
+		gap: 14px;
+		align-items: center;
+		padding-bottom: 24px;
+		border-bottom: 1px solid rgba(255,255,255,0.12);
+	}
+
+	.brand-logo-img {
+		width: 54px;
+		height: 54px;
+		object-fit: contain;
+		border-radius: 14px;
+		background: rgba(255,255,255,0.08);
+		padding: 8px;
+	}
+
+	.brand-logo-text {
+		width: 58px;
+		height: 58px;
+		border-radius: 16px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: rgba(0, 166, 200, 0.16);
+		border: 1px solid rgba(0, 166, 200, 0.42);
+		color: var(--hue-blue);
+		font-size: 24px;
+		font-weight: 800;
+		letter-spacing: -0.04em;
+	}
+
+	.brand-info strong {
+		display: block;
+		font-size: 15px;
+		color: #ffffff;
+	}
+
+	.brand-info span {
+		display: block;
+		margin-top: 2px;
+		color: #b8c5cc;
+		font-size: 12px;
+	}
+
+	.sidebar-section {
+		margin-top: 24px;
+	}
+
+	.sidebar-title {
+		font-size: 11px;
+		text-transform: uppercase;
+		letter-spacing: 0.14em;
+		color: #8fa5af;
+		font-weight: 800;
+		margin-bottom: 10px;
+	}
+
+	.sidebar-meta {
+		background: rgba(255,255,255,0.06);
+		border: 1px solid rgba(255,255,255,0.10);
+		border-radius: 14px;
+		padding: 12px;
+	}
+
+	.sidebar-meta span {
+		display: block;
+		color: #9fb2bc;
+		font-size: 11px;
+		text-transform: uppercase;
+		font-weight: 800;
+	}
+
+	.sidebar-meta strong {
+		display: block;
+		margin-top: 4px;
+		color: #ffffff;
+		font-size: 12px;
+		word-break: break-word;
+	}
+
+	.test-list {
+		display: grid;
+		gap: 9px;
+	}
+
+	.test-list-item {
+		text-decoration: none;
+		color: #ffffff;
+		display: flex;
+		justify-content: space-between;
+		gap: 12px;
+		align-items: center;
+		background: rgba(255,255,255,0.06);
+		border: 1px solid rgba(255,255,255,0.09);
+		border-left: 4px solid transparent;
+		border-radius: 14px;
+		padding: 12px;
+		transition: 0.18s ease;
+	}
+
+	.test-list-item:hover {
+		background: rgba(255,255,255,0.10);
+		transform: translateX(2px);
+	}
+
+	.test-list-item.passed {
+		border-left-color: var(--hue-green);
+	}
+
+	.test-list-item.failed {
+		border-left-color: var(--hue-red);
+	}
+
+	.test-list-item.skipped {
+		border-left-color: var(--hue-yellow);
+	}
+
+	.test-list-item.info {
+		border-left-color: var(--hue-blue);
+	}
+
+	.test-list-item strong {
+		display: block;
+		font-size: 12px;
+		line-height: 1.35;
+	}
+
+	.test-list-item span {
+		display: block;
+		margin-top: 5px;
+		color: #aebdc5;
+		font-size: 11px;
+	}
+
+	.test-list-item em {
+		border-radius: 999px;
+		font-style: normal;
+		font-size: 10px;
+		font-weight: 800;
+		text-transform: uppercase;
+		padding: 5px 8px;
+		white-space: nowrap;
+	}
+
+	.test-list-item em.passed {
+		color: #ffffff;
+		background: var(--hue-green);
+	}
+
+	.test-list-item em.failed {
+		color: #ffffff;
+		background: var(--hue-red);
+	}
+
+	.test-list-item em.skipped {
+		color: #ffffff;
+		background: var(--hue-yellow);
+	}
+
+	.test-list-item em.info {
+		color: #ffffff;
+		background: var(--hue-blue);
+	}
+
+	.test-list-empty {
+		color: #b8c5cc;
+		font-size: 13px;
+	}
+
+	.content-area {
+		min-width: 0;
+		padding: 28px;
+	}
+
+	.hero-banner {
+		position: relative;
+		overflow: hidden;
+		display: flex;
+		justify-content: space-between;
+		gap: 26px;
+		align-items: flex-end;
+		background:
+			radial-gradient(circle at 15% 18%, rgba(0,166,200,0.34), transparent 26%),
+			linear-gradient(135deg, #27343a 0%, #1f2a30 55%, #142127 100%);
+		border-radius: 24px;
+		box-shadow: var(--hue-shadow);
+		padding: 34px;
+		color: #ffffff;
+	}
+
+	.hero-banner:after {
+		content: "";
+		position: absolute;
+		right: -130px;
+		top: -130px;
+		width: 320px;
+		height: 320px;
+		border-radius: 50%;
+		background: rgba(0,166,200,0.16);
+		border: 1px solid rgba(0,166,200,0.20);
+	}
+
+	.hero-content {
+		position: relative;
+		z-index: 1;
+		min-width: 0;
+	}
+
+	.hero-kicker {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 12px;
+		font-weight: 800;
+		text-transform: uppercase;
+		letter-spacing: 0.12em;
+		color: #b8dce5;
+		margin-bottom: 12px;
+	}
+
+	.hue-dot {
+		width: 10px;
+		height: 10px;
+		border-radius: 50%;
+		background: var(--hue-blue);
+		box-shadow: 0 0 0 6px rgba(0,166,200,0.16);
+	}
+
+	.hero-banner h1 {
+		margin: 0;
+		font-size: 32px;
+		line-height: 1.1;
+		letter-spacing: -0.03em;
+	}
+
+	.hero-banner p {
+		margin: 10px 0 0;
+		color: #c5d2d8;
+		font-size: 15px;
+	}
+
+	.hero-folder {
+		position: relative;
+		z-index: 1;
+		width: min(440px, 42%);
+		background: rgba(255,255,255,0.08);
+		border: 1px solid rgba(255,255,255,0.12);
+		border-radius: 16px;
+		padding: 14px;
+	}
+
+	.hero-folder span {
+		display: block;
+		color: #b8c5cc;
+		font-size: 11px;
+		text-transform: uppercase;
+		font-weight: 800;
+		letter-spacing: 0.08em;
+	}
+
+	.hero-folder strong {
+		display: block;
+		margin-top: 6px;
+		font-size: 12px;
+		color: #ffffff;
+		word-break: break-word;
+	}
+
+	.summary-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+		gap: 14px;
+		margin-top: 22px;
+	}
+
+	.summary-card {
+		background: var(--hue-panel);
+		border: 1px solid var(--hue-border);
+		border-radius: 18px;
+		padding: 18px;
+		box-shadow: 0 12px 28px rgba(31,41,51,0.06);
+	}
+
+	.summary-card span {
+		display: block;
+		color: var(--hue-muted);
+		font-size: 11px;
+		font-weight: 800;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+	}
+
+	.summary-card strong {
+		display: block;
+		margin-top: 8px;
+		font-size: 23px;
+		color: var(--hue-text);
+		word-break: break-word;
+	}
+
+	.summary-card.passed strong {
+		color: var(--hue-green);
+	}
+
+	.summary-card.failed strong {
+		color: var(--hue-red);
+	}
+
+	.summary-card.skipped strong {
+		color: var(--hue-yellow);
+	}
+
+	.summary-card.duration,
+	.summary-card.start,
+	.summary-card.end {
+		border-color: rgba(0,166,200,0.28);
+		background: linear-gradient(180deg, #ffffff, var(--hue-blue-soft));
+	}
+
+	.summary-card.duration strong,
+	.summary-card.start strong,
+	.summary-card.end strong {
+		color: var(--hue-blue-dark);
+		font-size: 18px;
+	}
+
+	.section-heading {
+		display: flex;
+		justify-content: space-between;
+		align-items: end;
+		margin-top: 34px;
+		margin-bottom: 14px;
+	}
+
+	.section-heading span {
+		color: var(--hue-blue-dark);
+		text-transform: uppercase;
+		font-size: 12px;
+		font-weight: 800;
+		letter-spacing: 0.12em;
+	}
+
+	.section-heading h2 {
+		margin: 4px 0 0;
+		font-size: 26px;
+		letter-spacing: -0.03em;
+	}
+
+	.scenario-list {
+		display: grid;
+		gap: 18px;
+	}
+
+	.scenario-card {
+		background: var(--hue-panel);
+		border: 1px solid var(--hue-border);
+		border-left: 7px solid var(--hue-border);
+		border-radius: 22px;
+		padding: 22px;
+		box-shadow: var(--hue-shadow);
+		scroll-margin-top: 18px;
+	}
+
+	.scenario-card.passed {
+		border-left-color: var(--hue-green);
+	}
+
+	.scenario-card.failed {
+		border-left-color: var(--hue-red);
+	}
+
+	.scenario-card.skipped {
+		border-left-color: var(--hue-yellow);
+	}
+
+	.scenario-card.info {
+		border-left-color: var(--hue-blue);
+	}
+
+	.scenario-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: flex-start;
+		gap: 18px;
+	}
+
+	.scenario-number {
+		color: var(--hue-muted);
+		font-size: 11px;
+		font-weight: 800;
+		text-transform: uppercase;
+		letter-spacing: 0.10em;
+	}
+
+	.scenario-header h3 {
+		margin: 4px 0 0;
+		font-size: 21px;
+		line-height: 1.28;
+		letter-spacing: -0.02em;
+	}
+
+	.status-pill {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 999px;
+		padding: 8px 13px;
+		font-size: 12px;
+		font-weight: 900;
+		white-space: nowrap;
+	}
+
+	.status-pill.passed {
+		color: #ffffff;
+		background: var(--hue-green);
+	}
+
+	.status-pill.failed {
+		color: #ffffff;
+		background: var(--hue-red);
+	}
+
+	.status-pill.skipped {
+		color: #ffffff;
+		background: var(--hue-yellow);
+	}
+
+	.status-pill.info {
+		color: #ffffff;
+		background: var(--hue-blue);
+	}
+
+	.scenario-pills {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 10px;
+		margin-top: 16px;
+	}
+
+	.scenario-pill {
+		border-radius: 999px;
+		border: 1px solid var(--hue-border);
+		background: #f8fbfc;
+		padding: 8px 12px;
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+	}
+
+	.scenario-pill span {
+		color: var(--hue-muted);
+		font-size: 10px;
+		font-weight: 900;
+		text-transform: uppercase;
+		letter-spacing: 0.07em;
+	}
+
+	.scenario-pill strong {
+		color: var(--hue-text);
+		font-size: 12px;
+	}
+
+	.scenario-pill.passed {
+		background: var(--hue-green-soft);
+		border-color: rgba(87,166,57,0.32);
+	}
+
+	.scenario-pill.passed strong {
+		color: var(--hue-green);
+	}
+
+	.scenario-pill.failed {
+		background: var(--hue-red-soft);
+		border-color: rgba(201,68,68,0.32);
+	}
+
+	.scenario-pill.failed strong {
+		color: var(--hue-red);
+	}
+
+	.scenario-pill.skipped {
+		background: var(--hue-yellow-soft);
+		border-color: rgba(215,154,33,0.32);
+	}
+
+	.scenario-pill.skipped strong {
+		color: var(--hue-yellow);
+	}
+
+	.scenario-pill.start,
+	.scenario-pill.end,
+	.scenario-pill.duration {
+		background: var(--hue-blue-soft);
+		border-color: rgba(0,166,200,0.32);
+	}
+
+	.scenario-pill.start strong,
+	.scenario-pill.end strong,
+	.scenario-pill.duration strong {
+		color: var(--hue-blue-dark);
+	}
+
+	.error-box {
+		margin-top: 16px;
+		background: var(--hue-red-soft);
+		border: 1px solid rgba(201,68,68,0.22);
+		color: #842828;
+		border-radius: 16px;
+		padding: 14px 16px;
+	}
+
+	.error-box strong {
+		display: block;
+		font-size: 13px;
+	}
+
+	.error-box p {
+		margin: 6px 0 0;
+	}
+
+	.details-box,
+	.step-details {
+		margin-top: 12px;
+		border: 1px solid var(--hue-border);
+		border-radius: 14px;
+		background: #f8fbfc;
+		padding: 10px 12px;
+	}
+
+	summary {
+		cursor: pointer;
+		font-weight: 800;
+		color: var(--hue-blue-dark);
+	}
+
+	pre {
+		white-space: pre-wrap;
+		word-break: break-word;
+		font-family: Consolas, Monaco, monospace;
+		font-size: 12px;
+		background: #15232a;
+		color: #e8f2f5;
+		border-radius: 12px;
+		padding: 14px;
+		overflow: auto;
+	}
+
+	.evidence-section,
+	.steps-section {
+		margin-top: 20px;
+	}
+
+	.evidence-section h4,
+	.steps-section h4 {
+		margin: 0 0 12px;
+		font-size: 16px;
+	}
+
+	.evidence-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+		gap: 16px;
+	}
+
+	.evidence-item {
+		margin: 0;
+		border: 1px solid var(--hue-border);
+		border-radius: 16px;
+		overflow: hidden;
+		background: #f8fbfc;
+	}
+
+	.evidence-item img {
+		width: 100%;
+		max-height: 360px;
+		object-fit: contain;
+		display: block;
+		background: #15232a;
+	}
+
+	.evidence-placeholder {
+		height: 180px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--hue-muted);
+	}
+
+	.evidence-item figcaption {
+		padding: 10px 12px;
+		font-size: 12px;
+		color: var(--hue-muted);
+		word-break: break-word;
+	}
+
+	.steps-table {
+		border: 1px solid var(--hue-border);
+		border-radius: 16px;
+		overflow: hidden;
+		background: #ffffff;
+	}
+
+	.steps-table-header,
+	.steps-table-row {
+		display: grid;
+		grid-template-columns: 120px 130px 1fr;
+		gap: 14px;
+		align-items: start;
+	}
+
+	.steps-table-header {
+		background: #f0f5f7;
+		color: var(--hue-muted);
+		font-size: 11px;
+		font-weight: 900;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		padding: 12px 14px;
+		border-bottom: 1px solid var(--hue-border);
+	}
+
+	.steps-table-row {
+		padding: 14px;
+		border-bottom: 1px solid var(--hue-border);
+	}
+
+	.steps-table-row:last-child {
+		border-bottom: 0;
+	}
+
+	.row-status {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 76px;
+		border-radius: 999px;
+		padding: 6px 10px;
+		font-size: 11px;
+		font-weight: 900;
+		text-transform: uppercase;
+	}
+
+	.row-status.passed {
+		color: #ffffff;
+		background: var(--hue-green);
+	}
+
+	.row-status.failed {
+		color: #ffffff;
+		background: var(--hue-red);
+	}
+
+	.row-status.skipped {
+		color: #ffffff;
+		background: var(--hue-yellow);
+	}
+
+	.row-status.info {
+		color: #ffffff;
+		background: var(--hue-blue);
+	}
+
+	.row-time {
+		color: var(--hue-text);
+		font-size: 13px;
+		font-weight: 700;
+	}
+
+	.row-time small {
+		display: block;
+		margin-top: 4px;
+		color: var(--hue-muted);
+		font-weight: 600;
+	}
+
+	.row-details strong {
+		display: block;
+		font-size: 13px;
+	}
+
+	.step-error {
+		margin: 8px 0 0;
+		color: var(--hue-red);
+		font-weight: 800;
+	}
+
+	.muted {
+		color: var(--hue-muted);
+	}
+
+	.empty-state {
+		background: var(--hue-panel);
+		border: 1px dashed var(--hue-border);
+		border-radius: 22px;
+		padding: 28px;
+		text-align: center;
+		color: var(--hue-muted);
+	}
+
+	.empty-state h3 {
+		margin: 0 0 8px;
+		color: var(--hue-text);
+	}
+
+	@media (max-width: 980px) {
+		.app-shell {
+			grid-template-columns: 1fr;
+		}
+
+		.sidebar {
+			position: relative;
+			height: auto;
+		}
+
+		.hero-banner {
+			flex-direction: column;
+			align-items: flex-start;
+		}
+
+		.hero-folder {
+			width: 100%;
 		}
 	}
 
-	private String readConnectionBody(HttpURLConnection connection, int status) {
-		InputStream stream = null
-
-		try {
-			stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream()
-
-			if (stream == null) {
-				return ''
-			}
-
-			return stream.getText('UTF-8')
-		} catch (Exception ignored) {
-			return ''
-		} finally {
-			try {
-				stream?.close()
-			} catch (Exception ignored) {
-			}
-		}
-	}
-
-	private void writeText(DataOutputStream output, String value) {
-		output.write(value.getBytes(StandardCharsets.UTF_8))
-	}
-
-	private String sanitizeHeaderValue(String value) {
-		return owner.safe(value)
-				.replace('"', '_')
-				.replace('\r', '_')
-				.replace('\n', '_')
-	}
-
-	private String buildTestPlanReadFields() {
-		return 'summary,created,issuetype,' + resolveEpicFieldId() + ',parent'
-	}
-
-	private String resolveContentType(String fileName) {
-		String lower = owner.safe(fileName).toLowerCase()
-
-		if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'text/html'
-		if (lower.endsWith('.zip')) return 'application/zip'
-		if (lower.endsWith('.xml')) return 'application/xml'
-		if (lower.endsWith('.json')) return 'application/json'
-		if (lower.endsWith('.png')) return 'image/png'
-		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
-		if (lower.endsWith('.gif')) return 'image/gif'
-		if (lower.endsWith('.webp')) return 'image/webp'
-		if (lower.endsWith('.bmp')) return 'image/bmp'
-		if (lower.endsWith('.txt') || lower.endsWith('.log')) return 'text/plain'
-
-		return 'application/octet-stream'
-	}
-
-	private String resolveToken() {
-		try {
-			def direct = GlobalVariable.JIRA_TOKEN
-			if (!owner.isBlank(direct)) {
-				return owner.safe(direct)
-			}
-		} catch (Exception ignored) {
+	@media (max-width: 720px) {
+		.content-area {
+			padding: 18px;
 		}
 
-		try {
-			def fallback = GlobalVariable.token
-			if (!owner.isBlank(fallback)) {
-				return owner.safe(fallback)
-			}
-		} catch (Exception ignored) {
+		.hero-banner {
+			padding: 24px;
 		}
 
-		return owner.safe(owner.JIRA_TOKEN)
-	}
-
-	private String resolveEpicFieldId() {
-		return 'customfield_10006'
-	}
-
-	private List<TestObjectProperty> defaultGetHeaders() {
-		return [
-			header('Authorization', 'Bearer ' + resolveToken()),
-			header('Accept', 'application/json')
-		]
-	}
-
-	private List<TestObjectProperty> jsonHeaders() {
-		return [
-			header('Authorization', 'Bearer ' + resolveToken()),
-			header('Accept', 'application/json'),
-			header('Content-Type', 'application/json')
-		]
-	}
-
-	private TestObjectProperty header(String name, String value) {
-		return new TestObjectProperty(name, ConditionType.EQUALS, value)
-	}
-
-	private HttpTextBodyContent jsonBody(Object payload) {
-		String text = new JsonBuilder(payload).toString()
-		return new HttpTextBodyContent(text, 'UTF-8', 'application/json')
-	}
-
-	private Object parseJson(String body) {
-		if (owner.isBlank(body)) {
-			return [:]
+		.hero-banner h1 {
+			font-size: 25px;
 		}
 
-		try {
-			return jsonSlurper.parseText(body)
-		} catch (Exception ignored) {
-			return [:]
+		.scenario-header {
+			flex-direction: column;
+		}
+
+		.steps-table-header {
+			display: none;
+		}
+
+		.steps-table-row {
+			grid-template-columns: 1fr;
+			gap: 8px;
 		}
 	}
-
-	private String safeBody(ResponseObject response) {
-		try {
-			return owner.safe(response?.getResponseBodyContent())
-		} catch (Exception ignored) {
-			return ''
-		}
-	}
-
-	private String encode(String value) {
-		return URLEncoder.encode(owner.safe(value), StandardCharsets.UTF_8.toString())
+</style>
+'''
 	}
 }
