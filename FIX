@@ -1,1 +1,1322 @@
+✅ JiraGateway.groovy
+package jiraIntegration
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findTestObject
+
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+
+import com.kms.katalon.core.testobject.RequestObject
+import com.kms.katalon.core.testobject.ResponseObject
+import com.kms.katalon.core.testobject.TestObjectProperty
+import com.kms.katalon.core.testobject.ConditionType
+import com.kms.katalon.core.testobject.impl.HttpTextBodyContent
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.webservice.keyword.WSBuiltInKeywords as WS
+
+import groovy.json.JsonBuilder
+import groovy.json.JsonSlurper
+import internal.GlobalVariable
+
+class JiraGateway {
+
+	JiraFlowCoordinator owner
+	JsonSlurper jsonSlurper = new JsonSlurper()
+
+	JiraGateway(JiraFlowCoordinator owner) {
+		this.owner = owner
+	}
+
+	void validateRequiredConfiguration() {
+		List<String> missing = []
+
+		if (owner.isBlank(resolveToken())) {
+			missing << 'JIRA token'
+		}
+		if (owner.isBlank(owner.PROJECT_KEY)) {
+			missing << 'PROJECT_KEY'
+		}
+		if (owner.isBlank(owner.JIRA_BASE_URL)) {
+			missing << 'JIRA_BASE_URL'
+		}
+
+		if (!missing.isEmpty()) {
+			KeywordUtil.markFailedAndStop('Missing Jira configuration: ' + missing.join(', '))
+		}
+	}
+
+	String importExecutionResults(String xmlPath) {
+		if (owner.isBlank(xmlPath)) {
+			return 'ERROR: XML path is empty'
+		}
+
+		File xmlFile = new File(xmlPath)
+		if (!xmlFile.exists() || !xmlFile.isFile() || xmlFile.length() <= 0) {
+			return 'ERROR: XML file not found or empty'
+		}
+
+		try {
+			ResponseObject response = WS.sendRequest(findTestObject('Jira Integration/Import Results', [
+				('filePath') : xmlPath,
+				('project')  : owner.PROJECT_KEY,
+				('baseUrl')  : owner.JIRA_BASE_URL,
+				('token')    : resolveToken()
+			]))
+
+			int status = response.getStatusCode()
+			String body = safeBody(response)
+
+			KeywordUtil.logInfo("Import Results status: ${status}")
+			KeywordUtil.logInfo("Import Results response: ${body}")
+
+			if (status < 200 || status >= 300) {
+				return "ERROR: import execution failed with status ${status}"
+			}
+
+			def parsed = parseJson(body)
+			String key = owner.safe(parsed?.testExecIssue?.key)
+
+			if (owner.isBlank(key)) {
+				return 'ERROR: execution key not found in import response'
+			}
+
+			return key
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Import Results request failed: ${e.message}")
+			return "ERROR: import execution request failed - ${e.message}"
+		}
+	}
+
+	int addExecutionToTestPlan(String testPlanKey, String executionKey) {
+		if (owner.isBlank(testPlanKey) || owner.isBlank(executionKey)) {
+			return 0
+		}
+
+		Map payload = [
+			add: [executionKey]
+		]
+
+		RequestObject request = new RequestObject('Runtime Add Execution To Test Plan')
+		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/raven/2.0/api/testplan/' + encode(testPlanKey) + '/testexecution')
+		request.setRestRequestMethod('POST')
+		request.setHttpHeaderProperties(jsonHeaders())
+		request.setBodyContent(jsonBody(payload))
+
+		ResponseObject response = WS.sendRequest(request)
+		int status = response.getStatusCode()
+
+		KeywordUtil.logInfo("Add execution to Test Plan status: ${status}")
+		KeywordUtil.logInfo("Add execution to Test Plan response: ${safeBody(response)}")
+
+		return status
+	}
+
+	int updateTestExecution(String issueKey, String summary, String labels, String environment) {
+		if (owner.isBlank(issueKey)) {
+			return 0
+		}
+
+		List<String> labelList = []
+		if (!owner.isBlank(labels)) {
+			def flowRef = owner
+			labelList = labels
+					.split(',')
+					.collect { item -> flowRef.safe(item) }
+					.findAll { item -> !flowRef.isBlank(item) }
+		}
+
+		Map fields = [
+			summary: owner.safe(summary),
+			labels : labelList
+		]
+
+		if (!owner.isBlank(environment)) {
+			fields.environment = owner.safe(environment)
+		}
+
+		RequestObject request = new RequestObject('Runtime Update Test Execution')
+		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey))
+		request.setRestRequestMethod('PUT')
+		request.setHttpHeaderProperties(jsonHeaders())
+		request.setBodyContent(jsonBody([fields: fields]))
+
+		ResponseObject response = WS.sendRequest(request)
+		int status = response.getStatusCode()
+
+		KeywordUtil.logInfo("Update Test Execution status: ${status}")
+		KeywordUtil.logInfo("Update Test Execution response: ${safeBody(response)}")
+
+		return status
+	}
+
+	int uploadAttachment(String issueKey, String filePath) {
+		if (owner.isBlank(issueKey) || owner.isBlank(filePath)) {
+			KeywordUtil.logInfo("Skipping attachment upload because issue key or file path is empty.")
+			return 0
+		}
+
+		File file = new File(filePath)
+		if (!file.exists() || !file.isFile() || file.length() <= 0) {
+			KeywordUtil.logInfo("Skipping attachment upload because file path is empty or invalid: ${filePath}")
+			return 0
+		}
+
+		HttpURLConnection connection = null
+		DataOutputStream output = null
+		FileInputStream input = null
+
+		try {
+			String endpoint = owner.JIRA_BASE_URL + '/rest/api/2/issue/' + encode(issueKey) + '/attachments'
+			String boundary = '----KatalonJiraBoundary' + System.currentTimeMillis()
+
+			KeywordUtil.logInfo("Uploading attachment directly to Jira API: ${file.absolutePath}")
+			KeywordUtil.logInfo("Attachment target issue: ${issueKey}")
+			KeywordUtil.logInfo("Attachment size bytes: ${file.length()}")
+
+			URL url = new URL(endpoint)
+			connection = (HttpURLConnection) url.openConnection()
+			connection.setRequestMethod('POST')
+			connection.setDoOutput(true)
+			connection.setDoInput(true)
+			connection.setUseCaches(false)
+			connection.setConnectTimeout(60000)
+			connection.setReadTimeout(120000)
+
+			connection.setRequestProperty('Authorization', 'Bearer ' + resolveToken())
+			connection.setRequestProperty('X-Atlassian-Token', 'no-check')
+			connection.setRequestProperty('Accept', 'application/json')
+			connection.setRequestProperty('Content-Type', 'multipart/form-data; boundary=' + boundary)
+
+			output = new DataOutputStream(connection.getOutputStream())
+
+			writeText(output, '--' + boundary + '\r\n')
+			writeText(output, 'Content-Disposition: form-data; name="file"; filename="' + sanitizeHeaderValue(file.name) + '"\r\n')
+			writeText(output, 'Content-Type: ' + resolveContentType(file.name) + '\r\n')
+			writeText(output, 'Content-Transfer-Encoding: binary\r\n')
+			writeText(output, '\r\n')
+
+			input = new FileInputStream(file)
+			byte[] buffer = new byte[8192]
+			int readBytes = 0
+
+			while ((readBytes = input.read(buffer)) != -1) {
+				output.write(buffer, 0, readBytes)
+			}
+
+			writeText(output, '\r\n')
+			writeText(output, '--' + boundary + '--\r\n')
+			output.flush()
+
+			int status = connection.getResponseCode()
+			String body = readConnectionBody(connection, status)
+
+			KeywordUtil.logInfo("Upload attachment status (${filePath}): ${status}")
+			KeywordUtil.logInfo("Upload attachment response: ${body}")
+
+			return status
+		} catch (Exception e) {
+			KeywordUtil.logInfo("Upload attachment request failed: ${e.message}")
+			return 0
+		} finally {
+			try {
+				input?.close()
+			} catch (Exception ignored) {
+			}
+			try {
+				output?.close()
+			} catch (Exception ignored) {
+			}
+			try {
+				connection?.disconnect()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	String createTestPlan(String summary, String epicKey) {
+		String epicFieldId = resolveEpicFieldId()
+
+		Map fields = [
+			project  : [key: owner.PROJECT_KEY],
+			summary  : owner.safe(summary),
+			issuetype: [name: 'Test Plan']
+		]
+
+		if (!owner.isBlank(epicKey) && !owner.isBlank(epicFieldId)) {
+			fields[epicFieldId] = owner.safe(epicKey)
+		}
+
+		RequestObject request = new RequestObject('Runtime Create Test Plan')
+		request.setRestUrl(owner.JIRA_BASE_URL + '/rest/api/2/issue')
+		request.setRestRequestMethod('POST')
+		request.setHttpHeaderProperties(jsonHeaders())
+		request.setBodyContent(jsonBody([fields: fields]))
+
+		ResponseObject response = WS.sendRequest(request)
+
+		int status = response.getStatusCode()
+		String body = safeBody(response)
+
+		KeywordUtil.logInfo("Create Test Plan status: ${status}")
+		KeywordUtil.logInfo("Create Test Plan response: ${body}")
+
+		if (status < 200 || status >= 300) {
+			return "ERROR: create test plan failed with status ${status}"
+		}
+
+		def parsed = parseJson(body)
+		String key = owner.safe(parsed?.key)
+
+		if (owner.isBlank(key)) {
+			return 'ERROR: created Test Plan key not found in response'
+		}
+
+		return key
+	}
+
+	Map searchTestPlans(String summary, String epicKey) {
+		String jql =
+				'project = "' + owner.PROJECT_KEY + '" ' +
+				'AND issuetype = "Test Plan" ' +
+				'ORDER BY created DESC'
+
+		KeywordUtil.logInfo("Searching Test Plan using JQL: ${jql}")
+
+		String url =
+				owner.JIRA_BASE_URL +
+				'/rest/api/2/search' +
+				'?jql=' + encode(jql) +
+				'&maxResults=200' +
+				'&fields=' + encode('summary,created,issuetype')
+
+		RequestObject request = new RequestObject('Runtime Search Test Plan')
+		request.setRestUrl(url)
+		request.setRestRequestMethod('GET')
+		request.setHttpHeaderProperties(defaultGetHeaders())
+
+		ResponseObject response = WS.sendRequest(request)
+
+		int status = response.getStatusCode()
+		String body = safeBody(response)
+
+		KeywordUtil.logInfo("Get Test Plan status: ${status}")
+		KeywordUtil.logInfo("Get Test Plan response: ${body}")
+
+		def parsed = parseJson(body)
+
+		return [
+			statusCode: status,
+			body      : body,
+			issues    : parsed?.issues instanceof List ? parsed.issues : []
+		]
+	}
+
+	Map getIssueByKey(String issueKey) {
+		if (owner.isBlank(issueKey)) {
+			return [statusCode: 0, issue: null, body: '']
+		}
+
+		String url =
+				owner.JIRA_BASE_URL +
+				'/rest/api/2/issue/' + encode(issueKey) +
+				'?fields=' + encode('summary,created,issuetype')
+
+		RequestObject request = new RequestObject('Runtime Get Issue By Key')
+		request.setRestUrl(url)
+		request.setRestRequestMethod('GET')
+		request.setHttpHeaderProperties(defaultGetHeaders())
+
+		ResponseObject response = WS.sendRequest(request)
+
+		int status = response.getStatusCode()
+		String body = safeBody(response)
+
+		KeywordUtil.logInfo("Get Issue By Key status: ${status}")
+		KeywordUtil.logInfo("Get Issue By Key response: ${body}")
+
+		def parsed = parseJson(body)
+
+		return [
+			statusCode: status,
+			body      : body,
+			issue     : parsed
+		]
+	}
+
+	private void writeText(DataOutputStream output, String value) {
+		output.write(value.getBytes(StandardCharsets.UTF_8))
+	}
+
+	private String readConnectionBody(HttpURLConnection connection, int status) {
+		InputStream stream = null
+
+		try {
+			stream = status >= 400 ? connection.getErrorStream() : connection.getInputStream()
+			if (stream == null) {
+				return ''
+			}
+			return stream.getText('UTF-8')
+		} catch (Exception ignored) {
+			return ''
+		} finally {
+			try {
+				stream?.close()
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private String sanitizeHeaderValue(String value) {
+		return owner.safe(value)
+				.replace('"', '_')
+				.replace('\r', '_')
+				.replace('\n', '_')
+	}
+
+	private String resolveContentType(String fileName) {
+		String lower = owner.safe(fileName).toLowerCase()
+
+		if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'text/html; charset=UTF-8'
+		if (lower.endsWith('.zip')) return 'application/zip'
+		if (lower.endsWith('.xml')) return 'application/xml'
+		if (lower.endsWith('.json')) return 'application/json'
+		if (lower.endsWith('.png')) return 'image/png'
+		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+		if (lower.endsWith('.gif')) return 'image/gif'
+		if (lower.endsWith('.webp')) return 'image/webp'
+		if (lower.endsWith('.bmp')) return 'image/bmp'
+		if (lower.endsWith('.txt') || lower.endsWith('.log')) return 'text/plain; charset=UTF-8'
+
+		return 'application/octet-stream'
+	}
+
+	private String resolveToken() {
+		try {
+			def direct = GlobalVariable.JIRA_TOKEN
+			if (!owner.isBlank(direct)) {
+				return owner.safe(direct)
+			}
+		} catch (Exception ignored) {
+		}
+
+		try {
+			def fallback = GlobalVariable.token
+			if (!owner.isBlank(fallback)) {
+				return owner.safe(fallback)
+			}
+		} catch (Exception ignored) {
+		}
+
+		return owner.safe(owner.JIRA_TOKEN)
+	}
+
+	private String resolveEpicFieldId() {
+		return 'customfield_10006'
+	}
+
+	private List<TestObjectProperty> defaultGetHeaders() {
+		return [
+			header('Authorization', 'Bearer ' + resolveToken()),
+			header('Accept', 'application/json')
+		]
+	}
+
+	private List<TestObjectProperty> jsonHeaders() {
+		return [
+			header('Authorization', 'Bearer ' + resolveToken()),
+			header('Accept', 'application/json'),
+			header('Content-Type', 'application/json')
+		]
+	}
+
+	private TestObjectProperty header(String name, String value) {
+		return new TestObjectProperty(name, ConditionType.EQUALS, value)
+	}
+
+	private HttpTextBodyContent jsonBody(Object payload) {
+		String text = new JsonBuilder(payload).toString()
+		return new HttpTextBodyContent(text, 'UTF-8', 'application/json')
+	}
+
+	private Object parseJson(String body) {
+		if (owner.isBlank(body)) {
+			return [:]
+		}
+
+		try {
+			return jsonSlurper.parseText(body)
+		} catch (Exception ignored) {
+			return [:]
+		}
+	}
+
+	private String safeBody(ResponseObject response) {
+		try {
+			return owner.safe(response?.getResponseBodyContent())
+		} catch (Exception ignored) {
+			return ''
+		}
+	}
+
+	private String encode(String value) {
+		return URLEncoder.encode(owner.safe(value), StandardCharsets.UTF_8.toString())
+	}
+}
+✅ JiraHtmlTemplateBuilder.groovy
+package jiraIntegration
+
+import java.util.Locale
+
+class JiraHtmlTemplateBuilder {
+
+	String build(Map model) {
+		Map summary = model?.summary instanceof Map ? model.summary as Map : [:]
+		List<Map> scenarios = model?.scenarios instanceof List ? model.scenarios as List<Map> : []
+
+		StringBuilder html = new StringBuilder()
+
+		html << '<!DOCTYPE html>'
+		html << '<html lang="en">'
+		html << '<head>'
+		html << '<meta charset="UTF-8">'
+		html << '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+		html << '<title>' << escape(model?.reportTitle ?: 'Test report') << '</title>'
+		html << buildStyle()
+		html << '</head>'
+		html << '<body>'
+
+		html << '<main class="page">'
+		html << buildHeader(model)
+		html << buildSummary(summary)
+		html << buildScenarios(scenarios)
+		html << '</main>'
+
+		html << '</body>'
+		html << '</html>'
+
+		return html.toString()
+	}
+
+	private String buildHeader(Map model) {
+		StringBuilder html = new StringBuilder()
+
+		String logoSrc = safe(model?.logoSrc)
+		String reportTitle = safe(model?.reportTitle ?: 'Test report')
+		String subtitle = safe(model?.subtitle ?: 'Execution overview')
+		String generatedAt = safe(model?.generatedAt)
+		String reportFolder = safe(model?.reportFolder)
+
+		html << '<section class="hero">'
+
+		if (!isBlank(logoSrc)) {
+			html << '<div class="logo-box">'
+			html << '<img class="logo" src="' << attr(logoSrc) << '" alt="Logo">'
+			html << '</div>'
+		}
+
+		html << '<div class="hero-content">'
+		html << '<p class="eyebrow">Automated execution report</p>'
+		html << '<h1>' << escape(reportTitle) << '</h1>'
+		html << '<p class="subtitle">' << escape(subtitle) << '</p>'
+
+		html << '<div class="meta-grid">'
+		html << buildMetaItem('Generated at', generatedAt)
+		html << buildMetaItem('Report folder', reportFolder)
+		html << '</div>'
+
+		html << '</div>'
+		html << '</section>'
+
+		return html.toString()
+	}
+
+	private String buildMetaItem(String label, String value) {
+		if (isBlank(value)) {
+			return ''
+		}
+
+		StringBuilder html = new StringBuilder()
+		html << '<div class="meta-item">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << escape(value) << '</strong>'
+		html << '</div>'
+		return html.toString()
+	}
+
+	private String buildSummary(Map summary) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<section class="summary-grid">'
+		html << buildSummaryCard('Total tests', summary?.total, 'total')
+		html << buildSummaryCard('Passed', summary?.passed, 'passed')
+		html << buildSummaryCard('Failed', summary?.failed, 'failed')
+		html << buildSummaryCard('Skipped', summary?.skipped, 'skipped')
+		html << buildSummaryCard('Duration', summary?.durationLabel, 'duration')
+		html << buildSummaryCard('Start', summary?.startLabel, 'time')
+		html << buildSummaryCard('End', summary?.endLabel, 'time')
+		html << '</section>'
+
+		return html.toString()
+	}
+
+	private String buildSummaryCard(String label, def value, String type) {
+		StringBuilder html = new StringBuilder()
+		String displayValue = safe(value)
+
+		if (isBlank(displayValue)) {
+			displayValue = '0'
+		}
+
+		html << '<article class="summary-card ' << attr(type) << '">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << escape(displayValue) << '</strong>'
+		html << '</article>'
+
+		return html.toString()
+	}
+
+	private String buildScenarios(List<Map> scenarios) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<section class="section-title">'
+		html << '<h2>Scenarios</h2>'
+		html << '<p>Detailed execution result by test case.</p>'
+		html << '</section>'
+
+		html << '<section class="scenario-list">'
+
+		if (scenarios == null || scenarios.isEmpty()) {
+			html << '<article class="empty-state">'
+			html << '<h3>No scenarios were found</h3>'
+			html << '<p>The report could not read scenarios from the execution log or XML result.</p>'
+			html << '</article>'
+		} else {
+			scenarios.eachWithIndex { Map scenario, int index ->
+				html << buildScenarioCard(scenario, index + 1)
+			}
+		}
+
+		html << '</section>'
+
+		return html.toString()
+	}
+
+	private String buildScenarioCard(Map scenario, int index) {
+		StringBuilder html = new StringBuilder()
+
+		String status = normalizeStatus(scenario?.status)
+		String title = safe(scenario?.title)
+		String duration = safe(scenario?.durationLabel)
+		String start = safe(scenario?.startLabel)
+		String end = safe(scenario?.endLabel)
+		String errorShort = safe(scenario?.errorShort)
+		String errorFull = safe(scenario?.errorFull)
+
+		List<Map> steps = scenario?.steps instanceof List ? scenario.steps as List<Map> : []
+		List<Map> evidences = scenario?.evidences instanceof List ? scenario.evidences as List<Map> : []
+
+		html << '<article class="scenario-card ' << attr(status) << '">'
+		html << '<div class="scenario-header">'
+		html << '<div>'
+		html << '<div class="scenario-index">Scenario #' << index << '</div>'
+		html << '<h3>' << escape(title) << '</h3>'
+		html << '</div>'
+		html << '<span class="status-badge ' << attr(status) << '">' << escape(statusIcon(status) + ' ' + status.toUpperCase(Locale.ENGLISH)) << '</span>'
+		html << '</div>'
+
+		html << '<div class="scenario-meta">'
+		html << buildInlineMeta('Duration', duration)
+		html << buildInlineMeta('Start', start)
+		html << buildInlineMeta('End', end)
+		html << '</div>'
+
+		if (!isBlank(errorShort)) {
+			html << '<div class="error-box">'
+			html << '<strong>Error summary</strong>'
+			html << '<p>' << escape(errorShort) << '</p>'
+			html << '</div>'
+		}
+
+		if (!isBlank(errorFull)) {
+			html << '<details class="details-box">'
+			html << '<summary>Full error details</summary>'
+			html << '<pre>' << escape(errorFull) << '</pre>'
+			html << '</details>'
+		}
+
+		html << buildEvidenceBlock(evidences)
+		html << buildStepsBlock(steps)
+
+		html << '</article>'
+
+		return html.toString()
+	}
+
+	private String buildInlineMeta(String label, String value) {
+		if (isBlank(value)) {
+			return ''
+		}
+
+		StringBuilder html = new StringBuilder()
+		html << '<div class="inline-meta">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << escape(value) << '</strong>'
+		html << '</div>'
+		return html.toString()
+	}
+
+	private String buildEvidenceBlock(List<Map> evidences) {
+		StringBuilder html = new StringBuilder()
+
+		if (evidences == null || evidences.isEmpty()) {
+			return ''
+		}
+
+		html << '<div class="evidence-section">'
+		html << '<h4>Visual evidence</h4>'
+		html << '<div class="evidence-grid">'
+
+		evidences.each { Map evidence ->
+			html << buildEvidenceItem(evidence)
+		}
+
+		html << '</div>'
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildEvidenceItem(Map evidence) {
+		StringBuilder html = new StringBuilder()
+
+		String name = safe(evidence?.name ?: evidence?.fileName ?: 'Evidence')
+		String href = safe(evidence?.href)
+		String imgSrc = safe(evidence?.imgSrc ?: evidence?.imageSrc ?: evidence?.imageDataUri)
+
+		html << '<figure class="evidence-item">'
+
+		if (!isBlank(href)) {
+			html << '<a href="' << attr(href) << '" target="_blank">'
+		}
+
+		if (!isBlank(imgSrc)) {
+			html << '<img src="' << attr(imgSrc) << '" alt="' << attr(name) << '">'
+		} else {
+			html << '<div class="evidence-placeholder">Image evidence</div>'
+		}
+
+		if (!isBlank(href)) {
+			html << '</a>'
+		}
+
+		html << '<figcaption>' << escape(name) << '</figcaption>'
+		html << '</figure>'
+
+		return html.toString()
+	}
+
+	private String buildStepsBlock(List<Map> steps) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<div class="steps-section">'
+		html << '<h4>Execution steps</h4>'
+
+		if (steps == null || steps.isEmpty()) {
+			html << '<p class="muted">No step details were found.</p>'
+		} else {
+			html << '<ol class="step-list">'
+			steps.eachWithIndex { Map step, int index ->
+				html << buildStepItem(step, index + 1)
+			}
+			html << '</ol>'
+		}
+
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildStepItem(Map step, int index) {
+		StringBuilder html = new StringBuilder()
+
+		String status = normalizeStatus(step?.status)
+		String title = safe(step?.title)
+		String emoji = safe(step?.emoji)
+		String time = safe(step?.timeLabel)
+		String duration = safe(step?.durationLabel)
+		String shortError = safe(step?.shortError)
+		String detailText = safe(step?.detailText)
+		String errorFull = safe(step?.errorFull)
+
+		if (isBlank(emoji)) {
+			emoji = '🔹'
+		}
+
+		html << '<li class="step-item ' << attr(status) << '">'
+		html << '<div class="step-main">'
+		html << '<span class="step-emoji">' << escape(emoji) << '</span>'
+		html << '<div class="step-content">'
+		html << '<div class="step-title-row">'
+		html << '<strong>' << index << '. ' << escape(title) << '</strong>'
+		html << '<span class="mini-status ' << attr(status) << '">' << escape(status.toUpperCase(Locale.ENGLISH)) << '</span>'
+		html << '</div>'
+
+		html << '<div class="step-meta">'
+		html << buildSmallMeta('Time', time)
+		html << buildSmallMeta('Duration', duration)
+		html << '</div>'
+
+		if (!isBlank(shortError)) {
+			html << '<p class="step-error">' << escape(shortError) << '</p>'
+		}
+
+		if (!isBlank(errorFull)) {
+			html << '<details class="step-details">'
+			html << '<summary>Error details</summary>'
+			html << '<pre>' << escape(errorFull) << '</pre>'
+			html << '</details>'
+		} else if (!isBlank(detailText)) {
+			html << '<details class="step-details">'
+			html << '<summary>Step details</summary>'
+			html << '<pre>' << escape(detailText) << '</pre>'
+			html << '</details>'
+		}
+
+		html << '</div>'
+		html << '</div>'
+		html << '</li>'
+
+		return html.toString()
+	}
+
+	private String buildSmallMeta(String label, String value) {
+		if (isBlank(value)) {
+			return ''
+		}
+
+		StringBuilder html = new StringBuilder()
+		html << '<span>'
+		html << escape(label)
+		html << ': '
+		html << '<strong>' << escape(value) << '</strong>'
+		html << '</span>'
+		return html.toString()
+	}
+
+	private String normalizeStatus(def value) {
+		String status = safe(value).toLowerCase(Locale.ENGLISH)
+
+		if (status == 'passed') return 'passed'
+		if (status == 'failed') return 'failed'
+		if (status == 'skipped') return 'skipped'
+		if (status == 'info') return 'info'
+
+		return 'skipped'
+	}
+
+	private String statusIcon(String status) {
+		if (status == 'passed') return '✅'
+		if (status == 'failed') return '❌'
+		if (status == 'skipped') return '⏭️'
+		if (status == 'info') return 'ℹ️'
+		return 'ℹ️'
+	}
+
+	private String safe(def value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+
+	private boolean isBlank(def value) {
+		return safe(value).isEmpty()
+	}
+
+	private String escape(def value) {
+		String text = safe(value)
+		return text
+				.replace('&', '&amp;')
+				.replace('<', '&lt;')
+				.replace('>', '&gt;')
+				.replace('"', '&quot;')
+				.replace("'", '&#39;')
+	}
+
+	private String attr(def value) {
+		return escape(value)
+	}
+
+	private String buildStyle() {
+		return '''
+<style>
+	:root {
+		--bg: #f4f7fb;
+		--card: #ffffff;
+		--text: #172033;
+		--muted: #64748b;
+		--border: #e2e8f0;
+		--passed: #16a34a;
+		--passed-bg: #dcfce7;
+		--failed: #dc2626;
+		--failed-bg: #fee2e2;
+		--skipped: #ca8a04;
+		--skipped-bg: #fef3c7;
+		--info: #2563eb;
+		--info-bg: #dbeafe;
+		--shadow: 0 20px 40px rgba(15, 23, 42, 0.08);
+	}
+
+	* {
+		box-sizing: border-box;
+	}
+
+	body {
+		margin: 0;
+		background: var(--bg);
+		color: var(--text);
+		font-family: Arial, Helvetica, sans-serif;
+		line-height: 1.5;
+	}
+
+	.page {
+		width: min(1180px, calc(100% - 32px));
+		margin: 0 auto;
+		padding: 32px 0 56px;
+	}
+
+	.hero {
+		display: flex;
+		gap: 24px;
+		align-items: center;
+		background: linear-gradient(135deg, #111827, #1e293b);
+		color: #ffffff;
+		border-radius: 24px;
+		padding: 32px;
+		box-shadow: var(--shadow);
+	}
+
+	.logo-box {
+		width: 120px;
+		height: 120px;
+		border-radius: 24px;
+		background: rgba(255,255,255,0.12);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex: 0 0 auto;
+	}
+
+	.logo {
+		max-width: 88px;
+		max-height: 88px;
+		object-fit: contain;
+	}
+
+	.hero-content {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.eyebrow {
+		margin: 0 0 8px;
+		text-transform: uppercase;
+		letter-spacing: 0.14em;
+		color: #cbd5e1;
+		font-size: 12px;
+		font-weight: 700;
+	}
+
+	h1 {
+		margin: 0;
+		font-size: 34px;
+		line-height: 1.1;
+	}
+
+	.subtitle {
+		margin: 10px 0 0;
+		color: #cbd5e1;
+		font-size: 16px;
+	}
+
+	.meta-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+		gap: 12px;
+		margin-top: 22px;
+	}
+
+	.meta-item {
+		background: rgba(255,255,255,0.10);
+		border: 1px solid rgba(255,255,255,0.16);
+		border-radius: 14px;
+		padding: 12px;
+		min-width: 0;
+	}
+
+	.meta-item span,
+	.inline-meta span,
+	.summary-card span {
+		display: block;
+		color: var(--muted);
+		font-size: 12px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+	}
+
+	.meta-item span {
+		color: #cbd5e1;
+	}
+
+	.meta-item strong {
+		display: block;
+		margin-top: 4px;
+		color: #ffffff;
+		font-size: 13px;
+		word-break: break-word;
+	}
+
+	.summary-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+		gap: 16px;
+		margin-top: 24px;
+	}
+
+	.summary-card {
+		background: var(--card);
+		border: 1px solid var(--border);
+		border-radius: 18px;
+		padding: 18px;
+		box-shadow: var(--shadow);
+	}
+
+	.summary-card strong {
+		display: block;
+		margin-top: 8px;
+		font-size: 26px;
+	}
+
+	.summary-card.passed strong {
+		color: var(--passed);
+	}
+
+	.summary-card.failed strong {
+		color: var(--failed);
+	}
+
+	.summary-card.skipped strong {
+		color: var(--skipped);
+	}
+
+	.section-title {
+		margin-top: 36px;
+		margin-bottom: 16px;
+	}
+
+	.section-title h2 {
+		margin: 0;
+		font-size: 26px;
+	}
+
+	.section-title p {
+		margin: 4px 0 0;
+		color: var(--muted);
+	}
+
+	.scenario-list {
+		display: grid;
+		gap: 20px;
+	}
+
+	.scenario-card {
+		background: var(--card);
+		border: 1px solid var(--border);
+		border-left: 8px solid var(--border);
+		border-radius: 22px;
+		padding: 22px;
+		box-shadow: var(--shadow);
+	}
+
+	.scenario-card.passed {
+		border-left-color: var(--passed);
+	}
+
+	.scenario-card.failed {
+		border-left-color: var(--failed);
+	}
+
+	.scenario-card.skipped {
+		border-left-color: var(--skipped);
+	}
+
+	.scenario-card.info {
+		border-left-color: var(--info);
+	}
+
+	.scenario-header {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 16px;
+	}
+
+	.scenario-index {
+		font-size: 12px;
+		color: var(--muted);
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+	}
+
+	.scenario-header h3 {
+		margin: 4px 0 0;
+		font-size: 21px;
+	}
+
+	.status-badge,
+	.mini-status {
+		border-radius: 999px;
+		font-size: 12px;
+		font-weight: 800;
+		padding: 7px 11px;
+		white-space: nowrap;
+	}
+
+	.status-badge.passed,
+	.mini-status.passed {
+		color: var(--passed);
+		background: var(--passed-bg);
+	}
+
+	.status-badge.failed,
+	.mini-status.failed {
+		color: var(--failed);
+		background: var(--failed-bg);
+	}
+
+	.status-badge.skipped,
+	.mini-status.skipped {
+		color: var(--skipped);
+		background: var(--skipped-bg);
+	}
+
+	.status-badge.info,
+	.mini-status.info {
+		color: var(--info);
+		background: var(--info-bg);
+	}
+
+	.scenario-meta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+		margin-top: 16px;
+	}
+
+	.inline-meta {
+		background: #f8fafc;
+		border: 1px solid var(--border);
+		border-radius: 14px;
+		padding: 10px 12px;
+		min-width: 140px;
+	}
+
+	.inline-meta strong {
+		display: block;
+		margin-top: 2px;
+	}
+
+	.error-box {
+		margin-top: 16px;
+		background: var(--failed-bg);
+		border: 1px solid #fecaca;
+		color: #7f1d1d;
+		border-radius: 16px;
+		padding: 14px 16px;
+	}
+
+	.error-box p {
+		margin: 6px 0 0;
+	}
+
+	.details-box,
+	.step-details {
+		margin-top: 12px;
+		border: 1px solid var(--border);
+		border-radius: 14px;
+		background: #f8fafc;
+		padding: 10px 12px;
+	}
+
+	summary {
+		cursor: pointer;
+		font-weight: 700;
+		color: #334155;
+	}
+
+	pre {
+		white-space: pre-wrap;
+		word-break: break-word;
+		font-family: Consolas, Monaco, monospace;
+		font-size: 12px;
+		background: #0f172a;
+		color: #e2e8f0;
+		border-radius: 12px;
+		padding: 14px;
+		overflow: auto;
+	}
+
+	.evidence-section,
+	.steps-section {
+		margin-top: 20px;
+	}
+
+	.evidence-section h4,
+	.steps-section h4 {
+		margin: 0 0 12px;
+		font-size: 16px;
+	}
+
+	.evidence-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+		gap: 16px;
+	}
+
+	.evidence-item {
+		margin: 0;
+		border: 1px solid var(--border);
+		border-radius: 16px;
+		overflow: hidden;
+		background: #f8fafc;
+	}
+
+	.evidence-item img {
+		width: 100%;
+		max-height: 360px;
+		object-fit: contain;
+		display: block;
+		background: #111827;
+	}
+
+	.evidence-placeholder {
+		height: 180px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--muted);
+	}
+
+	.evidence-item figcaption {
+		padding: 10px 12px;
+		font-size: 12px;
+		color: var(--muted);
+		word-break: break-word;
+	}
+
+	.step-list {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+		display: grid;
+		gap: 12px;
+	}
+
+	.step-item {
+		border: 1px solid var(--border);
+		border-radius: 16px;
+		background: #ffffff;
+		padding: 14px;
+	}
+
+	.step-main {
+		display: flex;
+		gap: 12px;
+	}
+
+	.step-emoji {
+		width: 34px;
+		height: 34px;
+		border-radius: 12px;
+		background: #f1f5f9;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex: 0 0 auto;
+	}
+
+	.step-content {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.step-title-row {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 12px;
+	}
+
+	.step-title-row strong {
+		font-size: 14px;
+	}
+
+	.step-meta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+		margin-top: 8px;
+		color: var(--muted);
+		font-size: 12px;
+	}
+
+	.step-error {
+		margin: 10px 0 0;
+		color: var(--failed);
+		font-weight: 700;
+	}
+
+	.muted {
+		color: var(--muted);
+	}
+
+	.empty-state {
+		background: var(--card);
+		border: 1px dashed var(--border);
+		border-radius: 22px;
+		padding: 28px;
+		text-align: center;
+		color: var(--muted);
+	}
+
+	.empty-state h3 {
+		margin: 0 0 8px;
+		color: var(--text);
+	}
+
+	@media (max-width: 720px) {
+		.hero {
+			flex-direction: column;
+			align-items: flex-start;
+			padding: 24px;
+		}
+
+		h1 {
+			font-size: 26px;
+		}
+
+		.scenario-header,
+		.step-title-row {
+			flex-direction: column;
+			align-items: flex-start;
+		}
+	}
+</style>
+'''
+	}
+}
