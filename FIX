@@ -1,1 +1,1419 @@
+package jiraIntegration
 
+import java.util.Locale
+
+class JiraHtmlTemplateBuilder {
+
+	String build(Map model) {
+		Map summary = model?.summary instanceof Map ? model.summary as Map : [:]
+		List<Map> scenarios = model?.scenarios instanceof List ? model.scenarios as List<Map> : []
+
+		StringBuilder html = new StringBuilder()
+
+		html << '<!DOCTYPE html>'
+		html << '<html lang="en">'
+		html << '<head>'
+		html << '<meta charset="UTF-8">'
+		html << '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+		html << '<title>' << escape(model?.reportTitle ?: 'Test report') << '</title>'
+		html << buildStyle()
+		html << '</head>'
+		html << '<body>'
+
+		html << '<div class="report-page">'
+		html << buildHeader(model)
+		html << buildReportBody(model, summary, scenarios)
+		html << '</div>'
+
+		html << buildScript()
+		html << '</body>'
+		html << '</html>'
+
+		return html.toString()
+	}
+
+	private String buildHeader(Map model) {
+		StringBuilder html = new StringBuilder()
+
+		String logoSrc = safe(model?.logoSrc)
+		String reportTitle = safe(model?.reportTitle ?: 'Test report')
+		String subtitle = safe(model?.subtitle ?: 'Execution overview')
+		String generatedAt = safe(model?.generatedAt)
+
+		html << '<header class="report-hero">'
+		html << '<div class="hero-left">'
+
+		html << '<div class="project-logo-box">'
+		if (!isBlank(logoSrc)) {
+			html << '<img src="' << attr(logoSrc) << '" alt="Project logo" class="project-logo-img">'
+		} else {
+			html << '<div class="project-logo-text">Hue</div>'
+		}
+		html << '</div>'
+
+		html << '<div class="hero-title-block">'
+		html << '<div class="hero-kicker">'
+		html << '<span class="hero-dot"></span>'
+		html << '<span>Hue automation report</span>'
+		html << '</div>'
+		html << '<h1>' << escape(reportTitle) << '</h1>'
+		html << '<p>' << escape(subtitle) << '</p>'
+		html << '</div>'
+
+		html << '</div>'
+
+		if (!isBlank(generatedAt)) {
+			html << '<div class="hero-generated">'
+			html << '<span>Generated</span>'
+			html << '<strong>' << escape(generatedAt) << '</strong>'
+			html << '</div>'
+		}
+
+		html << '</header>'
+
+		return html.toString()
+	}
+
+	private String buildReportBody(Map model, Map summary, List<Map> scenarios) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<main class="report-body">'
+		html << buildSidebar(model, scenarios)
+		html << '<section class="report-content">'
+		html << buildSummary(summary)
+		html << buildScenarioDetails(model, scenarios)
+		html << '</section>'
+		html << '</main>'
+
+		return html.toString()
+	}
+
+	private String buildSidebar(Map model, List<Map> scenarios) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<aside class="left-panel">'
+
+		html << '<div class="panel-tabs">'
+		html << '<button type="button" class="tab-button active" data-tab-button="tests">Tests</button>'
+		html << '<button type="button" class="tab-button" data-tab-button="charts">Charts</button>'
+		html << '</div>'
+
+		html << '<div class="tab-panel active" data-tab-panel="tests">'
+		html << '<div class="search-box">'
+		html << '<input type="text" id="scenarioSearch" placeholder="Search test name, path, or status...">'
+		html << '</div>'
+
+		html << '<div class="scenario-nav-list">'
+
+		if (scenarios == null || scenarios.isEmpty()) {
+			html << '<div class="empty-sidebar">No tests found</div>'
+		} else {
+			scenarios.eachWithIndex { Map scenario, int index ->
+				html << buildSidebarItem(scenario, index + 1)
+			}
+		}
+
+		html << '</div>'
+		html << '</div>'
+
+		html << '<div class="tab-panel" data-tab-panel="charts">'
+		html << buildChartsPanel(model?.summary instanceof Map ? model.summary as Map : [:], scenarios)
+		html << '</div>'
+
+		html << '</aside>'
+
+		return html.toString()
+	}
+
+	private String buildSidebarItem(Map scenario, int index) {
+		StringBuilder html = new StringBuilder()
+
+		String title = safe(scenario?.title)
+		String status = normalizeStatus(scenario?.status)
+		String duration = safe(scenario?.durationLabel)
+		String searchValue = title + ' ' + status
+
+		html << '<a class="scenario-nav-item ' << attr(status) << '" href="#scenario-' << index << '" data-search="' << attr(searchValue.toLowerCase(Locale.ENGLISH)) << '">'
+		html << '<div class="scenario-nav-main">'
+		html << '<strong>' << escape(title) << '</strong>'
+		if (!isBlank(duration)) {
+			html << '<span>' << escape(duration) << '</span>'
+		}
+		html << '</div>'
+		html << '<em class="' << attr(status) << '">' << escape(status) << '</em>'
+		html << '</a>'
+
+		return html.toString()
+	}
+
+	private String buildChartsPanel(Map summary, List<Map> scenarios) {
+		StringBuilder html = new StringBuilder()
+
+		int total = toInt(summary?.total)
+		int passed = toInt(summary?.passed)
+		int failed = toInt(summary?.failed)
+		int skipped = toInt(summary?.skipped)
+		int info = toInt(summary?.info)
+
+		if (total <= 0 && scenarios != null) {
+			total = scenarios.size()
+		}
+
+		html << '<div class="charts-wrapper">'
+		html << '<h3>Execution overview</h3>'
+		html << '<p>Summary by result status.</p>'
+
+		html << buildChartRow('Passed', passed, total, 'passed')
+		html << buildChartRow('Failed', failed, total, 'failed')
+		html << buildChartRow('Skipped', skipped, total, 'skipped')
+
+		if (info > 0) {
+			html << buildChartRow('Info', info, total, 'info')
+		}
+
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildChartRow(String label, int value, int total, String status) {
+		StringBuilder html = new StringBuilder()
+
+		int percent = total > 0 ? Math.round((value * 100f) / total) as int : 0
+
+		html << '<div class="chart-row ' << attr(status) << '">'
+		html << '<div class="chart-label">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << value << '</strong>'
+		html << '</div>'
+		html << '<div class="chart-track">'
+		html << '<div class="chart-fill ' << attr(status) << '" style="width:' << percent << '%"></div>'
+		html << '</div>'
+		html << '<small>' << percent << '%</small>'
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildSummary(Map summary) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<section class="summary-grid">'
+		html << buildSummaryCard('Total tests', summary?.total, 'total')
+		html << buildSummaryCard('Passed', summary?.passed, 'passed')
+		html << buildSummaryCard('Failed', summary?.failed, 'failed')
+		html << buildSummaryCard('Skipped', summary?.skipped, 'skipped')
+		html << buildSummaryCard('Duration', summary?.durationLabel, 'duration')
+		html << buildSummaryCard('Start', summary?.startLabel, 'date')
+		html << buildSummaryCard('End', summary?.endLabel, 'date')
+		html << '</section>'
+
+		return html.toString()
+	}
+
+	private String buildSummaryCard(String label, def value, String type) {
+		String displayValue = safe(value)
+
+		if (isBlank(displayValue)) {
+			displayValue = '0'
+		}
+
+		StringBuilder html = new StringBuilder()
+		html << '<article class="summary-card ' << attr(type) << '">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << escape(displayValue) << '</strong>'
+		html << '</article>'
+
+		return html.toString()
+	}
+
+	private String buildScenarioDetails(Map model, List<Map> scenarios) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<section class="details-heading">'
+		html << '<span>Execution details</span>'
+		html << '<h2>Tests</h2>'
+		html << '</section>'
+
+		html << '<section class="scenario-details-list">'
+
+		if (scenarios == null || scenarios.isEmpty()) {
+			html << '<article class="empty-state">'
+			html << '<h3>No scenarios were found</h3>'
+			html << '<p>The report could not read scenarios from the execution log or XML result.</p>'
+			html << '</article>'
+		} else {
+			scenarios.eachWithIndex { Map scenario, int index ->
+				html << buildScenarioCard(model, scenario, index + 1)
+			}
+		}
+
+		html << '</section>'
+
+		return html.toString()
+	}
+
+	private String buildScenarioCard(Map model, Map scenario, int index) {
+		StringBuilder html = new StringBuilder()
+
+		String suiteName = safe(model?.suiteName)
+		String status = normalizeStatus(scenario?.status)
+		String title = safe(scenario?.title)
+		String duration = safe(scenario?.durationLabel)
+		String start = safe(scenario?.startLabel)
+		String end = safe(scenario?.endLabel)
+		String errorShort = safe(scenario?.errorShort)
+		String errorFull = safe(scenario?.errorFull)
+
+		List<Map> steps = scenario?.steps instanceof List ? scenario.steps as List<Map> : []
+		List<Map> evidences = scenario?.evidences instanceof List ? scenario.evidences as List<Map> : []
+
+		html << '<article id="scenario-' << index << '" class="scenario-card ' << attr(status) << '">'
+
+		html << '<div class="scenario-card-header">'
+		html << '<div>'
+		html << '<div class="scenario-index">Scenario #' << index << '</div>'
+		html << '<h3>' << escape(title) << '</h3>'
+		html << '</div>'
+		html << '<span class="scenario-status-badge ' << attr(status) << '">' << escape(statusIcon(status) + ' ' + status.toUpperCase(Locale.ENGLISH)) << '</span>'
+		html << '</div>'
+
+		html << '<div class="scenario-meta-pills">'
+		html << buildMetaPill('Suite', suiteName, 'suite')
+		html << buildMetaPill('Status', status.toUpperCase(Locale.ENGLISH), status)
+		html << buildMetaPill('Start', start, 'date')
+		html << buildMetaPill('End', end, 'date')
+		html << buildMetaPill('Duration', duration, 'date')
+		html << '</div>'
+
+		if (!isBlank(errorShort)) {
+			html << '<div class="error-summary">'
+			html << '<strong>Error summary</strong>'
+			html << '<p>' << escape(errorShort) << '</p>'
+			html << '</div>'
+		}
+
+		if (!isBlank(errorFull)) {
+			html << '<details class="details-box">'
+			html << '<summary>Full error details</summary>'
+			html << '<pre>' << escape(errorFull) << '</pre>'
+			html << '</details>'
+		}
+
+		html << buildEvidenceBlock(evidences)
+		html << buildStepsBlock(steps)
+
+		html << '</article>'
+
+		return html.toString()
+	}
+
+	private String buildMetaPill(String label, String value, String type) {
+		if (isBlank(value)) {
+			return ''
+		}
+
+		StringBuilder html = new StringBuilder()
+		html << '<div class="meta-pill ' << attr(type) << '">'
+		html << '<span>' << escape(label) << '</span>'
+		html << '<strong>' << escape(value) << '</strong>'
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildEvidenceBlock(List<Map> evidences) {
+		if (evidences == null || evidences.isEmpty()) {
+			return ''
+		}
+
+		StringBuilder html = new StringBuilder()
+
+		html << '<div class="evidence-section">'
+		html << '<h4>Visual evidence</h4>'
+		html << '<div class="evidence-grid">'
+
+		evidences.each { Map evidence ->
+			html << buildEvidenceItem(evidence)
+		}
+
+		html << '</div>'
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildEvidenceItem(Map evidence) {
+		StringBuilder html = new StringBuilder()
+
+		String name = safe(evidence?.name ?: evidence?.fileName ?: 'Evidence')
+		String href = safe(evidence?.href)
+		String imgSrc = safe(evidence?.imgSrc ?: evidence?.imageSrc ?: evidence?.imageDataUri)
+
+		html << '<figure class="evidence-item">'
+
+		if (!isBlank(href)) {
+			html << '<a href="' << attr(href) << '" target="_blank">'
+		}
+
+		if (!isBlank(imgSrc)) {
+			html << '<img src="' << attr(imgSrc) << '" alt="' << attr(name) << '">'
+		} else {
+			html << '<div class="evidence-placeholder">Image evidence</div>'
+		}
+
+		if (!isBlank(href)) {
+			html << '</a>'
+		}
+
+		html << '<figcaption>' << escape(name) << '</figcaption>'
+		html << '</figure>'
+
+		return html.toString()
+	}
+
+	private String buildStepsBlock(List<Map> steps) {
+		StringBuilder html = new StringBuilder()
+
+		html << '<div class="steps-section">'
+		html << '<h4>Steps</h4>'
+
+		if (steps == null || steps.isEmpty()) {
+			html << '<p class="muted">No step details were found.</p>'
+		} else {
+			html << '<div class="steps-table">'
+			html << '<div class="steps-header">'
+			html << '<span>Status</span>'
+			html << '<span>Timestamp</span>'
+			html << '<span>Details</span>'
+			html << '</div>'
+
+			steps.eachWithIndex { Map step, int index ->
+				html << buildStepRow(step, index + 1)
+			}
+
+			html << '</div>'
+		}
+
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String buildStepRow(Map step, int index) {
+		StringBuilder html = new StringBuilder()
+
+		String status = normalizeStatus(step?.status)
+		String title = safe(step?.title)
+		String emoji = safe(step?.emoji)
+		String time = safe(step?.timeLabel)
+		String duration = safe(step?.durationLabel)
+		String shortError = safe(step?.shortError)
+		String detailText = safe(step?.detailText)
+		String errorFull = safe(step?.errorFull)
+
+		if (isBlank(emoji)) {
+			emoji = '🔹'
+		}
+
+		html << '<div class="steps-row ' << attr(status) << '">'
+
+		html << '<div class="step-status-column">'
+		html << '<span class="step-status ' << attr(status) << '">' << escape(status) << '</span>'
+		html << '</div>'
+
+		html << '<div class="step-time-column">'
+		html << '<strong>' << escape(time) << '</strong>'
+		if (!isBlank(duration)) {
+			html << '<small>' << escape(duration) << '</small>'
+		}
+		html << '</div>'
+
+		html << '<div class="step-detail-column">'
+		html << '<strong>' << escape(emoji) << ' ' << index << '. ' << escape(title) << '</strong>'
+
+		if (!isBlank(shortError)) {
+			html << '<p class="step-error">' << escape(shortError) << '</p>'
+		}
+
+		if (!isBlank(errorFull)) {
+			html << '<details class="step-details">'
+			html << '<summary>Error details</summary>'
+			html << '<pre>' << escape(errorFull) << '</pre>'
+			html << '</details>'
+		} else if (!isBlank(detailText)) {
+			html << '<details class="step-details">'
+			html << '<summary>Step details</summary>'
+			html << '<pre>' << escape(detailText) << '</pre>'
+			html << '</details>'
+		}
+
+		html << '</div>'
+		html << '</div>'
+
+		return html.toString()
+	}
+
+	private String normalizeStatus(def value) {
+		String status = safe(value).toLowerCase(Locale.ENGLISH)
+
+		if (status == 'passed') return 'passed'
+		if (status == 'failed') return 'failed'
+		if (status == 'skipped') return 'skipped'
+		if (status == 'info') return 'info'
+
+		return 'skipped'
+	}
+
+	private String statusIcon(String status) {
+		if (status == 'passed') return '✓'
+		if (status == 'failed') return '✕'
+		if (status == 'skipped') return '↷'
+		if (status == 'info') return 'i'
+		return 'i'
+	}
+
+	private int toInt(def value) {
+		try {
+			return Integer.parseInt(safe(value))
+		} catch (Exception ignored) {
+			return 0
+		}
+	}
+
+	private String safe(def value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+
+	private boolean isBlank(def value) {
+		return safe(value).isEmpty()
+	}
+
+	private String escape(def value) {
+		String text = safe(value)
+		return text
+				.replace('&', '&amp;')
+				.replace('<', '&lt;')
+				.replace('>', '&gt;')
+				.replace('"', '&quot;')
+				.replace("'", '&#39;')
+	}
+
+	private String attr(def value) {
+		return escape(value)
+	}
+
+	private String buildScript() {
+		return '''
+<script>
+	document.addEventListener('DOMContentLoaded', function () {
+		var search = document.getElementById('scenarioSearch');
+		var items = document.querySelectorAll('.scenario-nav-item');
+
+		if (search) {
+			search.addEventListener('input', function () {
+				var value = search.value.toLowerCase().trim();
+
+				items.forEach(function (item) {
+					var content = item.getAttribute('data-search') || '';
+					item.style.display = content.indexOf(value) >= 0 ? '' : 'none';
+				});
+			});
+		}
+
+		var buttons = document.querySelectorAll('[data-tab-button]');
+		var panels = document.querySelectorAll('[data-tab-panel]');
+
+		buttons.forEach(function (button) {
+			button.addEventListener('click', function () {
+				var target = button.getAttribute('data-tab-button');
+
+				buttons.forEach(function (item) {
+					item.classList.remove('active');
+				});
+
+				panels.forEach(function (panel) {
+					panel.classList.remove('active');
+				});
+
+				button.classList.add('active');
+
+				var panel = document.querySelector('[data-tab-panel="' + target + '"]');
+				if (panel) {
+					panel.classList.add('active');
+				}
+			});
+		});
+	});
+</script>
+'''
+	}
+
+	private String buildStyle() {
+		return '''
+<style>
+	:root {
+		--bg: #f4f7fb;
+		--panel: #ffffff;
+		--text: #172033;
+		--muted: #697988;
+		--border: #e1e8ef;
+
+		--hue-dark: #1f2d33;
+		--hue-dark-2: #26393f;
+		--hue-cyan: #00a6c8;
+		--hue-cyan-dark: #007c96;
+		--hue-cyan-soft: #e3f8fb;
+
+		--passed: #57a639;
+		--passed-soft: #e7f5e1;
+		--failed: #c94444;
+		--failed-soft: #fde8e8;
+		--skipped: #d79a21;
+		--skipped-soft: #fff2d8;
+		--info: #2587a5;
+		--info-soft: #e4f5f8;
+
+		--shadow: 0 18px 40px rgba(31, 41, 51, 0.08);
+		--radius: 18px;
+	}
+
+	* {
+		box-sizing: border-box;
+	}
+
+	html {
+		scroll-behavior: smooth;
+	}
+
+	body {
+		margin: 0;
+		background: var(--bg);
+		color: var(--text);
+		font-family: Arial, Helvetica, sans-serif;
+		font-size: 14px;
+		line-height: 1.5;
+	}
+
+	.report-page {
+		width: min(1500px, calc(100% - 34px));
+		margin: 0 auto;
+		padding: 24px 0 44px;
+	}
+
+	.report-hero {
+		min-height: 126px;
+		border-radius: 22px;
+		background:
+			radial-gradient(circle at 88% 30%, rgba(0, 166, 200, 0.22), transparent 32%),
+			linear-gradient(135deg, var(--hue-dark) 0%, #17272d 56%, var(--hue-dark-2) 100%);
+		color: #ffffff;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 26px;
+		padding: 26px 30px;
+		box-shadow: var(--shadow);
+		overflow: hidden;
+	}
+
+	.hero-left {
+		display: flex;
+		align-items: center;
+		gap: 18px;
+		min-width: 0;
+	}
+
+	.project-logo-box {
+		width: 58px;
+		height: 58px;
+		border-radius: 16px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background: rgba(0, 166, 200, 0.13);
+		border: 1px solid rgba(0, 166, 200, 0.32);
+		flex: 0 0 auto;
+	}
+
+	.project-logo-img {
+		max-width: 44px;
+		max-height: 44px;
+		object-fit: contain;
+	}
+
+	.project-logo-text {
+		color: var(--hue-cyan);
+		font-size: 20px;
+		font-weight: 900;
+		letter-spacing: -0.05em;
+	}
+
+	.hero-title-block {
+		min-width: 0;
+	}
+
+	.hero-kicker {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		color: #a9dce6;
+		text-transform: uppercase;
+		letter-spacing: 0.12em;
+		font-size: 11px;
+		font-weight: 900;
+		margin-bottom: 7px;
+	}
+
+	.hero-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 999px;
+		background: var(--hue-cyan);
+		box-shadow: 0 0 0 5px rgba(0, 166, 200, 0.16);
+	}
+
+	.report-hero h1 {
+		margin: 0;
+		font-size: 30px;
+		line-height: 1.1;
+		letter-spacing: -0.04em;
+	}
+
+	.report-hero p {
+		margin: 8px 0 0;
+		color: #c8d5da;
+		font-size: 14px;
+	}
+
+	.hero-generated {
+		background: rgba(255, 255, 255, 0.08);
+		border: 1px solid rgba(255, 255, 255, 0.13);
+		border-radius: 15px;
+		padding: 13px 15px;
+		min-width: 230px;
+		text-align: left;
+	}
+
+	.hero-generated span {
+		display: block;
+		color: #a9bac1;
+		text-transform: uppercase;
+		letter-spacing: 0.10em;
+		font-size: 10px;
+		font-weight: 900;
+	}
+
+	.hero-generated strong {
+		display: block;
+		margin-top: 4px;
+		color: #ffffff;
+		font-size: 12px;
+	}
+
+	.report-body {
+		display: grid;
+		grid-template-columns: 320px 1fr;
+		gap: 22px;
+		margin-top: 22px;
+		align-items: start;
+	}
+
+	.left-panel {
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		box-shadow: var(--shadow);
+		min-height: 680px;
+		position: sticky;
+		top: 18px;
+		overflow: hidden;
+	}
+
+	.panel-tabs {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		border-bottom: 1px solid var(--border);
+		background: #f9fbfd;
+	}
+
+	.tab-button {
+		border: 0;
+		background: transparent;
+		padding: 16px;
+		cursor: pointer;
+		font-weight: 800;
+		color: var(--muted);
+		border-bottom: 3px solid transparent;
+	}
+
+	.tab-button.active {
+		color: var(--hue-cyan-dark);
+		border-bottom-color: var(--hue-cyan);
+		background: #ffffff;
+	}
+
+	.tab-panel {
+		display: none;
+		padding: 16px;
+	}
+
+	.tab-panel.active {
+		display: block;
+	}
+
+	.search-box input {
+		width: 100%;
+		border: 1px solid var(--border);
+		border-radius: 12px;
+		padding: 12px 13px;
+		outline: none;
+		color: var(--text);
+		background: #ffffff;
+	}
+
+	.search-box input:focus {
+		border-color: var(--hue-cyan);
+		box-shadow: 0 0 0 4px rgba(0, 166, 200, 0.10);
+	}
+
+	.scenario-nav-list {
+		display: grid;
+		gap: 10px;
+		margin-top: 14px;
+	}
+
+	.scenario-nav-item {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 12px;
+		text-decoration: none;
+		color: var(--text);
+		background: #ffffff;
+		border: 1px solid var(--border);
+		border-left: 5px solid transparent;
+		border-radius: 14px;
+		padding: 13px;
+		transition: 0.16s ease;
+	}
+
+	.scenario-nav-item:hover {
+		transform: translateX(2px);
+		box-shadow: 0 10px 20px rgba(31, 41, 51, 0.08);
+	}
+
+	.scenario-nav-item.passed {
+		border-left-color: var(--passed);
+	}
+
+	.scenario-nav-item.failed {
+		border-left-color: var(--failed);
+	}
+
+	.scenario-nav-item.skipped {
+		border-left-color: var(--skipped);
+	}
+
+	.scenario-nav-item.info {
+		border-left-color: var(--info);
+	}
+
+	.scenario-nav-main {
+		min-width: 0;
+	}
+
+	.scenario-nav-main strong {
+		display: block;
+		font-size: 13px;
+		line-height: 1.3;
+	}
+
+	.scenario-nav-main span {
+		display: block;
+		margin-top: 5px;
+		color: var(--muted);
+		font-size: 11px;
+	}
+
+	.scenario-nav-item em {
+		font-style: normal;
+		border-radius: 999px;
+		padding: 5px 8px;
+		font-size: 10px;
+		font-weight: 900;
+		text-transform: uppercase;
+		color: #ffffff;
+		white-space: nowrap;
+	}
+
+	.scenario-nav-item em.passed {
+		background: var(--passed);
+	}
+
+	.scenario-nav-item em.failed {
+		background: var(--failed);
+	}
+
+	.scenario-nav-item em.skipped {
+		background: var(--skipped);
+	}
+
+	.scenario-nav-item em.info {
+		background: var(--info);
+	}
+
+	.empty-sidebar {
+		color: var(--muted);
+		font-size: 13px;
+		padding: 10px 0;
+	}
+
+	.charts-wrapper h3 {
+		margin: 0;
+		font-size: 17px;
+	}
+
+	.charts-wrapper p {
+		margin: 5px 0 18px;
+		color: var(--muted);
+	}
+
+	.chart-row {
+		margin-bottom: 16px;
+	}
+
+	.chart-label {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 7px;
+	}
+
+	.chart-label span {
+		font-weight: 800;
+		color: var(--text);
+	}
+
+	.chart-label strong {
+		font-size: 13px;
+	}
+
+	.chart-track {
+		height: 10px;
+		border-radius: 999px;
+		background: #edf2f5;
+		overflow: hidden;
+	}
+
+	.chart-fill {
+		height: 100%;
+		border-radius: 999px;
+	}
+
+	.chart-fill.passed {
+		background: var(--passed);
+	}
+
+	.chart-fill.failed {
+		background: var(--failed);
+	}
+
+	.chart-fill.skipped {
+		background: var(--skipped);
+	}
+
+	.chart-fill.info {
+		background: var(--info);
+	}
+
+	.chart-row small {
+		display: block;
+		margin-top: 4px;
+		color: var(--muted);
+	}
+
+	.report-content {
+		min-width: 0;
+	}
+
+	.summary-grid {
+		display: grid;
+		grid-template-columns: repeat(7, minmax(110px, 1fr));
+		gap: 14px;
+	}
+
+	.summary-card {
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: 16px;
+		padding: 17px 16px;
+		box-shadow: 0 12px 28px rgba(31, 41, 51, 0.05);
+		min-height: 86px;
+	}
+
+	.summary-card span {
+		display: block;
+		color: var(--muted);
+		font-size: 10px;
+		font-weight: 900;
+		text-transform: uppercase;
+		letter-spacing: 0.10em;
+	}
+
+	.summary-card strong {
+		display: block;
+		margin-top: 8px;
+		font-size: 20px;
+		color: var(--text);
+		word-break: break-word;
+	}
+
+	.summary-card.passed strong {
+		color: var(--passed);
+	}
+
+	.summary-card.failed strong {
+		color: var(--failed);
+	}
+
+	.summary-card.skipped strong {
+		color: var(--skipped);
+	}
+
+	.summary-card.duration,
+	.summary-card.date {
+		background: linear-gradient(180deg, #ffffff, var(--hue-cyan-soft));
+		border-color: rgba(0, 166, 200, 0.25);
+	}
+
+	.summary-card.duration strong,
+	.summary-card.date strong {
+		color: var(--hue-cyan-dark);
+		font-size: 16px;
+	}
+
+	.details-heading {
+		margin-top: 28px;
+		margin-bottom: 14px;
+	}
+
+	.details-heading span {
+		color: var(--hue-cyan-dark);
+		font-size: 11px;
+		font-weight: 900;
+		text-transform: uppercase;
+		letter-spacing: 0.12em;
+	}
+
+	.details-heading h2 {
+		margin: 4px 0 0;
+		font-size: 25px;
+		letter-spacing: -0.03em;
+	}
+
+	.scenario-details-list {
+		display: grid;
+		gap: 18px;
+	}
+
+	.scenario-card {
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-left: 7px solid var(--border);
+		border-radius: 20px;
+		padding: 22px;
+		box-shadow: var(--shadow);
+		scroll-margin-top: 18px;
+	}
+
+	.scenario-card.passed {
+		border-left-color: var(--passed);
+	}
+
+	.scenario-card.failed {
+		border-left-color: var(--failed);
+	}
+
+	.scenario-card.skipped {
+		border-left-color: var(--skipped);
+	}
+
+	.scenario-card.info {
+		border-left-color: var(--info);
+	}
+
+	.scenario-card-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: flex-start;
+		gap: 18px;
+	}
+
+	.scenario-index {
+		color: var(--muted);
+		font-size: 10px;
+		font-weight: 900;
+		text-transform: uppercase;
+		letter-spacing: 0.10em;
+	}
+
+	.scenario-card h3 {
+		margin: 4px 0 0;
+		font-size: 20px;
+		line-height: 1.28;
+		letter-spacing: -0.02em;
+	}
+
+	.scenario-status-badge {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 999px;
+		padding: 8px 13px;
+		font-size: 11px;
+		font-weight: 900;
+		white-space: nowrap;
+		color: #ffffff;
+	}
+
+	.scenario-status-badge.passed {
+		background: var(--passed);
+	}
+
+	.scenario-status-badge.failed {
+		background: var(--failed);
+	}
+
+	.scenario-status-badge.skipped {
+		background: var(--skipped);
+	}
+
+	.scenario-status-badge.info {
+		background: var(--info);
+	}
+
+	.scenario-meta-pills {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 9px;
+		margin-top: 14px;
+	}
+
+	.meta-pill {
+		border-radius: 999px;
+		border: 1px solid var(--border);
+		background: #f8fbfd;
+		padding: 7px 11px;
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+	}
+
+	.meta-pill span {
+		color: var(--muted);
+		font-size: 9px;
+		font-weight: 900;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+	}
+
+	.meta-pill strong {
+		color: var(--text);
+		font-size: 11px;
+	}
+
+	.meta-pill.passed {
+		background: var(--passed-soft);
+		border-color: rgba(87, 166, 57, 0.28);
+	}
+
+	.meta-pill.passed strong {
+		color: var(--passed);
+	}
+
+	.meta-pill.failed {
+		background: var(--failed-soft);
+		border-color: rgba(201, 68, 68, 0.28);
+	}
+
+	.meta-pill.failed strong {
+		color: var(--failed);
+	}
+
+	.meta-pill.skipped {
+		background: var(--skipped-soft);
+		border-color: rgba(215, 154, 33, 0.28);
+	}
+
+	.meta-pill.skipped strong {
+		color: var(--skipped);
+	}
+
+	.meta-pill.info,
+	.meta-pill.date {
+		background: var(--hue-cyan-soft);
+		border-color: rgba(0, 166, 200, 0.28);
+	}
+
+	.meta-pill.info strong,
+	.meta-pill.date strong {
+		color: var(--hue-cyan-dark);
+	}
+
+	.error-summary {
+		margin-top: 16px;
+		background: var(--failed-soft);
+		border: 1px solid rgba(201, 68, 68, 0.22);
+		color: #842828;
+		border-radius: 14px;
+		padding: 13px 15px;
+	}
+
+	.error-summary p {
+		margin: 6px 0 0;
+	}
+
+	.details-box,
+	.step-details {
+		margin-top: 12px;
+		border: 1px solid var(--border);
+		border-radius: 14px;
+		background: #f8fbfd;
+		padding: 10px 12px;
+	}
+
+	summary {
+		cursor: pointer;
+		font-weight: 800;
+		color: var(--hue-cyan-dark);
+	}
+
+	pre {
+		white-space: pre-wrap;
+		word-break: break-word;
+		font-family: Consolas, Monaco, monospace;
+		font-size: 12px;
+		background: #15232a;
+		color: #e8f2f5;
+		border-radius: 12px;
+		padding: 14px;
+		overflow: auto;
+	}
+
+	.evidence-section,
+	.steps-section {
+		margin-top: 20px;
+	}
+
+	.evidence-section h4,
+	.steps-section h4 {
+		margin: 0 0 12px;
+		font-size: 15px;
+	}
+
+	.evidence-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+		gap: 14px;
+	}
+
+	.evidence-item {
+		margin: 0;
+		border: 1px solid var(--border);
+		border-radius: 14px;
+		overflow: hidden;
+		background: #f8fbfd;
+	}
+
+	.evidence-item img {
+		width: 100%;
+		max-height: 360px;
+		object-fit: contain;
+		display: block;
+		background: #15232a;
+	}
+
+	.evidence-placeholder {
+		height: 180px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--muted);
+	}
+
+	.evidence-item figcaption {
+		padding: 10px 12px;
+		font-size: 12px;
+		color: var(--muted);
+		word-break: break-word;
+	}
+
+	.steps-table {
+		border: 1px solid var(--border);
+		border-radius: 14px;
+		overflow: hidden;
+		background: #ffffff;
+	}
+
+	.steps-header,
+	.steps-row {
+		display: grid;
+		grid-template-columns: 120px 130px 1fr;
+		gap: 14px;
+		align-items: start;
+	}
+
+	.steps-header {
+		background: #f1f5f8;
+		color: var(--muted);
+		font-size: 10px;
+		font-weight: 900;
+		text-transform: uppercase;
+		letter-spacing: 0.08em;
+		padding: 12px 14px;
+		border-bottom: 1px solid var(--border);
+	}
+
+	.steps-row {
+		padding: 14px;
+		border-bottom: 1px solid var(--border);
+	}
+
+	.steps-row:last-child {
+		border-bottom: 0;
+	}
+
+	.step-status {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 76px;
+		border-radius: 999px;
+		padding: 6px 10px;
+		font-size: 10px;
+		font-weight: 900;
+		text-transform: uppercase;
+		color: #ffffff;
+	}
+
+	.step-status.passed {
+		background: var(--passed);
+	}
+
+	.step-status.failed {
+		background: var(--failed);
+	}
+
+	.step-status.skipped {
+		background: var(--skipped);
+	}
+
+	.step-status.info {
+		background: var(--info);
+	}
+
+	.step-time-column strong {
+		display: block;
+		font-size: 12px;
+		color: var(--text);
+	}
+
+	.step-time-column small {
+		display: block;
+		margin-top: 4px;
+		color: var(--muted);
+		font-size: 11px;
+	}
+
+	.step-detail-column strong {
+		display: block;
+		font-size: 13px;
+	}
+
+	.step-error {
+		margin: 8px 0 0;
+		color: var(--failed);
+		font-weight: 800;
+	}
+
+	.muted {
+		color: var(--muted);
+	}
+
+	.empty-state {
+		background: var(--panel);
+		border: 1px dashed var(--border);
+		border-radius: 20px;
+		padding: 28px;
+		text-align: center;
+		color: var(--muted);
+	}
+
+	.empty-state h3 {
+		margin: 0 0 8px;
+		color: var(--text);
+	}
+
+	@media (max-width: 1180px) {
+		.summary-grid {
+			grid-template-columns: repeat(4, minmax(120px, 1fr));
+		}
+	}
+
+	@media (max-width: 980px) {
+		.report-body {
+			grid-template-columns: 1fr;
+		}
+
+		.left-panel {
+			position: relative;
+			top: 0;
+			min-height: auto;
+		}
+
+		.report-hero {
+			flex-direction: column;
+			align-items: flex-start;
+		}
+
+		.hero-generated {
+			width: 100%;
+		}
+	}
+
+	@media (max-width: 720px) {
+		.report-page {
+			width: min(100% - 22px, 1500px);
+			padding-top: 12px;
+		}
+
+		.report-hero {
+			padding: 22px;
+		}
+
+		.report-hero h1 {
+			font-size: 24px;
+		}
+
+		.summary-grid {
+			grid-template-columns: repeat(2, minmax(120px, 1fr));
+		}
+
+		.scenario-card-header {
+			flex-direction: column;
+		}
+
+		.steps-header {
+			display: none;
+		}
+
+		.steps-row {
+			grid-template-columns: 1fr;
+			gap: 8px;
+		}
+	}
+</style>
+'''
+	}
+}
