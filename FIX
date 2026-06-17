@@ -1,1 +1,592 @@
+✅ 1. Novo file: ExportFileComparator.groovy
 
+Crie em:
+
+Keywords/commands/ExportFileComparator.groovy
+package commands
+
+import java.text.Normalizer
+
+import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.CellType
+import org.apache.poi.ss.usermodel.DataFormatter
+import org.apache.poi.ss.usermodel.FormulaEvaluator
+import org.apache.poi.ss.usermodel.Row
+import org.apache.poi.ss.usermodel.Sheet
+import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+class ExportFileComparator {
+
+	private static final int MAX_MISMATCHES_PER_COLUMN = 30
+
+	@Keyword
+	String validateRecProdExportFiles(Integer threshold) {
+		int safeThreshold = threshold == null ? 0 : threshold
+
+		File runRootFolder = resolveRunRootFolder()
+		String featureName = resolveCurrentFeatureName()
+
+		KeywordUtil.logInfo('REC/PRD comparison run root: ' + runRootFolder.getAbsolutePath())
+		KeywordUtil.logInfo('REC/PRD comparison feature name: ' + featureName)
+		KeywordUtil.logInfo('REC/PRD numeric threshold: ' + safeThreshold)
+
+		File recFile = findLatestExportFile(runRootFolder, 'REC', featureName)
+		File prdFile = findLatestExportFile(runRootFolder, 'PRD', featureName)
+
+		List<String> errors = []
+
+		if (recFile == null) {
+			errors.add('REC exported file was not found for feature: ' + featureName)
+		}
+
+		if (prdFile == null) {
+			errors.add('PRD exported file was not found for feature: ' + featureName)
+		}
+
+		if (!errors.isEmpty()) {
+			return errors.join('\n')
+		}
+
+		KeywordUtil.logInfo('REC file selected: ' + recFile.getAbsolutePath())
+		KeywordUtil.logInfo('PRD file selected: ' + prdFile.getAbsolutePath())
+
+		return compareExcelFiles(recFile, prdFile, safeThreshold)
+	}
+
+	private String compareExcelFiles(File recFile, File prdFile, int threshold) {
+		List<String> errors = []
+
+		Workbook recWorkbook = null
+		Workbook prdWorkbook = null
+
+		try {
+			recWorkbook = WorkbookFactory.create(recFile)
+			prdWorkbook = WorkbookFactory.create(prdFile)
+
+			FormulaEvaluator recEvaluator = recWorkbook.getCreationHelper().createFormulaEvaluator()
+			FormulaEvaluator prdEvaluator = prdWorkbook.getCreationHelper().createFormulaEvaluator()
+			DataFormatter formatter = new DataFormatter()
+
+			Sheet recSheet = recWorkbook.getSheetAt(0)
+			Sheet prdSheet = prdWorkbook.getSheetAt(0)
+
+			SheetData recData = readSheetData(recSheet, recEvaluator, formatter)
+			SheetData prdData = readSheetData(prdSheet, prdEvaluator, formatter)
+
+			compareNumberOfHeaders(recData, prdData, errors)
+			compareHeaders(recData, prdData, errors)
+			compareNumberOfRows(recData, prdData, errors)
+
+			compareColumnBetweenFiles(
+					'Year',
+					['year', 'annee', 'année'],
+					recData,
+					prdData,
+					threshold,
+					errors
+					)
+
+			compareColumnBetweenFiles(
+					'Nombre',
+					['nombre'],
+					recData,
+					prdData,
+					threshold,
+					errors
+					)
+
+			compareColumnBetweenFiles(
+					'Solde Transac CCY',
+					['solde transac ccy', 'solde transac', 'transac ccy'],
+					recData,
+					prdData,
+					threshold,
+					errors
+					)
+
+			compareColumnBetweenFiles(
+					'Solde Base CCY',
+					['solde base ccy', 'base ccy'],
+					recData,
+					prdData,
+					threshold,
+					errors
+					)
+
+			compareColumnBetweenFiles(
+					'Solde Solde Fixing Base CCY',
+					['solde solde fixing base ccy', 'solde fixing base ccy', 'fixing base ccy'],
+					recData,
+					prdData,
+					threshold,
+					errors
+					)
+
+			if (errors.isEmpty()) {
+				KeywordUtil.logInfo('REC/PRD Excel comparison finished successfully.')
+				return ''
+			}
+
+			return buildErrorMessage(recFile, prdFile, errors)
+
+		} catch (Exception e) {
+			return 'Error while comparing REC and PRD exported files.\n' +
+					'REC file: ' + recFile.getAbsolutePath() + '\n' +
+					'PRD file: ' + prdFile.getAbsolutePath() + '\n' +
+					'Error: ' + e.getMessage()
+		} finally {
+			try {
+				if (recWorkbook != null) {
+					recWorkbook.close()
+				}
+			} catch (Exception ignored) {
+			}
+
+			try {
+				if (prdWorkbook != null) {
+					prdWorkbook.close()
+				}
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void compareNumberOfHeaders(SheetData recData, SheetData prdData, List<String> errors) {
+		if (recData.headers.size() != prdData.headers.size()) {
+			errors.add(
+					'Compare Number of Table headers failed. ' +
+					'REC headers: ' + recData.headers.size() + ', ' +
+					'PRD headers: ' + prdData.headers.size()
+					)
+		}
+	}
+
+	private void compareHeaders(SheetData recData, SheetData prdData, List<String> errors) {
+		int maxHeaders = Math.max(recData.headers.size(), prdData.headers.size())
+
+		for (int i = 0; i < maxHeaders; i++) {
+			String recHeader = i < recData.headers.size() ? recData.headers[i] : ''
+			String prdHeader = i < prdData.headers.size() ? prdData.headers[i] : ''
+
+			if (normalizeText(recHeader) != normalizeText(prdHeader)) {
+				errors.add(
+						'Table header mismatch at column ' + (i + 1) + '. ' +
+						'REC: "' + recHeader + '", PRD: "' + prdHeader + '"'
+						)
+			}
+		}
+	}
+
+	private void compareNumberOfRows(SheetData recData, SheetData prdData, List<String> errors) {
+		if (recData.rows.size() != prdData.rows.size()) {
+			errors.add(
+					'Compare number of rows failed. ' +
+					'REC rows: ' + recData.rows.size() + ', ' +
+					'PRD rows: ' + prdData.rows.size()
+					)
+		}
+	}
+
+	private void compareColumnBetweenFiles(
+			String displayName,
+			List<String> aliases,
+			SheetData recData,
+			SheetData prdData,
+			int threshold,
+			List<String> errors
+			) {
+		Integer recColumnIndex = findColumnIndex(recData.headers, aliases)
+		Integer prdColumnIndex = findColumnIndex(prdData.headers, aliases)
+
+		if (recColumnIndex == null) {
+			errors.add(displayName + ' column was not found in REC file.')
+			return
+		}
+
+		if (prdColumnIndex == null) {
+			errors.add(displayName + ' column was not found in PRD file.')
+			return
+		}
+
+		int maxRows = Math.max(recData.rows.size(), prdData.rows.size())
+		int mismatches = 0
+
+		for (int rowIndex = 0; rowIndex < maxRows; rowIndex++) {
+			String recValue = getCellValue(recData.rows, rowIndex, recColumnIndex)
+			String prdValue = getCellValue(prdData.rows, rowIndex, prdColumnIndex)
+
+			if (valuesAreEquivalent(recValue, prdValue, threshold)) {
+				continue
+			}
+
+			mismatches++
+
+			if (mismatches <= MAX_MISMATCHES_PER_COLUMN) {
+				errors.add(
+						displayName + ' column-difference between sheets. ' +
+						'Row: ' + (rowIndex + 1) + ', ' +
+						'REC: "' + recValue + '", ' +
+						'PRD: "' + prdValue + '", ' +
+						'Threshold: ' + threshold
+						)
+			}
+		}
+
+		if (mismatches > MAX_MISMATCHES_PER_COLUMN) {
+			errors.add(
+					displayName + ' has ' + mismatches + ' differences. ' +
+					'Only first ' + MAX_MISMATCHES_PER_COLUMN + ' differences were listed.'
+					)
+		}
+	}
+
+	private boolean valuesAreEquivalent(String recValue, String prdValue, int threshold) {
+		String rec = recValue == null ? '' : recValue.trim()
+		String prd = prdValue == null ? '' : prdValue.trim()
+
+		if (rec.isEmpty() && prd.isEmpty()) {
+			return true
+		}
+
+		BigDecimal recNumber = parseNumber(rec)
+		BigDecimal prdNumber = parseNumber(prd)
+
+		if (recNumber != null && prdNumber != null) {
+			BigDecimal difference = recNumber.subtract(prdNumber).abs()
+			return difference.compareTo(new BigDecimal(threshold)) <= 0
+		}
+
+		return normalizeText(rec) == normalizeText(prd)
+	}
+
+	private BigDecimal parseNumber(String value) {
+		if (value == null || value.trim().isEmpty()) {
+			return null
+		}
+
+		String normalized = value
+				.replaceAll('\\s', '')
+				.replace(',', '.')
+				.replaceAll('[^0-9.\\-]', '')
+
+		if (normalized.isEmpty() || normalized == '-' || normalized == '.') {
+			return null
+		}
+
+		try {
+			return new BigDecimal(normalized)
+		} catch (Exception ignored) {
+			return null
+		}
+	}
+
+	private SheetData readSheetData(Sheet sheet, FormulaEvaluator evaluator, DataFormatter formatter) {
+		int headerRowIndex = findHeaderRowIndex(sheet, evaluator, formatter)
+
+		Row headerRow = sheet.getRow(headerRowIndex)
+		List<String> headers = readRowValues(headerRow, evaluator, formatter)
+
+		List<List<String>> rows = []
+
+		for (int rowIndex = headerRowIndex + 1; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
+			Row row = sheet.getRow(rowIndex)
+
+			if (row == null) {
+				continue
+			}
+
+			List<String> values = readRowValues(row, evaluator, formatter)
+
+			if (isEmptyRow(values)) {
+				continue
+			}
+
+			rows.add(values)
+		}
+
+		return new SheetData(headers, rows)
+	}
+
+	private int findHeaderRowIndex(Sheet sheet, FormulaEvaluator evaluator, DataFormatter formatter) {
+		int bestRowIndex = 0
+		int bestFilledCells = 0
+		int maxSearchRow = Math.min(sheet.getLastRowNum(), 30)
+
+		for (int rowIndex = 0; rowIndex <= maxSearchRow; rowIndex++) {
+			Row row = sheet.getRow(rowIndex)
+
+			if (row == null) {
+				continue
+			}
+
+			List<String> values = readRowValues(row, evaluator, formatter)
+			int filledCells = values.findAll { String value -> value != null && !value.trim().isEmpty() }.size()
+
+			if (filledCells > bestFilledCells) {
+				bestFilledCells = filledCells
+				bestRowIndex = rowIndex
+			}
+		}
+
+		return bestRowIndex
+	}
+
+	private List<String> readRowValues(Row row, FormulaEvaluator evaluator, DataFormatter formatter) {
+		List<String> values = []
+
+		if (row == null) {
+			return values
+		}
+
+		int lastCellNumber = row.getLastCellNum()
+
+		if (lastCellNumber < 0) {
+			return values
+		}
+
+		for (int cellIndex = 0; cellIndex < lastCellNumber; cellIndex++) {
+			Cell cell = row.getCell(cellIndex)
+			values.add(readCellValue(cell, evaluator, formatter))
+		}
+
+		return values
+	}
+
+	private String readCellValue(Cell cell, FormulaEvaluator evaluator, DataFormatter formatter) {
+		if (cell == null) {
+			return ''
+		}
+
+		try {
+			if (cell.getCellType() == CellType.FORMULA) {
+				return formatter.formatCellValue(cell, evaluator).trim()
+			}
+
+			return formatter.formatCellValue(cell).trim()
+		} catch (Exception ignored) {
+			return ''
+		}
+	}
+
+	private boolean isEmptyRow(List<String> values) {
+		if (values == null || values.isEmpty()) {
+			return true
+		}
+
+		return values.every { String value -> value == null || value.trim().isEmpty() }
+	}
+
+	private String getCellValue(List<List<String>> rows, int rowIndex, int columnIndex) {
+		if (rowIndex >= rows.size()) {
+			return ''
+		}
+
+		List<String> row = rows[rowIndex]
+
+		if (columnIndex >= row.size()) {
+			return ''
+		}
+
+		return row[columnIndex]
+	}
+
+	private Integer findColumnIndex(List<String> headers, List<String> aliases) {
+		for (int i = 0; i < headers.size(); i++) {
+			String normalizedHeader = normalizeText(headers[i])
+
+			for (String alias : aliases) {
+				String normalizedAlias = normalizeText(alias)
+
+				if (normalizedHeader == normalizedAlias || normalizedHeader.contains(normalizedAlias)) {
+					return i
+				}
+			}
+		}
+
+		return null
+	}
+
+	private File findLatestExportFile(File rootFolder, String environment, String featureName) {
+		if (rootFolder == null || !rootFolder.exists()) {
+			return null
+		}
+
+		List<File> candidates = []
+
+		rootFolder.eachFileRecurse { File file ->
+			if (!file.isFile()) {
+				return
+			}
+
+			String fileName = file.getName()
+
+			if (!fileName.toLowerCase().endsWith('.xlsx')) {
+				return
+			}
+
+			if (fileName.startsWith('~$')) {
+				return
+			}
+
+			if (!normalizeText(fileName).startsWith(normalizeText(environment + '_'))) {
+				return
+			}
+
+			if (featureName != null && !featureName.trim().isEmpty()) {
+				if (!normalizeText(fileName).contains(normalizeText(featureName))) {
+					return
+				}
+			}
+
+			candidates.add(file)
+		}
+
+		if (candidates.isEmpty()) {
+			return null
+		}
+
+		return candidates.sort { File file -> file.lastModified() }.last()
+	}
+
+	private File resolveRunRootFolder() {
+		File reportFolder = new File(RunConfiguration.getReportFolder())
+		List<File> chain = []
+
+		File current = reportFolder
+
+		while (current != null) {
+			chain.add(current)
+
+			if (current.getParentFile() != null &&
+					current.getParentFile().getName().equalsIgnoreCase('Reports')) {
+				return current
+			}
+
+			current = current.getParentFile()
+		}
+
+		return reportFolder
+	}
+
+	private String resolveCurrentFeatureName() {
+		String reportFolder = RunConfiguration.getReportFolder()
+
+		if (reportFolder == null || reportFolder.trim().isEmpty()) {
+			return ''
+		}
+
+		List<String> parts = reportFolder.replace('/', '\\').split('\\\\') as List<String>
+
+		for (int i = parts.size() - 1; i >= 0; i--) {
+			String part = parts[i] == null ? '' : parts[i].trim()
+
+			if (part.isEmpty()) {
+				continue
+			}
+
+			if (part ==~ /\d{8}_\d{6}/ || part ==~ /\d{14}/) {
+				continue
+			}
+
+			if (part.equalsIgnoreCase('Reports') ||
+					part.equalsIgnoreCase('Evidences') ||
+					part.equalsIgnoreCase('Exports')) {
+				continue
+			}
+
+			if (part.toLowerCase().contains('compare')) {
+				continue
+			}
+
+			if (part.toLowerCase().contains('export')) {
+				continue
+			}
+
+			if (part.toLowerCase().contains('validate')) {
+				continue
+			}
+
+			return part
+		}
+
+		return ''
+	}
+
+	private String normalizeText(String text) {
+		if (text == null) {
+			return ''
+		}
+
+		String normalized = Normalizer.normalize(text, Normalizer.Form.NFD)
+				.replaceAll('\\p{InCombiningDiacriticalMarks}+', '')
+				.toLowerCase()
+				.trim()
+				.replaceAll('[^a-z0-9]+', '_')
+				.replaceAll('_+', '_')
+				.replaceAll('^_|_$', '')
+
+		return normalized
+	}
+
+	private String buildErrorMessage(File recFile, File prdFile, List<String> errors) {
+		return 'REC/PRD exported files comparison failed.\n' +
+				'REC file: ' + recFile.getAbsolutePath() + '\n' +
+				'PRD file: ' + prdFile.getAbsolutePath() + '\n\n' +
+				errors.join('\n')
+	}
+
+	private static class SheetData {
+		List<String> headers
+		List<List<String>> rows
+
+		SheetData(List<String> headers, List<List<String>> rows) {
+			this.headers = headers
+			this.rows = rows
+		}
+	}
+}
+✅ 2. Atualizar o test case de comparação
+
+Substitua o test case por este:
+
+import com.kms.katalon.core.util.KeywordUtil
+
+Integer threshold = 3
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+	'Start validation of downloaded REC and PRD files'
+)
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+	'Validate REC and PRD exported files exist'
+)
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+	'Compare REC and PRD headers, rows and configured columns using threshold: ' + threshold
+)
+
+String errors = CustomKeywords.'commands.ExportFileComparator.validateRecProdExportFiles'(
+	threshold
+)
+
+if (errors != '') {
+	CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+		'File comparison finished with mismatches between REC and PRD'
+	)
+
+	KeywordUtil.markFailed('\n' + errors)
+} else {
+	CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+		'File comparison finished successfully with no mismatches'
+	)
+
+	KeywordUtil.markPassed(
+		'REC/PRD export validation completed successfully'
+	)
+}
+✅
