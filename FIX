@@ -1,1 +1,501 @@
+package commands
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
+import java.awt.event.KeyEvent
+import java.text.Normalizer
+import java.text.SimpleDateFormat
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import internal.GlobalVariable
+
+class ExportFile {
+
+	private ImageLoader imageLoader = new ImageLoader()
+
+	@Keyword
+	void exportFromOutilsToNo(String exportLabel) {
+		KeywordUtil.logInfo('Step 1. Open Outils menu.')
+		imageLoader.waitForImageOrStop('General', 'outilsMenu', 15)
+		imageLoader.clickImageOrStop('General', 'outilsMenu')
+		Windows.delay(2)
+
+		KeywordUtil.logInfo('Step 2. Validate Export button and click it.')
+		imageLoader.waitForImageOrStop('General', 'exportButton', 15)
+		imageLoader.clickImageOrStop('General', 'exportButton')
+		Windows.delay(3)
+
+		KeywordUtil.logInfo('Step 3. Save file inside execution REC/PRD export folder.')
+		saveToExecutionRecPrdExportFolder()
+
+		KeywordUtil.logInfo('Step 4. If Kodal asks to open the exported file, close it with No.')
+		clickNoUntilOpenFileModalCloses(2, 10)
+
+		KeywordUtil.logInfo('Export flow finished without opening exported file.')
+	}
+
+	private void saveToExecutionRecPrdExportFolder() {
+		File directory = resolveExecutionRecPrdExportFolder()
+		directory.mkdirs()
+
+		String fileName = buildAutomaticExportFileName()
+
+		KeywordUtil.logInfo('Execution REC/PRD export directory: ' + directory.getAbsolutePath())
+		KeywordUtil.logInfo('Export file name: ' + fileName)
+
+		Windows.click(findWindowsObject('Object Repository/Acapulco/filePath'))
+		Windows.delay(2)
+
+		pasteAndEnter(directory.getAbsolutePath())
+
+		Windows.delay(2)
+
+		setFileName(fileName)
+
+		Windows.click(findWindowsObject('General/btnSave'))
+		Windows.delay(5)
+	}
+
+	private File resolveExecutionRecPrdExportFolder() {
+		File executionRootFolder = resolveExecutionRootFolder()
+		String collectionName = sanitizeFileName(resolveCurrentCollectionName())
+		String featureName = sanitizeFileName(resolveCurrentFeatureName())
+
+		return new File(
+				executionRootFolder,
+				'Shared_REC_PRD_Exports\\' + collectionName + '\\' + featureName
+				)
+	}
+
+	private File resolveExecutionRootFolder() {
+		String reportFolderPath = RunConfiguration.getReportFolder()
+
+		if (reportFolderPath == null || reportFolderPath.trim().isEmpty()) {
+			return new File(RunConfiguration.getProjectDir(), 'Reports\\Unknown_Execution')
+		}
+
+		File current = new File(reportFolderPath)
+
+		while (current != null) {
+			File parent = current.getParentFile()
+
+			if (parent != null && parent.getName().equalsIgnoreCase('Reports')) {
+				return current
+			}
+
+			current = parent
+		}
+
+		return new File(reportFolderPath)
+	}
+
+	private String buildAutomaticExportFileName() {
+		String environment = resolveEnvironmentName()
+		String timestamp = new SimpleDateFormat('yyyyMMdd_HHmmss').format(new Date())
+		String featureName = resolveCurrentFeatureName()
+
+		return sanitizeFileName(environment + '_' + timestamp + '_' + featureName) + '.xlsx'
+	}
+
+	private String resolveEnvironmentName() {
+		List<String> candidates = []
+
+		addCandidate(candidates, getUiEnvironmentText())
+		addCandidate(candidates, getGlobalVariableValue('environment'))
+		addCandidate(candidates, getGlobalVariableValue('env'))
+		addCandidate(candidates, getGlobalVariableValue('ENV'))
+		addCandidate(candidates, getGlobalVariableValue('currentEnv'))
+		addCandidate(candidates, getGlobalVariableValue('environmentName'))
+		addCandidate(candidates, RunConfiguration.getExecutionProfile())
+
+		for (String candidate : candidates) {
+			String normalized = normalizeEnvironmentName(candidate)
+
+			if (normalized != null) {
+				return normalized
+			}
+		}
+
+		return 'REC'
+	}
+
+	private String getUiEnvironmentText() {
+		try {
+			String value = Windows.getText(findWindowsObject('Object Repository/General/curEnv'))
+
+			if (value != null && !value.trim().isEmpty()) {
+				return value
+			}
+		} catch (Exception ignored) {
+		}
+
+		try {
+			String value = Windows.getText(findWindowsObject('General/curEnv'))
+
+			if (value != null && !value.trim().isEmpty()) {
+				return value
+			}
+		} catch (Exception ignored) {
+		}
+
+		return null
+	}
+
+	private String getGlobalVariableValue(String variableName) {
+		try {
+			def value = GlobalVariable."${variableName}"
+
+			if (value != null && !value.toString().trim().isEmpty()) {
+				return value.toString()
+			}
+		} catch (Exception ignored) {
+		}
+
+		return null
+	}
+
+	private void addCandidate(List<String> candidates, String value) {
+		if (value != null && !value.trim().isEmpty()) {
+			candidates.add(value)
+		}
+	}
+
+	private String normalizeEnvironmentName(String rawEnvironment) {
+		if (rawEnvironment == null || rawEnvironment.trim().isEmpty()) {
+			return null
+		}
+
+		String value = rawEnvironment.trim().toUpperCase()
+
+		if (value.contains('PRD') ||
+				value.contains('PROD') ||
+				value.contains('PRODUCTION')) {
+			return 'PRD'
+		}
+
+		if (value.contains('REC') ||
+				value.contains('RECETTE')) {
+			return 'REC'
+		}
+
+		return null
+	}
+
+	private String resolveCurrentCollectionName() {
+		List<String> validParts = getValidReportFolderParts()
+
+		if (!validParts.isEmpty()) {
+			return validParts[0]
+		}
+
+		return 'Collection'
+	}
+
+	private String resolveCurrentFeatureName() {
+		List<String> validParts = getValidReportFolderParts()
+
+		if (!validParts.isEmpty()) {
+			return validParts.last()
+		}
+
+		return 'Export'
+	}
+
+	private List<String> getValidReportFolderParts() {
+		List<String> validParts = []
+		String reportFolderPath = RunConfiguration.getReportFolder()
+
+		if (reportFolderPath == null || reportFolderPath.trim().isEmpty()) {
+			return validParts
+		}
+
+		File executionRootFolder = resolveExecutionRootFolder()
+		String fullPath = new File(reportFolderPath).getAbsolutePath()
+		String rootPath = executionRootFolder.getAbsolutePath()
+
+		if (!fullPath.toLowerCase().startsWith(rootPath.toLowerCase())) {
+			return validParts
+		}
+
+		String relativePath = fullPath.substring(rootPath.length())
+		relativePath = relativePath.replaceAll('^\\\\+', '')
+
+		if (relativePath.trim().isEmpty()) {
+			return validParts
+		}
+
+		List<String> parts = relativePath.replace('/', '\\').split('\\\\') as List<String>
+
+		for (String part : parts) {
+			if (isValidFeatureNamePart(part)) {
+				validParts.add(part.trim())
+			}
+		}
+
+		return validParts
+	}
+
+	private boolean isValidFeatureNamePart(String part) {
+		if (part == null || part.trim().isEmpty()) {
+			return false
+		}
+
+		String value = part.trim()
+		String lower = value.toLowerCase()
+
+		if (value ==~ /\d{8}_\d{6}/ || value ==~ /\d{14}/) {
+			return false
+		}
+
+		if (value ==~ /^\d+\.\s*.*/) {
+			return false
+		}
+
+		List<String> ignoredExactValues = [
+			'reports',
+			'evidences',
+			'exports',
+			'test cases',
+			'test suites',
+			'connection',
+			'authentication',
+			'login rec',
+			'login prd'
+		]
+
+		if (ignoredExactValues.contains(lower)) {
+			return false
+		}
+
+		List<String> ignoredContainsValues = [
+			'export',
+			'validation',
+			'validations',
+			'validate',
+			'compare',
+			'close application',
+			'open module',
+			'login'
+		]
+
+		for (String ignored : ignoredContainsValues) {
+			if (lower.contains(ignored)) {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	private String sanitizeFileName(String text) {
+		if (text == null || text.trim().isEmpty()) {
+			return 'Export'
+		}
+
+		String normalized = Normalizer.normalize(text, Normalizer.Form.NFD)
+				.replaceAll('\\p{InCombiningDiacriticalMarks}+', '')
+
+		return normalized
+				.replaceAll('[\\\\/:*?"<>|]', '_')
+				.replaceAll('\\s+', '_')
+				.replaceAll('_+', '_')
+				.replaceAll('^_|_$', '')
+				.trim()
+	}
+
+	private void setFileName(String fileName) {
+		boolean fileNameFieldFocused = false
+
+		try {
+			Windows.click(findWindowsObject('General/txtFileName'))
+			Windows.delay(1)
+			fileNameFieldFocused = true
+			KeywordUtil.logInfo('File name field focused using General/txtFileName.')
+		} catch (Exception ignored) {
+			KeywordUtil.logInfo('General/txtFileName was not available. Trying ALT + N.')
+		}
+
+		if (!fileNameFieldFocused) {
+			focusFileNameFieldWithShortcut()
+			Windows.delay(1)
+		}
+
+		clearFocusedField()
+		pasteText(fileName)
+		Windows.delay(1)
+	}
+
+	private void clickNoUntilOpenFileModalCloses(Integer interval, Integer maxTimes) {
+		Integer safeInterval = interval == null || interval <= 0 ? 2 : interval
+		Integer safeMaxTimes = maxTimes == null || maxTimes <= 0 ? 10 : maxTimes
+
+		for (int attempt = 1; attempt <= safeMaxTimes; attempt++) {
+			Windows.delay(safeInterval)
+
+			boolean modalFocused = focusOpenFileModalIfPresent()
+
+			if (!modalFocused) {
+				KeywordUtil.logInfo('Open file modal was not found by title. Attempt: ' + attempt + '/' + safeMaxTimes)
+
+				if (attempt == 1) {
+					pressAltN()
+					Windows.delay(1)
+				}
+
+				continue
+			}
+
+			KeywordUtil.logInfo('Open file modal focused. Trying ALT + N. Attempt: ' + attempt + '/' + safeMaxTimes)
+			pressAltN()
+			Windows.delay(2)
+
+			if (!focusOpenFileModalIfPresent()) {
+				KeywordUtil.logInfo('Open file modal closed with ALT + N.')
+				return
+			}
+
+			KeywordUtil.logInfo('Open file modal still visible. Trying TAB + ENTER fallback.')
+			pressTab()
+			Windows.delay(1)
+			pressEnter()
+			Windows.delay(2)
+
+			if (!focusOpenFileModalIfPresent()) {
+				KeywordUtil.logInfo('Open file modal closed with TAB + ENTER fallback.')
+				return
+			}
+
+			KeywordUtil.logInfo('Open file modal still visible. Trying ESC fallback.')
+			pressEscape()
+			Windows.delay(2)
+
+			if (!focusOpenFileModalIfPresent()) {
+				KeywordUtil.logInfo('Open file modal closed with ESC fallback.')
+				return
+			}
+		}
+
+		if (focusOpenFileModalIfPresent()) {
+			imageLoader.takeEvidence('OpenFileModalStillVisible.png')
+
+			KeywordUtil.markFailedAndStop(
+					'Open file modal remained visible after trying to close it.\n' +
+					'Expected modal title: Export de données\n' +
+					'Close strategies tried: ALT + N, TAB + ENTER, ESC'
+					)
+		}
+
+		KeywordUtil.logInfo('Open file modal did not appear or was already closed. Continuing.')
+	}
+
+	private boolean focusOpenFileModalIfPresent() {
+		List<String> possibleTitles = [
+			'Export de données',
+			'Export de donnees',
+			'Export data',
+			'Data export'
+		]
+
+		for (String title : possibleTitles) {
+			try {
+				Windows.switchToWindowTitle(title)
+				Windows.delay(1)
+				return true
+			} catch (Exception ignored) {
+			}
+		}
+
+		return false
+	}
+
+	private void focusFileNameFieldWithShortcut() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_ALT)
+		robot.keyPress(KeyEvent.VK_N)
+		robot.keyRelease(KeyEvent.VK_N)
+		robot.keyRelease(KeyEvent.VK_ALT)
+	}
+
+	private void pressAltN() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_ALT)
+		robot.keyPress(KeyEvent.VK_N)
+		robot.keyRelease(KeyEvent.VK_N)
+		robot.keyRelease(KeyEvent.VK_ALT)
+	}
+
+	private void pressTab() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_TAB)
+		robot.keyRelease(KeyEvent.VK_TAB)
+	}
+
+	private void pressEnter() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_ENTER)
+		robot.keyRelease(KeyEvent.VK_ENTER)
+	}
+
+	private void pressEscape() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_ESCAPE)
+		robot.keyRelease(KeyEvent.VK_ESCAPE)
+	}
+
+	private void clearFocusedField() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
+
+		Windows.delay(1)
+
+		robot.keyPress(KeyEvent.VK_BACK_SPACE)
+		robot.keyRelease(KeyEvent.VK_BACK_SPACE)
+	}
+
+	private void pasteAndEnter(String text) {
+		pasteText(text)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_ENTER)
+		robot.keyRelease(KeyEvent.VK_ENTER)
+	}
+
+	private void pasteText(String text) {
+		StringSelection selection = new StringSelection(text)
+		Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, null)
+
+		Windows.delay(1)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
+	}
+}
