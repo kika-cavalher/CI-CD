@@ -1382,3 +1382,920 @@ function filterScenarios() {
 '''
 	}
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+package jiraIntegration
+
+import java.io.BufferedReader
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStreamReader
+import java.text.SimpleDateFormat
+import java.util.Base64
+import java.util.Date
+import java.util.LinkedHashMap
+import java.util.Locale
+
+import javax.xml.XMLConstants
+import javax.xml.parsers.DocumentBuilder
+import javax.xml.parsers.DocumentBuilderFactory
+
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+import org.w3c.dom.Node
+import org.w3c.dom.NodeList
+
+import com.kms.katalon.core.configuration.RunConfiguration
+
+class JiraReportBuilder {
+
+	private static final String APP_NAME = 'EMATCH'
+	private static final String DEFAULT_LOGO_SRC = 'Images/General/logo.png'
+
+	private static final SimpleDateFormat OUTPUT_DATE_TIME =
+	new SimpleDateFormat('dd/MM/yyyy HH:mm:ss', Locale.ENGLISH)
+
+	private static final SimpleDateFormat OUTPUT_CLOCK =
+	new SimpleDateFormat('HH:mm:ss', Locale.ENGLISH)
+
+	private static final List<String> TRACE_FILE_NAMES = [
+		'_custom_report_trace.log',
+		'custom-report-trace.log',
+		'jira_images_evidence.tsv'
+	]
+
+	private static final List<String> DATE_PATTERNS = [
+		'yyyy-MM-dd HH:mm:ss.SSS',
+		'yyyy-MM-dd HH:mm:ss',
+		"yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+		"yyyy-MM-dd'T'HH:mm:ss.SSS",
+		"yyyy-MM-dd'T'HH:mm:ss",
+		'dd/MM/yyyy HH:mm:ss',
+		'dd/MM/yyyy HH:mm:ss.SSS',
+		'HH:mm:ss'
+	]
+
+	File buildReport(String reportFolderPath) {
+		return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), '', '')
+	}
+
+	File buildReport(String reportFolderPath, String suiteName, String executionTitle) {
+		return buildReport(new File(safe(reportFolderPath).isEmpty() ? '.' : reportFolderPath), suiteName, executionTitle)
+	}
+
+	File buildReport(File reportFolder) {
+		return buildReport(reportFolder, '', '')
+	}
+
+	File buildReport(File reportFolder, String suiteName, String executionTitle) {
+		File root = reportFolder ?: new File('.')
+		Map model = buildModel(root, suiteName, executionTitle)
+
+		JiraHtmlTemplateBuilder htmlBuilder = new JiraHtmlTemplateBuilder()
+		String html = htmlBuilder.build(model)
+
+		File target = new File(root, 'eMatchReport.html')
+		target.setText(html, 'UTF-8')
+		return target
+	}
+
+	private Map buildModel(File reportFolder, String suiteName, String executionTitle) {
+		File root = reportFolder ?: new File('.')
+
+		Map<String, Map> traceByCase = readTrace(root)
+		List<File> junitFiles = collectJUnitFiles(root)
+		List<Map> scenarios = []
+
+		junitFiles.each { File junitFile ->
+			scenarios.addAll(buildScenariosFromJUnit(junitFile, root, traceByCase))
+		}
+
+		if (scenarios.isEmpty()) {
+			scenarios = buildFallbackFromTrace(root, traceByCase)
+		}
+
+		scenarios = scenarios.sort { Map a, Map b ->
+			int byStatus = statusRank(safe(a.status)) <=> statusRank(safe(b.status))
+			if (byStatus != 0) {
+				return byStatus
+			}
+			return safe(a.name).toLowerCase(Locale.ENGLISH) <=> safe(b.name).toLowerCase(Locale.ENGLISH)
+		}
+
+		String resolvedSuiteName = !safe(suiteName).isEmpty() ? safe(suiteName) : detectSuiteName(root, scenarios)
+		String resolvedExecutionTitle = !safe(executionTitle).isEmpty() ? safe(executionTitle) : resolvedSuiteName
+
+		int passedCount = scenarios.count { Map row -> safe(row.status) == 'passed' }
+		int failedCount = scenarios.count { Map row -> safe(row.status) == 'failed' }
+		int blockedCount = scenarios.count { Map row -> safe(row.status) == 'blocked' }
+
+		return [
+			appName        : APP_NAME,
+			logoSrc        : resolveLogoSrc(),
+			reportTitle    : 'Test report - ' + resolvedExecutionTitle,
+			suiteName      : resolvedSuiteName,
+			executionName  : resolvedExecutionTitle,
+			generatedLabel : 'Generated ' + OUTPUT_DATE_TIME.format(new Date()),
+			reportFolder   : root.absolutePath,
+			scenarios      : scenarios,
+			passedCount    : passedCount,
+			failedCount    : failedCount,
+			blockedCount   : blockedCount,
+			totalCount     : scenarios.size()
+		]
+	}
+
+	private List<Map> buildScenariosFromJUnit(File junitFile, File reportRoot, Map<String, Map> traceByCase) {
+		List<Map> scenarios = []
+		Document xml = parseXml(junitFile)
+
+		if (xml == null) {
+			return scenarios
+		}
+
+		NodeList testcases = xml.getElementsByTagName('testcase')
+
+		for (int i = 0; i < testcases.getLength(); i++) {
+			Node node = testcases.item(i)
+			if (!(node instanceof Element)) {
+				continue
+			}
+
+			Element testcase = (Element) node
+
+			String rawName = safe(testcase.getAttribute('name'))
+			String className = safe(testcase.getAttribute('classname'))
+			String displayName = buildDisplayName(className, rawName)
+			String scenarioId = buildScenarioId(displayName, i + 1)
+
+			String status = 'passed'
+			String fullError = ''
+
+			NodeList children = testcase.getChildNodes()
+			for (int c = 0; c < children.getLength(); c++) {
+				Node child = children.item(c)
+				if (!(child instanceof Element)) {
+					continue
+				}
+
+				String childName = safe(child.getNodeName()).toLowerCase(Locale.ENGLISH)
+
+				if ('failure'.equals(childName) || 'error'.equals(childName)) {
+					status = 'failed'
+					fullError = safe(child.getTextContent())
+					break
+				}
+
+				if ('skipped'.equals(childName)) {
+					status = 'blocked'
+					fullError = safe(child.getTextContent())
+				}
+			}
+
+			long junitDurationMs = toDurationMillis(safe(testcase.getAttribute('time')))
+			Map trace = resolveTrace(traceByCase, displayName)
+
+			long startMs = asLong(trace.startMs)
+			long endMs = asLong(trace.endMs)
+			long durationMs = 0L
+
+			if (startMs > 0L && endMs >= startMs) {
+				durationMs = endMs - startMs
+			} else {
+				durationMs = junitDurationMs
+			}
+
+			if (safe(trace.status).equalsIgnoreCase('FAILED')) {
+				status = 'failed'
+			}
+			if (safe(trace.status).equalsIgnoreCase('BLOCKED') || safe(trace.status).equalsIgnoreCase('SKIPPED')) {
+				status = 'blocked'
+			}
+
+			if (fullError.isEmpty() && !safe(trace.failure).isEmpty()) {
+				fullError = safe(trace.failure)
+			}
+
+			List<Map> steps = normalizeStepRows(trace.steps)
+			steps = applyFinalStatusToSteps(steps, status)
+
+			String shortError = buildCompactVisualError(displayName, fullError)
+			List<Map> evidence = 'failed'.equals(status)
+					? collectEvidence(reportRoot, displayName, trace.evidencePaths as List<String>)
+					: []
+
+			scenarios << [
+				id            : scenarioId,
+				name          : displayName,
+				scenarioName  : displayName,
+				status        : status,
+				result        : status,
+				durationMs    : durationMs,
+				durationLabel : formatDuration(durationMs),
+				startTime     : startMs > 0L ? formatDateTime(startMs) : '',
+				endTime       : endMs > 0L ? formatDateTime(endMs) : '',
+				startLabel    : startMs > 0L ? formatDateTime(startMs) : '--',
+				endLabel      : endMs > 0L ? formatDateTime(endMs) : '--',
+				startShort    : startMs > 0L ? formatDateTime(startMs) : '--',
+				endShort      : endMs > 0L ? formatDateTime(endMs) : '--',
+				startLong     : startMs > 0L ? formatDateTime(startMs) : '--',
+				endLong       : endMs > 0L ? formatDateTime(endMs) : '--',
+				shortError    : shortError,
+				visualError   : shortError,
+				errorSummary  : shortError,
+				fullError     : fullError,
+				errorDetail   : fullError,
+				reportFolder  : reportRoot.absolutePath,
+				steps         : steps,
+				evidence      : evidence
+			]
+		}
+
+		return scenarios
+	}
+
+	private List<Map> buildFallbackFromTrace(File reportRoot, Map<String, Map> traceByCase) {
+		List<Map> scenarios = []
+
+		traceByCase.eachWithIndex { String caseId, Map trace, int index ->
+			long startMs = asLong(trace.startMs)
+			long endMs = asLong(trace.endMs)
+			long durationMs = startMs > 0L && endMs >= startMs ? (endMs - startMs) : 0L
+
+			String rawStatus = safe(trace.status)
+			String status = normalizeScenarioStatus(rawStatus)
+			List<Map> steps = normalizeStepRows(trace.steps)
+			steps = applyFinalStatusToSteps(steps, status)
+
+			String fullError = safe(trace.failure)
+			String shortError = buildCompactVisualError(caseId, fullError)
+			List<Map> evidence = 'failed'.equals(status)
+					? collectEvidence(reportRoot, caseId, trace.evidencePaths as List<String>)
+					: []
+
+			scenarios << [
+				id            : buildScenarioId(caseId, index + 1),
+				name          : caseId,
+				scenarioName  : caseId,
+				status        : status,
+				result        : status,
+				durationMs    : durationMs,
+				durationLabel : formatDuration(durationMs),
+				startTime     : startMs > 0L ? formatDateTime(startMs) : '',
+				endTime       : endMs > 0L ? formatDateTime(endMs) : '',
+				startLabel    : startMs > 0L ? formatDateTime(startMs) : '--',
+				endLabel      : endMs > 0L ? formatDateTime(endMs) : '--',
+				startShort    : startMs > 0L ? formatDateTime(startMs) : '--',
+				endShort      : endMs > 0L ? formatDateTime(endMs) : '--',
+				startLong     : startMs > 0L ? formatDateTime(startMs) : '--',
+				endLong       : endMs > 0L ? formatDateTime(endMs) : '--',
+				shortError    : shortError,
+				visualError   : shortError,
+				errorSummary  : shortError,
+				fullError     : fullError,
+				errorDetail   : fullError,
+				reportFolder  : reportRoot.absolutePath,
+				steps         : steps,
+				evidence      : evidence
+			]
+		}
+
+		return scenarios
+	}
+
+	private Map<String, Map> readTrace(File root) {
+		Map<String, Map> result = new LinkedHashMap<String, Map>()
+
+		TRACE_FILE_NAMES.each { String traceName ->
+			File traceFile = new File(root, traceName)
+
+			if (!traceFile.exists()) {
+				return
+			}
+
+			eachLineSafely(traceFile) { String line ->
+				List<String> parts = line.split('\t', 4) as List<String>
+				if (parts.size() < 4) {
+					return
+				}
+
+				String type = ''
+				long millis = 0L
+				String caseId = ''
+				String payload = ''
+
+				if (parts[1]?.isLong()) {
+					type = safe(parts[0])
+					millis = asLong(parts[1])
+					caseId = safe(parts[2])
+					payload = decode64(parts[3])
+				} else {
+					millis = parseDateToMillis(parts[0])
+					type = safe(parts[1])
+					caseId = decode64(parts[2])
+					payload = decode64(parts[3])
+				}
+
+				if (caseId.isEmpty()) {
+					return
+				}
+
+				Map row = result.containsKey(caseId) ? result[caseId] : [
+					startMs       : 0L,
+					endMs         : 0L,
+					status        : '',
+					failure       : '',
+					steps         : [],
+					evidencePaths : []
+				]
+
+				if ('CASE_START'.equals(type)) {
+					row.startMs = millis
+				} else if ('CASE_END'.equals(type)) {
+					row.endMs = millis
+				} else if ('STATUS'.equals(type)) {
+					row.status = safe(payload)
+				} else if ('STEP'.equals(type) || 'REPORT_STEP'.equals(type)) {
+					row.steps << [
+						status    : 'passed',
+						timestamp : formatClock(millis),
+						timeMs    : millis,
+						detail    : safe(payload),
+						icon      : resolveStepIcon(safe(payload), 'passed')
+					]
+				} else if ('STEP_FAIL'.equals(type)) {
+					row.failure = safe(payload)
+					row.status = 'FAILED'
+				} else if ('EVIDENCE'.equals(type)) {
+					if (!safe(payload).isEmpty()) {
+						row.evidencePaths << safe(payload)
+					}
+				}
+
+				result[caseId] = row
+			}
+		}
+
+		return result
+	}
+
+	private List<Map> normalizeStepRows(def rawSteps) {
+		List<Map> result = []
+
+		if (!(rawSteps instanceof Collection)) {
+			return result
+		}
+
+		(rawSteps as Collection).each { def item ->
+			if (!(item instanceof Map)) {
+				return
+			}
+
+			String detail = safe(item.detail)
+			if (detail.isEmpty()) {
+				return
+			}
+
+			String status = normalizeStepStatus(safe(item.status))
+			String timestamp = safe(item.timestamp)
+			long timeMs = asLong(item.timeMs)
+
+			result << [
+				status    : status,
+				timestamp : !timestamp.isEmpty() ? timestamp : (timeMs > 0L ? formatClock(timeMs) : '--'),
+				detail    : detail,
+				icon      : resolveStepIcon(detail, status),
+				timeMs    : timeMs
+			]
+		}
+
+		result = result
+				.unique { Map row -> safe(row.status) + '|' + safe(row.timestamp) + '|' + safe(row.detail) }
+				.sort { Map a, Map b -> asLong(a.timeMs) <=> asLong(b.timeMs) }
+
+		return result
+	}
+
+	private List<Map> applyFinalStatusToSteps(List<Map> steps, String caseStatus) {
+		if (steps == null || steps.isEmpty()) {
+			return steps ?: []
+		}
+
+		String normalized = safe(caseStatus).toLowerCase(Locale.ENGLISH)
+		if (!(normalized in ['failed', 'blocked'])) {
+			return steps
+		}
+
+		int targetIndex = -1
+		for (int i = steps.size() - 1; i >= 0; i--) {
+			String stepStatus = safe(steps[i].status).toLowerCase(Locale.ENGLISH)
+			if (stepStatus == 'passed' || stepStatus == 'info') {
+				targetIndex = i
+				break
+			}
+		}
+
+		if (targetIndex < 0) {
+			targetIndex = steps.size() - 1
+		}
+
+		steps[targetIndex].status = normalized
+		steps[targetIndex].icon = resolveStepIcon(safe(steps[targetIndex].detail), normalized)
+
+		return steps
+	}
+
+	private Map resolveTrace(Map<String, Map> traceByCase, String displayName) {
+		if (traceByCase.containsKey(displayName)) {
+			return traceByCase[displayName]
+		}
+
+		String normalizedTarget = normalizeKey(displayName)
+
+		for (Map.Entry<String, Map> entry : traceByCase.entrySet()) {
+			if (normalizeKey(entry.key) == normalizedTarget) {
+				return entry.value
+			}
+		}
+
+		return [
+			startMs       : 0L,
+			endMs         : 0L,
+			status        : '',
+			failure       : '',
+			steps         : [],
+			evidencePaths : []
+		]
+	}
+
+	private List<Map> collectEvidence(File reportRoot, String scenarioName, List<String> tracedPaths) {
+		List<File> candidates = []
+
+		candidates.addAll(resolveEvidenceFromTracePaths(tracedPaths))
+
+		if (candidates.isEmpty()) {
+			File evidenceRoot = new File(reportRoot, 'Evidences')
+
+			if (evidenceRoot.exists()) {
+				File caseFolder = new File(evidenceRoot, sanitizeCaseFolderName(scenarioName))
+
+				if (caseFolder.exists()) {
+					caseFolder.eachFileRecurse { File file ->
+						if (isValidImage(file)) {
+							candidates << file
+						}
+					}
+				}
+			}
+		}
+
+		candidates = candidates
+				.findAll { File file -> isValidImage(file) }
+				.unique { File file -> file.absolutePath }
+
+		if (candidates.isEmpty()) {
+			return []
+		}
+
+		candidates = candidates.sort { File a, File b ->
+			b.lastModified() <=> a.lastModified()
+		}
+
+		File best = candidates[0]
+		String embeddedImage = toDataUri(best)
+
+		if (embeddedImage.isEmpty()) {
+			return []
+		}
+
+		return [
+			[
+				name   : best.name,
+				href   : embeddedImage,
+				image  : true,
+				imgSrc : embeddedImage
+			]
+		]
+	}
+
+	private List<File> resolveEvidenceFromTracePaths(List<String> tracedPaths) {
+		List<File> result = []
+
+		(tracedPaths ?: []).each { String rawPath ->
+			String path = safe(rawPath)
+			if (path.isEmpty()) {
+				return
+			}
+
+			File file = new File(path)
+			if (isValidImage(file)) {
+				result << file
+			}
+		}
+
+		return result
+	}
+
+	private boolean isValidImage(File file) {
+		if (file == null || !file.exists() || !file.isFile() || file.length() <= 0L) {
+			return false
+		}
+
+		String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+		return lower.endsWith('.png') ||
+				lower.endsWith('.jpg') ||
+				lower.endsWith('.jpeg') ||
+				lower.endsWith('.gif') ||
+				lower.endsWith('.bmp') ||
+				lower.endsWith('.webp')
+	}
+
+	private List<File> collectJUnitFiles(File root) {
+		List<File> result = []
+
+		if (root == null || !root.exists()) {
+			return result
+		}
+
+		root.eachFileRecurse { File file ->
+			if (!file.isFile()) {
+				return
+			}
+
+			String lower = safe(file.name).toLowerCase(Locale.ENGLISH)
+			if (lower == 'junit_report.xml' || lower == 'junit.xml' || lower == 'junitreport.xml' || lower == 'junit-report.xml' || lower == 'cucumber.xml') {
+				result << file
+			}
+		}
+
+		result = result
+				.unique { File file -> file.absolutePath }
+				.sort { File a, File b -> a.absolutePath.toLowerCase(Locale.ENGLISH) <=> b.absolutePath.toLowerCase(Locale.ENGLISH) }
+
+		return result
+	}
+
+	private Document parseXml(File file) {
+		if (file == null || !file.exists()) {
+			return null
+		}
+
+		try {
+			DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance()
+			factory.setNamespaceAware(false)
+			factory.setXIncludeAware(false)
+			factory.setExpandEntityReferences(false)
+			factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+
+			try {
+				factory.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)
+			} catch (Throwable ignored) {
+			}
+
+			DocumentBuilder builder = factory.newDocumentBuilder()
+			Document document = builder.parse(file)
+			document.getDocumentElement().normalize()
+			return document
+		} catch (Throwable ignored) {
+			return null
+		}
+	}
+
+	private String buildDisplayName(String className, String rawName) {
+		String cleanClass = safe(className)
+		String cleanName = safe(rawName)
+
+		if (!cleanClass.isEmpty()) {
+			if (cleanClass.startsWith('Test Cases/')) {
+				if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+					return cleanClass + '/' + cleanName
+				}
+				return cleanClass
+			}
+
+			if (cleanClass.contains('/')) {
+				if (!cleanName.isEmpty() && !cleanClass.endsWith(cleanName)) {
+					return cleanClass + '/' + cleanName
+				}
+				return cleanClass
+			}
+		}
+
+		return cleanName
+	}
+
+	private String detectSuiteName(File root, List<Map> scenarios) {
+		String folderName = root != null ? safe(root.name) : ''
+		if (!folderName.isEmpty() && !folderName.matches('\\d+')) {
+			return folderName
+		}
+
+		if (root != null && root.parentFile != null) {
+			String parent = safe(root.parentFile.name)
+			if (!parent.isEmpty() && !parent.matches('\\d+')) {
+				return parent
+			}
+		}
+
+		if (scenarios != null && !scenarios.isEmpty()) {
+			return safe(scenarios[0].name)
+		}
+
+		return 'Execution'
+	}
+
+	private String buildScenarioId(String value, int index) {
+		String text = safe(value)
+				.replace('\\', '/')
+				.replaceAll('[^A-Za-z0-9/_-]+', '-')
+				.replaceAll('-+', '-')
+				.replaceAll('^[-/]+', '')
+				.replaceAll('[-/]+$', '')
+
+		return text.isEmpty() ? 'scenario-' + index : text
+	}
+
+	private String buildCompactVisualError(String displayName, String fullError) {
+		String normalized = safe(fullError).replace('\r\n', '\n').replace('\r', '\n').trim()
+		if (normalized.isEmpty()) {
+			return ''
+		}
+
+		List<String> lines = normalized.readLines()
+				.collect { String line -> safe(line) }
+				.findAll { String line -> !line.isEmpty() }
+
+		if (lines.isEmpty()) {
+			return ''
+		}
+
+		List<String> compact = []
+
+		for (String line : lines) {
+			String lower = line.toLowerCase(Locale.ENGLISH)
+
+			if (line.startsWith('at ')) {
+				break
+			}
+
+			if (lower.startsWith('original error:')) {
+				break
+			}
+
+			compact << line
+
+			if (lower.startsWith('expected window title:')) {
+				break
+			}
+		}
+
+		if (compact.isEmpty()) {
+			compact = lines.take(Math.min(4, lines.size()))
+		}
+
+		return compact.join('\n')
+	}
+
+	private String normalizeScenarioStatus(String raw) {
+		String upper = safe(raw).toUpperCase(Locale.ENGLISH)
+		if (upper == 'PASSED' || upper == 'PASS' || upper == 'SUCCESS') {
+			return 'passed'
+		}
+		if (upper == 'FAILED' || upper == 'FAIL' || upper == 'ERROR') {
+			return 'failed'
+		}
+		if (upper == 'BLOCKED' || upper == 'SKIPPED' || upper == 'SKIP') {
+			return 'blocked'
+		}
+		return 'passed'
+	}
+
+	private String normalizeStepStatus(String raw) {
+		String lower = safe(raw).toLowerCase(Locale.ENGLISH)
+		if (lower == 'passed' || lower == 'pass' || lower == 'success') {
+			return 'passed'
+		}
+		if (lower == 'failed' || lower == 'fail' || lower == 'error') {
+			return 'failed'
+		}
+		if (lower == 'blocked' || lower == 'skipped' || lower == 'skip') {
+			return 'blocked'
+		}
+		return 'info'
+	}
+
+	private String resolveStepIcon(String detail, String status) {
+		String lower = safe(detail).toLowerCase(Locale.ENGLISH)
+
+		if ('failed'.equals(status)) {
+			return '❌'
+		}
+		if ('passed'.equals(status)) {
+			if (lower.contains('open') || lower.contains('screen') || lower.contains('page')) {
+				return '🌐'
+			}
+			if (lower.contains('select') || lower.contains('choose')) {
+				return '🖱️'
+			}
+			if (lower.contains('verify') || lower.contains('validate') || lower.contains('check')) {
+				return '✅'
+			}
+			if (lower.contains('credential') || lower.contains('username') || lower.contains('password')) {
+				return '🔐'
+			}
+			return '✅'
+		}
+		if ('blocked'.equals(status)) {
+			return '⛔'
+		}
+
+		if (lower.contains('open') || lower.contains('screen') || lower.contains('page')) {
+			return '🌐'
+		}
+		if (lower.contains('select') || lower.contains('choose')) {
+			return '🖱️'
+		}
+		if (lower.contains('verify') || lower.contains('validate') || lower.contains('check')) {
+			return '🔎'
+		}
+		return 'ℹ️'
+	}
+
+	private int statusRank(String value) {
+		String lower = safe(value).toLowerCase(Locale.ENGLISH)
+		if (lower == 'failed') {
+			return 0
+		}
+		if (lower == 'blocked') {
+			return 1
+		}
+		return 2
+	}
+
+	private String sanitizeCaseFolderName(String value) {
+		return safe(value).replaceAll('[^A-Za-z0-9._-]+', '_')
+	}
+
+	private long toDurationMillis(String secondsValue) {
+		String value = safe(secondsValue)
+		if (value.isEmpty()) {
+			return 0L
+		}
+
+		try {
+			BigDecimal seconds = new BigDecimal(value.replace(',', '.'))
+			return seconds.multiply(new BigDecimal('1000')).longValue()
+		} catch (Throwable ignored) {
+			return 0L
+		}
+	}
+
+	private long asLong(def value) {
+		try {
+			return Long.parseLong(String.valueOf(value))
+		} catch (Throwable ignored) {
+			return 0L
+		}
+	}
+
+	private long parseDateToMillis(String raw) {
+		String text = safe(raw)
+		if (text.isEmpty()) {
+			return 0L
+		}
+
+		for (String pattern : DATE_PATTERNS) {
+			try {
+				return new SimpleDateFormat(pattern, Locale.ENGLISH).parse(text).time
+			} catch (Throwable ignored) {
+			}
+		}
+
+		return 0L
+	}
+
+	private String decode64(String value) {
+		String text = safe(value)
+		if (text.isEmpty()) {
+			return ''
+		}
+
+		try {
+			return new String(Base64.decoder.decode(text), 'UTF-8')
+		} catch (Throwable ignored) {
+			return ''
+		}
+	}
+
+	private String formatDateTime(long millis) {
+		if (millis <= 0L) {
+			return '--'
+		}
+		return OUTPUT_DATE_TIME.format(new Date(millis))
+	}
+
+	private String formatClock(long millis) {
+		if (millis <= 0L) {
+			return '--'
+		}
+		return OUTPUT_CLOCK.format(new Date(millis))
+	}
+
+	private String formatDuration(long durationMs) {
+		long value = durationMs < 0L ? 0L : durationMs
+		long totalSeconds = Math.round(value / 1000.0d)
+		long hours = (long) (totalSeconds / 3600L)
+		long minutes = (long) ((totalSeconds % 3600L) / 60L)
+		long seconds = (long) (totalSeconds % 60L)
+
+		return String.format(Locale.ENGLISH, '%02dh %02dm %02ds', hours, minutes, seconds)
+	}
+
+	private void eachLineSafely(File file, Closure consumer) {
+		BufferedReader reader = null
+		try {
+			reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), 'UTF-8'))
+			String line
+			while ((line = reader.readLine()) != null) {
+				consumer.call(line)
+			}
+		} catch (Throwable ignored) {
+		} finally {
+			try {
+				reader?.close()
+			} catch (Throwable ignored) {
+			}
+		}
+	}
+
+	private String resolveLogoSrc() {
+		File projectDir = new File(RunConfiguration.getProjectDir())
+
+		List<File> candidates = [
+			new File(projectDir, 'Images/General/logo.png'),
+			new File(projectDir, 'Images/General/logo.PNG'),
+			new File(projectDir, 'Images/logo.png'),
+			new File(projectDir, 'Include/resources/logo.png')
+		]
+
+		File found = candidates.find { File file ->
+			file.exists() && file.isFile()
+		}
+
+		if (found == null) {
+			return DEFAULT_LOGO_SRC
+		}
+
+		String embedded = toDataUri(found)
+		return embedded.isEmpty() ? found.absolutePath : embedded
+	}
+
+	private String toDataUri(File file) {
+		if (file == null || !file.exists() || !file.isFile() || file.length() <= 0L) {
+			return ''
+		}
+
+		String mime = detectMimeType(file)
+		byte[] bytes = file.bytes
+
+		if (bytes == null || bytes.length == 0) {
+			return ''
+		}
+
+		return 'data:' + mime + ';base64,' + Base64.encoder.encodeToString(bytes)
+	}
+
+	private String detectMimeType(File file) {
+		String lower = safe(file?.name).toLowerCase(Locale.ENGLISH)
+
+		if (lower.endsWith('.png')) return 'image/png'
+		if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+		if (lower.endsWith('.gif')) return 'image/gif'
+		if (lower.endsWith('.bmp')) return 'image/bmp'
+		if (lower.endsWith('.webp')) return 'image/webp'
+		if (lower.endsWith('.svg')) return 'image/svg+xml'
+
+		return 'application/octet-stream'
+	}
+
+	private String normalizeKey(String value) {
+		return safe(value)
+				.toLowerCase(Locale.ENGLISH)
+				.replaceAll('[^a-z0-9]+', '')
+	}
+
+	private String safe(Object value) {
+		return value == null ? '' : String.valueOf(value).trim()
+	}
+}
