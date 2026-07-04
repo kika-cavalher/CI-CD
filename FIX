@@ -1,3 +1,4 @@
+1️⃣ JiraHtmlTemplateBuilder.groovy
 package jiraIntegration
 
 import java.io.File
@@ -185,12 +186,15 @@ class JiraHtmlTemplateBuilder {
 		asList(rawSteps).each { raw ->
 			Map row = raw instanceof Map ? (raw as Map) : [detail: safeValue(raw)]
 
-			String detail = pickFirst(row.detail, row.message, row.text, row.title, row.name)
+			String originalDetail = pickFirst(row.detail, row.message, row.text, row.title, row.name)
+			String detail = cleanStepDetail(originalDetail)
+
 			if (detail.isEmpty()) {
 				return
 			}
 
-			String status = normalizeStatus(pickFirst(row.status, row.result, row.outcome, 'info'))
+			String markerStatus = resolveStatusFromDetail(originalDetail)
+			String status = normalizeStatus(pickFirst(markerStatus, row.status, row.result, row.outcome, 'info'))
 			String timestamp = pickFirst(row.timestamp, row.time, row.label, '--')
 
 			result << [
@@ -234,7 +238,7 @@ class JiraHtmlTemplateBuilder {
 
 	private String buildScenarioListItem(Map scenario, boolean selected) {
 		String borderClass = selected ? 'scenario-list-item selected' : 'scenario-list-item'
-		String shortName = shorten(scenario.name, 68)
+		String shortName = shorten(shortScenarioName(scenario.name), 68)
 
 		StringBuilder sb = new StringBuilder()
 		sb.append('<button type="button" class="')
@@ -421,10 +425,12 @@ class JiraHtmlTemplateBuilder {
 			result = lines.take(max)
 		}
 
-		return result.join('\\n')
+		return result.join('\n')
 	}
 
 	private String buildStepRow(Map step) {
+		String detail = pickFirst(step.detail, '')
+
 		StringBuilder sb = new StringBuilder()
 
 		sb.append('<div class="step-row">')
@@ -442,10 +448,15 @@ class JiraHtmlTemplateBuilder {
 
 		sb.append('<div class="col-detail">')
 		sb.append('<span class="step-icon">')
-		sb.append(htmlEscape(pickFirst(step.icon, 'ℹ️')))
-		sb.append('</span> ')
-		sb.append(htmlEscape(pickFirst(step.detail, '')))
+		sb.append(htmlEscape(pickFirst(step.icon, resolveStepIcon(detail, pickFirst(step.status, 'info')))))
+		sb.append('</span>')
+		sb.append('<span class="step-detail-text" title="')
+		sb.append(htmlEscape(detail))
+		sb.append('">')
+		sb.append(htmlEscape(detail))
+		sb.append('</span>')
 		sb.append('</div>')
+
 		sb.append('</div>')
 
 		return sb.toString()
@@ -586,33 +597,135 @@ class JiraHtmlTemplateBuilder {
 
 	private String resolveStepIcon(String detail, String status) {
 		String lower = safeValue(detail).toLowerCase(Locale.ENGLISH)
+		String normalizedStatus = safeValue(status).toLowerCase(Locale.ENGLISH)
 
-		if (status == 'failed') {
+		if (normalizedStatus == 'failed') {
 			return '❌'
 		}
-		if (status == 'passed') {
-			return '✅'
+
+		if (normalizedStatus == 'blocked') {
+			return '⛔'
 		}
-		if (status == 'blocked') {
-			return '⏭️'
+
+		if (lower.contains('environment')) {
+			return '🌍'
 		}
-		if (lower.contains('click') || lower.contains('select') || lower.contains('tap')) {
-			return '🖱️'
+
+		if (lower.contains('authenticate') || lower.contains('login') || lower.contains('credential') || lower.contains('username') || lower.contains('password')) {
+			return '🔐'
 		}
-		if (lower.contains('open') || lower.contains('navigate') || lower.contains('url')) {
+
+		if (lower.contains('verify') || lower.contains('validate') || lower.contains('check')) {
+			return '🔎'
+		}
+
+		if (lower.contains('configure') || lower.contains('config') || lower.contains('parameter') || lower.contains('setting')) {
+			return '🛠️'
+		}
+
+		if (lower.contains('export') || lower.contains('download')) {
+			return '⬇️'
+		}
+
+		if (lower.contains('file') || lower.contains('folder') || lower.contains('path')) {
+			return '📂'
+		}
+
+		if (lower.contains('compare') || lower.contains('equal') || lower.contains('amount') || lower.contains('currency') || lower.contains('montant')) {
+			return '🧮'
+		}
+
+		if (lower.contains('open') || lower.contains('navigate') || lower.contains('screen') || lower.contains('page') || lower.contains('menu')) {
 			return '🌐'
 		}
+
+		if (lower.contains('click') || lower.contains('select') || lower.contains('choose') || lower.contains('tap')) {
+			return '🖱️'
+		}
+
 		if (lower.contains('wait')) {
 			return '⏳'
 		}
+
 		if (lower.contains('fill') || lower.contains('input') || lower.contains('type')) {
 			return '⌨️'
 		}
-		if (lower.contains('import') || lower.contains('export') || lower.contains('report')) {
-			return '📄'
+
+		if (lower.contains('close')) {
+			return '🚪'
+		}
+
+		if (lower.contains('start')) {
+			return '▶️'
 		}
 
 		return 'ℹ️'
+	}
+
+	private String shortScenarioName(String value) {
+		String text = safeValue(value)
+				.replace('\\', '/')
+				.replaceAll('/+$', '')
+
+		if (text.isEmpty()) {
+			return ''
+		}
+
+		List<String> parts = text.tokenize('/')
+				.collect { String part -> safeValue(part) }
+				.findAll { String part -> !part.isEmpty() }
+
+		if (parts.isEmpty()) {
+			return text
+		}
+
+		return parts.last()
+	}
+
+	private String resolveStatusFromDetail(String detail) {
+		String text = safeValue(detail)
+
+		if (text.isEmpty()) {
+			return ''
+		}
+
+		def matcher = text =~ '^\\s*\\[([^\\]]+)\\]'
+		if (!matcher.find()) {
+			return ''
+		}
+
+		String marker = safeValue(matcher.group(1)).toLowerCase(Locale.ENGLISH)
+
+		if (marker in ['pass', 'passed', 'success']) {
+			return 'passed'
+		}
+
+		if (marker in ['fail', 'failed', 'error']) {
+			return 'failed'
+		}
+
+		if (marker in ['blocked', 'skip', 'skipped']) {
+			return 'blocked'
+		}
+
+		if (marker == 'info') {
+			return 'info'
+		}
+
+		return ''
+	}
+
+	private String cleanStepDetail(String detail) {
+		String text = safeValue(detail)
+
+		boolean changed = true
+		while (changed) {
+			String before = text
+			text = text.replaceFirst('^\\s*\\[(?i:PASS|PASSED|SUCCESS|FAIL|FAILED|ERROR|BLOCKED|SKIP|SKIPPED|INFO|START|END|CONFIG|FILES|FILE|STEP|EXPORT|VALIDATION)\\]\\s*', '')
+			changed = before != text
+		}
+
+		return text.trim()
 	}
 
 	private String normalizeStatus(String raw) {
@@ -1073,12 +1186,29 @@ body {
 }
 .col-detail {
     min-width: 0;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
     white-space: normal;
     word-break: break-word;
     line-height: 1.45;
 }
 .step-icon {
-    margin-right: 3px;
+    flex: 0 0 24px;
+    width: 24px;
+    display: inline-flex;
+    justify-content: center;
+    margin-top: 1px;
+}
+.step-detail-text {
+    display: -webkit-box;
+    -webkit-line-clamp: 5;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.45;
 }
 .error-block,
 .evidence-block {
@@ -1382,19 +1512,7 @@ function filterScenarios() {
 '''
 	}
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
+2️⃣ JiraReportBuilder.groovy
 package jiraIntegration
 
 import java.io.BufferedReader
@@ -1727,16 +1845,43 @@ class JiraReportBuilder {
 				} else if ('STATUS'.equals(type)) {
 					row.status = safe(payload)
 				} else if ('STEP'.equals(type) || 'REPORT_STEP'.equals(type)) {
-					row.steps << [
-						status    : 'passed',
-						timestamp : formatClock(millis),
-						timeMs    : millis,
-						detail    : safe(payload),
-						icon      : resolveStepIcon(safe(payload), 'passed')
-					]
+					String rawDetail = safe(payload)
+					String detail = cleanStepDetail(rawDetail)
+					String stepStatus = resolveStepStatusFromDetail(rawDetail, 'passed')
+
+					if (!detail.isEmpty()) {
+						row.steps << [
+							status    : stepStatus,
+							timestamp : formatClock(millis),
+							timeMs    : millis,
+							detail    : detail,
+							icon      : resolveStepIcon(detail, stepStatus)
+						]
+					}
+
+					if ('failed'.equals(stepStatus)) {
+						row.status = 'FAILED'
+
+						if (safe(row.failure).isEmpty()) {
+							row.failure = detail
+						}
+					}
 				} else if ('STEP_FAIL'.equals(type)) {
-					row.failure = safe(payload)
+					String rawDetail = safe(payload)
+					String detail = cleanStepDetail(rawDetail)
+
+					row.failure = !rawDetail.isEmpty() ? rawDetail : detail
 					row.status = 'FAILED'
+
+					if (!detail.isEmpty()) {
+						row.steps << [
+							status    : 'failed',
+							timestamp : formatClock(millis),
+							timeMs    : millis,
+							detail    : detail,
+							icon      : resolveStepIcon(detail, 'failed')
+						]
+					}
 				} else if ('EVIDENCE'.equals(type)) {
 					if (!safe(payload).isEmpty()) {
 						row.evidencePaths << safe(payload)
@@ -1762,12 +1907,14 @@ class JiraReportBuilder {
 				return
 			}
 
-			String detail = safe(item.detail)
+			String rawDetail = safe(item.detail)
+			String detail = cleanStepDetail(rawDetail)
+
 			if (detail.isEmpty()) {
 				return
 			}
 
-			String status = normalizeStepStatus(safe(item.status))
+			String status = resolveStepStatusFromDetail(rawDetail, safe(item.status))
 			String timestamp = safe(item.timestamp)
 			long timeMs = asLong(item.timeMs)
 
@@ -1793,13 +1940,25 @@ class JiraReportBuilder {
 		}
 
 		String normalized = safe(caseStatus).toLowerCase(Locale.ENGLISH)
+
 		if (!(normalized in ['failed', 'blocked'])) {
 			return steps
 		}
 
+		boolean alreadyHasFinalStatus = steps.any { Map step ->
+			String stepStatus = safe(step.status).toLowerCase(Locale.ENGLISH)
+			return stepStatus == normalized
+		}
+
+		if (alreadyHasFinalStatus) {
+			return steps
+		}
+
 		int targetIndex = -1
+
 		for (int i = steps.size() - 1; i >= 0; i--) {
 			String stepStatus = safe(steps[i].status).toLowerCase(Locale.ENGLISH)
+
 			if (stepStatus == 'passed' || stepStatus == 'info') {
 				targetIndex = i
 				break
@@ -2067,6 +2226,49 @@ class JiraReportBuilder {
 		return compact.join('\n')
 	}
 
+	private String resolveStepStatusFromDetail(String detail, String fallbackStatus) {
+		String text = safe(detail)
+
+		if (!text.isEmpty()) {
+			def matcher = text =~ '^\\s*\\[([^\\]]+)\\]'
+
+			if (matcher.find()) {
+				String marker = safe(matcher.group(1)).toLowerCase(Locale.ENGLISH)
+
+				if (marker in ['pass', 'passed', 'success']) {
+					return 'passed'
+				}
+
+				if (marker in ['fail', 'failed', 'error']) {
+					return 'failed'
+				}
+
+				if (marker in ['blocked', 'skip', 'skipped']) {
+					return 'blocked'
+				}
+
+				if (marker == 'info') {
+					return 'info'
+				}
+			}
+		}
+
+		return normalizeStepStatus(fallbackStatus)
+	}
+
+	private String cleanStepDetail(String detail) {
+		String text = safe(detail)
+
+		boolean changed = true
+		while (changed) {
+			String before = text
+			text = text.replaceFirst('^\\s*\\[(?i:PASS|PASSED|SUCCESS|FAIL|FAILED|ERROR|BLOCKED|SKIP|SKIPPED|INFO|START|END|CONFIG|FILES|FILE|STEP|EXPORT|VALIDATION)\\]\\s*', '')
+			changed = before != text
+		}
+
+		return text.trim()
+	}
+
 	private String normalizeScenarioStatus(String raw) {
 		String upper = safe(raw).toUpperCase(Locale.ENGLISH)
 		if (upper == 'PASSED' || upper == 'PASS' || upper == 'SUCCESS') {
@@ -2097,38 +2299,68 @@ class JiraReportBuilder {
 
 	private String resolveStepIcon(String detail, String status) {
 		String lower = safe(detail).toLowerCase(Locale.ENGLISH)
+		String normalizedStatus = safe(status).toLowerCase(Locale.ENGLISH)
 
-		if ('failed'.equals(status)) {
+		if ('failed'.equals(normalizedStatus)) {
 			return '❌'
 		}
-		if ('passed'.equals(status)) {
-			if (lower.contains('open') || lower.contains('screen') || lower.contains('page')) {
-				return '🌐'
-			}
-			if (lower.contains('select') || lower.contains('choose')) {
-				return '🖱️'
-			}
-			if (lower.contains('verify') || lower.contains('validate') || lower.contains('check')) {
-				return '✅'
-			}
-			if (lower.contains('credential') || lower.contains('username') || lower.contains('password')) {
-				return '🔐'
-			}
-			return '✅'
-		}
-		if ('blocked'.equals(status)) {
+
+		if ('blocked'.equals(normalizedStatus)) {
 			return '⛔'
 		}
 
-		if (lower.contains('open') || lower.contains('screen') || lower.contains('page')) {
-			return '🌐'
+		if (lower.contains('environment')) {
+			return '🌍'
 		}
-		if (lower.contains('select') || lower.contains('choose')) {
-			return '🖱️'
+
+		if (lower.contains('authenticate') || lower.contains('login') || lower.contains('credential') || lower.contains('username') || lower.contains('password')) {
+			return '🔐'
 		}
+
 		if (lower.contains('verify') || lower.contains('validate') || lower.contains('check')) {
 			return '🔎'
 		}
+
+		if (lower.contains('configure') || lower.contains('config') || lower.contains('parameter') || lower.contains('setting')) {
+			return '🛠️'
+		}
+
+		if (lower.contains('export') || lower.contains('download')) {
+			return '⬇️'
+		}
+
+		if (lower.contains('file') || lower.contains('folder') || lower.contains('path')) {
+			return '📂'
+		}
+
+		if (lower.contains('compare') || lower.contains('equal') || lower.contains('amount') || lower.contains('currency') || lower.contains('montant')) {
+			return '🧮'
+		}
+
+		if (lower.contains('open') || lower.contains('navigate') || lower.contains('screen') || lower.contains('page') || lower.contains('menu')) {
+			return '🌐'
+		}
+
+		if (lower.contains('click') || lower.contains('select') || lower.contains('choose') || lower.contains('tap')) {
+			return '🖱️'
+		}
+
+		if (lower.contains('wait')) {
+			return '⏳'
+		}
+
+		if (lower.contains('fill') || lower.contains('input') || lower.contains('type')) {
+			return '⌨️'
+		}
+
+		if (lower.contains('close')) {
+			return '🚪'
+		}
+
+		if (lower.contains('start')) {
+			return '▶️'
+		}
+
 		return 'ℹ️'
 	}
 
