@@ -1,1 +1,795 @@
+package commands
 
+import java.text.Normalizer
+
+import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.DataFormatter
+import org.apache.poi.ss.usermodel.FormulaEvaluator
+import org.apache.poi.ss.usermodel.Row
+import org.apache.poi.ss.usermodel.Sheet
+import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.util.KeywordUtil
+
+class ExportFileValidationKeywords {
+
+	private static final String LIST_SEPARATOR = '|'
+
+	@Keyword
+	String validateEvidenceFolderExists(String folderPath) {
+		StringBuilder errors = new StringBuilder()
+
+		File folder = new File(safeText(folderPath))
+
+		KeywordUtil.logInfo('[VALIDATE FOLDER] ' + folder.getAbsolutePath())
+
+		if (!folder.exists()) {
+			errors.append('[ERROR] Export folder does not exist: ')
+					.append(folder.getAbsolutePath())
+					.append('\n')
+		} else if (!folder.isDirectory()) {
+			errors.append('[ERROR] Export path is not a folder: ')
+					.append(folder.getAbsolutePath())
+					.append('\n')
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String resolveExcelFilesAsString(String folderPath, String requestedFileNames, String includeSubFoldersText) {
+		File folder = new File(safeText(folderPath))
+		boolean includeSubFolders = parseBoolean(includeSubFoldersText)
+
+		List<File> files = []
+
+		if (!folder.exists() || !folder.isDirectory()) {
+			return ''
+		}
+
+		String requested = safeText(requestedFileNames)
+
+		if (!requested.trim().isEmpty()) {
+			List<String> requestedNames = splitText(requested)
+
+			for (String requestedName : requestedNames) {
+				File requestedFile = new File(requestedName)
+
+				if (!requestedFile.isAbsolute()) {
+					requestedFile = new File(folder, requestedName)
+				}
+
+				if (requestedFile.exists() && requestedFile.isFile() && isExcelFile(requestedFile)) {
+					files.add(requestedFile)
+				}
+			}
+		} else {
+			files.addAll(findExcelFiles(folder, includeSubFolders))
+		}
+
+		files = files
+				.findAll { File file -> file.exists() && file.isFile() && isExcelFile(file) }
+				.unique { File file -> file.getAbsolutePath().toLowerCase() }
+				.sort { File a, File b -> a.getName().toLowerCase() <=> b.getName().toLowerCase() }
+
+		String result = files.collect { File file -> file.getAbsolutePath() }.join(LIST_SEPARATOR)
+
+		KeywordUtil.logInfo('[RESOLVED EXCEL FILES]\n' + result)
+
+		return result
+	}
+
+	@Keyword
+	String validateMinimumExpectedFiles(String filesText, String minimumExpectedFilesText) {
+		Integer minimumExpectedFiles = parseInteger(minimumExpectedFilesText, 0)
+
+		return validateMinimumExpectedFilesInternal(filesText, minimumExpectedFiles)
+	}
+
+	@Keyword
+	String validateMinimumExpectedFiles(String filesText, Integer minimumExpectedFiles) {
+		Integer safeMinimum = minimumExpectedFiles == null ? 0 : minimumExpectedFiles
+
+		return validateMinimumExpectedFilesInternal(filesText, safeMinimum)
+	}
+
+	@Keyword
+	String validateCurrencyForRows(
+			String filesText,
+			String defaultValidationType,
+			String sheetIndexText,
+			String headerCurrency,
+			String headerCurrencyRef
+	) {
+		StringBuilder errors = new StringBuilder()
+		List<File> files = parseFiles(filesText)
+		Integer sheetIndex = parseInteger(sheetIndexText, 0)
+
+		for (File file : files) {
+			Workbook workbook = null
+
+			try {
+				workbook = WorkbookFactory.create(file)
+
+				if (sheetIndex >= workbook.getNumberOfSheets()) {
+					errors.append('[ERROR] Sheet index not found in file: ')
+							.append(file.getAbsolutePath())
+							.append(' | Sheet index: ')
+							.append(sheetIndex)
+							.append('\n')
+					continue
+				}
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+				FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator()
+
+				Map<String, Integer> headers = findHeaders(
+						sheet,
+						formatter,
+						evaluator,
+						[
+							headerCurrency,
+							headerCurrencyRef
+						]
+				)
+
+				Integer currencyColumn = headers.get(normalizeHeader(headerCurrency))
+				Integer currencyRefColumn = headers.get(normalizeHeader(headerCurrencyRef))
+
+				if (currencyColumn == null) {
+					errors.append('[ERROR] Header not found: ')
+							.append(headerCurrency)
+							.append(' | File: ')
+							.append(file.getAbsolutePath())
+							.append('\n')
+					continue
+				}
+
+				if (currencyRefColumn == null) {
+					errors.append('[ERROR] Header not found: ')
+							.append(headerCurrencyRef)
+							.append(' | File: ')
+							.append(file.getAbsolutePath())
+							.append('\n')
+					continue
+				}
+
+				String expectedCurrency = resolveExpectedCurrency(file.getName(), defaultValidationType)
+
+				if (expectedCurrency == 'MIXTE') {
+					KeywordUtil.logInfo('[CURRENCY VALIDATION] Mixte file detected. Only validating non-empty currency values: ' + file.getName())
+					validateCurrencyColumnsAreNotEmpty(
+							file,
+							sheet,
+							formatter,
+							evaluator,
+							currencyColumn,
+							currencyRefColumn,
+							errors
+					)
+				} else {
+					validateCurrencyColumnsMatchExpected(
+							file,
+							sheet,
+							formatter,
+							evaluator,
+							currencyColumn,
+							currencyRefColumn,
+							expectedCurrency,
+							errors
+					)
+				}
+			} catch (Exception e) {
+				errors.append('[ERROR] Could not validate currency columns. File: ')
+						.append(file.getAbsolutePath())
+						.append(' | Reason: ')
+						.append(e.getMessage())
+						.append('\n')
+			} finally {
+				closeWorkbook(workbook)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateAmountColumnsAreEqual(
+			String filesText,
+			String sheetIndexText,
+			String headerAmountCcy,
+			String headerAmountBaseCcy
+	) {
+		StringBuilder errors = new StringBuilder()
+		List<File> files = parseFiles(filesText)
+		Integer sheetIndex = parseInteger(sheetIndexText, 0)
+
+		for (File file : files) {
+			Workbook workbook = null
+
+			try {
+				workbook = WorkbookFactory.create(file)
+
+				if (sheetIndex >= workbook.getNumberOfSheets()) {
+					errors.append('[ERROR] Sheet index not found in file: ')
+							.append(file.getAbsolutePath())
+							.append(' | Sheet index: ')
+							.append(sheetIndex)
+							.append('\n')
+					continue
+				}
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+				FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator()
+
+				Map<String, Integer> headers = findHeaders(
+						sheet,
+						formatter,
+						evaluator,
+						[
+							headerAmountCcy,
+							headerAmountBaseCcy
+						]
+				)
+
+				Integer amountCcyColumn = headers.get(normalizeHeader(headerAmountCcy))
+				Integer amountBaseCcyColumn = headers.get(normalizeHeader(headerAmountBaseCcy))
+
+				if (amountCcyColumn == null) {
+					errors.append('[ERROR] Header not found: ')
+							.append(headerAmountCcy)
+							.append(' | File: ')
+							.append(file.getAbsolutePath())
+							.append('\n')
+					continue
+				}
+
+				if (amountBaseCcyColumn == null) {
+					errors.append('[ERROR] Header not found: ')
+							.append(headerAmountBaseCcy)
+							.append(' | File: ')
+							.append(file.getAbsolutePath())
+							.append('\n')
+					continue
+				}
+
+				for (int rowIndex = 0; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
+					Row row = sheet.getRow(rowIndex)
+
+					if (row == null) {
+						continue
+					}
+
+					String amountCcy = getCellText(row, amountCcyColumn, formatter, evaluator)
+					String amountBaseCcy = getCellText(row, amountBaseCcyColumn, formatter, evaluator)
+
+					if (amountCcy.trim().isEmpty() && amountBaseCcy.trim().isEmpty()) {
+						continue
+					}
+
+					if (isHeaderLikeValue(amountCcy, headerAmountCcy) || isHeaderLikeValue(amountBaseCcy, headerAmountBaseCcy)) {
+						continue
+					}
+
+					String normalizedAmountCcy = normalizeAmount(amountCcy)
+					String normalizedAmountBaseCcy = normalizeAmount(amountBaseCcy)
+
+					if (!normalizedAmountCcy.equals(normalizedAmountBaseCcy)) {
+						errors.append('[ERROR] Amount columns are different. File: ')
+								.append(file.getAbsolutePath())
+								.append(' | Row: ')
+								.append(rowIndex + 1)
+								.append(' | ')
+								.append(headerAmountCcy)
+								.append(': ')
+								.append(amountCcy)
+								.append(' | ')
+								.append(headerAmountBaseCcy)
+								.append(': ')
+								.append(amountBaseCcy)
+								.append('\n')
+					}
+				}
+			} catch (Exception e) {
+				errors.append('[ERROR] Could not validate amount columns. File: ')
+						.append(file.getAbsolutePath())
+						.append(' | Reason: ')
+						.append(e.getMessage())
+						.append('\n')
+			} finally {
+				closeWorkbook(workbook)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateHeaderExists(String filesText, String sheetIndexText, String headerName) {
+		StringBuilder errors = new StringBuilder()
+		List<File> files = parseFiles(filesText)
+		Integer sheetIndex = parseInteger(sheetIndexText, 0)
+
+		for (File file : files) {
+			Workbook workbook = null
+
+			try {
+				workbook = WorkbookFactory.create(file)
+
+				if (sheetIndex >= workbook.getNumberOfSheets()) {
+					errors.append('[ERROR] Sheet index not found in file: ')
+							.append(file.getAbsolutePath())
+							.append(' | Sheet index: ')
+							.append(sheetIndex)
+							.append('\n')
+					continue
+				}
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+				FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator()
+
+				Map<String, Integer> headers = findHeaders(
+						sheet,
+						formatter,
+						evaluator,
+						[
+							headerName
+						]
+				)
+
+				if (headers.get(normalizeHeader(headerName)) == null) {
+					errors.append('[ERROR] Header not found: ')
+							.append(headerName)
+							.append(' | File: ')
+							.append(file.getAbsolutePath())
+							.append('\n')
+				}
+			} catch (Exception e) {
+				errors.append('[ERROR] Could not validate header. File: ')
+						.append(file.getAbsolutePath())
+						.append(' | Header: ')
+						.append(headerName)
+						.append(' | Reason: ')
+						.append(e.getMessage())
+						.append('\n')
+			} finally {
+				closeWorkbook(workbook)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateDiscrepanciesBetweenSheets(
+			String filesText,
+			String sheetIndexText,
+			String keyHeadersText,
+			String compareHeadersText
+	) {
+		StringBuilder errors = new StringBuilder()
+		List<File> files = parseFiles(filesText)
+		Integer sheetIndex = parseInteger(sheetIndexText, 0)
+		List<String> keyHeaders = splitText(keyHeadersText)
+		List<String> compareHeaders = splitText(compareHeadersText)
+
+		if (files.size() <= 1) {
+			KeywordUtil.logInfo('[DISCREPANCY VALIDATION] Only one file found. Skipping cross-file comparison.')
+			return ''
+		}
+
+		if (compareHeaders.isEmpty()) {
+			KeywordUtil.logInfo('[DISCREPANCY VALIDATION] No compare headers configured. Skipping cross-file comparison.')
+			return ''
+		}
+
+		Map<String, Map<String, String>> fileValuesByName = [:]
+
+		for (File file : files) {
+			Workbook workbook = null
+
+			try {
+				workbook = WorkbookFactory.create(file)
+
+				if (sheetIndex >= workbook.getNumberOfSheets()) {
+					errors.append('[ERROR] Sheet index not found in file: ')
+							.append(file.getAbsolutePath())
+							.append(' | Sheet index: ')
+							.append(sheetIndex)
+							.append('\n')
+					continue
+				}
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+				FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator()
+
+				List<String> requiredHeaders = []
+				requiredHeaders.addAll(keyHeaders)
+				requiredHeaders.addAll(compareHeaders)
+
+				Map<String, Integer> headers = findHeaders(
+						sheet,
+						formatter,
+						evaluator,
+						requiredHeaders
+				)
+
+				Map<String, String> values = [:]
+
+				for (String compareHeader : compareHeaders) {
+					Integer columnIndex = headers.get(normalizeHeader(compareHeader))
+
+					if (columnIndex == null) {
+						errors.append('[ERROR] Header not found for discrepancy validation: ')
+								.append(compareHeader)
+								.append(' | File: ')
+								.append(file.getAbsolutePath())
+								.append('\n')
+						continue
+					}
+
+					values.put(compareHeader, collectColumnValues(sheet, columnIndex, formatter, evaluator))
+				}
+
+				fileValuesByName.put(file.getName(), values)
+			} catch (Exception e) {
+				errors.append('[ERROR] Could not validate discrepancies. File: ')
+						.append(file.getAbsolutePath())
+						.append(' | Reason: ')
+						.append(e.getMessage())
+						.append('\n')
+			} finally {
+				closeWorkbook(workbook)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	private String validateMinimumExpectedFilesInternal(String filesText, Integer minimumExpectedFiles) {
+		StringBuilder errors = new StringBuilder()
+		List<File> files = parseFiles(filesText)
+
+		KeywordUtil.logInfo('[MINIMUM FILES] Expected: ' + minimumExpectedFiles + ' | Found: ' + files.size())
+
+		if (files.size() < minimumExpectedFiles) {
+			errors.append('[ERROR] Minimum expected files not found. Expected: ')
+					.append(minimumExpectedFiles)
+					.append(' | Found: ')
+					.append(files.size())
+					.append('\nFiles:\n')
+					.append(files.collect { File file -> file.getAbsolutePath() }.join('\n'))
+					.append('\n')
+		}
+
+		return errors.toString()
+	}
+
+	private List<File> findExcelFiles(File folder, boolean includeSubFolders) {
+		List<File> result = []
+
+		File[] children = folder.listFiles()
+
+		if (children == null) {
+			return result
+		}
+
+		for (File child : children) {
+			if (child.isFile() && isExcelFile(child)) {
+				result.add(child)
+			} else if (child.isDirectory() && includeSubFolders) {
+				result.addAll(findExcelFiles(child, includeSubFolders))
+			}
+		}
+
+		return result
+	}
+
+	private boolean isExcelFile(File file) {
+		if (file == null) {
+			return false
+		}
+
+		String name = file.getName().toLowerCase()
+
+		return (name.endsWith('.xlsx') || name.endsWith('.xls')) && !name.startsWith('~$')
+	}
+
+	private List<File> parseFiles(String filesText) {
+		List<File> files = []
+
+		for (String path : splitText(filesText)) {
+			File file = new File(path)
+
+			if (file.exists() && file.isFile() && isExcelFile(file)) {
+				files.add(file)
+			}
+		}
+
+		return files.unique { File file -> file.getAbsolutePath().toLowerCase() }
+	}
+
+	private List<String> splitText(String text) {
+		if (text == null || text.trim().isEmpty()) {
+			return []
+		}
+
+		return text
+				.split('\\|')
+				.collect { String value -> value.trim() }
+				.findAll { String value -> !value.isEmpty() }
+	}
+
+	private boolean parseBoolean(String text) {
+		if (text == null) {
+			return false
+		}
+
+		String value = text.trim().toLowerCase()
+
+		return value == 'true' || value == 'yes' || value == 'y' || value == '1'
+	}
+
+	private Integer parseInteger(String text, Integer defaultValue) {
+		if (text == null || text.trim().isEmpty()) {
+			return defaultValue
+		}
+
+		try {
+			return Integer.parseInt(text.trim())
+		} catch (Exception ignored) {
+			return defaultValue
+		}
+	}
+
+	private String safeText(String text) {
+		return text == null ? '' : text
+	}
+
+	private Map<String, Integer> findHeaders(
+			Sheet sheet,
+			DataFormatter formatter,
+			FormulaEvaluator evaluator,
+			List<String> requiredHeaders
+	) {
+		Map<String, Integer> foundHeaders = [:]
+		List<String> normalizedRequiredHeaders = requiredHeaders
+				.collect { String header -> normalizeHeader(header) }
+				.findAll { String header -> !header.isEmpty() }
+
+		int maxHeaderSearchRow = Math.min(sheet.getLastRowNum(), 30)
+
+		for (int rowIndex = 0; rowIndex <= maxHeaderSearchRow; rowIndex++) {
+			Row row = sheet.getRow(rowIndex)
+
+			if (row == null) {
+				continue
+			}
+
+			int lastCellNumber = row.getLastCellNum()
+
+			if (lastCellNumber < 0) {
+				continue
+			}
+
+			for (int cellIndex = 0; cellIndex < lastCellNumber; cellIndex++) {
+				String cellText = getCellText(row, cellIndex, formatter, evaluator)
+				String normalizedCellText = normalizeHeader(cellText)
+
+				if (normalizedCellText.isEmpty()) {
+					continue
+				}
+
+				for (String requiredHeader : normalizedRequiredHeaders) {
+					if (normalizedCellText == requiredHeader || normalizedCellText.contains(requiredHeader)) {
+						if (!foundHeaders.containsKey(requiredHeader)) {
+							foundHeaders.put(requiredHeader, cellIndex)
+						}
+					}
+				}
+			}
+		}
+
+		return foundHeaders
+	}
+
+	private String getCellText(Row row, Integer cellIndex, DataFormatter formatter, FormulaEvaluator evaluator) {
+		if (row == null || cellIndex == null) {
+			return ''
+		}
+
+		Cell cell = row.getCell(cellIndex)
+
+		if (cell == null) {
+			return ''
+		}
+
+		try {
+			return formatter.formatCellValue(cell, evaluator)
+		} catch (Exception ignored) {
+			return formatter.formatCellValue(cell)
+		}
+	}
+
+	private String normalizeHeader(String text) {
+		if (text == null) {
+			return ''
+		}
+
+		String normalized = Normalizer.normalize(text, Normalizer.Form.NFD)
+				.replaceAll('\\p{InCombiningDiacriticalMarks}+', '')
+
+		return normalized
+				.toLowerCase()
+				.replaceAll('[^a-z0-9]+', ' ')
+				.replaceAll('\\s+', ' ')
+				.trim()
+	}
+
+	private String normalizeAmount(String text) {
+		if (text == null) {
+			return ''
+		}
+
+		return text
+				.trim()
+				.replaceAll('\\s+', '')
+				.replace(',', '.')
+	}
+
+	private boolean isHeaderLikeValue(String value, String header) {
+		return normalizeHeader(value) == normalizeHeader(header)
+	}
+
+	private String resolveExpectedCurrency(String fileName, String defaultValidationType) {
+		String normalizedFileName = fileName == null ? '' : fileName.toUpperCase()
+		String normalizedDefault = defaultValidationType == null ? '' : defaultValidationType.toUpperCase()
+
+		if (normalizedFileName.contains('EUR')) {
+			return 'EUR'
+		}
+
+		if (normalizedFileName.contains('USD')) {
+			return 'USD'
+		}
+
+		if (normalizedFileName.contains('MIXTE') || normalizedFileName.contains('MIX')) {
+			return 'MIXTE'
+		}
+
+		if (normalizedDefault.contains('EUR')) {
+			return 'EUR'
+		}
+
+		if (normalizedDefault.contains('USD')) {
+			return 'USD'
+		}
+
+		return 'MIXTE'
+	}
+
+	private void validateCurrencyColumnsAreNotEmpty(
+			File file,
+			Sheet sheet,
+			DataFormatter formatter,
+			FormulaEvaluator evaluator,
+			Integer currencyColumn,
+			Integer currencyRefColumn,
+			StringBuilder errors
+	) {
+		for (int rowIndex = 0; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
+			Row row = sheet.getRow(rowIndex)
+
+			if (row == null) {
+				continue
+			}
+
+			String currency = getCellText(row, currencyColumn, formatter, evaluator)
+			String currencyRef = getCellText(row, currencyRefColumn, formatter, evaluator)
+
+			if (isHeaderLikeValue(currency, 'Devise') || isHeaderLikeValue(currencyRef, 'Devise de ref.')) {
+				continue
+			}
+
+			if (currency.trim().isEmpty() && currencyRef.trim().isEmpty()) {
+				continue
+			}
+
+			if (currency.trim().isEmpty() || currencyRef.trim().isEmpty()) {
+				errors.append('[ERROR] Empty currency value. File: ')
+						.append(file.getAbsolutePath())
+						.append(' | Row: ')
+						.append(rowIndex + 1)
+						.append(' | Devise: ')
+						.append(currency)
+						.append(' | Devise de ref.: ')
+						.append(currencyRef)
+						.append('\n')
+			}
+		}
+	}
+
+	private void validateCurrencyColumnsMatchExpected(
+			File file,
+			Sheet sheet,
+			DataFormatter formatter,
+			FormulaEvaluator evaluator,
+			Integer currencyColumn,
+			Integer currencyRefColumn,
+			String expectedCurrency,
+			StringBuilder errors
+	) {
+		for (int rowIndex = 0; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
+			Row row = sheet.getRow(rowIndex)
+
+			if (row == null) {
+				continue
+			}
+
+			String currency = getCellText(row, currencyColumn, formatter, evaluator)
+			String currencyRef = getCellText(row, currencyRefColumn, formatter, evaluator)
+
+			if (isHeaderLikeValue(currency, 'Devise') || isHeaderLikeValue(currencyRef, 'Devise de ref.')) {
+				continue
+			}
+
+			if (currency.trim().isEmpty() && currencyRef.trim().isEmpty()) {
+				continue
+			}
+
+			if (!currency.toUpperCase().contains(expectedCurrency) || !currencyRef.toUpperCase().contains(expectedCurrency)) {
+				errors.append('[ERROR] Currency does not match expected value. File: ')
+						.append(file.getAbsolutePath())
+						.append(' | Row: ')
+						.append(rowIndex + 1)
+						.append(' | Expected: ')
+						.append(expectedCurrency)
+						.append(' | Devise: ')
+						.append(currency)
+						.append(' | Devise de ref.: ')
+						.append(currencyRef)
+						.append('\n')
+			}
+		}
+	}
+
+	private String collectColumnValues(
+			Sheet sheet,
+			Integer columnIndex,
+			DataFormatter formatter,
+			FormulaEvaluator evaluator
+	) {
+		List<String> values = []
+
+		for (int rowIndex = 0; rowIndex <= sheet.getLastRowNum(); rowIndex++) {
+			Row row = sheet.getRow(rowIndex)
+
+			if (row == null) {
+				continue
+			}
+
+			String value = getCellText(row, columnIndex, formatter, evaluator)
+
+			if (value != null && !value.trim().isEmpty()) {
+				values.add(value.trim())
+			}
+		}
+
+		return values.join(';')
+	}
+
+	private void closeWorkbook(Workbook workbook) {
+		try {
+			if (workbook != null) {
+				workbook.close()
+			}
+		} catch (Exception ignored) {
+		}
+	}
+}
