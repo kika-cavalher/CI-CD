@@ -1,3 +1,4 @@
+File completo: Keywords/component/MenuNavigator.groovy
 package component
 
 import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
@@ -8,6 +9,7 @@ import java.awt.datatransfer.StringSelection
 import java.awt.event.InputEvent
 import java.awt.event.KeyEvent
 import java.io.File
+import java.text.Normalizer
 
 import com.katalon.keywords.windows.WindowsImageKeywords
 import com.kms.katalon.core.annotation.Keyword
@@ -21,23 +23,59 @@ import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
 import com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper
 
 import commands.ImageLoader
+import commands.WindowsObjectLoader
 
 class MenuNavigator {
+
+	private static final String MATCH_AUTO = 'AUTO'
+	private static final String MATCH_EXACT = 'EXACT'
+	private static final String MATCH_CONTAINS = 'CONTAINS'
+
+	private static final String XPATH_NORMALIZE_FROM =
+			'ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜÝŸàáâãäåçèéêëìíîïñòóôõöùúûüýÿ'
+
+	private static final String XPATH_NORMALIZE_TO =
+			'abcdefghijklmnopqrstuvwxyzaaaaaaceeeeiiiinooooouuuuyyaaaaaaceeeeiiiinooooouuuuyy'
 
 	private ImageLoader imageLoader = new ImageLoader()
 
 	@Keyword
 	boolean searchAndOpenMenuByText(String menuName) {
-		return searchAndOpenMenuByText(menuName, menuName, 20)
+		return searchAndOpenMenuByTextInternal(menuName, menuName, 20, MATCH_AUTO)
 	}
 
 	@Keyword
 	boolean searchAndOpenMenuByText(String menuName, int timeoutSeconds) {
-		return searchAndOpenMenuByText(menuName, menuName, timeoutSeconds)
+		return searchAndOpenMenuByTextInternal(menuName, menuName, timeoutSeconds, MATCH_AUTO)
 	}
 
 	@Keyword
 	boolean searchAndOpenMenuByText(String menuName, String menuResultName, int timeoutSeconds) {
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, MATCH_AUTO)
+	}
+
+	@Keyword
+	boolean searchAndOpenMenuByText(String menuName, String menuResultName, int timeoutSeconds, boolean exactMatch) {
+		String matchMode = exactMatch ? MATCH_EXACT : MATCH_CONTAINS
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, matchMode)
+	}
+
+	@Keyword
+	boolean searchAndOpenExactMenuByText(String menuName, String menuResultName, int timeoutSeconds) {
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, MATCH_EXACT)
+	}
+
+	@Keyword
+	boolean searchAndOpenContainsMenuByText(String menuName, String menuResultName, int timeoutSeconds) {
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, MATCH_CONTAINS)
+	}
+
+	private boolean searchAndOpenMenuByTextInternal(
+			String menuName,
+			String menuResultName,
+			int timeoutSeconds,
+			String matchMode
+	) {
 		if (menuName == null || menuName.trim().isEmpty()) {
 			KeywordUtil.markFailedAndStop('Menu search text is empty.')
 			return false
@@ -50,11 +88,13 @@ class MenuNavigator {
 
 		int effectiveTimeout = timeoutSeconds <= 0 ? 20 : timeoutSeconds
 		int maxAttempts = 3
+		String safeMatchMode = normalizeMatchMode(matchMode)
 
 		KeywordUtil.logInfo(
 				'Searching and opening menu by text.\n' +
 				'Search text: ' + menuName + '\n' +
 				'Result text: ' + menuResultName + '\n' +
+				'Match mode: ' + safeMatchMode + '\n' +
 				'Timeout per attempt: ' + effectiveTimeout + ' seconds\n' +
 				'Max attempts: ' + maxAttempts
 				)
@@ -71,11 +111,12 @@ class MenuNavigator {
 			pasteText(menuName)
 			Thread.sleep(1000)
 
-			if (tryOpenByMenuResult(menuResultName, effectiveTimeout)) {
+			if (tryOpenByMenuResult(menuResultName, effectiveTimeout, safeMatchMode)) {
 				KeywordUtil.logInfo(
 						'Menu opened by result text.\n' +
 						'Search text: ' + menuName + '\n' +
-						'Result text: ' + menuResultName
+						'Result text: ' + menuResultName + '\n' +
+						'Match mode: ' + safeMatchMode
 						)
 				return true
 			}
@@ -84,6 +125,7 @@ class MenuNavigator {
 					'Menu result was not found in this attempt.\n' +
 					'Search text: ' + menuName + '\n' +
 					'Result text: ' + menuResultName + '\n' +
+					'Match mode: ' + safeMatchMode + '\n' +
 					'Attempt: ' + attempt + '/' + maxAttempts
 					)
 		}
@@ -94,6 +136,7 @@ class MenuNavigator {
 				'Menu result was not opened by text.\n' +
 				'Search text: ' + menuName + '\n' +
 				'Result text: ' + menuResultName + '\n' +
+				'Match mode: ' + safeMatchMode + '\n' +
 				'Attempts: ' + maxAttempts
 				)
 
@@ -164,16 +207,8 @@ class MenuNavigator {
 		return false
 	}
 
-	private boolean tryOpenByMenuResult(String menuResultName, int timeoutSeconds) {
-		String resultLiteral = toXPathLiteral(menuResultName)
-
-		List<WindowsTestObject> candidates = []
-
-		candidates.add(buildXpathObject("//*[@Name=" + resultLiteral + " and @LocalizedControlType='tree item']"))
-		candidates.add(buildXpathObject("//*[@Name=" + resultLiteral + " and contains(@ControlType,'TreeItem')]"))
-		candidates.add(buildXpathObject("//*[@Name=" + resultLiteral + "]"))
-		candidates.add(buildXpathObject("//*[contains(@Name," + resultLiteral + ") and @LocalizedControlType='tree item']"))
-		candidates.add(buildXpathObject("//*[contains(@Name," + resultLiteral + ")]"))
+	private boolean tryOpenByMenuResult(String menuResultName, int timeoutSeconds, String matchMode) {
+		List<WindowsTestObject> candidates = buildMenuResultCandidates(menuResultName, matchMode)
 
 		int elapsedSeconds = 0
 
@@ -187,7 +222,11 @@ class MenuNavigator {
 							)
 
 					if (isPresent) {
-						KeywordUtil.logInfo('Menu result found. Clicking exact result: ' + menuResultName)
+						KeywordUtil.logInfo(
+								'Menu result found. Clicking result.\n' +
+								'Result text: ' + menuResultName + '\n' +
+								'Match mode: ' + matchMode
+								)
 
 						clickElementCenterByCoordinates(candidate)
 						Thread.sleep(500)
@@ -206,6 +245,80 @@ class MenuNavigator {
 		}
 
 		return false
+	}
+
+	private List<WindowsTestObject> buildMenuResultCandidates(String menuResultName, String matchMode) {
+		String resultLiteral = toXPathLiteral(menuResultName)
+		String normalizedResultLiteral = toXPathLiteral(normalizeTextForComparison(menuResultName))
+		String normalizedNameXpath = normalizeXpathExpression('normalize-space(@Name)')
+
+		List<String> xpaths = []
+
+		if (matchMode == MATCH_EXACT || matchMode == MATCH_AUTO || matchMode == MATCH_CONTAINS) {
+			xpaths.add("//*[@Name=" + resultLiteral + " and @LocalizedControlType='tree item']")
+			xpaths.add("//*[@Name=" + resultLiteral + " and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[@Name=" + resultLiteral + "]")
+
+			xpaths.add("//*[" + normalizedNameXpath + "=" + normalizedResultLiteral + " and @LocalizedControlType='tree item']")
+			xpaths.add("//*[" + normalizedNameXpath + "=" + normalizedResultLiteral + " and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[" + normalizedNameXpath + "=" + normalizedResultLiteral + "]")
+		}
+
+		if (matchMode == MATCH_CONTAINS || matchMode == MATCH_AUTO) {
+			xpaths.add("//*[contains(@Name," + resultLiteral + ") and @LocalizedControlType='tree item']")
+			xpaths.add("//*[contains(@Name," + resultLiteral + ") and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[contains(@Name," + resultLiteral + ")]")
+
+			xpaths.add("//*[contains(" + normalizedNameXpath + "," + normalizedResultLiteral + ") and @LocalizedControlType='tree item']")
+			xpaths.add("//*[contains(" + normalizedNameXpath + "," + normalizedResultLiteral + ") and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[contains(" + normalizedNameXpath + "," + normalizedResultLiteral + ")]")
+		}
+
+		List<WindowsTestObject> candidates = []
+
+		for (String xpath : xpaths) {
+			candidates.add(buildXpathObject(xpath))
+		}
+
+		return candidates
+	}
+
+	private String normalizeMatchMode(String matchMode) {
+		if (matchMode == null || matchMode.trim().isEmpty()) {
+			return MATCH_AUTO
+		}
+
+		String cleanMode = matchMode.trim().toUpperCase()
+
+		if (cleanMode == MATCH_EXACT) {
+			return MATCH_EXACT
+		}
+
+		if (cleanMode == MATCH_CONTAINS) {
+			return MATCH_CONTAINS
+		}
+
+		return MATCH_AUTO
+	}
+
+	private String normalizeTextForComparison(String value) {
+		if (value == null) {
+			return ''
+		}
+
+		String normalized = Normalizer.normalize(value, Normalizer.Form.NFD)
+				.replaceAll('\\p{M}', '')
+				.toLowerCase()
+				.trim()
+				.replaceAll('\\s+', ' ')
+
+		return normalized
+	}
+
+	private String normalizeXpathExpression(String xpathValue) {
+		return "translate(" + xpathValue + ", " +
+				toXPathLiteral(XPATH_NORMALIZE_FROM) + ", " +
+				toXPathLiteral(XPATH_NORMALIZE_TO) + ")"
 	}
 
 	private boolean tryOpenByObject(String expectedObjectPath, String imageGroup) {
@@ -453,7 +566,11 @@ class MenuNavigator {
 			return '"' + value + '"'
 		}
 
-		return '"' + value.replace('"', '') + '"'
+		List<String> parts = value.split("'").collect { String part ->
+			return "'" + part + "'"
+		}
+
+		return "concat(" + parts.join(', "\'", ') + ")"
 	}
 
 	private void clickElementCenterByCoordinates(WindowsTestObject object) {
@@ -544,3 +661,15 @@ class MenuNavigator {
 		}
 	}
 }
+Para o teu TC atual
+
+Como existem 2 opções:
+
+PL économique
+PL économique Brut
+
+usa exact para não abrir o Brut por engano:
+
+CustomKeywords.'component.MenuNavigator.searchAndOpenExactMenuByText'(menuName, menuResultName, 60)
+
+Isso resolve a diferença entre:
