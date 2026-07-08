@@ -1,387 +1,662 @@
-import java.util.Locale
+package component
 
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
+import java.io.File
+import java.text.Normalizer
+
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
 import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.driver.WindowsDriverFactory
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+import com.kms.katalon.core.windows.keyword.helper.WindowsActionHelper
 
-Integer threshold = 3
-Integer maxDifferencesToShow = 999
-Integer maxErrorsToShow = 999
+import commands.ImageLoader
+import commands.WindowsObjectLoader
 
-String acceptedDifferenceText = '<= ' + threshold + '%'
+class MenuNavigator {
 
-def addNote = { String message ->
-	CustomKeywords.'jiraIntegration.JiraReportSteps.note'(message)
-}
+	private static final String MATCH_AUTO = 'AUTO'
+	private static final String MATCH_EXACT = 'EXACT'
+	private static final String MATCH_CONTAINS = 'CONTAINS'
 
-Map result = CustomKeywords.'commands.ExportFileComparator.compareRecProdExportFiles'(
-		threshold
-)
+	private static final String XPATH_NORMALIZE_FROM =
+	'ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÑÒÓÔÕÖÙÚÛÜÝŸàáâãäåçèéêëìíîïñòóôõöùúûüýÿ'
 
-String featureName = safeText(result.featureName, 'Not available')
-String sharedFolderName = folderNameOnly(result.sharedFolder)
+	private static final String XPATH_NORMALIZE_TO =
+	'abcdefghijklmnopqrstuvwxyzaaaaaaceeeeiiiinooooouuuuyyaaaaaaceeeeiiiinooooouuuuyy'
 
-String recFileName = fileNameOnly(result.recFileName)
-String prdFileName = fileNameOnly(result.prdFileName)
+	private ImageLoader imageLoader = new ImageLoader()
 
-String recFileStatus = isNotFound(recFileName) ? 'FAILED' : 'PASSED'
-String prdFileStatus = isNotFound(prdFileName) ? 'FAILED' : 'PASSED'
-
-Integer totalValidations = toInteger(result.totalValidations, 0)
-Integer passedValidations = toInteger(result.passedValidations, 0)
-Integer failedValidations = toInteger(result.failedValidations, 0)
-
-List<Map> validations = result.validations == null ? [] : result.validations as List<Map>
-List<String> differences = result.differences == null ? [] : result.differences as List<String>
-
-String errorsText = safeText(result.errorsText, '')
-Boolean hasFailure = failedValidations > 0 || !differences.isEmpty() || !errorsText.isEmpty()
-
-addNote(
-		'[PASS] REC x PRD Export Validation setup\n' +
-		'Feature: ' + featureName + '\n' +
-		'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
-		'Shared folder: ' + sharedFolderName + '\n' +
-		'Goal: compare the REC exported file against the PRD exported file.'
-)
-
-addNote(
-		((recFileStatus == 'PASSED' && prdFileStatus == 'PASSED') ? '[PASS] ' : '[FAIL] ') +
-		'Files selected for comparison\n' +
-		'Expected files: 2\n' +
-		'Files ready: ' + countReadyFiles(recFileName, prdFileName) + '\n\n' +
-		'REC file: ' + recFileStatus + ' - ' + recFileName + '\n' +
-		'PRD file: ' + prdFileStatus + ' - ' + prdFileName
-)
-
-addNote(
-		(hasFailure ? '[FAIL] ' : '[PASS] ') +
-		'Validation summary\n' +
-		'Total validations: ' + totalValidations + '\n' +
-		'Passed: ' + passedValidations + '\n' +
-		'Failed: ' + failedValidations + '\n' +
-		'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
-		'Differences listed: ' + differences.size()
-)
-
-if (validations.isEmpty()) {
-	addNote(
-			'[SKIPPED] Validation details\n' +
-			'No validation detail was returned by the comparator keyword.'
-	)
-} else {
-	validations.eachWithIndex { Map validation, int index ->
-		String validationName = safeText(validation.name, 'Validation ' + (index + 1))
-		String validationStatus = normalizeStatus(validation.status)
-		String validationDetails = cleanReportText(validation.details)
-
-		String statusPrefix = validationStatus == 'PASS' ? '[PASS] ' : '[FAIL] '
-
-		addNote(
-				statusPrefix +
-				'Validation ' + (index + 1) + ' - ' + validationName + '\n' +
-				'Status: ' + validationStatus + '\n' +
-				formatValidationDetails(validationDetails, acceptedDifferenceText)
-		)
-	}
-}
-
-if (!differences.isEmpty()) {
-	addNote(
-			'[FAIL] Differences found\n' +
-			'Total differences returned: ' + differences.size() + '\n' +
-			'Differences displayed: ' + Math.min(differences.size(), maxDifferencesToShow) + '\n' +
-			'Accepted numeric difference: ' + acceptedDifferenceText + '\n\n' +
-			buildDifferencesReport(differences, maxDifferencesToShow, acceptedDifferenceText)
-	)
-} else {
-	addNote(
-			'[PASS] Differences check\n' +
-			'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
-			'No differences were returned by the comparator keyword.'
-	)
-}
-
-if (!errorsText.isEmpty()) {
-	addNote(
-			'[FAIL] Comparator errors\n' +
-			'Accepted numeric difference: ' + acceptedDifferenceText + '\n\n' +
-			buildErrorsReport(errorsText, maxErrorsToShow, acceptedDifferenceText)
-	)
-}
-
-if (hasFailure) {
-	addNote(
-			'[FAIL] Final result\n' +
-			'REC x PRD export validation finished with mismatches.\n' +
-			'Feature: ' + featureName + '\n' +
-			'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
-			'REC file: ' + recFileName + '\n' +
-			'PRD file: ' + prdFileName
-	)
-
-	KeywordUtil.markFailed(
-			'REC x PRD export validation failed. Check the comparison report above.'
-	)
-} else {
-	addNote(
-			'[PASS] Final result\n' +
-			'REC x PRD export validation completed successfully.\n' +
-			'Feature: ' + featureName + '\n' +
-			'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
-			'REC file: ' + recFileName + '\n' +
-			'PRD file: ' + prdFileName + '\n' +
-			'Result: no mismatches were found between REC and PRD files.'
-	)
-
-	KeywordUtil.markPassed(
-			'REC x PRD export validation completed successfully.'
-	)
-}
-
-String formatValidationDetails(String details, String acceptedDifferenceText) {
-	String text = safeText(details, '')
-
-	if (text.isEmpty()) {
-		return 'Details: not available.'
+	@Keyword
+	boolean searchAndOpenMenuByText(String menuName) {
+		return searchAndOpenMenuByTextInternal(menuName, menuName, 20, MATCH_AUTO)
 	}
 
-	List<String> lines = []
+	@Keyword
+	boolean searchAndOpenMenuByText(String menuName, int timeoutSeconds) {
+		return searchAndOpenMenuByTextInternal(menuName, menuName, timeoutSeconds, MATCH_AUTO)
+	}
 
-	text.replace('\r\n', '\n')
-			.replace('\r', '\n')
-			.split('\n')
-			.each { String line ->
-				String clean = safeText(line, '')
+	@Keyword
+	boolean searchAndOpenMenuByText(String menuName, String menuResultName, int timeoutSeconds) {
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, MATCH_AUTO)
+	}
 
-				if (!clean.isEmpty() && !isPathLine(clean)) {
-					lines.add(normalizeToleranceText(clean, acceptedDifferenceText))
+	@Keyword
+	boolean searchAndOpenMenuByText(String menuName, String menuResultName, int timeoutSeconds, boolean exactMatch) {
+		String matchMode = exactMatch ? MATCH_EXACT : MATCH_CONTAINS
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, matchMode)
+	}
+
+	@Keyword
+	boolean searchAndOpenExactMenuByText(String menuName, String menuResultName, int timeoutSeconds) {
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, MATCH_EXACT)
+	}
+
+	@Keyword
+	boolean searchAndOpenContainsMenuByText(String menuName, String menuResultName, int timeoutSeconds) {
+		return searchAndOpenMenuByTextInternal(menuName, menuResultName, timeoutSeconds, MATCH_CONTAINS)
+	}
+
+	private boolean searchAndOpenMenuByTextInternal(
+			String menuName,
+			String menuResultName,
+			int timeoutSeconds,
+			String matchMode
+	) {
+		if (menuName == null || menuName.trim().isEmpty()) {
+			KeywordUtil.markFailedAndStop('Menu search text is empty.')
+			return false
+		}
+
+		if (menuResultName == null || menuResultName.trim().isEmpty()) {
+			KeywordUtil.markFailedAndStop('Menu result text is empty.')
+			return false
+		}
+
+		int effectiveTimeout = timeoutSeconds <= 0 ? 20 : timeoutSeconds
+		int maxAttempts = 3
+		String safeMatchMode = normalizeMatchMode(matchMode)
+
+		KeywordUtil.logInfo(
+				'Searching and opening menu by text.\n' +
+				'Search text: ' + menuName + '\n' +
+				'Result text: ' + menuResultName + '\n' +
+				'Match mode: ' + safeMatchMode + '\n' +
+				'Timeout per attempt: ' + effectiveTimeout + ' seconds\n' +
+				'Max attempts: ' + maxAttempts
+				)
+
+		WindowsTestObject searchBox = resolveSearchBox()
+
+		for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+			KeywordUtil.logInfo('Starting menu open by text attempt ' + attempt + ' of ' + maxAttempts + '.')
+
+			clickElementCenterByCoordinates(searchBox)
+			Thread.sleep(300)
+
+			clearFocusedField()
+			pasteText(menuName)
+			Thread.sleep(1000)
+
+			if (tryOpenByMenuResult(menuResultName, effectiveTimeout, safeMatchMode)) {
+				KeywordUtil.logInfo(
+						'Menu opened by result text.\n' +
+						'Search text: ' + menuName + '\n' +
+						'Result text: ' + menuResultName + '\n' +
+						'Match mode: ' + safeMatchMode
+						)
+				return true
+			}
+
+			KeywordUtil.logInfo(
+					'Menu result was not found in this attempt.\n' +
+					'Search text: ' + menuName + '\n' +
+					'Result text: ' + menuResultName + '\n' +
+					'Match mode: ' + safeMatchMode + '\n' +
+					'Attempt: ' + attempt + '/' + maxAttempts
+					)
+		}
+
+		takeEvidence('MenuResultNotOpenedByText.png')
+
+		KeywordUtil.markFailedAndStop(
+				'Menu result was not opened by text.\n' +
+				'Search text: ' + menuName + '\n' +
+				'Result text: ' + menuResultName + '\n' +
+				'Match mode: ' + safeMatchMode + '\n' +
+				'Attempts: ' + maxAttempts
+				)
+
+		return false
+	}
+
+	@Keyword
+	boolean searchAndOpenMenu(String menuName, String imageGroup, int timeoutSeconds) {
+		return searchAndOpenMenu(menuName, imageGroup, '', timeoutSeconds)
+	}
+
+	@Keyword
+	boolean searchAndOpenMenu(String menuName, String imageGroup, String expectedObjectPath, int timeoutSeconds) {
+		int effectiveTimeout = timeoutSeconds <= 0 ? 20 : timeoutSeconds
+		int maxAttempts = 3
+
+		KeywordUtil.logInfo(
+				'Searching and opening menu.\n' +
+				'Menu name: ' + menuName + '\n' +
+				'Image group: ' + imageGroup + '\n' +
+				'Expected object path/key: ' + expectedObjectPath + '\n' +
+				'Timeout per attempt: ' + effectiveTimeout + ' seconds\n' +
+				'Max attempts: ' + maxAttempts
+				)
+
+		WindowsTestObject searchBox = resolveSearchBox()
+
+		for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+			KeywordUtil.logInfo('Starting menu open attempt ' + attempt + ' of ' + maxAttempts + '.')
+
+			clickElementCenterByCoordinates(searchBox)
+			Thread.sleep(300)
+
+			clearFocusedField()
+			pasteText(menuName)
+			Thread.sleep(700)
+
+			boolean openedByObject = tryOpenByObject(expectedObjectPath, imageGroup)
+
+			if (openedByObject) {
+				KeywordUtil.logInfo('Menu opened successfully by Windows object.')
+				return true
+			}
+
+			boolean openedByImage = tryOpenByImage(imageGroup, expectedObjectPath, effectiveTimeout)
+
+			if (openedByImage) {
+				KeywordUtil.logInfo('Menu opened successfully by image fallback.')
+				return true
+			}
+
+			KeywordUtil.logInfo(
+					'Attempt finished and menu is still not open.\n' +
+					'Attempt: ' + attempt + '/' + maxAttempts
+					)
+		}
+
+		takeEvidence('MenuNotOpened.png')
+
+		KeywordUtil.markFailedAndStop(
+				'Menu was not opened after maximum retry attempts.\n' +
+				'Menu name: ' + menuName + '\n' +
+				'Image group: ' + imageGroup + '\n' +
+				'Expected object path/key: ' + expectedObjectPath + '\n' +
+				'Attempts: ' + maxAttempts
+				)
+
+		return false
+	}
+
+	private boolean tryOpenByMenuResult(String menuResultName, int timeoutSeconds, String matchMode) {
+		List<WindowsTestObject> candidates = buildMenuResultCandidates(menuResultName, matchMode)
+
+		int elapsedSeconds = 0
+
+		while (elapsedSeconds < timeoutSeconds) {
+			for (WindowsTestObject candidate : candidates) {
+				try {
+					boolean isPresent = Windows.verifyElementPresent(
+							candidate,
+							1,
+							FailureHandling.OPTIONAL
+							)
+
+					if (isPresent) {
+						KeywordUtil.logInfo(
+								'Menu result found. Clicking result.\n' +
+								'Result text: ' + menuResultName + '\n' +
+								'Match mode: ' + matchMode
+								)
+
+						clickElementCenterByCoordinates(candidate)
+						Thread.sleep(500)
+
+						pressKey(KeyEvent.VK_ENTER)
+						Thread.sleep(1500)
+
+						return true
+					}
+				} catch (Exception ignored) {
 				}
 			}
 
-	return lines.isEmpty() ? 'Details: not available.' : lines.join('\n')
-}
+			Thread.sleep(500)
+			elapsedSeconds = elapsedSeconds + 1
+		}
 
-String buildDifferencesReport(List<String> differences, Integer maxToShow, String acceptedDifferenceText) {
-	List<String> lines = []
+		return false
+	}
 
-	Integer limit = maxToShow == null || maxToShow <= 0 ? differences.size() : maxToShow
-	Integer index = 1
+	private List<WindowsTestObject> buildMenuResultCandidates(String menuResultName, String matchMode) {
+		String resultLiteral = toXPathLiteral(menuResultName)
+		String normalizedResultLiteral = toXPathLiteral(normalizeTextForComparison(menuResultName))
+		String normalizedNameXpath = normalizeXpathExpression('normalize-space(@Name)')
 
-	for (String difference : differences.take(limit)) {
-		String cleanDifference = normalizeToleranceText(cleanReportText(difference), acceptedDifferenceText)
+		List<String> xpaths = []
 
-		if (!cleanDifference.isEmpty()) {
-			lines.add('Difference ' + index + ': ' + cleanDifference)
-			index++
+		if (matchMode == MATCH_EXACT || matchMode == MATCH_AUTO || matchMode == MATCH_CONTAINS) {
+			xpaths.add("//*[@Name=" + resultLiteral + " and @LocalizedControlType='tree item']")
+			xpaths.add("//*[@Name=" + resultLiteral + " and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[@Name=" + resultLiteral + "]")
+
+			xpaths.add("//*[" + normalizedNameXpath + "=" + normalizedResultLiteral + " and @LocalizedControlType='tree item']")
+			xpaths.add("//*[" + normalizedNameXpath + "=" + normalizedResultLiteral + " and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[" + normalizedNameXpath + "=" + normalizedResultLiteral + "]")
+		}
+
+		if (matchMode == MATCH_CONTAINS || matchMode == MATCH_AUTO) {
+			xpaths.add("//*[contains(@Name," + resultLiteral + ") and @LocalizedControlType='tree item']")
+			xpaths.add("//*[contains(@Name," + resultLiteral + ") and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[contains(@Name," + resultLiteral + ")]")
+
+			xpaths.add("//*[contains(" + normalizedNameXpath + "," + normalizedResultLiteral + ") and @LocalizedControlType='tree item']")
+			xpaths.add("//*[contains(" + normalizedNameXpath + "," + normalizedResultLiteral + ") and contains(@ControlType,'TreeItem')]")
+			xpaths.add("//*[contains(" + normalizedNameXpath + "," + normalizedResultLiteral + ")]")
+		}
+
+		List<WindowsTestObject> candidates = []
+
+		for (String xpath : xpaths) {
+			candidates.add(buildXpathObject(xpath))
+		}
+
+		return candidates
+	}
+
+	private String normalizeMatchMode(String matchMode) {
+		if (matchMode == null || matchMode.trim().isEmpty()) {
+			return MATCH_AUTO
+		}
+
+		String cleanMode = matchMode.trim().toUpperCase()
+
+		if (cleanMode == MATCH_EXACT) {
+			return MATCH_EXACT
+		}
+
+		if (cleanMode == MATCH_CONTAINS) {
+			return MATCH_CONTAINS
+		}
+
+		return MATCH_AUTO
+	}
+
+	private String normalizeTextForComparison(String value) {
+		if (value == null) {
+			return ''
+		}
+
+		String normalized = Normalizer.normalize(value, Normalizer.Form.NFD)
+				.replaceAll('\\p{M}', '')
+				.toLowerCase()
+				.trim()
+				.replaceAll('\\s+', ' ')
+
+		return normalized
+	}
+
+	private String normalizeXpathExpression(String xpathValue) {
+		return "translate(" + xpathValue + ", " +
+				toXPathLiteral(XPATH_NORMALIZE_FROM) + ", " +
+				toXPathLiteral(XPATH_NORMALIZE_TO) + ")"
+	}
+
+	private boolean tryOpenByObject(String expectedObjectPath, String imageGroup) {
+		WindowsTestObject targetObject = resolveTargetMenuObject(expectedObjectPath, imageGroup)
+
+		if (targetObject == null) {
+			KeywordUtil.logInfo('No Windows object available for menu result. Skipping object click.')
+			return false
+		}
+
+		try {
+			boolean isPresent = Windows.verifyElementPresent(
+					targetObject,
+					5,
+					FailureHandling.OPTIONAL
+					)
+
+			if (!isPresent) {
+				KeywordUtil.logInfo('Menu result object was not visible for click.')
+				return false
+			}
+
+			KeywordUtil.logInfo('Menu result object found. Clicking with coordinates.')
+
+			clickElementCenterByCoordinates(targetObject)
+			Thread.sleep(500)
+
+			pressKey(KeyEvent.VK_ENTER)
+			Thread.sleep(1500)
+
+			return true
+		} catch (Exception e) {
+			KeywordUtil.logInfo(
+					'Windows object menu click failed.\n' +
+					'Reason: ' + e.getMessage()
+					)
+
+			return false
 		}
 	}
 
-	if (differences.size() > limit) {
-		lines.add('')
-		lines.add('... and ' + (differences.size() - limit) + ' more difference(s).')
-	}
+	private WindowsTestObject resolveTargetMenuObject(String expectedObjectPath, String imageGroup) {
+		if (expectedObjectPath != null && !expectedObjectPath.trim().isEmpty()) {
+			String cleanPath = expectedObjectPath
+					.replace('Object Repository/', '')
+					.replace('Object Repository\\', '')
+					.trim()
 
-	if (lines.isEmpty()) {
-		lines.add('Differences were returned, but no readable detail was available.')
-	}
+			if (cleanPath.contains('.') && !cleanPath.contains('/') && !cleanPath.contains('\\')) {
+				String[] parts = cleanPath.split('\\.', 2)
 
-	return lines.join('\n')
-}
-
-String buildErrorsReport(String errorsText, Integer maxToShow, String acceptedDifferenceText) {
-	List<String> lines = []
-
-	String text = normalizeToleranceText(cleanReportText(errorsText), acceptedDifferenceText)
-
-	if (text.isEmpty()) {
-		return 'No readable error detail was available.'
-	}
-
-	List<String> rawLines = []
-
-	text.replace('\r\n', '\n')
-			.replace('\r', '\n')
-			.split('\n')
-			.each { String line ->
-				String clean = safeText(line, '')
-
-				if (!clean.isEmpty() && !isPathLine(clean)) {
-					rawLines.add(normalizeToleranceText(clean, acceptedDifferenceText))
+				if (parts.length == 2) {
+					return WindowsObjectLoader.getObject(parts[0], parts[1])
 				}
 			}
 
-	Integer limit = maxToShow == null || maxToShow <= 0 ? rawLines.size() : maxToShow
+			try {
+				return findWindowsObject(cleanPath)
+			} catch (Exception e) {
+				KeywordUtil.logInfo(
+						'Could not resolve Object Repository object. Will try known menu object.\n' +
+						'Object: ' + cleanPath + '\n' +
+						'Reason: ' + e.getMessage()
+						)
+			}
+		}
 
-	Integer index = 1
+		if (imageGroup == 'ModuleDesResponsabilite') {
+			return WindowsObjectLoader.getObject('menu', 'moduleDesResponsabiliteResult')
+		}
 
-	for (String line : rawLines.take(limit)) {
-		lines.add('Error ' + index + ': ' + line)
-		index++
+		return null
 	}
 
-	if (rawLines.size() > limit) {
-		lines.add('')
-		lines.add('... and ' + (rawLines.size() - limit) + ' more error line(s).')
+	private boolean tryOpenByImage(String imageGroup, String expectedObjectPath, int timeoutSeconds) {
+		try {
+			imageLoader.validateGroupImagesExist(imageGroup)
+		} catch (Exception imageGroupError) {
+			KeywordUtil.logInfo(
+					'Image fallback skipped because image group is not available.\n' +
+					'Image group: ' + imageGroup + '\n' +
+					'Reason: ' + imageGroupError.getMessage()
+					)
+
+			return false
+		}
+
+		Map<String, String> images = imageLoader.getImages(imageGroup)
+
+		if (!images.containsKey('menuImage')) {
+			KeywordUtil.logInfo(
+					'Image fallback skipped because menuImage key does not exist.\n' +
+					'Image group: ' + imageGroup + '\n' +
+					'Available keys: ' + images.keySet()
+					)
+
+			return false
+		}
+
+		String menuImagePath = images['menuImage']
+		String openedTabImagePath = images.containsKey('openedTab') ? images['openedTab'] : ''
+
+		int elapsedSeconds = 0
+
+		while (elapsedSeconds < timeoutSeconds) {
+			try {
+				def imageFound = WindowsImageKeywords.findImage(menuImagePath)
+
+				if (imageFound != null && imageFound != false) {
+					KeywordUtil.logInfo(
+							'Menu image found as fallback.\n' +
+							'Image path: ' + menuImagePath + '\n' +
+							'Elapsed seconds: ' + elapsedSeconds
+							)
+
+					WindowsImageKeywords.clickImage(menuImagePath)
+					Thread.sleep(1500)
+
+					if (isMenuOpened(expectedObjectPath, openedTabImagePath, 8)) {
+						return true
+					}
+
+					return true
+				}
+			} catch (Exception imageError) {
+				KeywordUtil.logInfo(
+						'Image fallback attempt failed.\n' +
+						'Reason: ' + imageError.getMessage()
+						)
+			}
+
+			Thread.sleep(500)
+			elapsedSeconds = elapsedSeconds + 1
+		}
+
+		KeywordUtil.logInfo('Menu image fallback was not visible before timeout: ' + menuImagePath)
+		return false
 	}
 
-	return lines.join('\n')
-}
+	private boolean isMenuOpened(String expectedObjectPath, String openedTabImagePath, int timeoutSeconds) {
+		int elapsedSeconds = 0
 
-String cleanReportText(Object value) {
-	String text = safeText(value, '')
+		while (elapsedSeconds < timeoutSeconds) {
+			if (expectedObjectPath != null && !expectedObjectPath.trim().isEmpty()) {
+				try {
+					WindowsTestObject expectedObject = resolveTargetMenuObject(expectedObjectPath, '')
 
-	if (text.isEmpty()) {
-		return ''
+					if (expectedObject != null) {
+						boolean isPresent = Windows.verifyElementPresent(
+								expectedObject,
+								1,
+								FailureHandling.OPTIONAL
+								)
+
+						if (isPresent) {
+							KeywordUtil.logInfo('Expected menu object is visible.')
+							return true
+						}
+					}
+				} catch (Exception ignored) {
+				}
+			}
+
+			if (openedTabImagePath != null && !openedTabImagePath.trim().isEmpty()) {
+				try {
+					def openedTabFound = WindowsImageKeywords.findImage(openedTabImagePath)
+
+					if (openedTabFound != null && openedTabFound != false) {
+						KeywordUtil.logInfo('Opened tab image is visible: ' + openedTabImagePath)
+						return true
+					}
+				} catch (Exception ignored) {
+				}
+			}
+
+			Thread.sleep(500)
+			elapsedSeconds = elapsedSeconds + 1
+		}
+
+		return false
 	}
 
-	text = text.replace('\\', '/')
+	private WindowsTestObject resolveSearchBox() {
+		List<WindowsTestObject> candidates = []
 
-	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.xlsx)', '$1')
-	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.xls)', '$1')
-	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.csv)', '$1')
-	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.txt)', '$1')
+		try {
+			candidates.add(WindowsObjectLoader.getObject('menu', 'searchBox'))
+		} catch (Exception ignored) {
+		}
 
-	text = text.replaceAll('[A-Za-z]:/[^\\n\\r]*Shared_REC_PRD_Exports/?', 'Shared_REC_PRD_Exports')
-	text = text.replaceAll('[A-Za-z]:/[^\\n\\r]*Reports/?', 'Reports')
+		try {
+			candidates.add(findWindowsObject('General/txtSearch'))
+		} catch (Exception ignored) {
+		}
 
-	text = text.replaceAll('^com\\.kms\\.katalon\\.core\\.exception\\.StepFailedException:\\s*', '').trim()
-	text = text.replaceAll('^Reason:\\s*com\\.kms\\.katalon\\.core\\.exception\\.StepFailedException:\\s*', 'Reason: ').trim()
+		candidates.add(buildXpathObject("//*[@Name='Type keywords here']"))
+		candidates.add(buildXpathObject("//*[contains(@Name,'Type keywords here')]"))
+		candidates.add(buildXpathObject("//*[contains(@Name,'Type keywords')]"))
+		candidates.add(buildXpathObject("//*[@LocalizedControlType='combo box' and contains(@Name,'Type')]"))
+		candidates.add(buildXpathObject("//*[contains(@LocalizedControlType,'edit')]"))
 
-	return text.trim()
-}
+		for (WindowsTestObject candidate : candidates) {
+			try {
+				boolean isPresent = Windows.verifyElementPresent(
+						candidate,
+						2,
+						FailureHandling.OPTIONAL
+						)
 
-String normalizeToleranceText(String value, String acceptedDifferenceText) {
-	String text = safeText(value, '')
+				if (isPresent) {
+					KeywordUtil.logInfo('Search field found.')
+					return candidate
+				}
+			} catch (Exception ignored) {
+			}
+		}
 
-	if (text.isEmpty()) {
-		return ''
+		takeEvidence('SearchFieldNotFound.png')
+
+		KeywordUtil.markFailedAndStop(
+				'Search field was not found.\n' +
+				'Expected search input in menu panel.'
+				)
+
+		return null
 	}
 
-	text = text.replaceAll(
-			'(?i)Allowed numeric difference\\s*:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
-			'Accepted numeric difference: ' + acceptedDifferenceText
-	)
-
-	text = text.replaceAll(
-			'(?i)Allowed difference\\s*:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
-			'Allowed difference: ' + acceptedDifferenceText
-	)
-
-	text = text.replaceAll(
-			'(?i)Allowed difference is\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
-			'Accepted difference: ' + acceptedDifferenceText
-	)
-
-	text = text.replaceAll(
-			'(?i)Accepted difference\\s*:\\s*<=\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
-			'Accepted difference: ' + acceptedDifferenceText
-	)
-
-	return text.trim()
-}
-
-Boolean isPathLine(String value) {
-	String text = safeText(value, '').replace('\\', '/').trim()
-
-	return text ==~ /(?i)^Path\s*:.*$/ ||
-			text ==~ /(?i)^REC path\s*:.*$/ ||
-			text ==~ /(?i)^PRD path\s*:.*$/
-}
-
-String fileNameOnly(Object value) {
-	String text = safeText(value, 'NOT FOUND')
-
-	if (text.isEmpty()) {
-		return 'NOT FOUND'
+	private WindowsTestObject buildXpathObject(String xpath) {
+		WindowsTestObject object = new WindowsTestObject()
+		object.setLocatorStrategy(LocatorStrategy.XPATH)
+		object.setLocator(xpath)
+		return object
 	}
 
-	if (isNotFound(text)) {
-		return 'NOT FOUND'
+	private String toXPathLiteral(String value) {
+		if (value == null) {
+			return "''"
+		}
+
+		if (!value.contains("'")) {
+			return "'" + value + "'"
+		}
+
+		if (!value.contains('"')) {
+			return '"' + value + '"'
+		}
+
+		List<String> parts = value.split("'").collect { String part ->
+			return "'" + part + "'"
+		}
+
+		return "concat(" + parts.join(', "\'", ') + ")"
 	}
 
-	text = text.replace('\\', '/')
+	private void clickElementCenterByCoordinates(WindowsTestObject object) {
+		def rect = Windows.getElementRect(object)
 
-	if (text.contains('/')) {
-		return text.substring(text.lastIndexOf('/') + 1)
+		int x = rect.getX() + Math.floor(rect.getWidth() / 2).intValue()
+		int y = rect.getY() + Math.floor(getSafeHeight(rect) / 2).intValue()
+
+		mouseClick(x, y)
 	}
 
-	return text
-}
+	private void clearFocusedField() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(80)
 
-String folderNameOnly(Object value) {
-	String text = safeText(value, 'Not available')
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
 
-	if (text.isEmpty() || isNotFound(text)) {
-		return 'Not available'
+		Thread.sleep(150)
+
+		robot.keyPress(KeyEvent.VK_BACK_SPACE)
+		robot.keyRelease(KeyEvent.VK_BACK_SPACE)
+
+		Thread.sleep(150)
 	}
 
-	text = text.replace('\\', '/')
+	private void pasteText(String text) {
+		StringSelection selection = new StringSelection(text)
+		Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, null)
 
-	if (text.endsWith('/')) {
-		text = text.substring(0, text.length() - 1)
+		Robot robot = new Robot()
+		robot.setAutoDelay(80)
+
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
+
+		Thread.sleep(300)
 	}
 
-	if (text.contains('/')) {
-		return text.substring(text.lastIndexOf('/') + 1)
+	private void pressKey(int keyCode) {
+		Robot robot = new Robot()
+		robot.setAutoDelay(80)
+
+		robot.keyPress(keyCode)
+		robot.keyRelease(keyCode)
 	}
 
-	return text
-}
+	private void mouseClick(int x, int y) {
+		Robot robot = new Robot()
+		robot.setAutoDelay(80)
 
-String normalizeStatus(Object value) {
-	String status = safeText(value, 'FAIL').toUpperCase(Locale.ENGLISH)
+		robot.mouseMove(x, y)
+		Thread.sleep(80)
 
-	if (status == 'PASSED') {
-		return 'PASS'
+		robot.mousePress(InputEvent.BUTTON1_DOWN_MASK)
+		Thread.sleep(80)
+		robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK)
+
+		Thread.sleep(150)
 	}
 
-	if (status == 'FAILED') {
-		return 'FAIL'
+	private int getSafeHeight(def rect) {
+		int height = rect.getHeight()
+
+		if (height <= 0) {
+			return 20
+		}
+
+		return height
 	}
 
-	if (status != 'PASS' && status != 'FAIL') {
-		return status
+	private void takeEvidence(String fileName) {
+		try {
+			String evidenceDir = RunConfiguration.getReportFolder() + '\\Evidences\\'
+			new File(evidenceDir).mkdirs()
+
+			WindowsActionHelper
+					.create(WindowsDriverFactory.getWindowsSession())
+					.takeScreenshot(evidenceDir + fileName)
+
+			KeywordUtil.logInfo('Evidence captured: ' + evidenceDir + fileName)
+		} catch (Exception e) {
+			KeywordUtil.logInfo('Could not capture evidence: ' + e.getMessage())
+		}
 	}
-
-	return status
-}
-
-Boolean isNotFound(Object value) {
-	String text = safeText(value, '').toUpperCase(Locale.ENGLISH)
-
-	return text.isEmpty() ||
-			text == 'NOT FOUND' ||
-			text.contains('NOT_FOUND') ||
-			text.contains('NOT FOUND')
-}
-
-Integer countReadyFiles(String recFileName, String prdFileName) {
-	Integer count = 0
-
-	if (!isNotFound(recFileName)) {
-		count++
-	}
-
-	if (!isNotFound(prdFileName)) {
-		count++
-	}
-
-	return count
-}
-
-Integer toInteger(Object value, Integer defaultValue) {
-	try {
-		return Integer.parseInt(String.valueOf(value).trim())
-	} catch (Throwable ignored) {
-		return defaultValue
-	}
-}
-
-String safeText(Object value, String defaultValue) {
-	if (value == null) {
-		return defaultValue
-	}
-
-	String text = String.valueOf(value).trim()
-
-	return text.isEmpty() ? defaultValue : text
 }
