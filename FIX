@@ -1,1 +1,471 @@
+package testTool
 
+import java.text.Normalizer
+
+import org.apache.poi.ss.usermodel.DataFormatter
+import org.apache.poi.ss.usermodel.Row
+import org.apache.poi.ss.usermodel.Sheet
+import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+import commands.ImageLoader
+
+class TestToolValidationKeywords {
+
+	private ImageLoader imageLoader = new ImageLoader()
+
+	@Keyword
+	Map validateSourceTable(
+			String dataFileRelativePath,
+			String expectedScreenName,
+			String expectedSourceTable
+	) {
+		validateRequiredValue(
+				dataFileRelativePath,
+				'Data file relative path'
+		)
+
+		validateRequiredValue(
+				expectedScreenName,
+				'Expected screen name'
+		)
+
+		validateRequiredValue(
+				expectedSourceTable,
+				'Expected source table'
+		)
+
+		File sourceFile = resolveProjectFile(dataFileRelativePath)
+
+		Map result = [
+			passed              : false,
+			fileName            : sourceFile.getName(),
+			screenName          : expectedScreenName.trim(),
+			expectedSourceTable : expectedSourceTable.trim(),
+			actualSourceTable   : 'NOT FOUND',
+			screenOccurrences   : 0,
+			totalDataRows       : 0,
+			excelRow            : 0,
+			message             : ''
+		]
+
+		addNote(
+				'[INFO] Test Tool validation started\n' +
+				'Source file: ' + sourceFile.getName() + '\n' +
+				'Screen: ' + expectedScreenName.trim() + '\n' +
+				'Expected source table: ' + expectedSourceTable.trim()
+		)
+
+		if (!sourceFile.exists() || !sourceFile.isFile()) {
+			failValidation(
+					result,
+					'Test Tool source file was not found.\n' +
+					'File: ' + sourceFile.getName(),
+					'TestTool_SourceFileNotFound.png'
+			)
+
+			return result
+		}
+
+		if (sourceFile.length() <= 0) {
+			failValidation(
+					result,
+					'Test Tool source file is empty.\n' +
+					'File: ' + sourceFile.getName(),
+					'TestTool_SourceFileEmpty.png'
+			)
+
+			return result
+		}
+
+		Workbook workbook = null
+
+		try {
+			workbook = WorkbookFactory.create(sourceFile)
+
+			if (workbook.getNumberOfSheets() <= 0) {
+				failValidation(
+						result,
+						'Test Tool source file does not contain any worksheet.\n' +
+						'File: ' + sourceFile.getName(),
+						'TestTool_WorksheetNotFound.png'
+				)
+
+				return result
+			}
+
+			Sheet sheet = workbook.getSheetAt(0)
+			DataFormatter formatter = new DataFormatter()
+
+			Map headerIndexes = findHeaderIndexes(
+					sheet,
+					formatter
+			)
+
+			if (!headerIndexes.containsKey('screenName')) {
+				failValidation(
+						result,
+						'Required column was not found.\n' +
+						'Expected column: Screen Name',
+						'TestTool_ScreenNameHeaderNotFound.png'
+				)
+
+				return result
+			}
+
+			if (!headerIndexes.containsKey('sourceTable')) {
+				failValidation(
+						result,
+						'Required column was not found.\n' +
+						'Expected column: Source Table',
+						'TestTool_SourceTableHeaderNotFound.png'
+				)
+
+				return result
+			}
+
+			Integer screenNameColumnIndex =
+					headerIndexes.get('screenName') as Integer
+
+			Integer sourceTableColumnIndex =
+					headerIndexes.get('sourceTable') as Integer
+
+			List<Map> matchingRows = []
+			Integer totalDataRows = 0
+
+			for (Integer rowIndex = 1;
+					rowIndex <= sheet.getLastRowNum();
+					rowIndex++) {
+
+				Row row = sheet.getRow(rowIndex)
+
+				if (row == null) {
+					continue
+				}
+
+				String currentScreenName = getCellValue(
+						row,
+						screenNameColumnIndex,
+						formatter
+				)
+
+				String currentSourceTable = getCellValue(
+						row,
+						sourceTableColumnIndex,
+						formatter
+				)
+
+				if (!currentScreenName.isEmpty() ||
+						!currentSourceTable.isEmpty()) {
+
+					totalDataRows++
+				}
+
+				if (isSameText(
+						currentScreenName,
+						expectedScreenName
+				)) {
+					matchingRows.add(
+							[
+								rowNumber   : rowIndex + 1,
+								screenName  : currentScreenName,
+								sourceTable : currentSourceTable
+							]
+					)
+				}
+			}
+
+			result.put('totalDataRows', totalDataRows)
+			result.put('screenOccurrences', matchingRows.size())
+
+			addNote(
+					'[PASS] Test Tool file read successfully\n' +
+					'Worksheet: ' + sheet.getSheetName() + '\n' +
+					'Rows with data: ' + totalDataRows + '\n' +
+					'Screen occurrences: ' + matchingRows.size()
+			)
+
+			if (matchingRows.isEmpty()) {
+				failValidation(
+						result,
+						'Screen was not found in the Test Tool source file.\n' +
+						'Screen: ' + expectedScreenName.trim(),
+						'TestTool_ScreenNotFound.png'
+				)
+
+				return result
+			}
+
+			if (matchingRows.size() > 1) {
+				failValidation(
+						result,
+						'Screen was found more than once.\n' +
+						'Screen: ' + expectedScreenName.trim() + '\n' +
+						'Occurrences: ' + matchingRows.size() + '\n' +
+						'Rows: ' + getRowNumbers(matchingRows),
+						'TestTool_DuplicateScreenFound.png'
+				)
+
+				return result
+			}
+
+			Map matchingRow = matchingRows.get(0)
+
+			String actualSourceTable =
+					safeText(matchingRow.get('sourceTable'))
+
+			Integer excelRow =
+					matchingRow.get('rowNumber') as Integer
+
+			result.put('actualSourceTable', actualSourceTable)
+			result.put('excelRow', excelRow)
+
+			if (actualSourceTable.isEmpty()) {
+				failValidation(
+						result,
+						'Source Table is empty for the selected screen.\n' +
+						'Screen: ' + expectedScreenName.trim() + '\n' +
+						'Excel row: ' + excelRow,
+						'TestTool_SourceTableEmpty.png'
+				)
+
+				return result
+			}
+
+			if (!isSameText(
+					actualSourceTable,
+					expectedSourceTable
+			)) {
+				failValidation(
+						result,
+						'Source Table does not match the expected value.\n' +
+						'Screen: ' + expectedScreenName.trim() + '\n' +
+						'Expected: ' + expectedSourceTable.trim() + '\n' +
+						'Actual: ' + actualSourceTable + '\n' +
+						'Excel row: ' + excelRow,
+						'TestTool_SourceTableMismatch.png'
+				)
+
+				return result
+			}
+
+			result.put('passed', true)
+			result.put(
+					'message',
+					'Test Tool Source Table validation completed successfully.'
+			)
+
+			addNote(
+					'[PASS] Source Table validation\n' +
+					'Screen: ' + expectedScreenName.trim() + '\n' +
+					'Expected: ' + expectedSourceTable.trim() + '\n' +
+					'Actual: ' + actualSourceTable + '\n' +
+					'Excel row: ' + excelRow
+			)
+
+			return result
+		} catch (Exception error) {
+			failValidation(
+					result,
+					'Test Tool validation could not be completed.\n' +
+					'File: ' + sourceFile.getName() + '\n' +
+					'Reason: ' + getErrorMessage(error),
+					'TestTool_ValidationError.png'
+			)
+
+			return result
+		} finally {
+			try {
+				if (workbook != null) {
+					workbook.close()
+				}
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private Map findHeaderIndexes(
+			Sheet sheet,
+			DataFormatter formatter
+	) {
+		Map indexes = [:]
+
+		Row headerRow = sheet.getRow(0)
+
+		if (headerRow == null) {
+			return indexes
+		}
+
+		Integer lastCellNumber = headerRow.getLastCellNum()
+
+		if (lastCellNumber == null || lastCellNumber < 0) {
+			return indexes
+		}
+
+		for (Integer cellIndex = 0;
+				cellIndex < lastCellNumber;
+				cellIndex++) {
+
+			String headerValue = getCellValue(
+					headerRow,
+					cellIndex,
+					formatter
+			)
+
+			String normalizedHeader =
+					normalizeText(headerValue)
+
+			if (normalizedHeader == 'screen name' ||
+					normalizedHeader == 'screenname') {
+
+				indexes.put('screenName', cellIndex)
+			}
+
+			if (normalizedHeader == 'source table' ||
+					normalizedHeader == 'sourcetable') {
+
+				indexes.put('sourceTable', cellIndex)
+			}
+		}
+
+		return indexes
+	}
+
+	private String getCellValue(
+			Row row,
+			Integer cellIndex,
+			DataFormatter formatter
+	) {
+		if (row == null ||
+				cellIndex == null ||
+				cellIndex < 0) {
+
+			return ''
+		}
+
+		def cell = row.getCell(cellIndex)
+
+		if (cell == null) {
+			return ''
+		}
+
+		String value = formatter.formatCellValue(cell)
+
+		return value == null ? '' : value.trim()
+	}
+
+	private File resolveProjectFile(String relativePath) {
+		String normalizedPath = relativePath
+				.trim()
+				.replace('/', File.separator)
+				.replace('\\', File.separator)
+
+		while (normalizedPath.startsWith(File.separator)) {
+			normalizedPath = normalizedPath.substring(1)
+		}
+
+		return new File(
+				RunConfiguration.getProjectDir(),
+				normalizedPath
+		)
+	}
+
+	private Boolean isSameText(
+			String firstValue,
+			String secondValue
+	) {
+		return normalizeText(firstValue) ==
+				normalizeText(secondValue)
+	}
+
+	private String normalizeText(String value) {
+		if (value == null) {
+			return ''
+		}
+
+		return Normalizer
+				.normalize(
+						value,
+						Normalizer.Form.NFD
+				)
+				.replaceAll('\\p{M}', '')
+				.trim()
+				.toLowerCase()
+				.replaceAll('\\s+', ' ')
+	}
+
+	private String getRowNumbers(List<Map> rows) {
+		List<String> rowNumbers = []
+
+		rows.each { Map row ->
+			rowNumbers.add(
+					String.valueOf(row.get('rowNumber'))
+			)
+		}
+
+		return rowNumbers.join(', ')
+	}
+
+	private void validateRequiredValue(
+			String value,
+			String parameterName
+	) {
+		if (value == null || value.trim().isEmpty()) {
+			KeywordUtil.markFailedAndStop(
+					parameterName + ' is empty.'
+			)
+		}
+	}
+
+	private void failValidation(
+			Map result,
+			String message,
+			String evidenceName
+	) {
+		result.put('passed', false)
+		result.put('message', message)
+
+		imageLoader.takeEvidence(evidenceName)
+
+		addNote(
+				'[FAIL] Test Tool validation\n' +
+				message
+		)
+
+		KeywordUtil.markFailedAndStop(message)
+	}
+
+	private String safeText(Object value) {
+		if (value == null) {
+			return ''
+		}
+
+		return String.valueOf(value).trim()
+	}
+
+	private String getErrorMessage(Throwable error) {
+		if (error == null) {
+			return 'Unknown error.'
+		}
+
+		String message = error.getMessage()
+
+		if (message == null || message.trim().isEmpty()) {
+			return error.getClass().getSimpleName()
+		}
+
+		return message.trim()
+	}
+
+	private void addNote(String message) {
+		try {
+			new jiraIntegration.JiraReportSteps().note(message)
+		} catch (Throwable ignored) {
+			KeywordUtil.logInfo(message)
+		}
+	}
+}
