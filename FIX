@@ -1,1 +1,7660 @@
+import java.util.Locale
+
+import com.kms.katalon.core.util.KeywordUtil
+
+Integer threshold = 3
+Integer maxDifferencesToShow = 999
+Integer maxErrorsToShow = 999
+
+String acceptedDifferenceText = '<= ' + threshold + '%'
+
+def addNote = { String message ->
+	CustomKeywords.'jiraIntegration.JiraReportSteps.note'(message)
+}
+
+Map result = CustomKeywords.'commands.ExportFileComparator.compareRecProdExportFiles'(
+		threshold
+)
+
+String featureName = safeText(result.featureName, 'Not available')
+String sharedFolderName = folderNameOnly(result.sharedFolder)
+
+String recFileName = fileNameOnly(result.recFileName)
+String prdFileName = fileNameOnly(result.prdFileName)
+
+String recFileStatus = isNotFound(recFileName) ? 'FAILED' : 'PASSED'
+String prdFileStatus = isNotFound(prdFileName) ? 'FAILED' : 'PASSED'
+
+Integer totalValidations = toInteger(result.totalValidations, 0)
+Integer passedValidations = toInteger(result.passedValidations, 0)
+Integer failedValidations = toInteger(result.failedValidations, 0)
+
+List<Map> validations = result.validations == null ? [] : result.validations as List<Map>
+List<String> differences = result.differences == null ? [] : result.differences as List<String>
+
+String errorsText = safeText(result.errorsText, '')
+Boolean hasFailure = failedValidations > 0 || !differences.isEmpty() || !errorsText.isEmpty()
+
+addNote(
+		'[PASS] REC x PRD Export Validation setup\n' +
+		'Feature: ' + featureName + '\n' +
+		'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
+		'Shared folder: ' + sharedFolderName + '\n' +
+		'Goal: compare the REC exported file against the PRD exported file.'
+)
+
+addNote(
+		((recFileStatus == 'PASSED' && prdFileStatus == 'PASSED') ? '[PASS] ' : '[FAIL] ') +
+		'Files selected for comparison\n' +
+		'Expected files: 2\n' +
+		'Files ready: ' + countReadyFiles(recFileName, prdFileName) + '\n\n' +
+		'REC file: ' + recFileStatus + ' - ' + recFileName + '\n' +
+		'PRD file: ' + prdFileStatus + ' - ' + prdFileName
+)
+
+addNote(
+		(hasFailure ? '[FAIL] ' : '[PASS] ') +
+		'Validation summary\n' +
+		'Total validations: ' + totalValidations + '\n' +
+		'Passed: ' + passedValidations + '\n' +
+		'Failed: ' + failedValidations + '\n' +
+		'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
+		'Differences listed: ' + differences.size()
+)
+
+if (validations.isEmpty()) {
+	addNote(
+			'[SKIPPED] Validation details\n' +
+			'No validation detail was returned by the comparator keyword.'
+	)
+} else {
+	validations.eachWithIndex { Map validation, int index ->
+		String validationName = safeText(validation.name, 'Validation ' + (index + 1))
+		String validationStatus = normalizeStatus(validation.status)
+		String validationDetails = cleanReportText(validation.details)
+
+		String statusPrefix = validationStatus == 'PASS' ? '[PASS] ' : '[FAIL] '
+
+		addNote(
+				statusPrefix +
+				'Validation ' + (index + 1) + ' - ' + validationName + '\n' +
+				'Status: ' + validationStatus + '\n' +
+				formatValidationDetails(validationDetails, acceptedDifferenceText)
+		)
+	}
+}
+
+if (!differences.isEmpty()) {
+	addNote(
+			'[FAIL] Differences found\n' +
+			'Total differences returned: ' + differences.size() + '\n' +
+			'Differences displayed: ' + Math.min(differences.size(), maxDifferencesToShow) + '\n' +
+			'Accepted numeric difference: ' + acceptedDifferenceText + '\n\n' +
+			buildDifferencesReport(differences, maxDifferencesToShow, acceptedDifferenceText)
+	)
+} else {
+	addNote(
+			'[PASS] Differences check\n' +
+			'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
+			'No differences were returned by the comparator keyword.'
+	)
+}
+
+if (!errorsText.isEmpty()) {
+	addNote(
+			'[FAIL] Comparator errors\n' +
+			'Accepted numeric difference: ' + acceptedDifferenceText + '\n\n' +
+			buildErrorsReport(errorsText, maxErrorsToShow, acceptedDifferenceText)
+	)
+}
+
+if (hasFailure) {
+	addNote(
+			'[FAIL] Final result\n' +
+			'REC x PRD export validation finished with mismatches.\n' +
+			'Feature: ' + featureName + '\n' +
+			'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
+			'REC file: ' + recFileName + '\n' +
+			'PRD file: ' + prdFileName
+	)
+
+	KeywordUtil.markFailed(
+			'REC x PRD export validation failed. Check the comparison report above.'
+	)
+} else {
+	addNote(
+			'[PASS] Final result\n' +
+			'REC x PRD export validation completed successfully.\n' +
+			'Feature: ' + featureName + '\n' +
+			'Accepted numeric difference: ' + acceptedDifferenceText + '\n' +
+			'REC file: ' + recFileName + '\n' +
+			'PRD file: ' + prdFileName + '\n' +
+			'Result: no mismatches were found between REC and PRD files.'
+	)
+
+	KeywordUtil.markPassed(
+			'REC x PRD export validation completed successfully.'
+	)
+}
+
+String formatValidationDetails(String details, String acceptedDifferenceText) {
+	String text = safeText(details, '')
+
+	if (text.isEmpty()) {
+		return 'Details: not available.'
+	}
+
+	List<String> lines = []
+
+	text.replace('\r\n', '\n')
+			.replace('\r', '\n')
+			.split('\n')
+			.each { String line ->
+				String clean = safeText(line, '')
+
+				if (!clean.isEmpty() && !isPathLine(clean)) {
+					lines.add(normalizeToleranceText(clean, acceptedDifferenceText))
+				}
+			}
+
+	return lines.isEmpty() ? 'Details: not available.' : lines.join('\n')
+}
+
+String buildDifferencesReport(List<String> differences, Integer maxToShow, String acceptedDifferenceText) {
+	List<String> lines = []
+
+	Integer limit = maxToShow == null || maxToShow <= 0 ? differences.size() : maxToShow
+	Integer index = 1
+
+	for (String difference : differences.take(limit)) {
+		String cleanDifference = normalizeToleranceText(cleanReportText(difference), acceptedDifferenceText)
+
+		if (!cleanDifference.isEmpty()) {
+			lines.add('Difference ' + index + ': ' + cleanDifference)
+			index++
+		}
+	}
+
+	if (differences.size() > limit) {
+		lines.add('')
+		lines.add('... and ' + (differences.size() - limit) + ' more difference(s).')
+	}
+
+	if (lines.isEmpty()) {
+		lines.add('Differences were returned, but no readable detail was available.')
+	}
+
+	return lines.join('\n')
+}
+
+String buildErrorsReport(String errorsText, Integer maxToShow, String acceptedDifferenceText) {
+	List<String> lines = []
+
+	String text = normalizeToleranceText(cleanReportText(errorsText), acceptedDifferenceText)
+
+	if (text.isEmpty()) {
+		return 'No readable error detail was available.'
+	}
+
+	List<String> rawLines = []
+
+	text.replace('\r\n', '\n')
+			.replace('\r', '\n')
+			.split('\n')
+			.each { String line ->
+				String clean = safeText(line, '')
+
+				if (!clean.isEmpty() && !isPathLine(clean)) {
+					rawLines.add(normalizeToleranceText(clean, acceptedDifferenceText))
+				}
+			}
+
+	Integer limit = maxToShow == null || maxToShow <= 0 ? rawLines.size() : maxToShow
+
+	Integer index = 1
+
+	for (String line : rawLines.take(limit)) {
+		lines.add('Error ' + index + ': ' + line)
+		index++
+	}
+
+	if (rawLines.size() > limit) {
+		lines.add('')
+		lines.add('... and ' + (rawLines.size() - limit) + ' more error line(s).')
+	}
+
+	return lines.join('\n')
+}
+
+String cleanReportText(Object value) {
+	String text = safeText(value, '')
+
+	if (text.isEmpty()) {
+		return ''
+	}
+
+	text = text.replace('\\', '/')
+
+	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.xlsx)', '$1')
+	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.xls)', '$1')
+	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.csv)', '$1')
+	text = text.replaceAll('[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.txt)', '$1')
+
+	text = text.replaceAll('[A-Za-z]:/[^\\n\\r]*Shared_REC_PRD_Exports/?', 'Shared_REC_PRD_Exports')
+	text = text.replaceAll('[A-Za-z]:/[^\\n\\r]*Reports/?', 'Reports')
+
+	text = text.replaceAll('^com\\.kms\\.katalon\\.core\\.exception\\.StepFailedException:\\s*', '').trim()
+	text = text.replaceAll('^Reason:\\s*com\\.kms\\.katalon\\.core\\.exception\\.StepFailedException:\\s*', 'Reason: ').trim()
+
+	return text.trim()
+}
+
+String normalizeToleranceText(String value, String acceptedDifferenceText) {
+	String text = safeText(value, '')
+
+	if (text.isEmpty()) {
+		return ''
+	}
+
+	text = text.replaceAll(
+			'(?i)Allowed numeric difference\\s*:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
+			'Accepted numeric difference: ' + acceptedDifferenceText
+	)
+
+	text = text.replaceAll(
+			'(?i)Allowed difference\\s*:\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
+			'Allowed difference: ' + acceptedDifferenceText
+	)
+
+	text = text.replaceAll(
+			'(?i)Allowed difference is\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
+			'Accepted difference: ' + acceptedDifferenceText
+	)
+
+	text = text.replaceAll(
+			'(?i)Accepted difference\\s*:\\s*<=\\s*([0-9]+(?:[\\.,][0-9]+)?)\\s*%?',
+			'Accepted difference: ' + acceptedDifferenceText
+	)
+
+	return text.trim()
+}
+
+Boolean isPathLine(String value) {
+	String text = safeText(value, '').replace('\\', '/').trim()
+
+	return text ==~ /(?i)^Path\s*:.*$/ ||
+			text ==~ /(?i)^REC path\s*:.*$/ ||
+			text ==~ /(?i)^PRD path\s*:.*$/
+}
+
+String fileNameOnly(Object value) {
+	String text = safeText(value, 'NOT FOUND')
+
+	if (text.isEmpty()) {
+		return 'NOT FOUND'
+	}
+
+	if (isNotFound(text)) {
+		return 'NOT FOUND'
+	}
+
+	text = text.replace('\\', '/')
+
+	if (text.contains('/')) {
+		return text.substring(text.lastIndexOf('/') + 1)
+	}
+
+	return text
+}
+
+String folderNameOnly(Object value) {
+	String text = safeText(value, 'Not available')
+
+	if (text.isEmpty() || isNotFound(text)) {
+		return 'Not available'
+	}
+
+	text = text.replace('\\', '/')
+
+	if (text.endsWith('/')) {
+		text = text.substring(0, text.length() - 1)
+	}
+
+	if (text.contains('/')) {
+		return text.substring(text.lastIndexOf('/') + 1)
+	}
+
+	return text
+}
+
+String normalizeStatus(Object value) {
+	String status = safeText(value, 'FAIL').toUpperCase(Locale.ENGLISH)
+
+	if (status == 'PASSED') {
+		return 'PASS'
+	}
+
+	if (status == 'FAILED') {
+		return 'FAIL'
+	}
+
+	if (status != 'PASS' && status != 'FAIL') {
+		return status
+	}
+
+	return status
+}
+
+Boolean isNotFound(Object value) {
+	String text = safeText(value, '').toUpperCase(Locale.ENGLISH)
+
+	return text.isEmpty() ||
+			text == 'NOT FOUND' ||
+			text.contains('NOT_FOUND') ||
+			text.contains('NOT FOUND')
+}
+
+Integer countReadyFiles(String recFileName, String prdFileName) {
+	Integer count = 0
+
+	if (!isNotFound(recFileName)) {
+		count++
+	}
+
+	if (!isNotFound(prdFileName)) {
+		count++
+	}
+
+	return count
+}
+
+Integer toInteger(Object value, Integer defaultValue) {
+	try {
+		return Integer.parseInt(String.valueOf(value).trim())
+	} catch (Throwable ignored) {
+		return defaultValue
+	}
+}
+
+String safeText(Object value, String defaultValue) {
+	if (value == null) {
+		return defaultValue
+	}
+
+	String text = String.valueOf(value).trim()
+
+	return text.isEmpty() ? defaultValue : text
+}
+
+
+
+
+
+
+
+
+
+
+import java.io.File
+import java.math.RoundingMode
+import java.util.Locale
+
+import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.DataFormatter
+import org.apache.poi.ss.usermodel.Row
+import org.apache.poi.ss.usermodel.Sheet
+import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+String testCaseName = 'Export File Validation'
+
+// ======================================================
+// VALUES RECEIVED FROM THE EXPORT TC
+// ======================================================
+String targetEnvironment = readTcVariable(
+		'targetEnvironment',
+		readTcVariable('environment', '')
+)
+
+String exportLabel = readTcVariable(
+		'exportLabel',
+		''
+)
+
+String requiredHeadersText = readTcVariable(
+		'requiredHeaders',
+		''
+)
+
+String currencyHeadersText = readTcVariable(
+		'currencyHeaders',
+		''
+)
+
+String amountHeadersText = readTcVariable(
+		'amountHeaders',
+		''
+)
+
+// ======================================================
+// FIXED VALIDATION CONFIG
+// ======================================================
+String shortExportRoot = 'C:\\KatalonExports'
+String includeSubFolders = 'true'
+String minimumExpectedFiles = '1'
+String defaultValidationType = 'Mixte'
+String sheetIndex = '0'
+String amountDifferenceTolerancePercent = '3'
+String maxErrorsPerFile = '999'
+String maxGeneralErrors = '999'
+
+List<String> requiredHeaders = parseHeaderList(
+		requiredHeadersText
+)
+
+List<String> currencyHeaders = parseHeaderList(
+		currencyHeadersText
+)
+
+List<String> amountHeaders = parseHeaderList(
+		amountHeadersText
+)
+
+File baseExportFolder = resolveShortExportRoot(
+		shortExportRoot
+)
+
+String baseExportFolderPath =
+		baseExportFolder.getAbsolutePath()
+
+Boolean validationFailed = false
+File exportFileToValidate = null
+String fileToValidateText = ''
+
+def reportStep = {
+	String status,
+	String title,
+	String body ->
+
+		String message =
+				'[' +
+				status +
+				'] ' +
+				title +
+				'\n' +
+				(body == null ?
+					'' :
+					body.trim())
+
+		if ('FAIL'.equals(status)) {
+			KeywordUtil.markFailed(
+					message
+					)
+		} else {
+			CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+					message
+					)
+		}
+}
+
+if (exportLabel.trim().isEmpty()) {
+	KeywordUtil.markFailedAndStop(
+			'Export File Validation failed. Missing required TC variable: exportLabel.'
+			)
+}
+
+if (requiredHeaders.isEmpty()) {
+	KeywordUtil.markFailedAndStop(
+			'Export File Validation failed. Missing required TC variable: requiredHeaders.'
+			)
+}
+
+reportStep(
+		'PASS',
+		'Export validation setup',
+		'Environment: ' +
+		(targetEnvironment.trim().isEmpty() ?
+			'Not configured' :
+			targetEnvironment) +
+		'\n' +
+		'Export label: ' +
+		exportLabel +
+		'\n' +
+		'Required headers: ' +
+		requiredHeaders.join(' | ') +
+		'\n' +
+		'Currency headers: ' +
+		(currencyHeaders.isEmpty() ?
+			'Not configured' :
+			currencyHeaders.join(' | ')) +
+		'\n' +
+		'Amount headers: ' +
+		(amountHeaders.isEmpty() ?
+			'Not configured' :
+			amountHeaders.join(' | ')) +
+		'\n' +
+		'Accepted amount difference: <= ' +
+		amountDifferenceTolerancePercent +
+		'%'
+)
+
+String validationResult = ''
+
+validationResult =
+		CustomKeywords.'commands.ExportFileValidationKeywords.validateEvidenceFolderExists'(
+		baseExportFolderPath
+		)
+
+String folderReport = buildFolderReport(
+		baseExportFolderPath,
+		validationResult
+)
+
+if (hasValidationFailure(
+		validationResult
+		)) {
+	validationFailed = true
+
+	reportStep(
+			'FAIL',
+			'Export folder',
+			folderReport
+			)
+} else {
+	reportStep(
+			'PASS',
+			'Export folder',
+			folderReport
+			)
+}
+
+if (!validationFailed) {
+	String resolvedFilesText =
+			CustomKeywords.'commands.ExportFileValidationKeywords.resolveExcelFilesAsString'(
+			baseExportFolderPath,
+			'',
+			includeSubFolders
+			)
+
+	Map selectedExport = selectExportFile(
+			resolvedFilesText,
+			targetEnvironment,
+			exportLabel
+			)
+
+	exportFileToValidate =
+			selectedExport.file as File
+
+	fileToValidateText =
+			exportFileToValidate == null ?
+				'' :
+				exportFileToValidate.getAbsolutePath()
+
+	String fileValidationResult = ''
+
+	if (exportFileToValidate == null) {
+		fileValidationResult =
+				selectedExport.error as String
+	} else {
+		String fileFoundResult =
+				CustomKeywords.'commands.ExportFileValidationKeywords.validateExcelFilesFound'(
+				fileToValidateText
+				)
+
+		String minimumFilesResult =
+				CustomKeywords.'commands.ExportFileValidationKeywords.validateMinimumExpectedFileQuantity'(
+				fileToValidateText,
+				minimumExpectedFiles
+				)
+
+		fileValidationResult = combineValidationResults(
+				fileFoundResult,
+				minimumFilesResult
+				)
+	}
+
+	String exportFileReport = buildExportFileReport(
+			selectedExport,
+			fileValidationResult,
+			targetEnvironment,
+			exportLabel,
+			minimumExpectedFiles,
+			maxGeneralErrors
+			)
+
+	if (hasValidationFailure(
+			fileValidationResult
+			)) {
+		validationFailed = true
+
+		reportStep(
+				'FAIL',
+				'Export file',
+				exportFileReport
+				)
+	} else {
+		reportStep(
+				'PASS',
+				'Export file',
+				exportFileReport
+				)
+	}
+}
+
+if (!validationFailed &&
+		!fileToValidateText.trim().isEmpty()) {
+	Map requiredHeadersValidation =
+			validateHeadersInFile(
+			exportFileToValidate,
+			parseIntOrDefault(
+			sheetIndex,
+			0
+				),
+			requiredHeaders
+				)
+
+	String requiredHeadersReport =
+			buildDynamicHeadersReport(
+			requiredHeadersValidation,
+			exportFileToValidate,
+			'Required headers'
+				)
+
+	if (Boolean.TRUE.equals(
+			requiredHeadersValidation.failed
+			)) {
+		validationFailed = true
+
+		reportStep(
+				'FAIL',
+				'Required headers',
+				requiredHeadersReport
+				)
+	} else {
+		reportStep(
+				'PASS',
+				'Required headers',
+				requiredHeadersReport
+				)
+	}
+
+	if (currencyHeaders.size() >= 2) {
+		validationResult =
+				CustomKeywords.'commands.ExportFileValidationKeywords.validateRowsForValidationType'(
+				fileToValidateText,
+				defaultValidationType,
+				sheetIndex,
+				currencyHeaders[0],
+				currencyHeaders[1]
+				)
+
+		String currencyHeadersReport =
+				buildCurrencyHeadersReport(
+				validationResult,
+				exportFileToValidate,
+				currencyHeaders,
+				parseIntOrDefault(
+				maxGeneralErrors,
+				999
+					)
+				)
+
+		if (hasValidationFailure(
+				validationResult
+				)) {
+			validationFailed = true
+
+			reportStep(
+					'FAIL',
+					'Currency headers',
+					currencyHeadersReport
+					)
+		} else {
+			reportStep(
+					'PASS',
+					'Currency headers',
+					currencyHeadersReport
+					)
+		}
+	} else {
+		CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+				'[SKIPPED] Currency headers\n' +
+				'Currency validation was not executed.\n' +
+				'Reason: currencyHeaders must contain 2 headers. Current value: ' +
+				(currencyHeaders.isEmpty() ?
+					'Not configured' :
+					currencyHeaders.join(' | '))
+				)
+	}
+
+	if (!amountHeaders.isEmpty()) {
+		if (currencyHeaders.size() < 2) {
+			validationFailed = true
+
+			reportStep(
+					'FAIL',
+					'Amount columns comparison',
+					'Amount comparison cannot run because currencyHeaders must contain 2 headers.\n' +
+					'Current currencyHeaders: ' +
+					(currencyHeaders.isEmpty() ?
+						'Not configured' :
+						currencyHeaders.join(' | '))
+					)
+		} else if (amountHeaders.size() < 2 ||
+				amountHeaders.size() % 2 != 0) {
+			validationFailed = true
+
+			reportStep(
+					'FAIL',
+					'Amount columns comparison',
+					'Amount comparison cannot run because amountHeaders must contain pairs.\n' +
+					'Example: Montant ccy|Montant base ccy\n' +
+					'Current amountHeaders: ' +
+					amountHeaders.join(' | ')
+					)
+		} else {
+			for (int i = 0;
+					i < amountHeaders.size();
+					i += 2) {
+				String amountHeader =
+						amountHeaders[i]
+
+				String baseAmountHeader =
+						amountHeaders[i + 1]
+
+				validationResult =
+						CustomKeywords.'commands.ExportFileValidationKeywords.validateMontantCcyEqualsMontantBaseCcy'(
+						fileToValidateText,
+						defaultValidationType,
+						sheetIndex,
+						currencyHeaders[0],
+						currencyHeaders[1],
+						amountHeader,
+						baseAmountHeader
+						)
+
+				Boolean amountComparisonFailed =
+						shouldFailAmountComparison(
+						validationResult,
+						exportFileToValidate,
+						amountDifferenceTolerancePercent
+						)
+
+				String amountComparisonReport =
+						buildAmountComparisonReport(
+						validationResult,
+						exportFileToValidate,
+						amountHeader,
+						baseAmountHeader,
+						amountDifferenceTolerancePercent,
+						parseIntOrDefault(
+						maxErrorsPerFile,
+						999
+							),
+						parseIntOrDefault(
+						maxGeneralErrors,
+						999
+							)
+						)
+
+				String amountStepTitle =
+						'Amount columns comparison: ' +
+						amountHeader +
+						' vs ' +
+						baseAmountHeader
+
+				if (amountComparisonFailed) {
+					validationFailed = true
+
+					reportStep(
+							'FAIL',
+							amountStepTitle,
+							amountComparisonReport
+							)
+				} else {
+					reportStep(
+							'PASS',
+							amountStepTitle,
+							amountComparisonReport
+							)
+				}
+			}
+		}
+	} else {
+		CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+				'[SKIPPED] Amount columns comparison\n' +
+				'Amount comparison was not executed.\n' +
+				'Reason: amountHeaders was not configured.'
+				)
+	}
+}
+
+if (validationFailed) {
+	reportStep(
+			'FAIL',
+			'End of export validation',
+			'Environment: ' +
+			(targetEnvironment.trim().isEmpty() ?
+				'Not configured' :
+				targetEnvironment) +
+			'\n' +
+			'Export label: ' +
+			exportLabel +
+			'\n' +
+			'Result: FAILED\n' +
+			'Validated file: ' +
+			(exportFileToValidate == null ?
+				'Not available' :
+				exportFileToValidate.getName())
+			)
+
+	KeywordUtil.markFailedAndStop(
+			testCaseName +
+			' failed for export ' +
+			exportLabel +
+			'. Check the validation report above.'
+			)
+}
+
+reportStep(
+		'PASS',
+		'End of export validation',
+		'Environment: ' +
+		(targetEnvironment.trim().isEmpty() ?
+			'Not configured' :
+			targetEnvironment) +
+		'\n' +
+		'Export label: ' +
+		exportLabel +
+		'\n' +
+		'Result: PASSED\n' +
+		'Validated file: ' +
+		(exportFileToValidate == null ?
+			'Not available' :
+				exportFileToValidate.getName())
+		)
+
+KeywordUtil.markPassed(
+		testCaseName +
+		' completed successfully for export ' +
+		exportLabel +
+		'.'
+		)
+
+File resolveShortExportRoot(
+		String configuredRoot
+) {
+	File preferredRoot =
+			new File(
+			configuredRoot
+				)
+
+	if (preferredRoot.exists() &&
+			preferredRoot.isDirectory()) {
+		return preferredRoot
+	}
+
+	File temporaryRoot =
+			new File(
+			System.getProperty('java.io.tmpdir'),
+			'KatalonExports'
+				)
+
+	if (temporaryRoot.exists() &&
+			temporaryRoot.isDirectory()) {
+		return temporaryRoot
+	}
+
+	return preferredRoot
+}
+
+Map selectExportFile(
+		String resolvedFilesText,
+		String targetEnvironment,
+		String exportLabel
+) {
+	List<File> allFiles =
+			parseFileList(
+			resolvedFilesText
+				)
+
+	allFiles = allFiles.findAll {
+		File file ->
+			file != null &&
+			file.exists() &&
+			file.isFile() &&
+			file.length() > 0 &&
+			file.getName()
+					.toLowerCase(
+					Locale.ENGLISH
+						)
+					.endsWith(
+					'.xlsx'
+						) &&
+			!file.getName().startsWith(
+					'~$'
+						)
+	}
+
+	if (allFiles.isEmpty()) {
+		return [
+			file        : null,
+			allFiles    : allFiles,
+			matchedFiles: [],
+			error       : 'No valid Excel files were found under the export folder.'
+		]
+	}
+
+	String normalizedEnvironment =
+			normalizeEnvironment(
+			targetEnvironment
+				)
+
+	String normalizedLabel =
+			exportLabel == null ?
+				'' :
+				exportLabel
+					.trim()
+					.toLowerCase(
+					Locale.ENGLISH
+						)
+
+	List<File> matchedFiles = []
+
+	for (File file : allFiles) {
+		String fileName =
+				file.getName()
+					.toLowerCase(
+					Locale.ENGLISH
+						)
+
+		boolean environmentMatches =
+				normalizedEnvironment.isEmpty() ||
+				fileName.startsWith(
+				normalizedEnvironment.toLowerCase(
+				Locale.ENGLISH
+					) + '_'
+					)
+
+		boolean labelMatches =
+				normalizedLabel.isEmpty() ||
+				fileName.contains(
+				normalizedLabel
+					)
+
+		if (environmentMatches &&
+				labelMatches) {
+			matchedFiles.add(
+					file
+					)
+		}
+	}
+
+	if (matchedFiles.isEmpty()) {
+		String expectedDescription =
+				(normalizedEnvironment.isEmpty() ?
+					'' :
+					normalizedEnvironment + '_') +
+				'*' +
+				exportLabel +
+				'*.xlsx'
+
+		return [
+			file        : null,
+			allFiles    : allFiles,
+			matchedFiles: matchedFiles,
+			error       :
+				'No Excel file matched the expected environment and export label.\n' +
+				'Expected format: ' +
+				expectedDescription
+		]
+	}
+
+	List<File> sortedMatches =
+			matchedFiles.sort {
+				File a,
+				File b ->
+
+					b.lastModified() <=>
+					a.lastModified()
+			}
+
+	return [
+		file        : sortedMatches[0],
+		allFiles    : allFiles,
+		matchedFiles: matchedFiles,
+		error       : ''
+	]
+}
+
+String normalizeEnvironment(
+		String value
+) {
+	if (value == null ||
+			value.trim().isEmpty()) {
+		return ''
+	}
+
+	String environment =
+			value
+				.trim()
+				.toUpperCase(
+				Locale.ENGLISH
+					)
+
+	if (environment == 'REC' ||
+			environment == 'RECETTE') {
+		return 'REC'
+	}
+
+	if (environment == 'PRD' ||
+			environment == 'PROD' ||
+			environment == 'PRODUCTION') {
+		return 'PRD'
+	}
+
+	return environment
+}
+
+Map validateHeadersInFile(
+		File file,
+		Integer sheetIndex,
+		List<String> headers
+) {
+	List<String> foundHeaders = []
+	List<String> missingHeaders = []
+	List<String> errors = []
+
+	Workbook workbook = null
+
+	try {
+		if (file == null ||
+				!file.exists() ||
+				!file.isFile()) {
+			return [
+				failed        : true,
+				headerRow     : '',
+				foundHeaders  : foundHeaders,
+				missingHeaders: headers,
+				errors        : [
+					'File was not found.'
+				]
+			]
+		}
+
+		workbook =
+				WorkbookFactory.create(
+				file
+					)
+
+		if (sheetIndex < 0 ||
+				sheetIndex >=
+				workbook.getNumberOfSheets()) {
+			return [
+				failed        : true,
+				headerRow     : '',
+				foundHeaders  : foundHeaders,
+				missingHeaders: headers,
+				errors        : [
+					'Sheet index ' +
+					sheetIndex +
+					' was not found. Available sheets: ' +
+					workbook.getNumberOfSheets()
+				]
+			]
+		}
+
+		Sheet sheet =
+				workbook.getSheetAt(
+				sheetIndex
+					)
+
+		DataFormatter formatter =
+				new DataFormatter(
+				Locale.ENGLISH
+					)
+
+		def evaluator =
+				workbook
+				.getCreationHelper()
+				.createFormulaEvaluator()
+
+		Map headerInfo =
+				findBestHeaderRow(
+				sheet,
+				formatter,
+				evaluator,
+				headers
+					)
+
+		foundHeaders.addAll(
+				headerInfo.foundHeaders as List<String>
+				)
+
+		missingHeaders.addAll(
+				headerInfo.missingHeaders as List<String>
+				)
+
+		return [
+			failed        : !missingHeaders.isEmpty(),
+			headerRow     : headerInfo.headerRow,
+			foundHeaders  : foundHeaders,
+			missingHeaders: missingHeaders,
+			errors        : errors
+		]
+	} catch (Throwable throwable) {
+		errors.add(
+				throwable
+					.getClass()
+					.getSimpleName() +
+				': ' +
+				safeText(
+				throwable.getMessage()
+					)
+				)
+
+		return [
+			failed        : true,
+			headerRow     : '',
+			foundHeaders  : foundHeaders,
+			missingHeaders: headers,
+			errors        : errors
+		]
+	} finally {
+		try {
+			workbook?.close()
+		} catch (Throwable ignored) {
+		}
+	}
+}
+
+Map findBestHeaderRow(
+		Sheet sheet,
+		DataFormatter formatter,
+		def evaluator,
+		List<String> headers
+) {
+	Integer maxHeaderScanRows =
+			Math.min(
+			sheet.getLastRowNum(),
+			50
+				)
+
+	List<String> bestFound = []
+	List<String> bestMissing = headers
+	Integer bestHeaderRow = -1
+
+	for (int rowIndex = 0;
+			rowIndex <= maxHeaderScanRows;
+			rowIndex++) {
+		Row row =
+				sheet.getRow(
+				rowIndex
+					)
+
+		if (row == null ||
+				row.getFirstCellNum() < 0 ||
+				row.getLastCellNum() < 0) {
+			continue
+		}
+
+		Set<String> rowValues =
+				[] as Set<String>
+
+		for (int cellIndex =
+				row.getFirstCellNum();
+				cellIndex <
+				row.getLastCellNum();
+				cellIndex++) {
+			Cell cell =
+					row.getCell(
+					cellIndex,
+					Row.MissingCellPolicy.RETURN_BLANK_AS_NULL
+						)
+
+			String value =
+					cellText(
+					cell,
+					formatter,
+					evaluator
+						)
+
+			if (!value.isEmpty()) {
+				rowValues.add(
+						normalizeHeader(
+						value
+							)
+						)
+			}
+		}
+
+		List<String> currentFound = []
+		List<String> currentMissing = []
+
+		for (String header : headers) {
+			if (rowValues.contains(
+					normalizeHeader(
+					header
+						)
+					)) {
+				currentFound.add(
+						header
+						)
+			} else {
+				currentMissing.add(
+						header
+						)
+			}
+		}
+
+		if (currentFound.size() >
+				bestFound.size()) {
+			bestFound =
+					currentFound
+
+			bestMissing =
+					currentMissing
+
+			bestHeaderRow =
+					rowIndex + 1
+		}
+
+		if (currentMissing.isEmpty()) {
+			break
+		}
+	}
+
+	return [
+		headerRow     :
+				bestHeaderRow < 0 ?
+					'' :
+					String.valueOf(
+					bestHeaderRow
+						),
+		foundHeaders  : bestFound,
+		missingHeaders: bestMissing
+	]
+}
+
+String buildDynamicHeadersReport(
+		Map validation,
+		File file,
+		String title
+) {
+	List<String> foundHeaders =
+			validation.foundHeaders as List<String>
+
+	List<String> missingHeaders =
+			validation.missingHeaders as List<String>
+
+	List<String> errors =
+			validation.errors as List<String>
+
+	List<String> lines = []
+
+	lines.add(
+			'Checked file: ' +
+			(file == null ?
+				'Not available' :
+				file.getName())
+			)
+
+	lines.add(
+			'Header row: ' +
+			(safeText(
+			validation.headerRow
+				).isEmpty() ?
+				'Not found' :
+				safeText(
+				validation.headerRow
+					))
+			)
+
+	lines.add(
+			'Headers found: ' +
+			foundHeaders.size()
+			)
+
+	lines.add(
+			'Headers missing: ' +
+			missingHeaders.size()
+			)
+
+	lines.add(
+			''
+			)
+
+	lines.add(
+			'Header feedback:'
+			)
+
+	Integer index = 1
+
+	for (String header : foundHeaders) {
+		lines.add(
+				'Header ' +
+				index +
+				': PASSED - ' +
+				header
+				)
+
+		index++
+	}
+
+	for (String header : missingHeaders) {
+		lines.add(
+				'Header ' +
+				index +
+				': FAILED - ' +
+				header
+				)
+
+		index++
+	}
+
+	if (!errors.isEmpty()) {
+		lines.add(
+				''
+				)
+
+		lines.add(
+				'Errors:'
+				)
+
+		for (String error : errors) {
+			lines.add(
+					'- ' +
+					error
+					)
+		}
+	}
+
+	return lines.join(
+			'\n'
+			)
+}
+
+String buildFolderReport(
+		String folderPath,
+		String validationResult
+) {
+	File folder =
+			new File(
+			folderPath
+				)
+
+	String result =
+			validationResult == null ?
+				'' :
+				validationResult.trim()
+
+	if (hasValidationFailure(
+			result
+			)) {
+		return 'Folder: ' +
+				folder.getName() +
+				'\n' +
+				'Result: Not available\n' +
+				'Details: ' +
+				cleanErrorLineForReport(
+				result,
+				[]
+					)
+	}
+
+	return 'Folder: ' +
+			folder.getName() +
+			'\n' +
+			'Result: Available'
+}
+
+String buildExportFileReport(
+		Map selectedExport,
+		String validationResult,
+		String targetEnvironment,
+		String exportLabel,
+		String minimumExpectedFilesText,
+		String maxGeneralErrorsText
+) {
+	List<File> allFiles =
+			selectedExport.allFiles as List<File>
+
+	List<File> matchedFiles =
+			selectedExport.matchedFiles as List<File>
+
+	File selectedFile =
+			selectedExport.file as File
+
+	Integer minimum =
+			parseIntOrDefault(
+			minimumExpectedFilesText,
+			1
+				)
+
+	List<String> lines = []
+
+	lines.add(
+			'Expected environment: ' +
+			(targetEnvironment.trim().isEmpty() ?
+				'Not configured' :
+				normalizeEnvironment(
+				targetEnvironment
+					))
+			)
+
+	lines.add(
+			'Expected export label: ' +
+			exportLabel
+			)
+
+	lines.add(
+			'Required files: ' +
+			minimum
+			)
+
+	lines.add(
+			'Valid Excel files found: ' +
+			(allFiles == null ?
+				0 :
+				allFiles.size())
+			)
+
+	lines.add(
+			'Matched files: ' +
+			(matchedFiles == null ?
+				0 :
+				matchedFiles.size())
+			)
+
+	lines.add(
+			''
+			)
+
+	if (selectedFile != null) {
+		lines.add(
+				'File 1: PASSED - ' +
+				selectedFile.getName()
+				)
+
+		lines.add(
+				'Selected file: ' +
+				selectedFile.getName()
+				)
+
+		if (matchedFiles != null &&
+				matchedFiles.size() > 1) {
+			lines.add(
+					''
+					)
+
+			lines.add(
+					'Note: more than one matching file was found. The latest file was selected.'
+					)
+		}
+	} else {
+		lines.add(
+				'File 1: FAILED - Expected export file was not found.'
+				)
+	}
+
+	if (hasValidationFailure(
+			validationResult
+			)) {
+		List<String> errors =
+				extractErrorLines(
+				validationResult
+					)
+
+		if (!errors.isEmpty()) {
+			lines.add(
+					''
+					)
+
+			lines.add(
+					'Errors:'
+					)
+
+			for (String error : limitLines(
+					errors,
+					parseIntOrDefault(
+					maxGeneralErrorsText,
+					999
+						)
+					)) {
+				lines.add(
+						'- ' +
+						cleanErrorLineForReport(
+						error,
+						allFiles
+							)
+						)
+			}
+		}
+
+		if (allFiles != null &&
+				!allFiles.isEmpty()) {
+			lines.add(
+					''
+					)
+
+			lines.add(
+					'Available files:'
+					)
+
+			for (File file : allFiles) {
+				lines.add(
+						'- ' +
+						file.getName()
+						)
+			}
+		}
+	}
+
+	return lines.join(
+			'\n'
+			)
+}
+
+String buildCurrencyHeadersReport(
+		String validationResult,
+		File file,
+		List<String> currencyHeaders,
+		Integer maxGeneral
+) {
+	List<File> files =
+			file == null ?
+				[] :
+				[file]
+
+	List<String> lines = []
+
+	lines.add(
+			'Headers checked: ' +
+			currencyHeaders.join(' | ')
+			)
+
+	lines.add(
+			'Checked files: ' +
+			files.size()
+			)
+
+	lines.add(
+			''
+			)
+
+	if (file != null) {
+		lines.add(
+				'File 1: ' +
+				(hasValidationFailure(
+				validationResult
+					) ?
+					'FAILED' :
+					'PASSED') +
+				' - ' +
+				file.getName()
+				)
+	}
+
+	if (hasValidationFailure(
+			validationResult
+			)) {
+		List<String> errors =
+				extractErrorLines(
+				validationResult
+					)
+
+		lines.add(
+				''
+				)
+
+		lines.add(
+				'Errors:'
+				)
+
+		for (String error : limitLines(
+				errors,
+				maxGeneral
+				)) {
+			lines.add(
+					'- ' +
+					cleanErrorLineForReport(
+					error,
+					files
+						)
+					)
+		}
+	}
+
+	return lines.join(
+			'\n'
+			)
+}
+
+String buildAmountComparisonReport(
+		String validationResult,
+		File file,
+		String amountHeader,
+		String baseAmountHeader,
+		String tolerancePercentText,
+		Integer maxPerFile,
+		Integer maxGeneral
+) {
+	List<File> files =
+			file == null ?
+				[] :
+				[file]
+
+	BigDecimal tolerancePercent =
+			parseDecimalOrDefault(
+			tolerancePercentText,
+			new BigDecimal(
+			'3'
+				)
+			)
+
+	List<Map> parsedRows =
+			parseAmountComparisonRows(
+			validationResult,
+			files,
+			tolerancePercent
+				)
+
+	List<Map> rejectedRows =
+			parsedRows.findAll {
+				Map row ->
+					Boolean.FALSE.equals(
+					row.accepted
+						)
+			}
+
+	List<Map> acceptedRows =
+			parsedRows.findAll {
+				Map row ->
+					Boolean.TRUE.equals(
+					row.accepted
+						)
+			}
+
+	Boolean shouldFail =
+			shouldFailAmountComparison(
+			validationResult,
+			file,
+			tolerancePercentText
+				)
+
+	List<String> lines = []
+
+	lines.add(
+			'Headers compared: ' +
+			amountHeader +
+			' | ' +
+			baseAmountHeader
+			)
+
+	lines.add(
+			'Accepted difference: <= ' +
+			formatDecimal(
+			tolerancePercent
+				) +
+			'%'
+			)
+
+	lines.add(
+			'Checked files: ' +
+			files.size()
+			)
+
+	lines.add(
+			''
+			)
+
+	if (file != null) {
+		if (shouldFail) {
+			if (!rejectedRows.isEmpty()) {
+				lines.add(
+						'File 1: FAILED - ' +
+						file.getName() +
+						' - ' +
+						rejectedRows.size() +
+						' wrong row(s) above tolerance.'
+						)
+			} else {
+				lines.add(
+						'File 1: FAILED - ' +
+						file.getName() +
+						' - Amount comparison returned an error.'
+						)
+			}
+		} else if (!acceptedRows.isEmpty()) {
+			lines.add(
+					'File 1: PASSED WITH ACCEPTED DIFFERENCES - ' +
+					file.getName() +
+					' - ' +
+					acceptedRows.size() +
+					' difference(s) within tolerance.'
+					)
+		} else {
+			lines.add(
+					'File 1: PASSED - ' +
+					file.getName() +
+					' - No amount errors returned.'
+					)
+		}
+	}
+
+	if (!hasValidationFailure(
+			validationResult
+			)) {
+		lines.add(
+				''
+				)
+
+		lines.add(
+				'Result: all amount values are equal.'
+				)
+
+		return lines.join(
+				'\n'
+				)
+	}
+
+	if (parsedRows.isEmpty()) {
+		lines.add(
+				''
+				)
+
+		lines.add(
+				'Result: failed.'
+				)
+
+		lines.add(
+				'Reason: the keyword returned an error, but no row-level values were available.'
+				)
+
+		lines.add(
+				''
+				)
+
+		lines.add(
+				'Raw errors:'
+				)
+
+		for (String error : limitLines(
+				extractErrorLines(
+				validationResult
+					),
+				maxGeneral
+				)) {
+			lines.add(
+					'- ' +
+					cleanErrorLineForReport(
+					error,
+					files
+						)
+					)
+		}
+
+		return lines.join(
+				'\n'
+				)
+	}
+
+	if (!rejectedRows.isEmpty()) {
+		lines.add(
+				''
+				)
+
+		lines.add(
+				'Wrong values:'
+				)
+
+		lines.add(
+				''
+				)
+
+		lines.add(
+				file == null ?
+					'Unknown file' :
+					file.getName()
+				)
+
+		lines.add(
+				'Row | Devise | Montant ccy | Montant base ccy | Difference | Difference % | Reason'
+				)
+
+		lines.add(
+				'--- | --- | --- | --- | --- | --- | ---'
+				)
+
+		for (Map row : rejectedRows.take(
+				maxPerFile
+				)) {
+			lines.add(
+					tableValue(
+					row.rowNumber
+						) +
+					' | ' +
+					tableValue(
+					row.devise
+						) +
+					' | ' +
+					tableValue(
+					row.amountCcy
+						) +
+					' | ' +
+					tableValue(
+					row.amountBaseCcy
+						) +
+					' | ' +
+					tableValue(
+					row.difference
+						) +
+					' | ' +
+					tableValue(
+					row.differencePercent
+						) +
+					' | ' +
+					tableValue(
+					row.reason
+						)
+					)
+		}
+
+		if (rejectedRows.size() >
+				maxPerFile) {
+			lines.add(
+					'... and ' +
+					(rejectedRows.size() -
+					maxPerFile) +
+					' more wrong row(s) in this file.'
+					)
+		}
+	}
+
+	if (!acceptedRows.isEmpty()) {
+		lines.add(
+				''
+				)
+
+		lines.add(
+				'Accepted differences:'
+				)
+
+		lines.add(
+				''
+				)
+
+		lines.add(
+				file == null ?
+					'Unknown file' :
+					file.getName()
+				)
+
+		lines.add(
+				'Row | Devise | Montant ccy | Montant base ccy | Difference | Difference % | Reason'
+				)
+
+		lines.add(
+				'--- | --- | --- | --- | --- | --- | ---'
+				)
+
+		for (Map row : acceptedRows.take(
+				maxPerFile
+				)) {
+			lines.add(
+					tableValue(
+					row.rowNumber
+						) +
+					' | ' +
+					tableValue(
+					row.devise
+						) +
+					' | ' +
+					tableValue(
+					row.amountCcy
+						) +
+					' | ' +
+					tableValue(
+					row.amountBaseCcy
+						) +
+					' | ' +
+					tableValue(
+					row.difference
+						) +
+					' | ' +
+					tableValue(
+					row.differencePercent
+						) +
+					' | ' +
+					tableValue(
+					row.reason
+						)
+					)
+		}
+
+		if (acceptedRows.size() >
+				maxPerFile) {
+			lines.add(
+					'... and ' +
+					(acceptedRows.size() -
+					maxPerFile) +
+					' more accepted row(s) in this file.'
+					)
+		}
+	}
+
+	return lines.join(
+			'\n'
+			)
+}
+
+Boolean shouldFailAmountComparison(
+		String validationResult,
+		File file,
+		String tolerancePercentText
+) {
+	if (!hasValidationFailure(
+			validationResult
+			)) {
+		return false
+	}
+
+	BigDecimal tolerancePercent =
+			parseDecimalOrDefault(
+			tolerancePercentText,
+			new BigDecimal(
+			'3'
+				)
+			)
+
+	List<File> files =
+			file == null ?
+				[] :
+				[file]
+
+	List<Map> parsedRows =
+			parseAmountComparisonRows(
+			validationResult,
+			files,
+			tolerancePercent
+				)
+
+	if (parsedRows.any {
+			Map row ->
+				Boolean.FALSE.equals(
+				row.accepted
+					)
+		}) {
+		return true
+	}
+
+	if (parsedRows.isEmpty()) {
+		return true
+	}
+
+	return false
+}
+
+List<Map> parseAmountComparisonRows(
+		String validationResult,
+		List<File> files,
+		BigDecimal tolerancePercent
+) {
+	List<Map> rows = []
+
+	String text =
+			cleanErrorLineForReport(
+			validationResult,
+			files
+				)
+			.replace(
+			'\r\n',
+			' '
+				)
+			.replace(
+			'\n',
+			' '
+				)
+			.replace(
+			'\r',
+			' '
+				)
+
+	def matcher =
+			text =~ /(?is)(?:^|[\s\-])File\s+'?([^'\s|]+\.xlsx)'?\s+row\s+(\d+)\s+has\s+different\s+amounts\.?\s*(.*?)(?=(?:[\s\-]File\s+'?[^'\s|]+\.xlsx'?\s+row\s+\d+\s+has\s+different\s+amounts)|$)/
+
+	while (matcher.find()) {
+		String fileName =
+				matcher.group(
+				1
+					).trim()
+
+		String rowNumber =
+				matcher.group(
+				2
+					).trim()
+
+		String details =
+				matcher.group(
+				3
+					).trim()
+
+		String devise =
+				extractByRegex(
+				details,
+				"Devise\\s*=\\s*'([^']*)'"
+					)
+
+		String amountCcy =
+				extractByRegex(
+				details,
+				"Montant ccy\\s*=\\s*'([^']*)'"
+					)
+
+		String amountBaseCcy =
+				extractByRegex(
+				details,
+				"Montant base ccy\\s*=\\s*'([^']*)'"
+					)
+
+		BigDecimal amountCcyNumber =
+				parseDecimalOrNull(
+				amountCcy
+					)
+
+		BigDecimal amountBaseCcyNumber =
+				parseDecimalOrNull(
+				amountBaseCcy
+					)
+
+		BigDecimal difference = null
+		BigDecimal differencePercent = null
+		Boolean accepted = false
+		String reason = ''
+
+		if (amountCcyNumber == null ||
+				amountBaseCcyNumber == null) {
+			reason =
+					'Cannot calculate difference because one amount is missing or not numeric.'
+
+			accepted = false
+		} else {
+			difference =
+					amountCcyNumber
+					.subtract(
+					amountBaseCcyNumber
+						)
+					.abs()
+
+			if (amountBaseCcyNumber.compareTo(
+					BigDecimal.ZERO
+					) == 0) {
+				differencePercent =
+						difference.compareTo(
+						BigDecimal.ZERO
+							) == 0 ?
+							BigDecimal.ZERO :
+							new BigDecimal(
+							'100'
+								)
+			} else {
+				differencePercent =
+						difference
+						.divide(
+						amountBaseCcyNumber.abs(),
+						10,
+						RoundingMode.HALF_UP
+							)
+						.multiply(
+						new BigDecimal(
+						'100'
+							)
+							)
+			}
+
+			accepted =
+					differencePercent.compareTo(
+					tolerancePercent
+						) <= 0
+
+			reason =
+					accepted ?
+						'Accepted within tolerance.' :
+						'Difference is above the accepted tolerance.'
+		}
+
+		rows.add(
+				[
+					fileName         : fileName,
+					rowNumber        : rowNumber,
+					devise           : devise,
+					amountCcy        : amountCcy,
+					amountBaseCcy    : amountBaseCcy,
+					difference       :
+							difference == null ?
+								'-' :
+								formatDecimal(
+								difference
+									),
+					differencePercent:
+							differencePercent == null ?
+								'-' :
+								formatDecimal(
+								differencePercent
+									) +
+								'%',
+					accepted         : accepted,
+					reason           : reason
+				]
+				)
+	}
+
+	return rows
+}
+
+String cellText(
+		Cell cell,
+		DataFormatter formatter,
+		def evaluator
+) {
+	if (cell == null) {
+		return ''
+	}
+
+	try {
+		return formatter
+				.formatCellValue(
+				cell,
+				evaluator
+					)
+				.trim()
+	} catch (Throwable ignored) {
+		try {
+			return formatter
+					.formatCellValue(
+					cell
+						)
+					.trim()
+		} catch (Throwable ignoredAgain) {
+			return ''
+		}
+	}
+}
+
+String normalizeHeader(
+		String value
+) {
+	return safeText(
+			value
+				)
+			.toLowerCase(
+			Locale.ENGLISH
+				)
+			.replaceAll(
+			'[^a-z0-9]+',
+			''
+				)
+}
+
+String combineValidationResults(
+		Object... values
+) {
+	List<String> results = []
+
+	if (values == null) {
+		return ''
+	}
+
+	for (Object value : values) {
+		String text =
+				value == null ?
+					'' :
+					String.valueOf(
+					value
+						).trim()
+
+		if (!text.isEmpty()) {
+			results.add(
+					text
+					)
+		}
+	}
+
+	return results.join(
+			'\n'
+			)
+}
+
+Boolean hasValidationFailure(
+		String validationResult
+) {
+	String result =
+			validationResult == null ?
+				'' :
+				validationResult.trim()
+
+	if (result.isEmpty()) {
+		return false
+	}
+
+	if (isSkippedResult(
+			result
+			)) {
+		return false
+	}
+
+	String upper =
+			result.toUpperCase(
+			Locale.ENGLISH
+				)
+
+	if (upper == 'PASS' ||
+			upper == 'PASSED' ||
+			upper == 'SUCCESS') {
+		return false
+	}
+
+	if (upper.startsWith(
+			'[PASS]'
+			) ||
+			upper.startsWith(
+			'[PASSED]'
+			) ||
+			upper.startsWith(
+			'[SUCCESS]'
+			)) {
+		return false
+	}
+
+	if (upper.contains(
+			'RESULT: PASSED'
+			)) {
+		return false
+	}
+
+	return true
+}
+
+Boolean isSkippedResult(
+		String validationResult
+) {
+	String result =
+			validationResult == null ?
+				'' :
+				validationResult.trim()
+
+	result =
+			result.replaceFirst(
+			'^\\s*[^A-Za-z0-9\\[]+\\s*',
+			''
+				)
+
+	return result.startsWith(
+			'[SKIPPED]'
+			)
+}
+
+List<String> parseHeaderList(
+		String text
+) {
+	List<String> result = []
+
+	String value =
+			text == null ?
+				'' :
+				text.trim()
+
+	if (value.isEmpty()) {
+		return result
+	}
+
+	String[] parts =
+			value.split(
+			'\\|'
+				)
+
+	for (String part : parts) {
+		String clean =
+				part == null ?
+					'' :
+					part.trim()
+
+		if (!clean.isEmpty()) {
+			result.add(
+					clean
+					)
+		}
+	}
+
+	return result
+}
+
+List<File> parseFileList(
+		String filesText
+) {
+	List<File> files = []
+
+	String text =
+			filesText == null ?
+				'' :
+				filesText.trim()
+
+	if (text.isEmpty()) {
+		return files
+	}
+
+	String normalized =
+			text
+			.replace(
+			'\r\n',
+			'|'
+				)
+			.replace(
+			'\n',
+			'|'
+				)
+			.replace(
+			';',
+			'|'
+				)
+
+	String[] parts =
+			normalized.split(
+			'\\|'
+				)
+
+	for (String part : parts) {
+		String clean =
+				part == null ?
+					'' :
+					part.trim()
+
+		if (!clean.isEmpty()) {
+			files.add(
+					new File(
+					clean
+						)
+					)
+		}
+	}
+
+	return files.unique {
+		File file ->
+			file.getAbsolutePath()
+				.toLowerCase(
+				Locale.ENGLISH
+					)
+	}
+}
+
+List<String> extractErrorLines(
+		String validationResult
+) {
+	List<String> lines = []
+
+	String result =
+			validationResult == null ?
+				'' :
+				validationResult.trim()
+
+	if (result.isEmpty()) {
+		return lines
+	}
+
+	String normalized =
+			result
+			.replace(
+			'\r\n',
+			'\n'
+				)
+			.replace(
+			'\r',
+			'\n'
+				)
+
+	String[] parts =
+			normalized.split(
+			'\n'
+				)
+
+	for (String part : parts) {
+		String clean =
+				part == null ?
+					'' :
+					part.trim()
+
+		if (!clean.isEmpty()) {
+			lines.add(
+					clean
+					)
+		}
+	}
+
+	if (lines.isEmpty()) {
+		lines.add(
+				result
+				)
+	}
+
+	return lines
+}
+
+List<String> limitLines(
+		List<String> lines,
+		Integer limit
+) {
+	List<String> result = []
+
+	if (lines == null ||
+			lines.isEmpty()) {
+		return result
+	}
+
+	Integer safeLimit =
+			limit == null ||
+			limit <= 0 ?
+				999 :
+				limit
+
+	for (int i = 0;
+			i < lines.size() &&
+			i < safeLimit;
+			i++) {
+		result.add(
+				lines[i]
+				)
+	}
+
+	return result
+}
+
+String cleanErrorLineForReport(
+		String errorLine,
+		List<File> files
+) {
+	String line =
+			errorLine == null ?
+				'' :
+				errorLine.trim()
+
+	line =
+			line.replace(
+			'[ERROR]',
+			''
+				).trim()
+
+	line =
+			line.replace(
+			'[FAIL]',
+			''
+				).trim()
+
+	line =
+			line.replace(
+			'[FAILED]',
+			''
+				).trim()
+
+	line =
+			line.replace(
+			'[PASS]',
+			''
+				).trim()
+
+	line =
+			line.replace(
+			'[PASSED]',
+			''
+				).trim()
+
+	line =
+			line.replace(
+			'[SKIPPED]',
+			''
+				).trim()
+
+	line =
+			line.replaceFirst(
+			'^\\s*[^A-Za-z0-9\\[]+\\s*',
+			''
+				).trim()
+
+	line =
+			line.replaceAll(
+			'^com\\.kms\\.katalon\\.core\\.exception\\.StepFailedException:\\s*',
+			''
+				).trim()
+
+	line =
+			line.replaceAll(
+			'^Reason:\\s*com\\.kms\\.katalon\\.core\\.exception\\.StepFailedException:\\s*',
+			'Reason: '
+				).trim()
+
+	for (File file : files ?: []) {
+		line =
+				line.replace(
+				file.getAbsolutePath(),
+				file.getName()
+					)
+
+		line =
+				line.replace(
+				file.getPath(),
+				file.getName()
+					)
+	}
+
+	line =
+			stripPathsKeepingFileNames(
+			line
+				)
+
+	return line.trim()
+}
+
+String stripPathsKeepingFileNames(
+		String value
+) {
+	String line =
+			value == null ?
+				'' :
+				value
+
+	line =
+			line.replace(
+			'\\',
+			'/'
+				)
+
+	line =
+			line.replaceAll(
+			'[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.xlsx)',
+			'$1'
+				)
+
+	line =
+			line.replaceAll(
+			'[A-Za-z]:/[^\\s|"]*/([^/\\s|"]+\\.xls)',
+			'$1'
+				)
+
+	return line
+}
+
+BigDecimal parseDecimalOrNull(
+		String value
+) {
+	String text =
+			value == null ?
+				'' :
+				value.trim()
+
+	if (text.isEmpty() ||
+			text == '-') {
+		return null
+	}
+
+	String clean =
+			text
+			.replace(
+			' ',
+			''
+				)
+			.replace(
+			"'",
+			''
+				)
+
+	if (clean.startsWith(
+			'('
+			) &&
+			clean.endsWith(
+			')'
+			)) {
+		clean =
+				'-' +
+				clean.substring(
+				1,
+				clean.length() - 1
+					)
+	}
+
+	if (clean.contains(
+			','
+			) &&
+			clean.contains(
+			'.'
+			)) {
+		Integer lastComma =
+				clean.lastIndexOf(
+				','
+					)
+
+		Integer lastDot =
+				clean.lastIndexOf(
+				'.'
+					)
+
+		if (lastComma >
+				lastDot) {
+			clean =
+				clean
+					.replace(
+					'.',
+					''
+						)
+					.replace(
+					',',
+					'.'
+						)
+		} else {
+			clean =
+				clean.replace(
+				',',
+				''
+					)
+		}
+	} else if (clean.contains(
+			','
+			) &&
+			!clean.contains(
+			'.'
+			)) {
+		clean =
+			clean.replace(
+				',',
+				'.'
+					)
+	}
+
+	try {
+		return new BigDecimal(
+				clean
+				)
+	} catch (Throwable ignored) {
+		return null
+	}
+}
+
+BigDecimal parseDecimalOrDefault(
+		String value,
+		BigDecimal defaultValue
+) {
+	BigDecimal parsed =
+			parseDecimalOrNull(
+			value
+				)
+
+	return parsed == null ?
+			defaultValue :
+			parsed
+}
+
+String extractByRegex(
+		String text,
+		String pattern
+) {
+	try {
+		def matcher =
+				text =~ pattern
+
+		if (matcher.find()) {
+			return matcher
+					.group(
+					1
+						)
+					.trim()
+		}
+	} catch (Throwable ignored) {
+	}
+
+	return ''
+}
+
+String formatDecimal(
+		BigDecimal value
+) {
+	if (value == null) {
+		return '-'
+	}
+
+	BigDecimal normalized =
+			value
+			.setScale(
+			4,
+			RoundingMode.HALF_UP
+				)
+			.stripTrailingZeros()
+
+	return normalized.toPlainString()
+}
+
+String safeText(
+		Object value
+) {
+	String text =
+			value == null ?
+				'' :
+				String.valueOf(
+				value
+					).trim()
+
+	return text.isEmpty() ?
+			'' :
+			text
+}
+
+String tableValue(
+		Object value
+) {
+	String text =
+			safeText(
+			value
+				)
+
+	if (text.isEmpty()) {
+		return '-'
+	}
+
+	return text.replace(
+			'|',
+			'/'
+			)
+}
+
+Integer parseIntOrDefault(
+		String value,
+		Integer defaultValue
+) {
+	try {
+		return Integer.parseInt(
+				value == null ?
+					'' :
+					value.trim()
+				)
+	} catch (Exception ignored) {
+		return defaultValue
+	}
+}
+
+String readTcVariable(
+		String variableName,
+		String defaultValue
+) {
+	try {
+		if (getBinding() != null &&
+				getBinding().hasVariable(
+				variableName
+					)) {
+			Object raw =
+					getBinding().getVariable(
+					variableName
+						)
+
+			String value =
+					raw == null ?
+						'' :
+						String.valueOf(
+						raw
+							).trim()
+
+			if (!value.isEmpty()) {
+				return value
+			}
+		}
+	} catch (Throwable ignored) {
+	}
+
+	return defaultValue
+}
+
+
+
+
+
+
+
+
+
+package commands
+
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
+import java.awt.event.KeyEvent
+import java.text.Normalizer
+import java.text.SimpleDateFormat
+
+import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.DataFormatter
+import org.apache.poi.ss.usermodel.FormulaEvaluator
+import org.apache.poi.ss.usermodel.Row
+import org.apache.poi.ss.usermodel.Sheet
+import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import internal.GlobalVariable
+
+class ExportFile {
+
+	private static final Integer MAX_WINDOWS_PATH_LENGTH = 220
+	private static final Integer MAX_COLLECTION_LENGTH = 20
+	private static final Integer MAX_FEATURE_LENGTH = 28
+	private static final Integer MAX_LABEL_LENGTH = 20
+
+	private static final String SHORT_EXPORT_ROOT = 'C:\\KatalonExports'
+
+	private ImageLoader imageLoader = new ImageLoader()
+
+	@Keyword
+	void exportFromOutilsToNo(String exportLabel) {
+		exportFromOutilsToNo(exportLabel, null)
+	}
+
+	@Keyword
+	void exportFromOutilsToNo(
+			String exportLabel,
+			String targetEnvironment
+	) {
+		KeywordUtil.logInfo(
+				'Step 1. Open Outils menu.'
+				)
+
+		imageLoader.waitForImageOrStop(
+				'General',
+				'outilsMenu',
+				15
+				)
+
+		imageLoader.clickImageOrStop(
+				'General',
+				'outilsMenu'
+				)
+
+		Windows.delay(2)
+
+		KeywordUtil.logInfo(
+				'Step 2. Validate Export button and click it.'
+				)
+
+		clickExportButtonByElement()
+
+		Windows.delay(3)
+
+		KeywordUtil.logInfo(
+				'Step 3. Save file inside short REC/PRD export folder.'
+				)
+
+		File exportedFile = saveToShortExportFolder(
+				exportLabel,
+				targetEnvironment
+				)
+
+		KeywordUtil.logInfo(
+				'Step 4. Close open-file modal.'
+				)
+
+		closeOpenFileModal()
+
+		KeywordUtil.logInfo(
+				'Step 5. Validate exported Excel file has rows and values.'
+				)
+
+		validateExportedExcelFileHasRowsAndValues(
+				exportedFile
+				)
+
+		KeywordUtil.logInfo(
+				'Export flow finished without opening exported file.'
+				)
+	}
+
+	@Keyword
+	void exportFromTwoExportImagesToNo(String exportLabel) {
+		exportFromTwoExportImagesToNo(
+				exportLabel,
+				null
+				)
+	}
+
+	@Keyword
+	void exportFromTwoExportImagesToNo(
+			String exportLabel,
+			String targetEnvironment
+	) {
+		KeywordUtil.logInfo(
+				'Step 1. Validate Exports element and click it.'
+				)
+
+		clickExportsButtonByElement()
+
+		Windows.delay(2)
+
+		KeywordUtil.logInfo(
+				'Step 2. Validate Export button and click it.'
+				)
+
+		clickExportButtonByElement()
+
+		Windows.delay(3)
+
+		KeywordUtil.logInfo(
+				'Step 3. Save file inside short REC/PRD export folder.'
+				)
+
+		File exportedFile = saveToShortExportFolder(
+				exportLabel,
+				targetEnvironment
+				)
+
+		KeywordUtil.logInfo(
+				'Step 4. Close open-file modal.'
+				)
+
+		closeOpenFileModal()
+
+		KeywordUtil.logInfo(
+				'Step 5. Validate exported Excel file has rows and values.'
+				)
+
+		validateExportedExcelFileHasRowsAndValues(
+				exportedFile
+				)
+
+		KeywordUtil.logInfo(
+				'Exports flow finished without opening exported file.'
+				)
+	}
+
+	@Keyword
+	void exportFromExportsAndExportButtonToNo(String exportLabel) {
+		exportFromExportsAndExportButtonToNo(
+				exportLabel,
+				null
+				)
+	}
+
+	@Keyword
+	void exportFromExportsAndExportButtonToNo(
+			String exportLabel,
+			String targetEnvironment
+	) {
+		KeywordUtil.logInfo(
+				'Step 1. Validate Exports element and click it.'
+				)
+
+		clickExportsButtonByElement()
+
+		Windows.delay(2)
+
+		KeywordUtil.logInfo(
+				'Step 2. Validate Export button and click it.'
+				)
+
+		clickExportButtonByElement()
+
+		Windows.delay(3)
+
+		KeywordUtil.logInfo(
+				'Step 3. Save file inside short REC/PRD export folder.'
+				)
+
+		File exportedFile = saveToShortExportFolder(
+				exportLabel,
+				targetEnvironment
+				)
+
+		KeywordUtil.logInfo(
+				'Step 4. Close open-file modal.'
+				)
+
+		closeOpenFileModal()
+
+		KeywordUtil.logInfo(
+				'Step 5. Validate exported Excel file has rows and values.'
+				)
+
+		validateExportedExcelFileHasRowsAndValues(
+				exportedFile
+				)
+
+		KeywordUtil.logInfo(
+				'Exports and Export button flow finished successfully.'
+				)
+	}
+
+	private void clickExportsButtonByElement() {
+		WindowsTestObject exportsButton = buildXpathObject(
+				"//*[@Name='Exports' and " +
+				"(@LocalizedControlType='button' or contains(@ControlType,'Button'))]"
+				)
+
+		boolean found = Windows.verifyElementPresent(
+				exportsButton,
+				5,
+				FailureHandling.OPTIONAL
+				)
+
+		if (!found) {
+			imageLoader.takeEvidence(
+					'ExportsButtonNotFound.png'
+					)
+
+			KeywordUtil.markFailedAndStop(
+					'Exports button was not found.\n' +
+					'Expected element name: Exports'
+					)
+		}
+
+		Windows.click(
+				exportsButton
+				)
+
+		KeywordUtil.logInfo(
+				'Exports button clicked successfully.'
+				)
+	}
+
+	private void clickExportButtonByElement() {
+		WindowsTestObject exportButton = buildXpathObject(
+				"//*[@Name='Export' and " +
+				"(@LocalizedControlType='button' or contains(@ControlType,'Button'))]"
+				)
+
+		boolean found = Windows.verifyElementPresent(
+				exportButton,
+				5,
+				FailureHandling.OPTIONAL
+				)
+
+		if (!found) {
+			imageLoader.takeEvidence(
+					'ExportButtonNotFound.png'
+					)
+
+			KeywordUtil.markFailedAndStop(
+					'Export button was not found.\n' +
+					'Expected element name: Export'
+					)
+		}
+
+		Windows.click(
+				exportButton
+				)
+
+		KeywordUtil.logInfo(
+				'Export button clicked successfully.'
+				)
+	}
+
+	private File saveToShortExportFolder(
+			String exportLabel,
+			String targetEnvironment
+	) {
+		String environment = resolveEnvironmentName(
+				targetEnvironment,
+				exportLabel
+				)
+
+		String collectionName = shortenFilePart(
+				sanitizeFileName(
+				resolveCurrentCollectionName()
+				),
+				MAX_COLLECTION_LENGTH
+				)
+
+		String featureName = shortenFilePart(
+				sanitizeFileName(
+				resolveCurrentFeatureName()
+				),
+				MAX_FEATURE_LENGTH
+				)
+
+		String exportLabelSuffix = shortenFilePart(
+				resolveExportLabelSuffixForFileName(
+				exportLabel
+				),
+				MAX_LABEL_LENGTH
+				)
+
+		File directory = resolveShortExportDirectory(
+				environment,
+				collectionName,
+				featureName
+				)
+
+		if (!directory.exists()) {
+			boolean created = directory.mkdirs()
+
+			if (!created && !directory.exists()) {
+				KeywordUtil.markFailedAndStop(
+						'Could not create short export directory.\n' +
+						'Directory: ' + directory.getAbsolutePath()
+						)
+			}
+		}
+
+		String fileName = buildAutomaticExportFileName(
+				environment,
+				featureName,
+				exportLabelSuffix
+				)
+
+		File exportedFile = new File(
+				directory,
+				fileName
+				)
+
+		exportedFile = ensurePathIsShortEnough(
+				exportedFile,
+				environment,
+				exportLabelSuffix
+				)
+
+		KeywordUtil.logInfo(
+				'Short export configuration.\n' +
+				'Environment: ' + environment + '\n' +
+				'Collection: ' + collectionName + '\n' +
+				'Feature: ' + featureName + '\n' +
+				'Export label: ' + exportLabelSuffix + '\n' +
+				'Directory: ' + exportedFile.getParentFile().getAbsolutePath() + '\n' +
+				'File name: ' + exportedFile.getName() + '\n' +
+				'Full path length: ' + exportedFile.getAbsolutePath().length() + '\n' +
+				'Maximum allowed by automation: ' + MAX_WINDOWS_PATH_LENGTH
+				)
+
+		Windows.click(
+				findWindowsObject(
+				'Object Repository/Acapulco/filePath'
+				)
+				)
+
+		Windows.delay(1)
+
+		clearFocusedField()
+
+		pasteAndEnter(
+				exportedFile.getParentFile().getAbsolutePath()
+				)
+
+		Windows.delay(2)
+
+		setFileName(
+				exportedFile.getName()
+				)
+
+		Windows.click(
+				findWindowsObject(
+				'General/btnSave'
+				)
+				)
+
+		Windows.delay(3)
+
+		waitForExportedFileOrStop(
+				exportedFile,
+				20
+				)
+
+		return exportedFile
+	}
+
+	private File resolveShortExportDirectory(
+			String environment,
+			String collectionName,
+			String featureName
+	) {
+		File rootDirectory = resolveShortExportRoot()
+
+		File environmentDirectory = new File(
+				rootDirectory,
+				shortenFilePart(
+				sanitizeFileName(environment),
+				8
+				)
+				)
+
+		File collectionDirectory = new File(
+				environmentDirectory,
+				collectionName
+				)
+
+		return new File(
+				collectionDirectory,
+				featureName
+				)
+	}
+
+	private File resolveShortExportRoot() {
+		File preferredRoot = new File(
+				SHORT_EXPORT_ROOT
+				)
+
+		try {
+			if (!preferredRoot.exists()) {
+				preferredRoot.mkdirs()
+			}
+
+			if (preferredRoot.exists() &&
+					preferredRoot.isDirectory() &&
+					preferredRoot.canWrite()) {
+				return preferredRoot
+			}
+		} catch (Exception ignored) {
+		}
+
+		File temporaryRoot = new File(
+				System.getProperty('java.io.tmpdir'),
+				'KatalonExports'
+				)
+
+		if (!temporaryRoot.exists()) {
+			temporaryRoot.mkdirs()
+		}
+
+		return temporaryRoot
+	}
+
+	private File ensurePathIsShortEnough(
+			File proposedFile,
+			String environment,
+			String exportLabelSuffix
+	) {
+		if (proposedFile.getAbsolutePath().length() <= MAX_WINDOWS_PATH_LENGTH) {
+			return proposedFile
+		}
+
+		String timestamp = new SimpleDateFormat(
+				'yyyyMMdd_HHmmss'
+				).format(
+				new Date()
+				)
+
+		String shortEnvironment = shortenFilePart(
+				sanitizeFileName(environment),
+				6
+				)
+
+		String shortLabel = shortenFilePart(
+				sanitizeFileName(exportLabelSuffix),
+				12
+				)
+
+		File shortDirectory = new File(
+				resolveShortExportRoot(),
+				shortEnvironment
+				)
+
+		if (!shortDirectory.exists()) {
+			shortDirectory.mkdirs()
+		}
+
+		String shortFileName =
+				shortEnvironment +
+				'_' +
+				timestamp
+
+		if (shortLabel != null && !shortLabel.trim().isEmpty()) {
+			shortFileName =
+					shortFileName +
+					'_' +
+					shortLabel
+		}
+
+		shortFileName =
+				shortFileName +
+				'.xlsx'
+
+		File shortFile = new File(
+				shortDirectory,
+				shortFileName
+				)
+
+		if (shortFile.getAbsolutePath().length() > MAX_WINDOWS_PATH_LENGTH) {
+			KeywordUtil.markFailedAndStop(
+					'Could not create an export path shorter than the configured limit.\n' +
+					'Path: ' + shortFile.getAbsolutePath() + '\n' +
+					'Length: ' + shortFile.getAbsolutePath().length()
+					)
+		}
+
+		KeywordUtil.logInfo(
+				'Original export path was too long.\n' +
+				'Fallback short path selected: ' +
+				shortFile.getAbsolutePath()
+				)
+
+		return shortFile
+	}
+
+	private void waitForExportedFileOrStop(
+			File exportedFile,
+			Integer timeoutSeconds
+	) {
+		int safeTimeout =
+				timeoutSeconds == null ||
+				timeoutSeconds <= 0 ?
+				20 :
+				timeoutSeconds
+
+		int elapsedSeconds = 0
+
+		while (elapsedSeconds < safeTimeout) {
+			if (exportedFile.exists() &&
+					exportedFile.isFile() &&
+					exportedFile.length() > 0) {
+				KeywordUtil.logInfo(
+						'Exported file found.\n' +
+						'Path: ' + exportedFile.getAbsolutePath() + '\n' +
+						'Size bytes: ' + exportedFile.length()
+						)
+
+				return
+			}
+
+			Windows.delay(1)
+			elapsedSeconds = elapsedSeconds + 1
+		}
+
+		imageLoader.takeEvidence(
+				'ExportedFileNotFound.png'
+				)
+
+		KeywordUtil.markFailedAndStop(
+				'Exported file was not found or is empty after save.\n' +
+				'Expected path: ' + exportedFile.getAbsolutePath() + '\n' +
+				'Path length: ' + exportedFile.getAbsolutePath().length() + '\n' +
+				'Timeout seconds: ' + safeTimeout
+				)
+	}
+
+	private void closeOpenFileModal() {
+		KeywordUtil.logInfo(
+				'Waiting for open-file modal image.'
+				)
+
+		String modalImageName = null
+
+		boolean modalVisible = imageLoader.waitForImage(
+				'General',
+				'iconeModal',
+				5
+				)
+
+		if (modalVisible) {
+			modalImageName = 'iconeModal'
+		} else {
+			modalVisible = imageLoader.waitForImage(
+					'General',
+					'iconeModalPRD',
+					5
+					)
+
+			if (modalVisible) {
+				modalImageName = 'iconeModalPRD'
+			}
+		}
+
+		if (!modalVisible) {
+			Windows.delay(1)
+
+			modalVisible = imageLoader.waitForImage(
+					'General',
+					'iconeModal',
+					3
+					)
+
+			if (modalVisible) {
+				modalImageName = 'iconeModal'
+			} else {
+				modalVisible = imageLoader.waitForImage(
+						'General',
+						'iconeModalPRD',
+						3
+						)
+
+				if (modalVisible) {
+					modalImageName = 'iconeModalPRD'
+				}
+			}
+		}
+
+		if (!modalVisible) {
+			imageLoader.takeEvidence(
+					'OpenFileModalNotFound.png'
+					)
+
+			KeywordUtil.markFailedAndStop(
+					'Open-file modal was not found.\n' +
+					'Expected REC image: General/iconeModal\n' +
+					'Expected PRD image: General/iconeModalPRD'
+					)
+		}
+
+		KeywordUtil.logInfo(
+				'Open-file modal detected using image General/' +
+				modalImageName +
+				'. Pressing TAB and ENTER to select Non.'
+				)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(
+				KeyEvent.VK_TAB
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_TAB
+				)
+
+		Thread.sleep(300)
+
+		robot.keyPress(
+				KeyEvent.VK_ENTER
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_ENTER
+				)
+
+		Windows.delay(1)
+
+		boolean recModalStillVisible = imageLoader.isVisible(
+				'General',
+				'iconeModal'
+				)
+
+		boolean prdModalStillVisible = imageLoader.isVisible(
+				'General',
+				'iconeModalPRD'
+				)
+
+		if (recModalStillVisible || prdModalStillVisible) {
+			imageLoader.takeEvidence(
+					'OpenFileModalStillVisible.png'
+					)
+
+			KeywordUtil.markFailedAndStop(
+					'Open-file modal is still visible after TAB and ENTER.'
+					)
+		}
+
+		KeywordUtil.logInfo(
+				'Open-file modal closed successfully.'
+				)
+	}
+
+	private void validateExportedExcelFileHasRowsAndValues(
+			File exportedFile
+	) {
+		if (exportedFile == null ||
+				!exportedFile.exists() ||
+				!exportedFile.isFile()) {
+			KeywordUtil.markFailedAndStop(
+					'Exported file does not exist for validation.\n' +
+					'Path: ' +
+					(exportedFile == null ?
+					'null' :
+					exportedFile.getAbsolutePath())
+					)
+		}
+
+		if (exportedFile.length() <= 0) {
+			KeywordUtil.markFailedAndStop(
+					'Exported file is empty.\n' +
+					'Path: ' +
+					exportedFile.getAbsolutePath()
+					)
+		}
+
+		Workbook workbook = null
+
+		try {
+			workbook = WorkbookFactory.create(
+					exportedFile
+					)
+
+			if (workbook.getNumberOfSheets() <= 0) {
+				KeywordUtil.markFailedAndStop(
+						'Exported Excel file has no sheets.\n' +
+						'Path: ' +
+						exportedFile.getAbsolutePath()
+						)
+			}
+
+			Sheet sheet = workbook.getSheetAt(0)
+
+			FormulaEvaluator evaluator =
+					workbook
+					.getCreationHelper()
+					.createFormulaEvaluator()
+
+			DataFormatter formatter =
+					new DataFormatter()
+
+			int nonEmptyRows = 0
+			int nonEmptyCells = 0
+
+			for (int rowIndex = 0;
+					rowIndex <= sheet.getLastRowNum();
+					rowIndex++) {
+				Row row = sheet.getRow(
+						rowIndex
+						)
+
+				if (row == null) {
+					continue
+				}
+
+				boolean rowHasValue = false
+				int lastCellNumber = row.getLastCellNum()
+
+				if (lastCellNumber < 0) {
+					continue
+				}
+
+				for (int cellIndex = 0;
+						cellIndex < lastCellNumber;
+						cellIndex++) {
+					Cell cell = row.getCell(
+							cellIndex
+							)
+
+					if (cell == null) {
+						continue
+					}
+
+					String value =
+							formatter.formatCellValue(
+							cell,
+							evaluator
+							)
+
+					if (value != null &&
+							!value.trim().isEmpty()) {
+						nonEmptyCells =
+								nonEmptyCells + 1
+
+						rowHasValue = true
+					}
+				}
+
+				if (rowHasValue) {
+					nonEmptyRows =
+							nonEmptyRows + 1
+				}
+			}
+
+			KeywordUtil.logInfo(
+					'Exported Excel validation result.\n' +
+					'File: ' + exportedFile.getName() + '\n' +
+					'Non-empty rows: ' + nonEmptyRows + '\n' +
+					'Non-empty cells: ' + nonEmptyCells
+					)
+
+			if (nonEmptyRows <= 1) {
+				KeywordUtil.markFailedAndStop(
+						'Exported Excel file does not have enough rows with values.\n' +
+						'File: ' + exportedFile.getName() + '\n' +
+						'Non-empty rows: ' + nonEmptyRows
+						)
+			}
+
+			if (nonEmptyCells <= 0) {
+				KeywordUtil.markFailedAndStop(
+						'Exported Excel file does not have values.\n' +
+						'File: ' + exportedFile.getName()
+						)
+			}
+		} catch (Exception e) {
+			KeywordUtil.markFailedAndStop(
+					'Could not validate exported Excel file.\n' +
+					'File: ' + exportedFile.getName() + '\n' +
+					'Reason: ' + e.getMessage()
+					)
+		} finally {
+			try {
+				if (workbook != null) {
+					workbook.close()
+				}
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private String buildAutomaticExportFileName(
+			String environment,
+			String featureName,
+			String exportLabelSuffix
+	) {
+		String timestamp = new SimpleDateFormat(
+				'yyyyMMdd_HHmmss'
+				).format(
+				new Date()
+				)
+
+		String safeEnvironment = shortenFilePart(
+				sanitizeFileName(
+				environment == null ||
+				environment.trim().isEmpty() ?
+				'REC' :
+				environment
+				),
+				6
+				)
+
+		String safeFeatureName = shortenFilePart(
+				sanitizeFileName(
+				featureName == null ||
+				featureName.trim().isEmpty() ?
+				'Export' :
+				featureName
+				),
+				MAX_FEATURE_LENGTH
+				)
+
+		String safeExportLabelSuffix = shortenFilePart(
+				sanitizeFileName(
+				exportLabelSuffix == null ?
+				'' :
+				exportLabelSuffix
+				),
+				MAX_LABEL_LENGTH
+				)
+
+		String baseFileName =
+				safeEnvironment +
+				'_' +
+				timestamp +
+				'_' +
+				safeFeatureName
+
+		if (safeExportLabelSuffix != null &&
+				!safeExportLabelSuffix.trim().isEmpty() &&
+				safeExportLabelSuffix != 'Export') {
+			baseFileName =
+					baseFileName +
+					'_' +
+					safeExportLabelSuffix
+		}
+
+		return baseFileName + '.xlsx'
+	}
+
+	private String resolveExportLabelSuffixForFileName(
+			String exportLabel
+	) {
+		if (exportLabel == null ||
+				exportLabel.trim().isEmpty()) {
+			return ''
+		}
+
+		String value = sanitizeFileName(
+				exportLabel
+				)
+
+		value = value.replaceFirst(
+				'(?i)^REC_',
+				''
+				)
+
+		value = value.replaceFirst(
+				'(?i)^PRD_',
+				''
+				)
+
+		value = value.replaceFirst(
+				'(?i)^REC-',
+				''
+				)
+
+		value = value.replaceFirst(
+				'(?i)^PRD-',
+				''
+				)
+
+		value = value.replaceFirst(
+				'(?i)^REC ',
+				''
+				)
+
+		value = value.replaceFirst(
+				'(?i)^PRD ',
+				''
+				)
+
+		if (value == null ||
+				value.trim().isEmpty()) {
+			return ''
+		}
+
+		return value
+	}
+
+	private String resolveEnvironmentName(
+			String targetEnvironment,
+			String exportLabel
+	) {
+		String environmentFromParameter =
+				normalizeEnvironmentNameStrict(
+				targetEnvironment
+				)
+
+		if (environmentFromParameter != null) {
+			KeywordUtil.logInfo(
+					'Environment resolved from targetEnvironment parameter: ' +
+					environmentFromParameter
+					)
+
+			return environmentFromParameter
+		}
+
+		List<String> globalVariableNames = [
+			'targetEnvironment',
+			'currentEnvironment',
+			'environment',
+			'env',
+			'ENV',
+			'currentEnv',
+			'environmentName'
+		]
+
+		for (String variableName : globalVariableNames) {
+			String globalValue =
+					getGlobalVariableValue(
+					variableName
+					)
+
+			String normalizedValue =
+					normalizeEnvironmentNameStrict(
+					globalValue
+					)
+
+			if (normalizedValue != null) {
+				KeywordUtil.logInfo(
+						'Environment resolved from GlobalVariable.' +
+						variableName +
+						': ' +
+						normalizedValue
+						)
+
+				return normalizedValue
+			}
+		}
+
+		String environmentFromProfile =
+				normalizeEnvironmentNameStrict(
+				RunConfiguration.getExecutionProfile()
+				)
+
+		if (environmentFromProfile != null) {
+			KeywordUtil.logInfo(
+					'Environment resolved from execution profile: ' +
+					environmentFromProfile
+					)
+
+			return environmentFromProfile
+		}
+
+		String environmentFromVisibleScreen =
+				getEnvironmentFromVisibleScreen()
+
+		if (environmentFromVisibleScreen != null) {
+			KeywordUtil.logInfo(
+					'Environment resolved from visible screen: ' +
+					environmentFromVisibleScreen
+					)
+
+			return environmentFromVisibleScreen
+		}
+
+		String environmentFromLabel =
+				normalizeEnvironmentNamePrefixOnly(
+				exportLabel
+				)
+
+		if (environmentFromLabel != null) {
+			KeywordUtil.logInfo(
+					'Environment resolved from export label prefix: ' +
+					environmentFromLabel
+					)
+
+			return environmentFromLabel
+		}
+
+		KeywordUtil.logInfo(
+				'Environment not resolved. Defaulting to REC.'
+				)
+
+		return 'REC'
+	}
+
+	private String normalizeEnvironmentNameStrict(
+			String rawEnvironment
+	) {
+		if (rawEnvironment == null ||
+				rawEnvironment.trim().isEmpty()) {
+			return null
+		}
+
+		String value =
+				rawEnvironment
+				.trim()
+				.toUpperCase()
+
+		if (value == 'PRD' ||
+				value == 'PROD' ||
+				value == 'PRODUCTION') {
+			return 'PRD'
+		}
+
+		if (value == 'REC' ||
+				value == 'RECETTE') {
+			return 'REC'
+		}
+
+		if (value.startsWith('PRD_') ||
+				value.startsWith('PRD-') ||
+				value.startsWith('PRD ')) {
+			return 'PRD'
+		}
+
+		if (value.startsWith('REC_') ||
+				value.startsWith('REC-') ||
+				value.startsWith('REC ')) {
+			return 'REC'
+		}
+
+		return null
+	}
+
+	private String normalizeEnvironmentNamePrefixOnly(
+			String rawEnvironment
+	) {
+		if (rawEnvironment == null ||
+				rawEnvironment.trim().isEmpty()) {
+			return null
+		}
+
+		String value =
+				rawEnvironment
+				.trim()
+				.toUpperCase()
+
+		if (value == 'PRD' ||
+				value.startsWith('PRD_') ||
+				value.startsWith('PRD-') ||
+				value.startsWith('PRD ')) {
+			return 'PRD'
+		}
+
+		if (value == 'REC' ||
+				value.startsWith('REC_') ||
+				value.startsWith('REC-') ||
+				value.startsWith('REC ')) {
+			return 'REC'
+		}
+
+		return null
+	}
+
+	private String getEnvironmentFromVisibleScreen() {
+		if (isAnyTextVisibleOnCurrentWindow(
+				[
+					'PROD',
+					'PRODUCTION',
+					'PRD'
+				]
+				)) {
+			return 'PRD'
+		}
+
+		if (isAnyTextVisibleOnCurrentWindow(
+				[
+					'RECETTE',
+					'REC'
+				]
+				)) {
+			return 'REC'
+		}
+
+		return null
+	}
+
+	private boolean isAnyTextVisibleOnCurrentWindow(
+			List<String> texts
+	) {
+		for (String text : texts) {
+			if (isTextVisibleOnCurrentWindow(
+					text
+					)) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	private boolean isTextVisibleOnCurrentWindow(
+			String text
+	) {
+		if (text == null ||
+				text.trim().isEmpty()) {
+			return false
+		}
+
+		String upperText =
+				text
+				.trim()
+				.toUpperCase()
+
+		try {
+			WindowsTestObject object =
+					new WindowsTestObject(
+					'visibleText_' +
+					sanitizeObjectName(
+					upperText
+					)
+					)
+
+			object.setLocatorStrategy(
+					LocatorStrategy.XPATH
+					)
+
+			object.setLocator(
+					"//*[contains(" +
+					"translate(@Name, " +
+					"'abcdefghijklmnopqrstuvwxyz', " +
+					"'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), " +
+					"'" + upperText + "')]"
+					)
+
+			return Windows.verifyElementPresent(
+					object,
+					1,
+					FailureHandling.OPTIONAL
+					)
+		} catch (Exception ignored) {
+		}
+
+		return false
+	}
+
+	private String getGlobalVariableValue(
+			String variableName
+	) {
+		try {
+			def value =
+					GlobalVariable."${variableName}"
+
+			if (value != null &&
+					!value.toString().trim().isEmpty()) {
+				return value.toString()
+			}
+		} catch (Exception ignored) {
+		}
+
+		return null
+	}
+
+	private String resolveCurrentCollectionName() {
+		List<String> validParts =
+				getValidReportFolderParts()
+
+		if (!validParts.isEmpty()) {
+			return validParts[0]
+		}
+
+		return 'Collection'
+	}
+
+	private String resolveCurrentFeatureName() {
+		List<String> validParts =
+				getValidReportFolderParts()
+
+		if (!validParts.isEmpty()) {
+			return validParts.last()
+		}
+
+		return 'Export'
+	}
+
+	private List<String> getValidReportFolderParts() {
+		List<String> validParts = []
+
+		String reportFolderPath =
+				RunConfiguration.getReportFolder()
+
+		if (reportFolderPath == null ||
+				reportFolderPath.trim().isEmpty()) {
+			return validParts
+		}
+
+		List<String> parts =
+				reportFolderPath
+				.replace('/', '\\')
+				.split('\\\\') as List<String>
+
+		for (String part : parts) {
+			if (isValidFeatureNamePart(
+					part
+					)) {
+				validParts.add(
+						part.trim()
+						)
+			}
+		}
+
+		return validParts
+	}
+
+	private boolean isValidFeatureNamePart(
+			String part
+	) {
+		if (part == null ||
+				part.trim().isEmpty()) {
+			return false
+		}
+
+		String value = part.trim()
+		String lower = value.toLowerCase()
+
+		if (value ==~ /\d{8}_\d{6}/ ||
+				value ==~ /\d{14}/) {
+			return false
+		}
+
+		if (value ==~ /^\d+\.\s*.*/) {
+			return false
+		}
+
+		List<String> ignoredExactValues = [
+			'reports',
+			'evidences',
+			'exports',
+			'test cases',
+			'test suites',
+			'connection',
+			'authentication',
+			'login rec',
+			'login prd',
+			'katalon',
+			'temp'
+		]
+
+		if (ignoredExactValues.contains(
+				lower
+				)) {
+			return false
+		}
+
+		List<String> ignoredContainsValues = [
+			'validation',
+			'validations',
+			'validate',
+			'compare',
+			'close application',
+			'open module',
+			'login'
+		]
+
+		for (String ignored : ignoredContainsValues) {
+			if (lower.contains(
+					ignored
+					)) {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	private String sanitizeFileName(
+			String text
+	) {
+		if (text == null ||
+				text.trim().isEmpty()) {
+			return 'Export'
+		}
+
+		String normalized =
+				Normalizer
+				.normalize(
+				text,
+				Normalizer.Form.NFD
+				)
+				.replaceAll(
+				'\\p{InCombiningDiacriticalMarks}+',
+				''
+				)
+
+		String cleaned =
+				normalized
+				.replaceAll(
+				'[\\\\/:*?"<>|]',
+				'_'
+				)
+				.replaceAll(
+				'\\s+',
+				'_'
+				)
+				.replaceAll(
+				'_+',
+				'_'
+				)
+				.replaceAll(
+				'^_|_$',
+				''
+				)
+				.trim()
+
+		if (cleaned.isEmpty()) {
+			return 'Export'
+		}
+
+		return cleaned
+	}
+
+	private String shortenFilePart(
+			String value,
+			Integer maximumLength
+	) {
+		if (value == null ||
+				value.trim().isEmpty()) {
+			return ''
+		}
+
+		int safeMaximum =
+				maximumLength == null ||
+				maximumLength <= 0 ?
+				20 :
+				maximumLength
+
+		String cleanValue =
+				sanitizeFileName(
+				value
+				)
+
+		if (cleanValue.length() <= safeMaximum) {
+			return cleanValue
+		}
+
+		return cleanValue.substring(
+				0,
+				safeMaximum
+				)
+	}
+
+	private void setFileName(
+			String fileName
+	) {
+		boolean fileNameFieldFocused =
+				focusFileNameField()
+
+		if (!fileNameFieldFocused) {
+			imageLoader.takeEvidence(
+					'FileNameFieldNotFocused.png'
+					)
+
+			KeywordUtil.markFailedAndStop(
+					'Could not focus export file name field before saving.\n' +
+					'Expected file name: ' + fileName
+					)
+		}
+
+		clearFocusedField()
+		pasteText(fileName)
+		Windows.delay(1)
+	}
+
+	private boolean focusFileNameField() {
+		List<WindowsTestObject> candidateObjects = [
+			buildFileNameFieldByAutomationId(),
+			buildFileNameFieldByName(
+			'File name'
+			),
+			buildFileNameFieldByName(
+			'Nom du fichier'
+			),
+			buildFileNameFieldByName(
+			'Nome do ficheiro'
+			),
+			buildFileNameFieldByName(
+			'Nome do arquivo'
+			)
+		]
+
+		for (WindowsTestObject object : candidateObjects) {
+			try {
+				if (Windows.verifyElementPresent(
+						object,
+						1,
+						FailureHandling.OPTIONAL
+						)) {
+					Windows.click(
+							object
+							)
+
+					Windows.delay(1)
+
+					KeywordUtil.logInfo(
+							'File name field focused using dynamic Windows object: ' +
+							object.getObjectId()
+							)
+
+					return true
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		try {
+			Windows.click(
+					findWindowsObject(
+					'General/txtFileName'
+					)
+					)
+
+			Windows.delay(1)
+
+			KeywordUtil.logInfo(
+					'File name field focused using General/txtFileName.'
+					)
+
+			return true
+		} catch (Exception ignored) {
+			KeywordUtil.logInfo(
+					'General/txtFileName was not available.'
+					)
+		}
+
+		try {
+			focusFileNameFieldWithShortcut()
+
+			Windows.delay(1)
+
+			KeywordUtil.logInfo(
+					'File name field focused using ALT + N.'
+					)
+
+			return true
+		} catch (Exception ignored) {
+		}
+
+		return false
+	}
+
+	private WindowsTestObject buildFileNameFieldByAutomationId() {
+		WindowsTestObject object =
+				new WindowsTestObject(
+				'fileNameFieldAutomationId'
+				)
+
+		object.setLocatorStrategy(
+				LocatorStrategy.XPATH
+				)
+
+		object.setLocator(
+				"//*[@AutomationId='FileNameControlHost']"
+				)
+
+		return object
+	}
+
+	private WindowsTestObject buildFileNameFieldByName(
+			String name
+	) {
+		WindowsTestObject object =
+				new WindowsTestObject(
+				'fileNameField_' +
+				sanitizeObjectName(
+				name
+				)
+				)
+
+		object.setLocatorStrategy(
+				LocatorStrategy.XPATH
+				)
+
+		object.setLocator(
+				"//*[contains(" +
+				"translate(@Name, " +
+				"'abcdefghijklmnopqrstuvwxyz', " +
+				"'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), " +
+				"'" + name.toUpperCase() + "')]"
+				)
+
+		return object
+	}
+
+	private WindowsTestObject buildXpathObject(
+			String xpath
+	) {
+		WindowsTestObject object =
+				new WindowsTestObject()
+
+		object.setLocatorStrategy(
+				LocatorStrategy.XPATH
+				)
+
+		object.setLocator(
+				xpath
+				)
+
+		return object
+	}
+
+	private String sanitizeObjectName(
+			String text
+	) {
+		if (text == null) {
+			return 'empty'
+		}
+
+		return text.replaceAll(
+				'[^a-zA-Z0-9]',
+				'_'
+				)
+	}
+
+	private void focusFileNameFieldWithShortcut() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(
+				KeyEvent.VK_ALT
+				)
+
+		robot.keyPress(
+				KeyEvent.VK_N
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_N
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_ALT
+				)
+	}
+
+	private void clearFocusedField() {
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(
+				KeyEvent.VK_CONTROL
+				)
+
+		robot.keyPress(
+				KeyEvent.VK_A
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_A
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_CONTROL
+				)
+
+		Windows.delay(1)
+
+		robot.keyPress(
+				KeyEvent.VK_BACK_SPACE
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_BACK_SPACE
+				)
+	}
+
+	private void pasteAndEnter(
+			String text
+	) {
+		pasteText(
+				text
+				)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(
+				KeyEvent.VK_ENTER
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_ENTER
+				)
+	}
+
+	private void pasteText(
+			String text
+	) {
+		StringSelection selection =
+				new StringSelection(
+				text
+				)
+
+		Toolkit
+				.getDefaultToolkit()
+				.getSystemClipboard()
+				.setContents(
+				selection,
+				null
+				)
+
+		Windows.delay(1)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(
+				KeyEvent.VK_CONTROL
+				)
+
+		robot.keyPress(
+				KeyEvent.VK_V
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_V
+				)
+
+		robot.keyRelease(
+				KeyEvent.VK_CONTROL
+				)
+	}
+}
+
+
+
+
+
+package commands
+
+import java.text.Normalizer
+
+import org.apache.poi.ss.usermodel.Cell
+import org.apache.poi.ss.usermodel.CellType
+import org.apache.poi.ss.usermodel.DataFormatter
+import org.apache.poi.ss.usermodel.FormulaEvaluator
+import org.apache.poi.ss.usermodel.Row
+import org.apache.poi.ss.usermodel.Sheet
+import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.util.KeywordUtil
+
+class ExportFileComparator {
+
+	private static final int MAX_MISMATCHES_PER_COLUMN = 30
+
+	private static final String SHORT_EXPORT_ROOT =
+	'C:\\KatalonExports'
+
+	@Keyword
+	String validateRecProdExportFiles(Integer threshold) {
+		Map result = compareRecProdExportFiles(
+				threshold
+				)
+
+		return result.errorsText
+	}
+
+	@Keyword
+	Map compareRecProdExportFiles(Integer threshold) {
+		int safeThreshold =
+				threshold == null ?
+				0 :
+				threshold
+
+		File sharedExportFolder =
+				resolveComparisonExportRootFolder()
+
+		String featureName =
+				resolveCurrentFeatureName()
+
+		String collectionName =
+				resolveCurrentCollectionName()
+
+		String sanitizedFeatureName =
+				sanitizeFileName(
+				featureName
+				)
+
+		File recFile = findLatestExportFile(
+				sharedExportFolder,
+				'REC',
+				sanitizedFeatureName
+				)
+
+		File prdFile = findLatestExportFile(
+				sharedExportFolder,
+				'PRD',
+				sanitizedFeatureName
+				)
+
+		Map result = [
+			collectionName   : collectionName,
+			featureName      : featureName,
+			threshold        : safeThreshold,
+			sharedFolder     : sharedExportFolder.getAbsolutePath(),
+			recFileName      : recFile == null ?
+			'NOT FOUND' :
+			recFile.getName(),
+			recFilePath      : recFile == null ?
+			'NOT FOUND' :
+			recFile.getAbsolutePath(),
+			prdFileName      : prdFile == null ?
+			'NOT FOUND' :
+			prdFile.getName(),
+			prdFilePath      : prdFile == null ?
+			'NOT FOUND' :
+			prdFile.getAbsolutePath(),
+			validations      : [],
+			differences      : [],
+			errors           : [],
+			errorsText       : '',
+			totalValidations : 0,
+			passedValidations: 0,
+			failedValidations: 0
+		]
+
+		if (recFile == null) {
+			addValidation(
+					result,
+					'Validate REC exported file exists',
+					false,
+					'Expected root folder: ' +
+					sharedExportFolder.getAbsolutePath() +
+					'\nExpected format: REC_yyyyMMdd_HHmmss_*.xlsx'
+					)
+
+			result.errors.add(
+					'REC exported file was not found under export root folder: ' +
+					sharedExportFolder.getAbsolutePath()
+					)
+		} else {
+			addValidation(
+					result,
+					'Validate REC exported file exists',
+					true,
+					'REC file selected: ' +
+					recFile.getName() +
+					'\nPath: ' +
+					recFile.getAbsolutePath()
+					)
+		}
+
+		if (prdFile == null) {
+			addValidation(
+					result,
+					'Validate PRD exported file exists',
+					false,
+					'Expected root folder: ' +
+					sharedExportFolder.getAbsolutePath() +
+					'\nExpected format: PRD_yyyyMMdd_HHmmss_*.xlsx'
+					)
+
+			result.errors.add(
+					'PRD exported file was not found under export root folder: ' +
+					sharedExportFolder.getAbsolutePath()
+					)
+		} else {
+			addValidation(
+					result,
+					'Validate PRD exported file exists',
+					true,
+					'PRD file selected: ' +
+					prdFile.getName() +
+					'\nPath: ' +
+					prdFile.getAbsolutePath()
+					)
+		}
+
+		if (recFile != null &&
+				prdFile != null) {
+			compareExcelFiles(
+					recFile,
+					prdFile,
+					safeThreshold,
+					result
+					)
+		}
+
+		refreshResultCounters(
+				result
+				)
+
+		result.errorsText =
+				result.errors.join(
+				'\n'
+				)
+
+		KeywordUtil.logInfo(
+				'REC/PRD comparison collection: ' +
+				collectionName
+				)
+
+		KeywordUtil.logInfo(
+				'REC/PRD comparison feature: ' +
+				featureName
+				)
+
+		KeywordUtil.logInfo(
+				'REC/PRD comparison export root: ' +
+				result.sharedFolder
+				)
+
+		KeywordUtil.logInfo(
+				'REC file selected: ' +
+				result.recFilePath
+				)
+
+		KeywordUtil.logInfo(
+				'PRD file selected: ' +
+				result.prdFilePath
+				)
+
+		KeywordUtil.logInfo(
+				'REC/PRD comparison errors: ' +
+				result.errors.size()
+				)
+
+		return result
+	}
+
+	private File resolveComparisonExportRootFolder() {
+		File shortExportRoot =
+				new File(
+				SHORT_EXPORT_ROOT
+				)
+
+		if (shortExportRoot.exists() &&
+				shortExportRoot.isDirectory()) {
+			KeywordUtil.logInfo(
+					'Comparison export root resolved from short export folder: ' +
+					shortExportRoot.getAbsolutePath()
+					)
+
+			return shortExportRoot
+		}
+
+		File legacyExportFolder =
+				resolveLegacyRecPrdExportFolder()
+
+		KeywordUtil.logInfo(
+				'Short export root was not found. ' +
+				'Using legacy comparison folder: ' +
+				legacyExportFolder.getAbsolutePath()
+				)
+
+		return legacyExportFolder
+	}
+
+	private File resolveLegacyRecPrdExportFolder() {
+		File executionRootFolder =
+				resolveExecutionRootFolder()
+
+		String collectionName =
+				sanitizeFileName(
+				resolveCurrentCollectionName()
+				)
+
+		String featureName =
+				sanitizeFileName(
+				resolveCurrentFeatureName()
+				)
+
+		return new File(
+				executionRootFolder,
+				'Shared_REC_PRD_Exports\\' +
+				collectionName +
+				'\\' +
+				featureName
+				)
+	}
+
+	private File resolveExecutionRootFolder() {
+		String reportFolderPath =
+				RunConfiguration.getReportFolder()
+
+		if (reportFolderPath == null ||
+				reportFolderPath.trim().isEmpty()) {
+			return new File(
+					RunConfiguration.getProjectDir(),
+					'Reports\\Unknown_Execution'
+					)
+		}
+
+		File current =
+				new File(
+				reportFolderPath
+				)
+
+		while (current != null) {
+			File parent =
+					current.getParentFile()
+
+			if (parent != null &&
+					parent.getName().equalsIgnoreCase(
+					'Reports'
+					)) {
+				return current
+			}
+
+			current = parent
+		}
+
+		return new File(
+				reportFolderPath
+				)
+	}
+
+	private String resolveCurrentCollectionName() {
+		List<String> validParts =
+				getValidReportFolderParts()
+
+		if (!validParts.isEmpty()) {
+			return validParts[0]
+		}
+
+		return 'Collection'
+	}
+
+	private String resolveCurrentFeatureName() {
+		List<String> validParts =
+				getValidReportFolderParts()
+
+		if (!validParts.isEmpty()) {
+			return validParts.last()
+		}
+
+		return 'Export'
+	}
+
+	private List<String> getValidReportFolderParts() {
+		List<String> validParts = []
+
+		String reportFolderPath =
+				RunConfiguration.getReportFolder()
+
+		if (reportFolderPath == null ||
+				reportFolderPath.trim().isEmpty()) {
+			return validParts
+		}
+
+		File executionRootFolder =
+				resolveExecutionRootFolder()
+
+		String fullPath =
+				new File(
+				reportFolderPath
+				).getAbsolutePath()
+
+		String rootPath =
+				executionRootFolder.getAbsolutePath()
+
+		if (!fullPath.toLowerCase().startsWith(
+				rootPath.toLowerCase()
+				)) {
+			return validParts
+		}
+
+		String relativePath =
+				fullPath.substring(
+				rootPath.length()
+				)
+
+		relativePath =
+				relativePath.replaceAll(
+				'^\\\\+',
+				''
+				)
+
+		if (relativePath.trim().isEmpty()) {
+			return validParts
+		}
+
+		List<String> parts =
+				relativePath
+				.replace(
+				'/',
+				'\\'
+				)
+				.split(
+				'\\\\'
+				) as List<String>
+
+		for (String part : parts) {
+			if (isValidFeatureNamePart(
+					part
+					)) {
+				validParts.add(
+						part.trim()
+						)
+			}
+		}
+
+		return validParts
+	}
+
+	private boolean isValidFeatureNamePart(
+			String part
+	) {
+		if (part == null ||
+				part.trim().isEmpty()) {
+			return false
+		}
+
+		String value =
+				part.trim()
+
+		String lower =
+				value.toLowerCase()
+
+		if (value ==~ /\d{8}_\d{6}/ ||
+				value ==~ /\d{14}/) {
+			return false
+		}
+
+		if (value ==~ /^\d+\.\s*.*/) {
+			return false
+		}
+
+		List<String> ignoredExactValues = [
+			'reports',
+			'evidences',
+			'exports',
+			'test cases',
+			'test suites',
+			'connection',
+			'authentication',
+			'login rec',
+			'login prd'
+		]
+
+		if (ignoredExactValues.contains(
+				lower
+				)) {
+			return false
+		}
+
+		List<String> ignoredContainsValues = [
+			'export',
+			'validation',
+			'validations',
+			'validate',
+			'compare',
+			'close application',
+			'open module',
+			'login'
+		]
+
+		for (String ignored : ignoredContainsValues) {
+			if (lower.contains(
+					ignored
+					)) {
+				return false
+			}
+		}
+
+		return true
+	}
+
+	private File findLatestExportFile(
+			File rootFolder,
+			String environment,
+			String sanitizedFeatureName
+	) {
+		if (rootFolder == null ||
+				!rootFolder.exists() ||
+				!rootFolder.isDirectory()) {
+			return null
+		}
+
+		List<File> allCandidates = []
+
+		collectExportFilesRecursively(
+				rootFolder,
+				environment,
+				allCandidates
+				)
+
+		if (allCandidates.isEmpty()) {
+			return null
+		}
+
+		List<File> featureCandidates =
+				findFeatureMatchingCandidates(
+				allCandidates,
+				sanitizedFeatureName
+				)
+
+		List<File> selectedCandidates =
+				featureCandidates.isEmpty() ?
+				allCandidates :
+				featureCandidates
+
+		File selectedFile =
+				selectedCandidates.sort { File file ->
+					file.lastModified()
+				}.last()
+
+		KeywordUtil.logInfo(
+				environment +
+				' candidate files found: ' +
+				allCandidates.size() +
+				'\nFeature-matching candidates: ' +
+				featureCandidates.size() +
+				'\nSelected file: ' +
+				selectedFile.getAbsolutePath()
+				)
+
+		return selectedFile
+	}
+
+	private void collectExportFilesRecursively(
+			File folder,
+			String environment,
+			List<File> candidates
+	) {
+		if (folder == null ||
+				!folder.exists() ||
+				!folder.isDirectory()) {
+			return
+		}
+
+		File[] files =
+				folder.listFiles()
+
+		if (files == null) {
+			return
+		}
+
+		String normalizedEnvironment =
+				normalizeText(
+				environment
+				)
+
+		for (File file : files) {
+			if (file.isDirectory()) {
+				collectExportFilesRecursively(
+						file,
+						environment,
+						candidates
+						)
+
+				continue
+			}
+
+			if (!file.isFile()) {
+				continue
+			}
+
+			String fileName =
+					file.getName()
+
+			if (!fileName.toLowerCase().endsWith(
+					'.xlsx'
+					)) {
+				continue
+			}
+
+			if (fileName.startsWith(
+					'~$'
+					)) {
+				continue
+			}
+
+			if (file.length() <= 0) {
+				continue
+			}
+
+			String normalizedFileName =
+					normalizeText(
+					fileName
+					)
+
+			if (!normalizedFileName.startsWith(
+					normalizedEnvironment + '_'
+					)) {
+				continue
+			}
+
+			candidates.add(
+					file
+					)
+		}
+	}
+
+	private List<File> findFeatureMatchingCandidates(
+			List<File> candidates,
+			String sanitizedFeatureName
+	) {
+		if (candidates == null ||
+				candidates.isEmpty()) {
+			return []
+		}
+
+		List<String> featureTokens =
+				resolveFeatureTokens(
+				sanitizedFeatureName
+				)
+
+		if (featureTokens.isEmpty()) {
+			return []
+		}
+
+		Map<File, Integer> scores = [:]
+		Integer highestScore = 0
+
+		for (File file : candidates) {
+			String searchableText =
+					normalizeText(
+					file.getAbsolutePath()
+					)
+
+			Integer score = 0
+
+			for (String token : featureTokens) {
+				if (searchableText.contains(
+						token
+						)) {
+					score++
+				}
+			}
+
+			scores[file] = score
+
+			if (score > highestScore) {
+				highestScore = score
+			}
+		}
+
+		if (highestScore <= 0) {
+			return []
+		}
+
+		return candidates.findAll { File file ->
+			scores[file] == highestScore
+		}
+	}
+
+	private List<String> resolveFeatureTokens(
+			String sanitizedFeatureName
+	) {
+		String normalizedFeatureName =
+				normalizeText(
+				sanitizedFeatureName
+				)
+
+		if (normalizedFeatureName.isEmpty()) {
+			return []
+		}
+
+		List<String> ignoredTokens = [
+			'export',
+			'validation',
+			'validate',
+			'comparison',
+			'compare',
+			'file',
+			'files',
+			'rec',
+			'prd'
+		]
+
+		List<String> tokens = []
+
+		normalizedFeatureName
+				.split(
+				'_'
+				)
+				.each { String token ->
+
+					if (token != null &&
+							token.length() >= 3 &&
+							!ignoredTokens.contains(
+							token
+							)) {
+						tokens.add(
+								token
+								)
+					}
+				}
+
+		return tokens.unique()
+	}
+
+	private void compareExcelFiles(
+			File recFile,
+			File prdFile,
+			int threshold,
+			Map result
+	) {
+		Workbook recWorkbook = null
+		Workbook prdWorkbook = null
+
+		try {
+			recWorkbook =
+					WorkbookFactory.create(
+					recFile
+					)
+
+			prdWorkbook =
+					WorkbookFactory.create(
+					prdFile
+					)
+
+			FormulaEvaluator recEvaluator =
+					recWorkbook
+					.getCreationHelper()
+					.createFormulaEvaluator()
+
+			FormulaEvaluator prdEvaluator =
+					prdWorkbook
+					.getCreationHelper()
+					.createFormulaEvaluator()
+
+			DataFormatter formatter =
+					new DataFormatter()
+
+			Sheet recSheet =
+					recWorkbook.getSheetAt(
+					0
+					)
+
+			Sheet prdSheet =
+					prdWorkbook.getSheetAt(
+					0
+					)
+
+			SheetData recData =
+					readSheetData(
+					recSheet,
+					recEvaluator,
+					formatter
+					)
+
+			SheetData prdData =
+					readSheetData(
+					prdSheet,
+					prdEvaluator,
+					formatter
+					)
+
+			compareNumberOfHeaders(
+					recData,
+					prdData,
+					result
+					)
+
+			compareHeadersStructure(
+					recData,
+					prdData,
+					result
+					)
+
+			compareNumberOfRows(
+					recData,
+					prdData,
+					result
+					)
+
+			compareColumnBetweenFiles(
+					'Year',
+					[
+						'year',
+						'annee',
+						'année'
+					],
+					recData,
+					prdData,
+					threshold,
+					result
+					)
+
+			compareColumnBetweenFiles(
+					'Nombre',
+					['nombre'],
+					recData,
+					prdData,
+					threshold,
+					result
+					)
+
+			compareColumnBetweenFiles(
+					'Solde Transac CCY',
+					[
+						'solde transac ccy',
+						'solde transac',
+						'transac ccy'
+					],
+					recData,
+					prdData,
+					threshold,
+					result
+					)
+
+			compareColumnBetweenFiles(
+					'Solde Base CCY',
+					[
+						'solde base ccy',
+						'base ccy'
+					],
+					recData,
+					prdData,
+					threshold,
+					result
+					)
+
+			compareColumnBetweenFiles(
+					'Solde Solde Fixing Base CCY',
+					[
+						'solde solde fixing base ccy',
+						'solde fixing base ccy',
+						'fixing base ccy'
+					],
+					recData,
+					prdData,
+					threshold,
+					result
+					)
+		} catch (Exception e) {
+			String message =
+					'Error while comparing REC and PRD exported files: ' +
+					e.getMessage()
+
+			addValidation(
+					result,
+					'Open and read REC/PRD Excel files',
+					false,
+					message
+					)
+
+			result.errors.add(
+					message
+					)
+		} finally {
+			try {
+				if (recWorkbook != null) {
+					recWorkbook.close()
+				}
+			} catch (Exception ignored) {
+			}
+
+			try {
+				if (prdWorkbook != null) {
+					prdWorkbook.close()
+				}
+			} catch (Exception ignored) {
+			}
+		}
+	}
+
+	private void compareNumberOfHeaders(
+			SheetData recData,
+			SheetData prdData,
+			Map result
+	) {
+		boolean passed =
+				recData.headers.size() ==
+				prdData.headers.size()
+
+		String details =
+				'REC headers: ' +
+				recData.headers.size() +
+				'\n' +
+				'PRD headers: ' +
+				prdData.headers.size()
+
+		addValidation(
+				result,
+				'Compare Number of Table headers',
+				passed,
+				details
+				)
+
+		if (!passed) {
+			result.errors.add(
+					'Compare Number of Table headers failed. ' +
+					details.replace(
+					'\n',
+					' | '
+					)
+					)
+		}
+	}
+
+	private void compareHeadersStructure(
+			SheetData recData,
+			SheetData prdData,
+			Map result
+	) {
+		int maxHeaders =
+				Math.max(
+				recData.headers.size(),
+				prdData.headers.size()
+				)
+
+		List<String> mismatches = []
+
+		for (int i = 0;
+				i < maxHeaders;
+				i++) {
+			String recHeader =
+					i < recData.headers.size() ?
+					recData.headers[i] :
+					''
+
+			String prdHeader =
+					i < prdData.headers.size() ?
+					prdData.headers[i] :
+					''
+
+			if (normalizeText(
+					recHeader
+					) != normalizeText(
+					prdHeader
+					)) {
+				mismatches.add(
+						'Column ' +
+						(i + 1) +
+						': REC "' +
+						recHeader +
+						'" | PRD "' +
+						prdHeader +
+						'"'
+						)
+			}
+		}
+
+		boolean passed =
+				mismatches.isEmpty()
+
+		String details =
+				passed ?
+				'All REC headers match PRD headers in the same order.' :
+				'Mismatched headers: ' +
+				mismatches.size() +
+				'\n' +
+				mismatches.join(
+				'\n'
+				)
+
+		addValidation(
+				result,
+				'Compare table headers structure',
+				passed,
+				details
+				)
+
+		if (!passed) {
+			result.errors.add(
+					'Table headers structure mismatch.\n' +
+					mismatches.join(
+					'\n'
+					)
+					)
+		}
+	}
+
+	private void compareNumberOfRows(
+			SheetData recData,
+			SheetData prdData,
+			Map result
+	) {
+		boolean passed =
+				recData.rows.size() ==
+				prdData.rows.size()
+
+		String details =
+				'REC rows: ' +
+				recData.rows.size() +
+				'\n' +
+				'PRD rows: ' +
+				prdData.rows.size()
+
+		addValidation(
+				result,
+				'Compare number of rows',
+				passed,
+				details
+				)
+
+		if (!passed) {
+			result.errors.add(
+					'Compare number of rows failed. ' +
+					details.replace(
+					'\n',
+					' | '
+					)
+					)
+		}
+	}
+
+	private void compareColumnBetweenFiles(
+			String displayName,
+			List<String> aliases,
+			SheetData recData,
+			SheetData prdData,
+			int threshold,
+			Map result
+	) {
+		Integer recColumnIndex =
+				findColumnIndex(
+				recData.headers,
+				aliases
+				)
+
+		Integer prdColumnIndex =
+				findColumnIndex(
+				prdData.headers,
+				aliases
+				)
+
+		if (recColumnIndex == null) {
+			String message =
+					displayName +
+					' column was not found in REC file.'
+
+			addValidation(
+					result,
+					displayName +
+					' column comparison',
+					false,
+					message
+					)
+
+			result.errors.add(
+					message
+					)
+
+			return
+		}
+
+		if (prdColumnIndex == null) {
+			String message =
+					displayName +
+					' column was not found in PRD file.'
+
+			addValidation(
+					result,
+					displayName +
+					' column comparison',
+					false,
+					message
+					)
+
+			result.errors.add(
+					message
+					)
+
+			return
+		}
+
+		int maxRows =
+				Math.max(
+				recData.rows.size(),
+				prdData.rows.size()
+				)
+
+		int mismatches = 0
+		List<String> examples = []
+
+		for (int rowIndex = 0;
+				rowIndex < maxRows;
+				rowIndex++) {
+			String recValue =
+					getCellValue(
+					recData.rows,
+					rowIndex,
+					recColumnIndex
+					)
+
+			String prdValue =
+					getCellValue(
+					prdData.rows,
+					rowIndex,
+					prdColumnIndex
+					)
+
+			if (valuesAreEquivalent(
+					recValue,
+					prdValue,
+					threshold
+					)) {
+				continue
+			}
+
+			mismatches++
+
+			String diff =
+					displayName +
+					' | Row ' +
+					(rowIndex + 1) +
+					' | REC: "' +
+					recValue +
+					'"' +
+					' | PRD: "' +
+					prdValue +
+					'"' +
+					' | Allowed difference: ' +
+					threshold
+
+			if (examples.size() <
+					MAX_MISMATCHES_PER_COLUMN) {
+				examples.add(
+						diff
+						)
+
+				result.differences.add(
+						diff
+						)
+			}
+		}
+
+		boolean passed =
+				mismatches == 0
+
+		String details =
+				'REC column: ' +
+				(recColumnIndex + 1) +
+				'\n' +
+				'PRD column: ' +
+				(prdColumnIndex + 1) +
+				'\n' +
+				'Rows compared: ' +
+				maxRows +
+				'\n' +
+				'Allowed numeric difference: ' +
+				threshold +
+				'\n' +
+				'Differences found: ' +
+				mismatches
+
+		if (!passed &&
+				!examples.isEmpty()) {
+			details +=
+					'\n\nFirst differences:\n' +
+					examples.join(
+					'\n'
+					)
+		}
+
+		addValidation(
+				result,
+				displayName +
+				' column comparison',
+				passed,
+				details
+				)
+
+		if (!passed) {
+			result.errors.add(
+					displayName +
+					' column comparison failed. Differences found: ' +
+					mismatches
+					)
+
+			result.errors.addAll(
+					examples
+					)
+		}
+	}
+
+	private void addValidation(
+			Map result,
+			String name,
+			boolean passed,
+			String details
+	) {
+		result.validations.add(
+				[
+					name   : name,
+					status : passed ?
+					'PASS' :
+					'FAILED',
+					details: details
+				]
+				)
+	}
+
+	private void refreshResultCounters(
+			Map result
+	) {
+		List<Map> validations =
+				result.validations as List<Map>
+
+		result.totalValidations =
+				validations.size()
+
+		result.passedValidations =
+				validations.findAll { Map validation ->
+					validation.status == 'PASS'
+				}.size()
+
+		result.failedValidations =
+				validations.findAll { Map validation ->
+					validation.status == 'FAILED'
+				}.size()
+	}
+
+	private boolean valuesAreEquivalent(
+			String recValue,
+			String prdValue,
+			int threshold
+	) {
+		String rec =
+				recValue == null ?
+				'' :
+				recValue.trim()
+
+		String prd =
+				prdValue == null ?
+				'' :
+				prdValue.trim()
+
+		if (rec.isEmpty() &&
+				prd.isEmpty()) {
+			return true
+		}
+
+		BigDecimal recNumber =
+				parseNumber(
+				rec
+				)
+
+		BigDecimal prdNumber =
+				parseNumber(
+				prd
+				)
+
+		if (recNumber != null &&
+				prdNumber != null) {
+			BigDecimal difference =
+					recNumber
+					.subtract(
+					prdNumber
+					)
+					.abs()
+
+			return difference.compareTo(
+					new BigDecimal(
+					threshold
+					)
+					) <= 0
+		}
+
+		return normalizeText(
+				rec
+				) == normalizeText(
+				prd
+				)
+	}
+
+	private BigDecimal parseNumber(
+			String value
+	) {
+		if (value == null ||
+				value.trim().isEmpty()) {
+			return null
+		}
+
+		String normalized =
+				value
+				.replaceAll(
+				'\\s',
+				''
+				)
+				.replace(
+				',',
+				'.'
+				)
+				.replaceAll(
+				'[^0-9.\\-]',
+				''
+				)
+
+		if (normalized.isEmpty() ||
+				normalized == '-' ||
+				normalized == '.') {
+			return null
+		}
+
+		try {
+			return new BigDecimal(
+					normalized
+					)
+		} catch (Exception ignored) {
+			return null
+		}
+	}
+
+	private SheetData readSheetData(
+			Sheet sheet,
+			FormulaEvaluator evaluator,
+			DataFormatter formatter
+	) {
+		int headerRowIndex =
+				findHeaderRowIndex(
+				sheet,
+				evaluator,
+				formatter
+				)
+
+		Row headerRow =
+				sheet.getRow(
+				headerRowIndex
+				)
+
+		List<String> headers =
+				readRowValues(
+				headerRow,
+				evaluator,
+				formatter
+				)
+
+		List<List<String>> rows = []
+
+		for (int rowIndex =
+				headerRowIndex + 1;
+				rowIndex <= sheet.getLastRowNum();
+				rowIndex++) {
+			Row row =
+					sheet.getRow(
+					rowIndex
+					)
+
+			if (row == null) {
+				continue
+			}
+
+			List<String> values =
+					readRowValues(
+					row,
+					evaluator,
+					formatter
+					)
+
+			if (isEmptyRow(
+					values
+					)) {
+				continue
+			}
+
+			rows.add(
+					values
+					)
+		}
+
+		return new SheetData(
+				headers,
+				rows
+				)
+	}
+
+	private int findHeaderRowIndex(
+			Sheet sheet,
+			FormulaEvaluator evaluator,
+			DataFormatter formatter
+	) {
+		int bestRowIndex = 0
+		int bestFilledCells = 0
+
+		int maxSearchRow =
+				Math.min(
+				sheet.getLastRowNum(),
+				30
+				)
+
+		for (int rowIndex = 0;
+				rowIndex <= maxSearchRow;
+				rowIndex++) {
+			Row row =
+					sheet.getRow(
+					rowIndex
+					)
+
+			if (row == null) {
+				continue
+			}
+
+			List<String> values =
+					readRowValues(
+					row,
+					evaluator,
+					formatter
+					)
+
+			int filledCells =
+					values.findAll { String value ->
+						value != null &&
+								!value.trim().isEmpty()
+					}.size()
+
+			if (filledCells >
+					bestFilledCells) {
+				bestFilledCells =
+						filledCells
+
+				bestRowIndex =
+						rowIndex
+			}
+		}
+
+		return bestRowIndex
+	}
+
+	private List<String> readRowValues(
+			Row row,
+			FormulaEvaluator evaluator,
+			DataFormatter formatter
+	) {
+		List<String> values = []
+
+		if (row == null) {
+			return values
+		}
+
+		int lastCellNumber =
+				row.getLastCellNum()
+
+		if (lastCellNumber < 0) {
+			return values
+		}
+
+		for (int cellIndex = 0;
+				cellIndex < lastCellNumber;
+				cellIndex++) {
+			Cell cell =
+					row.getCell(
+					cellIndex
+					)
+
+			values.add(
+					readCellValue(
+					cell,
+					evaluator,
+					formatter
+					)
+					)
+		}
+
+		return values
+	}
+
+	private String readCellValue(
+			Cell cell,
+			FormulaEvaluator evaluator,
+			DataFormatter formatter
+	) {
+		if (cell == null) {
+			return ''
+		}
+
+		try {
+			if (cell.getCellType() ==
+					CellType.FORMULA) {
+				return formatter
+						.formatCellValue(
+						cell,
+						evaluator
+						)
+						.trim()
+			}
+
+			return formatter
+					.formatCellValue(
+					cell
+					)
+					.trim()
+		} catch (Exception ignored) {
+			return ''
+		}
+	}
+
+	private boolean isEmptyRow(
+			List<String> values
+	) {
+		if (values == null ||
+				values.isEmpty()) {
+			return true
+		}
+
+		return values.every { String value ->
+			value == null ||
+					value.trim().isEmpty()
+		}
+	}
+
+	private String getCellValue(
+			List<List<String>> rows,
+			int rowIndex,
+			int columnIndex
+	) {
+		if (rowIndex >= rows.size()) {
+			return ''
+		}
+
+		List<String> row =
+				rows[rowIndex]
+
+		if (columnIndex >= row.size()) {
+			return ''
+		}
+
+		return row[columnIndex]
+	}
+
+	private Integer findColumnIndex(
+			List<String> headers,
+			List<String> aliases
+	) {
+		for (int i = 0;
+				i < headers.size();
+				i++) {
+			String normalizedHeader =
+					normalizeText(
+					headers[i]
+					)
+
+			for (String alias : aliases) {
+				String normalizedAlias =
+						normalizeText(
+						alias
+						)
+
+				if (normalizedHeader ==
+						normalizedAlias ||
+						normalizedHeader.contains(
+						normalizedAlias
+						)) {
+					return i
+				}
+			}
+		}
+
+		return null
+	}
+
+	private String normalizeText(
+			String text
+	) {
+		if (text == null) {
+			return ''
+		}
+
+		return Normalizer
+				.normalize(
+				text,
+				Normalizer.Form.NFD
+				)
+				.replaceAll(
+				'\\p{InCombiningDiacriticalMarks}+',
+				''
+				)
+				.toLowerCase()
+				.trim()
+				.replaceAll(
+				'[^a-z0-9]+',
+				'_'
+				)
+				.replaceAll(
+				'_+',
+				'_'
+				)
+				.replaceAll(
+				'^_|_$',
+				''
+				)
+	}
+
+	private String sanitizeFileName(
+			String text
+	) {
+		if (text == null ||
+				text.trim().isEmpty()) {
+			return 'Export'
+		}
+
+		String normalized =
+				Normalizer
+				.normalize(
+				text,
+				Normalizer.Form.NFD
+				)
+				.replaceAll(
+				'\\p{InCombiningDiacriticalMarks}+',
+				''
+				)
+
+		return normalized
+				.replaceAll(
+				'[\\\\/:*?"<>|]',
+				'_'
+				)
+				.replaceAll(
+				'\\s+',
+				'_'
+				)
+				.replaceAll(
+				'_+',
+				'_'
+				)
+				.replaceAll(
+				'^_|_$',
+				''
+				)
+				.trim()
+	}
+
+	private static class SheetData {
+
+		List<String> headers
+		List<List<String>> rows
+
+		SheetData(
+		List<String> headers,
+		List<List<String>> rows
+		) {
+			this.headers = headers
+			this.rows = rows
+		}
+	}
+}
+
+
+
+
+
+
+
+package commands
+
+import org.apache.poi.ss.usermodel.*
+import org.apache.poi.ss.usermodel.WorkbookFactory
+
+import java.io.File
+import java.io.FileInputStream
+import java.math.RoundingMode
+
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.util.KeywordUtil
+
+class ExportFileValidationKeywords {
+
+	private static final String LIST_SEPARATOR = '|'
+
+	@Keyword
+	String validateEvidenceFolderExists(String folderPath) {
+
+		StringBuilder errors = new StringBuilder()
+
+		File folder = new File(safeText(folderPath))
+
+		KeywordUtil.logInfo("📁 [VALIDATE FOLDER] " + folder.getAbsolutePath())
+
+		if (!folder.exists()) {
+			errors.append("[ERROR] Evidence folder does not exist: ").append(folder.getAbsolutePath()).append("\n")
+		} else if (!folder.isDirectory()) {
+			errors.append("[ERROR] Evidence path is not a folder: ").append(folder.getAbsolutePath()).append("\n")
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String resolveExcelFilesAsString(String folderPath, String requestedFileNames, String includeSubFoldersText) {
+
+		File folder = new File(safeText(folderPath))
+		boolean includeSubFolders = isTrue(includeSubFoldersText)
+
+		List<File> files = []
+
+		List<String> requestedFiles = splitText(requestedFileNames)
+
+		if (requestedFiles.size() > 0) {
+
+			for (String fileName : requestedFiles) {
+
+				File file = new File(fileName)
+
+				if (!file.isAbsolute()) {
+					file = new File(folder, fileName)
+				}
+
+				files.add(file)
+			}
+		} else if (folder.exists() && folder.isDirectory()) {
+
+			files = collectExcelFiles(folder, includeSubFolders)
+		}
+
+		files = files.findAll { File file ->
+			file != null && isExcelFile(file.getName()) && !file.getName().startsWith('~$')
+		}
+
+		files = files.unique { File file ->
+			file.getAbsolutePath().toLowerCase()
+		}
+
+		files.sort { File file ->
+			file.getAbsolutePath().toLowerCase()
+		}
+
+		String result = files.collect { File file ->
+			file.getAbsolutePath()
+		}.join(LIST_SEPARATOR)
+
+		KeywordUtil.logInfo("📄 [RESOLVED FILES] " + result)
+
+		return result
+	}
+
+	@Keyword
+	String validateExcelFilesFound(String filesToValidate) {
+
+		StringBuilder errors = new StringBuilder()
+
+		List<File> files = parseFiles(filesToValidate)
+
+		if (files.size() == 0) {
+			errors.append("[ERROR] No Excel files found to validate.\n")
+		}
+
+		for (File file : files) {
+
+			if (!file.exists()) {
+				errors.append("[ERROR] File not found: ").append(file.getAbsolutePath()).append("\n")
+			} else if (!file.isFile()) {
+				errors.append("[ERROR] Path is not a file: ").append(file.getAbsolutePath()).append("\n")
+			} else if (!isExcelFile(file.getName())) {
+				errors.append("[ERROR] File is not Excel: ").append(file.getAbsolutePath()).append("\n")
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateMinimumExpectedFileQuantity(String filesToValidate, String minimumExpectedFilesText) {
+
+		int minimumExpectedFiles = parseIntOrZero(minimumExpectedFilesText)
+
+		if (minimumExpectedFiles <= 0) {
+			return "[SKIPPED] Minimum expected file quantity was not configured."
+		}
+
+		StringBuilder errors = new StringBuilder()
+
+		List<File> files = parseFiles(filesToValidate)
+
+		KeywordUtil.logInfo("📄 [FILE COUNT] found=" + files.size() + " | minimumExpected=" + minimumExpectedFiles)
+
+		if (files.size() < minimumExpectedFiles) {
+			errors.append("[ERROR] Expected at least ")
+					.append(minimumExpectedFiles)
+					.append(" Excel files, but found ")
+					.append(files.size())
+					.append(".\n")
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateMinimumExpectedFiles(String filesToValidate, String minimumExpectedFilesText) {
+		return validateMinimumExpectedFileQuantity(filesToValidate, minimumExpectedFilesText)
+	}
+
+	@Keyword
+	String validateMinimumExpectedFiles(String filesToValidate, Integer minimumExpectedFiles) {
+		return validateMinimumExpectedFileQuantity(filesToValidate, safeText(minimumExpectedFiles))
+	}
+
+	@Keyword
+	String validateRequiredHeaders(
+			String filesToValidate,
+			String defaultValidationType,
+			String sheetIndexText,
+			String headerCurrency,
+			String headerCurrencyRef,
+			String headerAmountCcy,
+			String headerAmountBaseCcy) {
+
+		StringBuilder errors = new StringBuilder()
+
+		List<File> files = parseFiles(filesToValidate)
+		int sheetIndex = parseIntOrZero(sheetIndexText)
+
+		for (File file : files) {
+
+			String validationType = resolveValidationTypeForFile(file, defaultValidationType)
+			boolean needCurrencyRef = isCurrencyRefRequired(validationType)
+
+			String fileErrors = validateRequiredHeadersForFile(
+					file,
+					validationType,
+					sheetIndex,
+					headerCurrency,
+					headerCurrencyRef,
+					headerAmountCcy,
+					headerAmountBaseCcy,
+					needCurrencyRef
+					)
+
+			if (fileErrors.trim().length() > 0) {
+				errors.append(fileErrors)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateRowsForValidationType(
+			String filesToValidate,
+			String defaultValidationType,
+			String sheetIndexText,
+			String headerCurrency,
+			String headerCurrencyRef) {
+
+		StringBuilder errors = new StringBuilder()
+
+		List<File> files = parseFiles(filesToValidate)
+		int sheetIndex = parseIntOrZero(sheetIndexText)
+
+		for (File file : files) {
+
+			String validationType = resolveValidationTypeForFile(file, defaultValidationType)
+
+			String fileErrors = validateRowsForValidationTypeInFile(
+					file,
+					validationType,
+					sheetIndex,
+					headerCurrency,
+					headerCurrencyRef
+					)
+
+			if (fileErrors.trim().length() > 0) {
+				errors.append(fileErrors)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateCurrencyForRows(
+			String filesToValidate,
+			String defaultValidationType,
+			String sheetIndexText,
+			String headerCurrency,
+			String headerCurrencyRef) {
+
+		return validateRowsForValidationType(
+				filesToValidate,
+				defaultValidationType,
+				sheetIndexText,
+				headerCurrency,
+				headerCurrencyRef
+				)
+	}
+
+	@Keyword
+	String validateMontantCcyEqualsMontantBaseCcy(
+			String filesToValidate,
+			String defaultValidationType,
+			String sheetIndexText,
+			String headerCurrency,
+			String headerCurrencyRef,
+			String headerAmountCcy,
+			String headerAmountBaseCcy) {
+
+		StringBuilder errors = new StringBuilder()
+
+		List<File> files = parseFiles(filesToValidate)
+		int sheetIndex = parseIntOrZero(sheetIndexText)
+
+		for (File file : files) {
+
+			String validationType = resolveValidationTypeForFile(file, defaultValidationType)
+
+			String fileErrors = validateAmountsInFile(
+					file,
+					validationType,
+					sheetIndex,
+					headerCurrency,
+					headerCurrencyRef,
+					headerAmountCcy,
+					headerAmountBaseCcy
+					)
+
+			if (fileErrors.trim().length() > 0) {
+				errors.append(fileErrors)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateAmountColumnsAreEqual(
+			String filesToValidate,
+			String sheetIndexText,
+			String headerAmountCcy,
+			String headerAmountBaseCcy) {
+
+		return validateMontantCcyEqualsMontantBaseCcy(
+				filesToValidate,
+				'Mixte',
+				sheetIndexText,
+				'Devise',
+				'Devise de ref.',
+				headerAmountCcy,
+				headerAmountBaseCcy
+				)
+	}
+
+	@Keyword
+	String validateAmountColumnsAreEqual(
+			String filesToValidate,
+			String defaultValidationType,
+			String sheetIndexText,
+			String headerCurrency,
+			String headerCurrencyRef,
+			String headerAmountCcy,
+			String headerAmountBaseCcy) {
+
+		return validateMontantCcyEqualsMontantBaseCcy(
+				filesToValidate,
+				defaultValidationType,
+				sheetIndexText,
+				headerCurrency,
+				headerCurrencyRef,
+				headerAmountCcy,
+				headerAmountBaseCcy
+				)
+	}
+
+	@Keyword
+	String validateHeaderExists(String filesToValidate, String sheetIndexText, String headerName) {
+
+		StringBuilder errors = new StringBuilder()
+
+		List<File> files = parseFiles(filesToValidate)
+		int sheetIndex = parseIntOrZero(sheetIndexText)
+
+		for (File file : files) {
+
+			FileInputStream input = null
+			Workbook workbook = null
+
+			try {
+
+				input = new FileInputStream(file)
+				workbook = WorkbookFactory.create(input)
+
+				if (workbook.getNumberOfSheets() <= sheetIndex) {
+
+					errors.append("[ERROR] File '")
+							.append(file.getName())
+							.append("' does not contain sheet index ")
+							.append(sheetIndex)
+							.append(".\n")
+				} else {
+
+					Sheet sheet = workbook.getSheetAt(sheetIndex)
+					DataFormatter formatter = new DataFormatter()
+
+					int column = findHeaderColumn(sheet, headerName, formatter)
+
+					if (column < 0) {
+						errors.append("[ERROR] File '")
+								.append(file.getName())
+								.append("' missing header: ")
+								.append(headerName)
+								.append("\n")
+					}
+				}
+			} catch (Exception e) {
+
+				errors.append("[ERROR] Header exists validation failed for file '")
+						.append(file.getName())
+						.append("': ")
+						.append(e.getClass().getSimpleName())
+						.append(" | ")
+						.append(e.getMessage())
+						.append("\n")
+			} finally {
+
+				try {
+					if (workbook != null) {
+						workbook.close()
+					}
+				} catch (Exception ignored) {}
+
+				try {
+					if (input != null) {
+						input.close()
+					}
+				} catch (Exception ignored) {}
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateNoDiscrepanciesBetweenFiles(
+			String filesToValidate,
+			String defaultValidationType,
+			String sheetIndexText,
+			String keyHeadersText,
+			String compareHeadersText) {
+
+		String keyHeadersClean = safeText(keyHeadersText)
+		String compareHeadersClean = safeText(compareHeadersText)
+
+		if (keyHeadersClean.length() == 0 || compareHeadersClean.length() == 0) {
+			return "[SKIPPED] Discrepancy validation was not executed because key headers or compare headers were not configured."
+		}
+
+		StringBuilder errors = new StringBuilder()
+
+		List<File> files = parseFiles(filesToValidate)
+		int sheetIndex = parseIntOrZero(sheetIndexText)
+
+		if (files.size() < 2) {
+			return "[SKIPPED] Discrepancy validation needs at least 2 files."
+		}
+
+		List<String> keyHeaders = splitText(keyHeadersText)
+		List<String> compareHeaders = splitText(compareHeadersText)
+
+		Map<String, String> expectedValuesByKey = [:]
+		Map<String, String> sourceByKey = [:]
+
+		for (File file : files) {
+
+			String validationType = resolveValidationTypeForFile(file, defaultValidationType)
+
+			String fileErrors = collectDiscrepanciesFromFile(
+					file,
+					validationType,
+					sheetIndex,
+					keyHeaders,
+					compareHeaders,
+					expectedValuesByKey,
+					sourceByKey
+					)
+
+			if (fileErrors.trim().length() > 0) {
+				errors.append(fileErrors)
+			}
+		}
+
+		return errors.toString()
+	}
+
+	@Keyword
+	String validateDiscrepanciesBetweenSheets(
+			String filesToValidate,
+			String sheetIndexText,
+			String keyHeadersText,
+			String compareHeadersText) {
+
+		return validateNoDiscrepanciesBetweenFiles(
+				filesToValidate,
+				'Mixte',
+				sheetIndexText,
+				keyHeadersText,
+				compareHeadersText
+				)
+	}
+
+	@Keyword
+	String validateDiscrepanciesBetweenSheets(
+			String filesToValidate,
+			String defaultValidationType,
+			String sheetIndexText,
+			String keyHeadersText,
+			String compareHeadersText) {
+
+		return validateNoDiscrepanciesBetweenFiles(
+				filesToValidate,
+				defaultValidationType,
+				sheetIndexText,
+				keyHeadersText,
+				compareHeadersText
+				)
+	}
+
+	private String validateRequiredHeadersForFile(
+			File file,
+			String validationType,
+			int sheetIndex,
+			String headerCurrency,
+			String headerCurrencyRef,
+			String headerAmountCcy,
+			String headerAmountBaseCcy,
+			boolean needCurrencyRef) {
+
+		StringBuilder errors = new StringBuilder()
+
+		FileInputStream input = null
+		Workbook workbook = null
+
+		try {
+
+			KeywordUtil.logInfo("🧾 [VALIDATE HEADERS] file=" + file.getName() + " | validationType=" + validationType)
+
+			input = new FileInputStream(file)
+			workbook = WorkbookFactory.create(input)
+
+			if (workbook.getNumberOfSheets() <= sheetIndex) {
+
+				errors.append("[ERROR] File '")
+						.append(file.getName())
+						.append("' does not contain sheet index ")
+						.append(sheetIndex)
+						.append(".\n")
+			} else {
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+
+				int currencyCol = findHeaderColumn(sheet, headerCurrency, formatter)
+				int currencyRefCol = findHeaderColumn(sheet, headerCurrencyRef, formatter)
+				int amountCcyCol = findHeaderColumn(sheet, headerAmountCcy, formatter)
+				int amountBaseCol = findHeaderColumn(sheet, headerAmountBaseCcy, formatter)
+
+				KeywordUtil.logInfo("🧾 [HEADERS] file=" + file.getName() +
+						" | " + headerCurrency + "=" + currencyCol +
+						" | " + headerCurrencyRef + "=" + currencyRefCol +
+						" | " + headerAmountCcy + "=" + amountCcyCol +
+						" | " + headerAmountBaseCcy + "=" + amountBaseCol)
+
+				if (currencyCol < 0) {
+					errors.append("[ERROR] File '").append(file.getName()).append("' missing header: ").append(headerCurrency).append("\n")
+				}
+
+				if (needCurrencyRef && currencyRefCol < 0) {
+					errors.append("[ERROR] File '").append(file.getName()).append("' missing header: ").append(headerCurrencyRef).append("\n")
+				}
+
+				if (amountCcyCol < 0) {
+					errors.append("[ERROR] File '").append(file.getName()).append("' missing header: ").append(headerAmountCcy).append("\n")
+				}
+
+				if (amountBaseCol < 0) {
+					errors.append("[ERROR] File '").append(file.getName()).append("' missing header: ").append(headerAmountBaseCcy).append("\n")
+				}
+			}
+		} catch (Exception e) {
+
+			errors.append("[ERROR] Header validation failed for file '")
+					.append(file.getName())
+					.append("': ")
+					.append(e.getClass().getSimpleName())
+					.append(" | ")
+					.append(e.getMessage())
+					.append("\n")
+		} finally {
+
+			try {
+				if (workbook != null) {
+					workbook.close()
+				}
+			} catch (Exception ignored) {}
+
+			try {
+				if (input != null) {
+					input.close()
+				}
+			} catch (Exception ignored) {}
+		}
+
+		return errors.toString()
+	}
+
+	private String validateRowsForValidationTypeInFile(
+			File file,
+			String validationType,
+			int sheetIndex,
+			String headerCurrency,
+			String headerCurrencyRef) {
+
+		StringBuilder errors = new StringBuilder()
+
+		FileInputStream input = null
+		Workbook workbook = null
+
+		try {
+
+			KeywordUtil.logInfo("🔎 [VALIDATE ROWS] file=" + file.getName() + " | validationType=" + validationType)
+
+			input = new FileInputStream(file)
+			workbook = WorkbookFactory.create(input)
+
+			if (workbook.getNumberOfSheets() <= sheetIndex) {
+
+				errors.append("[ERROR] File '")
+						.append(file.getName())
+						.append("' does not contain sheet index ")
+						.append(sheetIndex)
+						.append(".\n")
+			} else {
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+				FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator()
+
+				int currencyCol = findHeaderColumn(sheet, headerCurrency, formatter)
+				int currencyRefCol = findHeaderColumn(sheet, headerCurrencyRef, formatter)
+
+				boolean needCurrencyRef = isCurrencyRefRequired(validationType)
+
+				if (currencyCol < 0 || (needCurrencyRef && currencyRefCol < 0)) {
+
+					errors.append("[ERROR] File '")
+							.append(file.getName())
+							.append("' cannot validate rows because required currency headers are missing.\n")
+				} else {
+
+					int matchingRows = 0
+					int lastRowNum = sheet.getLastRowNum()
+
+					for (int i = 1; i <= lastRowNum; i++) {
+
+						Row row = sheet.getRow(i)
+
+						if (row != null && !isRowEmpty(row, formatter, evaluator)) {
+
+							String currency = getCellText(row, currencyCol, formatter, evaluator)
+							String currencyRef = needCurrencyRef ? getCellText(row, currencyRefCol, formatter, evaluator) : ''
+
+							if (shouldValidateRow(validationType, currency, currencyRef)) {
+								matchingRows++
+							}
+						}
+					}
+
+					KeywordUtil.logInfo("🔎 [ROWS FOUND] file=" + file.getName() + " | validationType=" + validationType + " | rows=" + matchingRows)
+
+					if (matchingRows == 0) {
+						errors.append("[ERROR] File '")
+								.append(file.getName())
+								.append("' has no rows corresponding to validation type ")
+								.append(validationType)
+								.append(".\n")
+					}
+				}
+			}
+		} catch (Exception e) {
+
+			errors.append("[ERROR] Row validation failed for file '")
+					.append(file.getName())
+					.append("': ")
+					.append(e.getClass().getSimpleName())
+					.append(" | ")
+					.append(e.getMessage())
+					.append("\n")
+		} finally {
+
+			try {
+				if (workbook != null) {
+					workbook.close()
+				}
+			} catch (Exception ignored) {}
+
+			try {
+				if (input != null) {
+					input.close()
+				}
+			} catch (Exception ignored) {}
+		}
+
+		return errors.toString()
+	}
+
+	private String validateAmountsInFile(
+			File file,
+			String validationType,
+			int sheetIndex,
+			String headerCurrency,
+			String headerCurrencyRef,
+			String headerAmountCcy,
+			String headerAmountBaseCcy) {
+
+		StringBuilder errors = new StringBuilder()
+
+		FileInputStream input = null
+		Workbook workbook = null
+
+		try {
+
+			KeywordUtil.logInfo("💰 [VALIDATE AMOUNTS] file=" + file.getName() + " | validationType=" + validationType)
+
+			input = new FileInputStream(file)
+			workbook = WorkbookFactory.create(input)
+
+			if (workbook.getNumberOfSheets() <= sheetIndex) {
+
+				errors.append("[ERROR] File '")
+						.append(file.getName())
+						.append("' does not contain sheet index ")
+						.append(sheetIndex)
+						.append(".\n")
+			} else {
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+				FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator()
+
+				int currencyCol = findHeaderColumn(sheet, headerCurrency, formatter)
+				int currencyRefCol = findHeaderColumn(sheet, headerCurrencyRef, formatter)
+				int amountCcyCol = findHeaderColumn(sheet, headerAmountCcy, formatter)
+				int amountBaseCol = findHeaderColumn(sheet, headerAmountBaseCcy, formatter)
+
+				boolean needCurrencyRef = isCurrencyRefRequired(validationType)
+
+				if (currencyCol < 0 || amountCcyCol < 0 || amountBaseCol < 0 || (needCurrencyRef && currencyRefCol < 0)) {
+
+					errors.append("[ERROR] File '")
+							.append(file.getName())
+							.append("' cannot validate amounts because required headers are missing.\n")
+				} else {
+
+					int lastRowNum = sheet.getLastRowNum()
+					int processed = 0
+					int validatedRows = 0
+					int skippedNullRow = 0
+					int skippedEmptyRow = 0
+					int invalidComparable = 0
+					int fallbackTextComparison = 0
+
+					for (int i = 1; i <= lastRowNum; i++) {
+
+						Row row = sheet.getRow(i)
+
+						if (row == null) {
+
+							skippedNullRow++
+						} else if (isRowEmpty(row, formatter, evaluator)) {
+
+							skippedEmptyRow++
+						} else {
+
+							processed++
+
+							String currency = getCellText(row, currencyCol, formatter, evaluator)
+							String currencyRef = needCurrencyRef ? getCellText(row, currencyRefCol, formatter, evaluator) : ''
+
+							if (shouldValidateRow(validationType, currency, currencyRef)) {
+
+								validatedRows++
+
+								String amountCcyText = getCellText(row, amountCcyCol, formatter, evaluator)
+								String amountBaseText = getCellText(row, amountBaseCol, formatter, evaluator)
+
+								ComparisonResult comparisonResult = compareAmountValues(
+										row,
+										amountCcyCol,
+										amountBaseCol,
+										formatter,
+										evaluator
+										)
+
+								if (comparisonResult.usedTextFallback) {
+									fallbackTextComparison++
+								}
+
+								if (!comparisonResult.comparable) {
+
+									invalidComparable++
+
+									errors.append("[ERROR] File '")
+											.append(file.getName())
+											.append("' row ")
+											.append(i + 1)
+											.append(" has non-comparable amount values. ")
+											.append(headerAmountCcy)
+											.append("='")
+											.append(amountCcyText)
+											.append("' | ")
+											.append(headerAmountBaseCcy)
+											.append("='")
+											.append(amountBaseText)
+											.append("'\n")
+								} else if (!comparisonResult.equals) {
+
+									errors.append("[ERROR] File '")
+											.append(file.getName())
+											.append("' row ")
+											.append(i + 1)
+											.append(" has different amounts. ")
+											.append(headerCurrency)
+											.append("='")
+											.append(currency)
+											.append("'")
+
+									if (needCurrencyRef) {
+										errors.append(" | ")
+												.append(headerCurrencyRef)
+												.append("='")
+												.append(currencyRef)
+												.append("'")
+									}
+
+									errors.append(" | ")
+											.append(headerAmountCcy)
+											.append("='")
+											.append(amountCcyText)
+											.append("' | ")
+											.append(headerAmountBaseCcy)
+											.append("='")
+											.append(amountBaseText)
+											.append("' | comparison=")
+											.append(comparisonResult.message)
+											.append("\n")
+								}
+							}
+						}
+
+						if (i % 200 == 0) {
+							KeywordUtil.logInfo("🟦 [PROGRESS] file=" + file.getName() +
+									" | row=" + i + "/" + lastRowNum +
+									" | processed=" + processed +
+									" | validatedRows=" + validatedRows +
+									" | nullRow=" + skippedNullRow +
+									" | emptyRow=" + skippedEmptyRow +
+									" | nonComparable=" + invalidComparable +
+									" | fallbackTextComparison=" + fallbackTextComparison)
+						}
+					}
+
+					KeywordUtil.logInfo("✅ [AMOUNT LOOP END] file=" + file.getName() +
+							" | processed=" + processed +
+							" | validatedRows=" + validatedRows +
+							" | skippedNullRow=" + skippedNullRow +
+							" | skippedEmptyRow=" + skippedEmptyRow +
+							" | nonComparable=" + invalidComparable +
+							" | fallbackTextComparison=" + fallbackTextComparison +
+							" | lastRowNum=" + lastRowNum)
+				}
+			}
+		} catch (Exception e) {
+
+			errors.append("[ERROR] Amount validation failed for file '")
+					.append(file.getName())
+					.append("': ")
+					.append(e.getClass().getSimpleName())
+					.append(" | ")
+					.append(e.getMessage())
+					.append("\n")
+		} finally {
+
+			try {
+				if (workbook != null) {
+					workbook.close()
+				}
+			} catch (Exception ignored) {}
+
+			try {
+				if (input != null) {
+					input.close()
+				}
+			} catch (Exception ignored) {}
+		}
+
+		return errors.toString()
+	}
+
+	private String collectDiscrepanciesFromFile(
+			File file,
+			String validationType,
+			int sheetIndex,
+			List<String> keyHeaders,
+			List<String> compareHeaders,
+			Map<String, String> expectedValuesByKey,
+			Map<String, String> sourceByKey) {
+
+		StringBuilder errors = new StringBuilder()
+
+		FileInputStream input = null
+		Workbook workbook = null
+
+		try {
+
+			KeywordUtil.logInfo("🔁 [DISCREPANCY CHECK] file=" + file.getName() + " | validationType=" + validationType)
+
+			input = new FileInputStream(file)
+			workbook = WorkbookFactory.create(input)
+
+			if (workbook.getNumberOfSheets() <= sheetIndex) {
+
+				errors.append("[ERROR] File '")
+						.append(file.getName())
+						.append("' does not contain sheet index ")
+						.append(sheetIndex)
+						.append(".\n")
+			} else {
+
+				Sheet sheet = workbook.getSheetAt(sheetIndex)
+				DataFormatter formatter = new DataFormatter()
+				FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator()
+
+				Map<String, Integer> keyColumns = resolveHeaderColumns(sheet, keyHeaders, formatter)
+				Map<String, Integer> compareColumns = resolveHeaderColumns(sheet, compareHeaders, formatter)
+
+				if (keyColumns.size() != keyHeaders.size() || compareColumns.size() != compareHeaders.size()) {
+
+					errors.append("[ERROR] File '")
+							.append(file.getName())
+							.append("' cannot run discrepancy validation because one or more configured headers were not found.\n")
+				} else {
+
+					int lastRowNum = sheet.getLastRowNum()
+
+					for (int i = 1; i <= lastRowNum; i++) {
+
+						Row row = sheet.getRow(i)
+
+						if (row != null && !isRowEmpty(row, formatter, evaluator)) {
+
+							String key = buildValueByHeaders(row, keyHeaders, keyColumns, formatter, evaluator)
+							String value = buildValueByHeaders(row, compareHeaders, compareColumns, formatter, evaluator)
+
+							String fullKey = key
+
+							if (!expectedValuesByKey.containsKey(fullKey)) {
+
+								expectedValuesByKey.put(fullKey, value)
+								sourceByKey.put(fullKey, file.getName() + " row " + (i + 1))
+							} else {
+
+								String expectedValue = expectedValuesByKey.get(fullKey)
+
+								if (!safeText(expectedValue).equals(safeText(value))) {
+
+									errors.append("[ERROR] Discrepancy found for key [")
+											.append(fullKey)
+											.append("]. Expected from ")
+											.append(sourceByKey.get(fullKey))
+											.append(": ")
+											.append(expectedValue)
+											.append(" | Found in ")
+											.append(file.getName())
+											.append(" row ")
+											.append(i + 1)
+											.append(": ")
+											.append(value)
+											.append("\n")
+								}
+							}
+						}
+					}
+				}
+			}
+		} catch (Exception e) {
+
+			errors.append("[ERROR] Discrepancy validation failed for file '")
+					.append(file.getName())
+					.append("': ")
+					.append(e.getClass().getSimpleName())
+					.append(" | ")
+					.append(e.getMessage())
+					.append("\n")
+		} finally {
+
+			try {
+				if (workbook != null) {
+					workbook.close()
+				}
+			} catch (Exception ignored) {}
+
+			try {
+				if (input != null) {
+					input.close()
+				}
+			} catch (Exception ignored) {}
+		}
+
+		return errors.toString()
+	}
+
+	private List<File> collectExcelFiles(File folder, boolean includeSubFolders) {
+
+		List<File> result = []
+
+		File[] children = folder.listFiles()
+
+		if (children != null) {
+
+			for (File child : children) {
+
+				if (child.isFile() && isExcelFile(child.getName()) && !child.getName().startsWith('~$')) {
+
+					result.add(child)
+				} else if (includeSubFolders && child.isDirectory()) {
+
+					List<File> childFiles = collectExcelFiles(child, includeSubFolders)
+
+					for (File childFile : childFiles) {
+						result.add(childFile)
+					}
+				}
+			}
+		}
+
+		return result
+	}
+
+	private List<File> parseFiles(String filesToValidate) {
+
+		List<File> result = []
+		List<String> paths = splitText(filesToValidate)
+
+		for (String path : paths) {
+
+			String cleanPath = safeText(path)
+
+			if (cleanPath.length() > 0) {
+				result.add(new File(cleanPath))
+			}
+		}
+
+		return result.unique { File file ->
+			file.getAbsolutePath().toLowerCase()
+		}
+	}
+
+	private List<String> splitText(String value) {
+
+		List<String> result = []
+
+		String text = safeText(value)
+				.replace('\r\n', String.valueOf(LIST_SEPARATOR))
+				.replace('\n', String.valueOf(LIST_SEPARATOR))
+				.replace(';', String.valueOf(LIST_SEPARATOR))
+
+		if (text.length() > 0) {
+
+			String[] parts = text.split('\\|')
+
+			for (String part : parts) {
+
+				String clean = safeText(part)
+
+				if (clean.length() > 0) {
+					result.add(clean)
+				}
+			}
+		}
+
+		return result.unique()
+	}
+
+	private boolean isExcelFile(String fileName) {
+
+		String name = safeText(fileName).toLowerCase()
+
+		return name.endsWith('.xlsx') ||
+				name.endsWith('.xls') ||
+				name.endsWith('.xlsm')
+	}
+
+	private String resolveValidationTypeForFile(File file, String defaultValidationType) {
+
+		String source = safeText(file.getAbsolutePath()).toUpperCase()
+
+		if (source.contains('EUR')) {
+			return 'EUR'
+		}
+
+		if (source.contains('USD')) {
+			return 'USD'
+		}
+
+		if (source.contains('MIXTE') || source.contains('MIX')) {
+			return 'MIXTE'
+		}
+
+		return normalizeValidationType(defaultValidationType)
+	}
+
+	private String normalizeValidationType(String validationType) {
+
+		String value = safeText(validationType).toUpperCase()
+
+		if (value.contains('EUR')) {
+			return 'EUR'
+		}
+
+		if (value.contains('USD')) {
+			return 'USD'
+		}
+
+		if (value.contains('MIX')) {
+			return 'MIXTE'
+		}
+
+		return safeText(validationType)
+	}
+
+	private boolean isCurrencyRefRequired(String validationType) {
+		return !('EUR'.equalsIgnoreCase(validationType) || 'USD'.equalsIgnoreCase(validationType))
+	}
+
+	private boolean shouldValidateRow(String validationType, String currency, String currencyRef) {
+
+		String type = normalizeValidationType(validationType)
+
+		if ('EUR'.equalsIgnoreCase(type)) {
+			return 'EUR'.equalsIgnoreCase(safeText(currency))
+		}
+
+		if ('USD'.equalsIgnoreCase(type)) {
+			return 'USD'.equalsIgnoreCase(safeText(currency))
+		}
+
+		return safeText(currency).length() > 0 && safeText(currency).equalsIgnoreCase(safeText(currencyRef))
+	}
+
+	private int findHeaderColumn(Sheet sheet, String headerName, DataFormatter formatter) {
+
+		Row headerRow = sheet.getRow(0)
+
+		if (headerRow == null) {
+			KeywordUtil.logInfo("[ERROR] Header row not found in row 1.")
+			return -1
+		}
+
+		String expectedHeader = normalizeHeader(headerName)
+		short lastCellNum = headerRow.getLastCellNum()
+
+		if (lastCellNum <= 0) {
+			KeywordUtil.logInfo("[ERROR] Header row is empty.")
+			return -1
+		}
+
+		for (int i = 0; i < lastCellNum; i++) {
+
+			Cell cell = headerRow.getCell(i)
+			String value = cell == null ? '' : formatter.formatCellValue(cell).trim()
+
+			if (normalizeHeader(value).equals(expectedHeader)) {
+				return i
+			}
+		}
+
+		KeywordUtil.logInfo("[ERROR] Header '" + headerName + "' not found.")
+		return -1
+	}
+
+	private Map<String, Integer> resolveHeaderColumns(Sheet sheet, List<String> headers, DataFormatter formatter) {
+
+		Map<String, Integer> result = [:]
+
+		for (String header : headers) {
+
+			int columnIndex = findHeaderColumn(sheet, header, formatter)
+
+			if (columnIndex >= 0) {
+				result.put(header, columnIndex)
+			}
+		}
+
+		return result
+	}
+
+	private String buildValueByHeaders(
+			Row row,
+			List<String> headers,
+			Map<String, Integer> columns,
+			DataFormatter formatter,
+			FormulaEvaluator evaluator) {
+
+		List<String> values = []
+
+		for (String header : headers) {
+
+			Integer columnIndex = columns.get(header)
+			String cellText = getCellText(row, columnIndex, formatter, evaluator)
+
+			BigDecimal number = parseNumber(cellText)
+
+			if (number != null) {
+				cellText = round2(number).toPlainString()
+			}
+
+			values.add(header + '=' + normalizeValue(cellText))
+		}
+
+		return values.join(' | ')
+	}
+
+	private String normalizeHeader(String value) {
+
+		return safeText(value)
+				.replace('\u00A0', ' ')
+				.replaceAll('\\s+', ' ')
+				.trim()
+				.toLowerCase()
+	}
+
+	private String normalizeValue(String value) {
+
+		return safeText(value)
+				.replace('\u00A0', ' ')
+				.replaceAll('\\s+', ' ')
+				.trim()
+	}
+
+	private String getCellText(Row row, int col, DataFormatter formatter, FormulaEvaluator evaluator) {
+
+		if (row == null || col < 0) {
+			return ''
+		}
+
+		Cell cell = row.getCell(col)
+
+		if (cell == null) {
+			return ''
+		}
+
+		try {
+			return formatter.formatCellValue(cell, evaluator).trim()
+		} catch (Exception e) {
+			return formatter.formatCellValue(cell).trim()
+		}
+	}
+
+	private BigDecimal getCellNumber(Row row, int col, DataFormatter formatter, FormulaEvaluator evaluator) {
+
+		if (row == null || col < 0) {
+			return null
+		}
+
+		Cell cell = row.getCell(col)
+
+		if (cell == null) {
+			return null
+		}
+
+		try {
+
+			CellType cellType = cell.getCellType()
+
+			if (cellType == CellType.NUMERIC) {
+				return BigDecimal.valueOf(cell.getNumericCellValue())
+			}
+
+			if (cellType == CellType.FORMULA) {
+
+				CellValue evaluatedValue = evaluator.evaluate(cell)
+
+				if (evaluatedValue != null && evaluatedValue.getCellType() == CellType.NUMERIC) {
+					return BigDecimal.valueOf(evaluatedValue.getNumberValue())
+				}
+			}
+
+			String text = getCellText(row, col, formatter, evaluator)
+
+			return parseNumber(text)
+		} catch (Exception e) {
+
+			try {
+				String text = getCellText(row, col, formatter, evaluator)
+				return parseNumber(text)
+			} catch (Exception ignored) {
+				return null
+			}
+		}
+	}
+
+	private ComparisonResult compareAmountValues(
+			Row row,
+			int amountCcyCol,
+			int amountBaseCol,
+			DataFormatter formatter,
+			FormulaEvaluator evaluator) {
+
+		String amountCcyText = getCellText(row, amountCcyCol, formatter, evaluator)
+		String amountBaseText = getCellText(row, amountBaseCol, formatter, evaluator)
+
+		BigDecimal amountCcy = getCellNumber(row, amountCcyCol, formatter, evaluator)
+		BigDecimal amountBase = getCellNumber(row, amountBaseCol, formatter, evaluator)
+
+		if (amountCcy != null && amountBase != null) {
+
+			BigDecimal ccy = round2(amountCcy)
+			BigDecimal base = round2(amountBase)
+
+			return new ComparisonResult(
+					true,
+					ccy.compareTo(base) == 0,
+					false,
+					'numeric: ' + ccy + ' vs ' + base
+					)
+		}
+
+		String normalizedCcy = normalizeComparableAmountText(amountCcyText)
+		String normalizedBase = normalizeComparableAmountText(amountBaseText)
+
+		if (normalizedCcy.length() == 0 && normalizedBase.length() == 0) {
+			return new ComparisonResult(true, true, true, 'both empty')
+		}
+
+		if (normalizedCcy.length() == 0 || normalizedBase.length() == 0) {
+			return new ComparisonResult(
+					true,
+					false,
+					true,
+					'one amount empty: ' + normalizedCcy + ' vs ' + normalizedBase
+					)
+		}
+
+		BigDecimal parsedCcyFromText = parseNumber(normalizedCcy)
+		BigDecimal parsedBaseFromText = parseNumber(normalizedBase)
+
+		if (parsedCcyFromText != null && parsedBaseFromText != null) {
+
+			BigDecimal ccy = round2(parsedCcyFromText)
+			BigDecimal base = round2(parsedBaseFromText)
+
+			return new ComparisonResult(
+					true,
+					ccy.compareTo(base) == 0,
+					true,
+					'text numeric fallback: ' + ccy + ' vs ' + base
+					)
+		}
+
+		return new ComparisonResult(
+				true,
+				normalizedCcy.equalsIgnoreCase(normalizedBase),
+				true,
+				'text fallback: ' + normalizedCcy + ' vs ' + normalizedBase
+				)
+	}
+
+	private String normalizeComparableAmountText(String value) {
+
+		String text = safeText(value)
+
+		if (text.length() == 0) {
+			return ''
+		}
+
+		BigDecimal number = parseNumber(text)
+
+		if (number != null) {
+			return round2(number).toPlainString()
+		}
+
+		return text
+				.replace('\u00A0', ' ')
+				.replace('\u202F', ' ')
+				.replaceAll('\\s+', '')
+				.trim()
+	}
+
+	private BigDecimal parseNumber(String value) {
+
+		String text = safeText(value)
+
+		if (text.length() == 0) {
+			return null
+		}
+
+		text = text
+				.replace('\u00A0', ' ')
+				.replace('\u202F', ' ')
+				.replace('\u2212', '-')
+				.replace('\u2012', '-')
+				.replace('\u2013', '-')
+				.replace('\u2014', '-')
+				.replace('\u2015', '-')
+				.trim()
+
+		boolean negativeByParentheses = text.startsWith('(') && text.endsWith(')')
+		boolean negativeByTrailingMinus = text.endsWith('-')
+
+		text = text
+				.replaceAll('[^0-9,\\.\\-\\(\\)]', '')
+				.replace('(', '')
+				.replace(')', '')
+
+		if (negativeByTrailingMinus && text.endsWith('-')) {
+			text = text.substring(0, text.length() - 1)
+		}
+
+		boolean hasNegativeSign = text.startsWith('-') || negativeByParentheses || negativeByTrailingMinus
+
+		text = text.replace('-', '')
+
+		if (text.length() == 0) {
+			return null
+		}
+
+		String normalized = normalizeNumericSeparators(text)
+
+		if (normalized.length() == 0) {
+			return null
+		}
+
+		BigDecimal result = new BigDecimal(normalized)
+
+		if (hasNegativeSign && result.compareTo(BigDecimal.ZERO) > 0) {
+			result = result.multiply(BigDecimal.valueOf(-1))
+		}
+
+		return result
+	}
+
+	private String normalizeNumericSeparators(String text) {
+
+		String value = safeText(text)
+
+		if (value.length() == 0) {
+			return ''
+		}
+
+		int commaCount = countOccurrences(value, ',')
+		int dotCount = countOccurrences(value, '.')
+
+		if (commaCount > 0 && dotCount > 0) {
+
+			int lastComma = value.lastIndexOf(',')
+			int lastDot = value.lastIndexOf('.')
+
+			if (lastComma > lastDot) {
+				value = value.replace('.', '')
+				value = value.replace(',', '.')
+			} else {
+				value = value.replace(',', '')
+			}
+
+			return value
+		}
+
+		if (commaCount > 0) {
+			return normalizeSingleSeparatorNumber(value, ',')
+		}
+
+		if (dotCount > 0) {
+			return normalizeSingleSeparatorNumber(value, '.')
+		}
+
+		return value
+	}
+
+	private String normalizeSingleSeparatorNumber(String value, String separator) {
+
+		int separatorCount = countOccurrences(value, separator)
+
+		if (separatorCount == 0) {
+			return value
+		}
+
+		if (separatorCount > 1) {
+
+			int lastSeparator = value.lastIndexOf(separator)
+			String decimals = value.substring(lastSeparator + 1)
+
+			if (decimals.length() == 1 || decimals.length() == 2) {
+				String integerPart = value.substring(0, lastSeparator).replace(separator, '')
+				return integerPart + '.' + decimals
+			}
+
+			return value.replace(separator, '')
+		}
+
+		int separatorIndex = value.indexOf(separator)
+		String before = value.substring(0, separatorIndex)
+		String after = value.substring(separatorIndex + 1)
+
+		if (after.length() == 3 && before.length() >= 1 && before.length() <= 3) {
+			return before + after
+		}
+
+		if (separator == ',') {
+			return before + '.' + after
+		}
+
+		return value
+	}
+
+	private BigDecimal round2(BigDecimal value) {
+
+		if (value == null) {
+			return null
+		}
+
+		return value.setScale(2, RoundingMode.HALF_UP)
+	}
+
+	private boolean isRowEmpty(Row row, DataFormatter formatter, FormulaEvaluator evaluator) {
+
+		if (row == null) {
+			return true
+		}
+
+		short lastCellNum = row.getLastCellNum()
+
+		if (lastCellNum <= 0) {
+			return true
+		}
+
+		for (int i = 0; i < lastCellNum; i++) {
+
+			Cell cell = row.getCell(i)
+
+			if (cell != null) {
+
+				String value = ''
+
+				try {
+					value = formatter.formatCellValue(cell, evaluator).trim()
+				} catch (Exception e) {
+					value = formatter.formatCellValue(cell).trim()
+				}
+
+				if (value.length() > 0) {
+					return false
+				}
+			}
+		}
+
+		return true
+	}
+
+	private int parseIntOrZero(String value) {
+
+		try {
+			return Integer.parseInt(safeText(value))
+		} catch (Exception e) {
+			return 0
+		}
+	}
+
+	private int countOccurrences(String text, String token) {
+
+		int count = 0
+		int index = 0
+
+		while (index >= 0) {
+
+			index = text.indexOf(token, index)
+
+			if (index >= 0) {
+				count++
+				index = index + token.length()
+			}
+		}
+
+		return count
+	}
+
+	private boolean isTrue(String value) {
+
+		String text = safeText(value).toLowerCase()
+
+		return text == 'true' ||
+				text == 'yes' ||
+				text == 'y' ||
+				text == '1' ||
+				text == 'sim'
+	}
+
+	private String safeText(Object value) {
+
+		if (value == null) {
+			return ''
+		}
+
+		return value.toString().trim()
+	}
+
+	private static class ComparisonResult {
+
+		boolean comparable
+		boolean equals
+		boolean usedTextFallback
+		String message
+
+		ComparisonResult(boolean comparable, boolean equals, boolean usedTextFallback, String message) {
+			this.comparable = comparable
+			this.equals = equals
+			this.usedTextFallback = usedTextFallback
+			this.message = message
+		}
+	}
+}
+
+
+
+
 
