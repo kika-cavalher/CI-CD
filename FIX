@@ -1,1007 +1,1023 @@
 package commands
 
-import java.io.File
-import java.io.FileInputStream
-import java.io.InputStream
-import java.math.RoundingMode
+import static com.kms.katalon.core.testobject.ObjectRepository.findWindowsObject
+
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
+import java.awt.event.KeyEvent
 import java.text.Normalizer
-
-import javax.xml.parsers.SAXParserFactory
-
-import org.apache.poi.openxml4j.opc.OPCPackage
-import org.apache.poi.ss.usermodel.Cell
-import org.apache.poi.ss.usermodel.CellType
-import org.apache.poi.ss.usermodel.DataFormatter
-import org.apache.poi.ss.usermodel.Row
-import org.apache.poi.ss.usermodel.Sheet
-import org.apache.poi.ss.usermodel.Workbook
-import org.apache.poi.ss.usermodel.WorkbookFactory
-import org.apache.poi.ss.util.CellReference
-import org.apache.poi.xssf.eventusermodel.ReadOnlySharedStringsTable
-import org.apache.poi.xssf.eventusermodel.XSSFReader
-import org.apache.poi.xssf.eventusermodel.XSSFSheetXMLHandler
-import org.apache.poi.xssf.model.StylesTable
-import org.apache.poi.xssf.usermodel.XSSFComment
-import org.xml.sax.InputSource
-import org.xml.sax.XMLReader
+import java.text.SimpleDateFormat
 
 import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.configuration.RunConfiguration
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.testobject.WindowsTestObject.LocatorStrategy
 import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import internal.GlobalVariable
 
 
-class RecPrdExportValidationKeywords {
+class ExportFile {
 
-	// ======================================================
-	// PUBLIC VALIDATION
-	// ======================================================
+	private static final Integer MAX_WINDOWS_PATH_LENGTH = 220
+	private static final Integer MAX_COLLECTION_LENGTH = 20
+	private static final Integer MAX_FEATURE_LENGTH = 28
+	private static final Integer MAX_LABEL_LENGTH = 20
+	private static final Integer EXPORT_FILE_TIMEOUT_SECONDS = 120
+
+	private static final String SHORT_EXPORT_ROOT = 'C:\\KatalonExports'
+
+	private ImageLoader imageLoader = new ImageLoader()
+
 
 	@Keyword
-	Map validateLatestRecPrdExport(
-			String exportRootFolder,
-			String exportGroupFolder,
-			String exportFeatureFolder,
-			Integer columnIndex,
-			String expectedColumnName) {
-
-		Map result = createEmptyResult(
-				exportRootFolder,
-				exportGroupFolder,
-				exportFeatureFolder,
-				columnIndex,
-				expectedColumnName
-		)
-
-		StringBuilder errors = new StringBuilder()
-		StringBuilder passedDetails = new StringBuilder()
-
-		try {
-			File exportRoot = new File(safeText(exportRootFolder))
-			int validatedColumnIndex = columnIndex == null ? -1 : columnIndex.intValue()
-
-			if (!exportRoot.exists() || !exportRoot.isDirectory()) {
-				errors.append('[ERROR] Export root folder does not exist or is not a folder.\n')
-						.append('Folder: ')
-						.append(exportRoot.getAbsolutePath())
-
-				return finalizeResult(result, errors, passedDetails)
-			}
-
-			if (validatedColumnIndex < 0) {
-				errors.append('[ERROR] Invalid column index.\n')
-						.append('Column index: ')
-						.append(validatedColumnIndex)
-
-				return finalizeResult(result, errors, passedDetails)
-			}
-
-			Map selectedFiles = resolveLatestRecPrdFiles(
-					exportRoot,
-					exportGroupFolder,
-					exportFeatureFolder
-			)
-
-			File recFile = selectedFiles.recFile as File
-			File prdFile = selectedFiles.prdFile as File
-			File selectedFolder = selectedFiles.selectedFolder as File
-
-			result.recFileName = recFile == null ? 'NOT FOUND' : recFile.getName()
-			result.prdFileName = prdFile == null ? 'NOT FOUND' : prdFile.getName()
-			result.selectedFolderPath = selectedFolder == null ? '' : selectedFolder.getAbsolutePath()
-
-			if (recFile == null || prdFile == null) {
-				errors.append('[ERROR] REC and PRD exported files were not found.\n')
-						.append('Search root: ')
-						.append(exportRoot.getAbsolutePath())
-						.append('\nExpected folder: ')
-						.append(safeText(exportGroupFolder))
-						.append('\\')
-						.append(safeText(exportFeatureFolder))
-						.append('\nREC file: ')
-						.append(result.recFileName)
-						.append('\nPRD file: ')
-						.append(result.prdFileName)
-
-				return finalizeResult(result, errors, passedDetails)
-			}
-
-			KeywordUtil.logInfo(
-					'[REC X PRD] Folder=' + selectedFolder.getAbsolutePath() +
-					' | REC=' + recFile.getName() +
-					' | PRD=' + prdFile.getName()
-			)
-
-			Map recData = readFileStatistics(
-					recFile,
-					validatedColumnIndex,
-					expectedColumnName,
-					'REC'
-			)
-
-			Map prdData = readFileStatistics(
-					prdFile,
-					validatedColumnIndex,
-					expectedColumnName,
-					'PRD'
-			)
-
-			copyStatisticsToResult(
-					result,
-					recData,
-					prdData,
-					expectedColumnName
-			)
-
-			appendFileErrors(errors, recData)
-			appendFileErrors(errors, prdData)
-
-			if (errors.length() > 0) {
-				return finalizeResult(result, errors, passedDetails)
-			}
-
-			if (!normalizeText(result.recColumnName).equals(
-					normalizeText(result.prdColumnName))) {
-
-				errors.append('[ERROR] REC and PRD column headers are different.\n')
-						.append('REC: ')
-						.append(result.recColumnName)
-						.append('\nPRD: ')
-						.append(result.prdColumnName)
-						.append('\n')
-			}
-
-			if ((result.recRows as int) != (result.prdRows as int)) {
-				errors.append('[ERROR] Number of rows is different.\n')
-						.append('REC: ')
-						.append(result.recRows)
-						.append('\nPRD: ')
-						.append(result.prdRows)
-						.append('\n')
-			} else {
-				passedDetails.append('[PASS] Number of rows is equal.\n')
-						.append('REC: ')
-						.append(result.recRows)
-						.append('\nPRD: ')
-						.append(result.prdRows)
-						.append('\n')
-			}
-
-			appendComparison(
-					errors,
-					passedDetails,
-					'Column sum',
-					result.columnName,
-					result.recSum as BigDecimal,
-					result.prdSum as BigDecimal
-			)
-
-			appendComparison(
-					errors,
-					passedDetails,
-					'Minimum value',
-					result.columnName,
-					result.recMinimum as BigDecimal,
-					result.prdMinimum as BigDecimal
-			)
-
-			appendComparison(
-					errors,
-					passedDetails,
-					'Maximum value',
-					result.columnName,
-					result.recMaximum as BigDecimal,
-					result.prdMaximum as BigDecimal
-			)
-
-		} catch (OutOfMemoryError error) {
-			errors.append('[ERROR] Not enough memory to validate the exported files.\n')
-					.append('Message: ')
-					.append(safeText(error.getMessage()))
-		} catch (Exception exception) {
-			errors.append('[ERROR] REC x PRD export validation failed.\n')
-					.append('Exception: ')
-					.append(exception.getClass().getSimpleName())
-					.append('\nMessage: ')
-					.append(safeText(exception.getMessage()))
-		}
-
-		return finalizeResult(result, errors, passedDetails)
+	void exportFromOutilsToNo(String exportLabel) {
+		exportFromOutilsToNo(exportLabel, null)
 	}
 
 
-	// ======================================================
-	// FILE READING
-	// ======================================================
+	@Keyword
+	void exportFromOutilsToNo(
+			String exportLabel,
+			String targetEnvironment) {
 
-	private Map readFileStatistics(
-			File file,
-			int columnIndex,
-			String expectedColumnName,
-			String environment) {
+		KeywordUtil.logInfo('Step 1. Open Outils menu.')
 
-		String lowerName = file.getName().toLowerCase()
+		imageLoader.waitForImageOrStop(
+				'General',
+				'outilsMenu',
+				15
+		)
 
-		if (lowerName.endsWith('.xlsx') || lowerName.endsWith('.xlsm')) {
-			return readXlsxStreaming(
-					file,
-					columnIndex,
-					expectedColumnName,
-					environment
-			)
-		}
+		imageLoader.clickImageOrStop(
+				'General',
+				'outilsMenu'
+		)
 
-		return readLegacyWorkbook(
-				file,
-				columnIndex,
-				expectedColumnName,
-				environment
+		Windows.delay(2)
+
+		KeywordUtil.logInfo(
+				'Step 2. Validate Export button and click it.'
+		)
+
+		clickExportButtonByElement()
+
+		Windows.delay(3)
+
+		KeywordUtil.logInfo(
+				'Step 3. Save file inside short REC/PRD export folder.'
+		)
+
+		File exportedFile = saveToShortExportFolder(
+				exportLabel,
+				targetEnvironment
+		)
+
+		KeywordUtil.logInfo(
+				'Step 4. Close open-file modal.'
+		)
+
+		closeOpenFileModal()
+
+		KeywordUtil.logInfo(
+				'Step 5. Validate exported file exists and is not empty.'
+		)
+
+		validateExportedFile(exportedFile)
+
+		KeywordUtil.logInfo(
+				'Export flow finished without opening exported file.'
 		)
 	}
 
 
-	private Map readXlsxStreaming(
-			File file,
-			int columnIndex,
-			String expectedColumnName,
-			String environment) {
+	@Keyword
+	void exportFromTwoExportImagesToNo(String exportLabel) {
+		exportFromTwoExportImagesToNo(exportLabel, null)
+	}
 
-		Map result = createEmptyStatistics()
-		OPCPackage opcPackage = null
-		InputStream sheetInput = null
+
+	@Keyword
+	void exportFromTwoExportImagesToNo(
+			String exportLabel,
+			String targetEnvironment) {
+
+		KeywordUtil.logInfo(
+				'Step 1. Validate Exports element and click it.'
+		)
+
+		clickExportsButtonByElement()
+
+		Windows.delay(2)
+
+		KeywordUtil.logInfo(
+				'Step 2. Validate Export button and click it.'
+		)
+
+		clickExportButtonByElement()
+
+		Windows.delay(3)
+
+		KeywordUtil.logInfo(
+				'Step 3. Save file inside short REC/PRD export folder.'
+		)
+
+		File exportedFile = saveToShortExportFolder(
+				exportLabel,
+				targetEnvironment
+		)
+
+		KeywordUtil.logInfo(
+				'Step 4. Close open-file modal.'
+		)
+
+		closeOpenFileModal()
+
+		KeywordUtil.logInfo(
+				'Step 5. Validate exported file exists and is not empty.'
+		)
+
+		validateExportedFile(exportedFile)
+
+		KeywordUtil.logInfo(
+				'Exports flow finished without opening exported file.'
+		)
+	}
+
+
+	@Keyword
+	void exportFromExportsAndExportButtonToNo(String exportLabel) {
+		exportFromExportsAndExportButtonToNo(exportLabel, null)
+	}
+
+
+	@Keyword
+	void exportFromExportsAndExportButtonToNo(
+			String exportLabel,
+			String targetEnvironment) {
+
+		exportFromTwoExportImagesToNo(
+				exportLabel,
+				targetEnvironment
+		)
+	}
+
+
+	private void clickExportsButtonByElement() {
+
+		WindowsTestObject exportsButton = buildXpathObject(
+				"//*[@Name='Exports' and " +
+				"(@LocalizedControlType='button' or contains(@ControlType,'Button'))]"
+		)
+
+		boolean found = Windows.verifyElementPresent(
+				exportsButton,
+				5,
+				FailureHandling.OPTIONAL
+		)
+
+		if (!found) {
+			imageLoader.takeEvidence(
+					'ExportsButtonNotFound.png'
+			)
+
+			KeywordUtil.markFailedAndStop(
+					'Exports button was not found.\n' +
+					'Expected element name: Exports'
+			)
+		}
+
+		Windows.click(exportsButton)
+
+		KeywordUtil.logInfo(
+				'Exports button clicked successfully.'
+		)
+	}
+
+
+	private void clickExportButtonByElement() {
+
+		WindowsTestObject exportButton = buildXpathObject(
+				"//*[@Name='Export' and " +
+				"(@LocalizedControlType='button' or contains(@ControlType,'Button'))]"
+		)
+
+		boolean found = Windows.verifyElementPresent(
+				exportButton,
+				5,
+				FailureHandling.OPTIONAL
+		)
+
+		if (!found) {
+			imageLoader.takeEvidence(
+					'ExportButtonNotFound.png'
+			)
+
+			KeywordUtil.markFailedAndStop(
+					'Export button was not found.\n' +
+					'Expected element name: Export'
+			)
+		}
+
+		Windows.click(exportButton)
+
+		KeywordUtil.logInfo(
+				'Export button clicked successfully.'
+		)
+	}
+
+
+	private File saveToShortExportFolder(
+			String exportLabel,
+			String targetEnvironment) {
+
+		String environment = resolveEnvironmentName(
+				targetEnvironment,
+				exportLabel
+		)
+
+		String collectionName = shortenFilePart(
+				sanitizeFileName(resolveCurrentCollectionName()),
+				MAX_COLLECTION_LENGTH
+		)
+
+		String featureName = shortenFilePart(
+				sanitizeFileName(resolveCurrentFeatureName()),
+				MAX_FEATURE_LENGTH
+		)
+
+		String exportLabelSuffix = shortenFilePart(
+				resolveExportLabelSuffixForFileName(exportLabel),
+				MAX_LABEL_LENGTH
+		)
+
+		File directory = resolveShortExportDirectory(
+				environment,
+				collectionName,
+				featureName
+		)
+
+		if (!directory.exists()) {
+			boolean created = directory.mkdirs()
+
+			if (!created && !directory.exists()) {
+				KeywordUtil.markFailedAndStop(
+						'Could not create short export directory.\n' +
+						'Directory: ' +
+						directory.getAbsolutePath()
+				)
+			}
+		}
+
+		String fileName = buildAutomaticExportFileName(
+				environment,
+				featureName,
+				exportLabelSuffix
+		)
+
+		File exportedFile = new File(
+				directory,
+				fileName
+		)
+
+		exportedFile = ensurePathIsShortEnough(
+				exportedFile,
+				environment,
+				exportLabelSuffix
+		)
+
+		KeywordUtil.logInfo(
+				'Short export configuration.\n' +
+				'Environment: ' + environment + '\n' +
+				'Collection: ' + collectionName + '\n' +
+				'Feature: ' + featureName + '\n' +
+				'Export label: ' + exportLabelSuffix + '\n' +
+				'Directory: ' +
+				exportedFile.getParentFile().getAbsolutePath() + '\n' +
+				'File name: ' +
+				exportedFile.getName() + '\n' +
+				'Full path length: ' +
+				exportedFile.getAbsolutePath().length()
+		)
+
+		Windows.click(
+				findWindowsObject(
+						'Object Repository/Acapulco/filePath'
+				)
+		)
+
+		Windows.delay(1)
+
+		clearFocusedField()
+
+		pasteAndEnter(
+				exportedFile
+				.getParentFile()
+				.getAbsolutePath()
+		)
+
+		Windows.delay(2)
+
+		setFileName(
+				exportedFile.getName()
+		)
+
+		Windows.click(
+				findWindowsObject(
+						'General/btnSave'
+				)
+		)
+
+		Windows.delay(3)
+
+		waitForExportedFileOrStop(
+				exportedFile,
+				EXPORT_FILE_TIMEOUT_SECONDS
+		)
+
+		return exportedFile
+	}
+
+
+	private File resolveShortExportDirectory(
+			String environment,
+			String collectionName,
+			String featureName) {
+
+		File executionDirectory = resolveShortExportRoot()
+		File collectionDirectory = new File(
+				executionDirectory,
+				collectionName
+		)
+
+		return new File(
+				collectionDirectory,
+				featureName
+		)
+	}
+
+
+	private File resolveShortExportRoot() {
+
+		File baseRoot = resolveWritableBaseExportRoot()
+		File executionRoot = resolveExecutionRootFolder()
+
+		String executionName =
+				executionRoot == null
+					? ''
+					: executionRoot.getName()
+
+		if (executionName == null ||
+			executionName.trim().isEmpty()) {
+
+			executionName = 'Unknown_Execution'
+		}
+
+		File executionDirectory = new File(
+				baseRoot,
+				shortenFilePart(
+						sanitizeFileName(executionName),
+						48
+				)
+		)
+
+		if (!executionDirectory.exists()) {
+			boolean created = executionDirectory.mkdirs()
+
+			if (!created && !executionDirectory.exists()) {
+				KeywordUtil.markFailedAndStop(
+						'Could not create suite execution export directory.\n' +
+						'Directory: ' +
+						executionDirectory.getAbsolutePath()
+				)
+			}
+		}
+
+		return executionDirectory
+	}
+
+
+	private File resolveWritableBaseExportRoot() {
+
+		File preferredRoot = new File(SHORT_EXPORT_ROOT)
 
 		try {
-			opcPackage = OPCPackage.open(file)
-
-			XSSFReader reader = new XSSFReader(opcPackage)
-			StylesTable styles = reader.getStylesTable()
-			ReadOnlySharedStringsTable sharedStrings =
-					new ReadOnlySharedStringsTable(opcPackage)
-
-			Iterator<InputStream> sheets = reader.getSheetsData()
-
-			if (!sheets.hasNext()) {
-				result.errors =
-						'[ERROR] ' + environment +
-						' workbook does not contain worksheets.\n' +
-						'File: ' + file.getName()
-
-				return result
+			if (!preferredRoot.exists()) {
+				preferredRoot.mkdirs()
 			}
 
-			sheetInput = sheets.next()
+			if (preferredRoot.exists() &&
+				preferredRoot.isDirectory() &&
+				preferredRoot.canWrite()) {
 
-			StreamingStatisticsHandler statisticsHandler =
-					new StreamingStatisticsHandler(columnIndex)
+				return preferredRoot
+			}
+		} catch (Exception ignored) {
+		}
 
-			XSSFSheetXMLHandler sheetHandler =
-					new XSSFSheetXMLHandler(
-							styles,
-							null,
-							sharedStrings,
-							statisticsHandler,
-							new DataFormatter(),
-							false
+		File temporaryRoot = new File(
+				System.getProperty('java.io.tmpdir'),
+				'KatalonExports'
+		)
+
+		if (!temporaryRoot.exists()) {
+			temporaryRoot.mkdirs()
+		}
+
+		return temporaryRoot
+	}
+
+
+	private File resolveExecutionRootFolder() {
+
+		String reportFolderPath =
+				RunConfiguration.getReportFolder()
+
+		if (reportFolderPath == null ||
+			reportFolderPath.trim().isEmpty()) {
+
+			return new File(
+					RunConfiguration.getProjectDir(),
+					'Reports\\Unknown_Execution'
+			)
+		}
+
+		File current = new File(reportFolderPath)
+
+		while (current != null) {
+			File parent = current.getParentFile()
+
+			if (parent != null &&
+				parent.getName().equalsIgnoreCase('Reports')) {
+
+				return current
+			}
+
+			current = parent
+		}
+
+		return new File(reportFolderPath)
+	}
+
+
+	private File ensurePathIsShortEnough(
+			File proposedFile,
+			String environment,
+			String exportLabelSuffix) {
+
+		if (proposedFile.getAbsolutePath().length() <=
+				MAX_WINDOWS_PATH_LENGTH) {
+
+			return proposedFile
+		}
+
+		String timestamp =
+				new SimpleDateFormat(
+						'yyyyMMdd_HHmmss'
+				).format(new Date())
+
+		String shortEnvironment = shortenFilePart(
+				sanitizeFileName(environment),
+				6
+		)
+
+		String shortLabel = shortenFilePart(
+				sanitizeFileName(exportLabelSuffix),
+				12
+		)
+
+		String shortFileName =
+				shortEnvironment +
+				'_' +
+				timestamp
+
+		if (shortLabel != null &&
+			!shortLabel.trim().isEmpty()) {
+
+			shortFileName +=
+					'_' +
+					shortLabel
+		}
+
+		File shortFile = new File(
+				proposedFile.getParentFile(),
+				shortFileName + '.xlsx'
+		)
+
+		if (shortFile.getAbsolutePath().length() >
+				MAX_WINDOWS_PATH_LENGTH) {
+
+			KeywordUtil.markFailedAndStop(
+					'Could not create an export path shorter than the configured limit.\n' +
+					'Path: ' +
+					shortFile.getAbsolutePath()
+			)
+		}
+
+		return shortFile
+	}
+
+
+	private void waitForExportedFileOrStop(
+			File exportedFile,
+			Integer timeoutSeconds) {
+
+		int safeTimeout =
+				timeoutSeconds == null ||
+				timeoutSeconds <= 0
+					? EXPORT_FILE_TIMEOUT_SECONDS
+					: timeoutSeconds
+
+		int elapsedSeconds = 0
+		long previousSize = -1
+		int stableSizeChecks = 0
+
+		while (elapsedSeconds < safeTimeout) {
+
+			if (exportedFile.exists() &&
+				exportedFile.isFile() &&
+				exportedFile.length() > 0) {
+
+				long currentSize = exportedFile.length()
+
+				if (currentSize == previousSize) {
+					stableSizeChecks++
+				} else {
+					stableSizeChecks = 0
+					previousSize = currentSize
+				}
+
+				if (stableSizeChecks >= 3) {
+					KeywordUtil.logInfo(
+							'Exported file found and write completed.\n' +
+							'Path: ' +
+							exportedFile.getAbsolutePath() + '\n' +
+							'Size bytes: ' +
+							currentSize
 					)
 
-			SAXParserFactory parserFactory = SAXParserFactory.newInstance()
-			parserFactory.setNamespaceAware(true)
-
-			XMLReader parser =
-					parserFactory
-					.newSAXParser()
-					.getXMLReader()
-
-			parser.setContentHandler(sheetHandler)
-			parser.parse(new InputSource(sheetInput))
-
-			result.columnName = statisticsHandler.columnName
-			result.rows = statisticsHandler.rows
-			result.numericValues = statisticsHandler.numericValues
-			result.sum = statisticsHandler.numericValues > 0
-					? round2(statisticsHandler.sum)
-					: null
-			result.minimum = statisticsHandler.numericValues > 0
-					? round2(statisticsHandler.minimum)
-					: null
-			result.maximum = statisticsHandler.numericValues > 0
-					? round2(statisticsHandler.maximum)
-					: null
-
-			validateStatistics(
-					result,
-					expectedColumnName,
-					columnIndex,
-					environment
-			)
-
-			KeywordUtil.logInfo(
-					'[STREAMING EXCEL] Environment=' + environment +
-					' | File=' + file.getName() +
-					' | Rows=' + result.rows +
-					' | Numeric values=' + result.numericValues
-			)
-
-			return result
-
-		} finally {
-			try {
-				if (sheetInput != null) {
-					sheetInput.close()
+					return
 				}
-			} catch (Exception ignored) {
 			}
 
-			try {
-				if (opcPackage != null) {
-					opcPackage.close()
-				}
-			} catch (Exception ignored) {
-			}
-		}
-	}
-
-
-	private Map readLegacyWorkbook(
-			File file,
-			int columnIndex,
-			String expectedColumnName,
-			String environment) {
-
-		Map result = createEmptyStatistics()
-
-		FileInputStream input = null
-		Workbook workbook = null
-
-		try {
-			input = new FileInputStream(file)
-			workbook = WorkbookFactory.create(input)
-
-			if (workbook.getNumberOfSheets() == 0) {
-				result.errors =
-						'[ERROR] ' + environment +
-						' workbook does not contain worksheets.\n' +
-						'File: ' + file.getName()
-
-				return result
-			}
-
-			Sheet sheet = workbook.getSheetAt(0)
-			DataFormatter formatter = new DataFormatter()
-
-			result.columnName = readHeaderName(
-					sheet,
-					columnIndex,
-					formatter
-			)
-
-			BigDecimal sum = BigDecimal.ZERO
-			BigDecimal minimum = null
-			BigDecimal maximum = null
-			int rows = 0
-			int numericValues = 0
-
-			for (int rowIndex = 1;
-					rowIndex <= sheet.getLastRowNum();
-					rowIndex++) {
-
-				Row row = sheet.getRow(rowIndex)
-
-				if (row == null || isRowEmpty(row, formatter)) {
-					continue
-				}
-
-				rows++
-
-				BigDecimal value = getCellNumber(
-						row,
-						columnIndex,
-						formatter
-				)
-
-				if (value == null) {
-					continue
-				}
-
-				sum = sum.add(value)
-
-				if (minimum == null || value.compareTo(minimum) < 0) {
-					minimum = value
-				}
-
-				if (maximum == null || value.compareTo(maximum) > 0) {
-					maximum = value
-				}
-
-				numericValues++
-			}
-
-			result.rows = rows
-			result.numericValues = numericValues
-			result.sum = numericValues > 0 ? round2(sum) : null
-			result.minimum = numericValues > 0 ? round2(minimum) : null
-			result.maximum = numericValues > 0 ? round2(maximum) : null
-
-			validateStatistics(
-					result,
-					expectedColumnName,
-					columnIndex,
-					environment
-			)
-
-			return result
-
-		} finally {
-			try {
-				if (workbook != null) {
-					workbook.close()
-				}
-			} catch (Exception ignored) {
-			}
-
-			try {
-				if (input != null) {
-					input.close()
-				}
-			} catch (Exception ignored) {
-			}
-		}
-	}
-
-
-	private void validateStatistics(
-			Map result,
-			String expectedColumnName,
-			int columnIndex,
-			String environment) {
-
-		StringBuilder errors = new StringBuilder()
-		String columnName = safeText(result.columnName)
-
-		if (columnName.isEmpty()) {
-			errors.append('[ERROR] ')
-					.append(environment)
-					.append(' column header was not found.\n')
-					.append('Column index: ')
-					.append(columnIndex)
-					.append('\n')
-		} else if (!normalizeText(columnName).equals(
-				normalizeText(expectedColumnName))) {
-
-			errors.append('[ERROR] Unexpected ')
-					.append(environment)
-					.append(' column header.\n')
-					.append('Expected: ')
-					.append(safeText(expectedColumnName))
-					.append('\nFound: ')
-					.append(columnName)
-					.append('\n')
+			Windows.delay(1)
+			elapsedSeconds++
 		}
 
-		if ((result.numericValues as int) == 0) {
-			errors.append('[ERROR] ')
-					.append(environment)
-					.append(' column does not contain numeric values.\n')
-					.append('Column: ')
-					.append(columnName)
-					.append('\n')
-		}
-
-		result.errors = errors.toString().trim()
-	}
-
-
-	// ======================================================
-	// STREAMING HANDLER
-	// ======================================================
-
-	private class StreamingStatisticsHandler
-			implements XSSFSheetXMLHandler.SheetContentsHandler {
-
-		private final int targetColumnIndex
-
-		String columnName = ''
-		int rows = 0
-		int numericValues = 0
-
-		BigDecimal sum = BigDecimal.ZERO
-		BigDecimal minimum = null
-		BigDecimal maximum = null
-
-		private boolean rowHasValue = false
-		private String targetCellValue = ''
-
-		StreamingStatisticsHandler(int targetColumnIndex) {
-			this.targetColumnIndex = targetColumnIndex
-		}
-
-		@Override
-		void startRow(int rowNum) {
-			rowHasValue = false
-			targetCellValue = ''
-		}
-
-		@Override
-		void endRow(int rowNum) {
-			if (rowNum == 0) {
-				columnName = safeText(targetCellValue)
-				return
-			}
-
-			if (!rowHasValue) {
-				return
-			}
-
-			rows++
-
-			BigDecimal number = parseNumber(targetCellValue)
-
-			if (number == null) {
-				return
-			}
-
-			sum = sum.add(number)
-
-			if (minimum == null || number.compareTo(minimum) < 0) {
-				minimum = number
-			}
-
-			if (maximum == null || number.compareTo(maximum) > 0) {
-				maximum = number
-			}
-
-			numericValues++
-		}
-
-		@Override
-		void cell(
-				String cellReference,
-				String formattedValue,
-				XSSFComment comment) {
-
-			String value = safeText(formattedValue)
-
-			if (!value.isEmpty()) {
-				rowHasValue = true
-			}
-
-			if (cellReference == null) {
-				return
-			}
-
-			int currentColumnIndex =
-					new CellReference(cellReference).getCol()
-
-			if (currentColumnIndex == targetColumnIndex) {
-				targetCellValue = value
-			}
-		}
-
-		@Override
-		void headerFooter(
-				String text,
-				boolean isHeader,
-				String tagName) {
-		}
-	}
-
-
-	// ======================================================
-	// FILE SEARCH
-	// ======================================================
-
-	private Map resolveLatestRecPrdFiles(
-			File exportRoot,
-			String expectedGroupFolder,
-			String expectedFeatureFolder) {
-
-		Map result = [
-			recFile        : null,
-			prdFile        : null,
-			selectedFolder : null
-		]
-
-		List<File> matchingFeatureFolders = []
-
-		collectMatchingFeatureFolders(
-				exportRoot,
-				expectedGroupFolder,
-				expectedFeatureFolder,
-				matchingFeatureFolders
+		imageLoader.takeEvidence(
+				'ExportedFileNotFound.png'
 		)
 
-		if (matchingFeatureFolders.isEmpty()) {
-			collectFallbackFeatureFolders(
-					exportRoot,
-					expectedFeatureFolder,
-					matchingFeatureFolders
-			)
-		}
-
-		List<Map> validPairs = []
-
-		for (File featureFolder : matchingFeatureFolders) {
-			File[] folderFiles = featureFolder.listFiles()
-
-			if (folderFiles == null) {
-				continue
-			}
-
-			List<File> recFiles = folderFiles.findAll { File file ->
-				isEnvironmentExcelFile(file, 'REC')
-			}
-
-			List<File> prdFiles = folderFiles.findAll { File file ->
-				isEnvironmentExcelFile(file, 'PRD')
-			}
-
-			if (recFiles.isEmpty() || prdFiles.isEmpty()) {
-				continue
-			}
-
-			recFiles.sort { File first, File second ->
-				second.lastModified() <=> first.lastModified()
-			}
-
-			prdFiles.sort { File first, File second ->
-				second.lastModified() <=> first.lastModified()
-			}
-
-			File recFile = recFiles.get(0)
-			File prdFile = prdFiles.get(0)
-
-			validPairs.add([
-				recFile        : recFile,
-				prdFile        : prdFile,
-				selectedFolder : featureFolder,
-				pairTimestamp  : Math.max(
-						recFile.lastModified(),
-						prdFile.lastModified()
-				)
-			])
-		}
-
-		if (validPairs.isEmpty()) {
-			return result
-		}
-
-		validPairs.sort { Map first, Map second ->
-			(second.pairTimestamp as Long) <=>
-			(first.pairTimestamp as Long)
-		}
-
-		Map latestPair = validPairs.get(0)
-
-		result.recFile = latestPair.recFile
-		result.prdFile = latestPair.prdFile
-		result.selectedFolder = latestPair.selectedFolder
-
-		return result
-	}
-
-
-	private void collectMatchingFeatureFolders(
-			File currentFolder,
-			String expectedGroupFolder,
-			String expectedFeatureFolder,
-			List<File> result) {
-
-		if (currentFolder == null ||
-				!currentFolder.exists() ||
-				!currentFolder.isDirectory()) {
-
-			return
-		}
-
-		File parentFolder = currentFolder.getParentFile()
-
-		boolean featureMatches =
-				normalizeText(currentFolder.getName()).equals(
-						normalizeText(expectedFeatureFolder)
-				)
-
-		boolean groupMatches =
-				parentFolder != null &&
-				normalizeText(parentFolder.getName()).equals(
-						normalizeText(expectedGroupFolder)
-				)
-
-		if (featureMatches && groupMatches) {
-			result.add(currentFolder)
-			return
-		}
-
-		File[] children = currentFolder.listFiles()
-
-		if (children == null) {
-			return
-		}
-
-		for (File child : children) {
-			if (child != null && child.isDirectory()) {
-				collectMatchingFeatureFolders(
-						child,
-						expectedGroupFolder,
-						expectedFeatureFolder,
-						result
-				)
-			}
-		}
-	}
-
-
-	private void collectFallbackFeatureFolders(
-			File currentFolder,
-			String expectedFeatureFolder,
-			List<File> result) {
-
-		if (currentFolder == null ||
-				!currentFolder.exists() ||
-				!currentFolder.isDirectory()) {
-
-			return
-		}
-
-		if (normalizeText(currentFolder.getName()).equals(
-				normalizeText(expectedFeatureFolder))) {
-
-			result.add(currentFolder)
-			return
-		}
-
-		File[] children = currentFolder.listFiles()
-
-		if (children == null) {
-			return
-		}
-
-		for (File child : children) {
-			if (child != null && child.isDirectory()) {
-				collectFallbackFeatureFolders(
-						child,
-						expectedFeatureFolder,
-						result
-				)
-			}
-		}
-	}
-
-
-	private boolean isEnvironmentExcelFile(
-			File file,
-			String environment) {
-
-		if (file == null ||
-				!file.exists() ||
-				!file.isFile()) {
-
-			return false
-		}
-
-		String fileName = file.getName()
-
-		if (fileName.startsWith('~$')) {
-			return false
-		}
-
-		String lowerName = fileName.toLowerCase()
-
-		return fileName.toUpperCase().startsWith(
-				safeText(environment).toUpperCase() + '_'
-		) && (
-			lowerName.endsWith('.xlsx') ||
-			lowerName.endsWith('.xlsm') ||
-			lowerName.endsWith('.xls')
+		KeywordUtil.markFailedAndStop(
+				'Exported file was not found, is empty or did not finish writing.\n' +
+				'Expected path: ' +
+				exportedFile.getAbsolutePath() + '\n' +
+				'Timeout seconds: ' +
+				safeTimeout
 		)
 	}
 
 
-	// ======================================================
-	// RESULT
-	// ======================================================
+	private void closeOpenFileModal() {
 
-	private void copyStatisticsToResult(
-			Map result,
-			Map recData,
-			Map prdData,
-			String expectedColumnName) {
+		KeywordUtil.logInfo(
+				'Waiting for REC or PRD open-file modal image.'
+		)
 
-		result.recColumnName = safeText(recData.columnName)
-		result.prdColumnName = safeText(prdData.columnName)
+		String detectedModalImage = null
 
-		result.columnName = !safeText(recData.columnName).isEmpty()
-				? safeText(recData.columnName)
-				: safeText(expectedColumnName)
+		if (imageLoader.waitForImage(
+				'General',
+				'iconeModal',
+				5)) {
 
-		result.recRows = recData.rows
-		result.prdRows = prdData.rows
-		result.recNumericValues = recData.numericValues
-		result.prdNumericValues = prdData.numericValues
-		result.recSum = recData.sum
-		result.prdSum = prdData.sum
-		result.recMinimum = recData.minimum
-		result.prdMinimum = prdData.minimum
-		result.recMaximum = recData.maximum
-		result.prdMaximum = prdData.maximum
-	}
+			detectedModalImage = 'iconeModal'
+		} else if (imageLoader.waitForImage(
+				'General',
+				'iconeModalPRD',
+				5)) {
 
+			detectedModalImage = 'iconeModalPRD'
+		}
 
-	private void appendFileErrors(
-			StringBuilder errors,
-			Map data) {
+		if (detectedModalImage == null) {
+			Windows.delay(1)
 
-		String value = safeText(data.errors)
+			if (imageLoader.waitForImage(
+					'General',
+					'iconeModal',
+					3)) {
 
-		if (!value.isEmpty()) {
-			errors.append(value).append('\n')
+				detectedModalImage = 'iconeModal'
+			} else if (imageLoader.waitForImage(
+					'General',
+					'iconeModalPRD',
+					3)) {
+
+				detectedModalImage = 'iconeModalPRD'
+			}
+		}
+
+		if (detectedModalImage == null) {
+			imageLoader.takeEvidence(
+					'OpenFileModalNotFound.png'
+			)
+
+			KeywordUtil.markFailedAndStop(
+					'Open-file modal was not found.\n' +
+					'Expected REC image: General/iconeModal\n' +
+					'Expected PRD image: General/iconeModalPRD'
+			)
+		}
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_TAB)
+		robot.keyRelease(KeyEvent.VK_TAB)
+
+		Thread.sleep(300)
+
+		robot.keyPress(KeyEvent.VK_ENTER)
+		robot.keyRelease(KeyEvent.VK_ENTER)
+
+		Windows.delay(1)
+
+		if (imageLoader.isVisible('General', 'iconeModal') ||
+			imageLoader.isVisible('General', 'iconeModalPRD')) {
+
+			imageLoader.takeEvidence(
+					'OpenFileModalStillVisible.png'
+			)
+
+			KeywordUtil.markFailedAndStop(
+					'Open-file modal is still visible after TAB and ENTER.'
+			)
 		}
 	}
 
 
-	private void appendComparison(
-			StringBuilder errors,
-			StringBuilder passedDetails,
-			String validationLabel,
-			Object columnName,
-			BigDecimal recValue,
-			BigDecimal prdValue) {
+	private void validateExportedFile(File exportedFile) {
 
-		if (recValue == null || prdValue == null) {
-			errors.append('[ERROR] ')
-					.append(validationLabel)
-					.append(' could not be compared.\n')
-			return
+		if (exportedFile == null) {
+			KeywordUtil.markFailedAndStop(
+					'Exported file reference is null.'
+			)
 		}
 
-		if (recValue.compareTo(prdValue) != 0) {
-			errors.append('[ERROR] ')
-					.append(validationLabel)
-					.append(' is different.\n')
-					.append('Column: ')
-					.append(safeText(columnName))
-					.append('\nREC: ')
-					.append(recValue)
-					.append('\nPRD: ')
-					.append(prdValue)
-					.append('\n')
-		} else {
-			passedDetails.append('[PASS] ')
-					.append(validationLabel)
-					.append(' is equal.\n')
-					.append('Column: ')
-					.append(safeText(columnName))
-					.append('\nValue: ')
-					.append(recValue)
-					.append('\n')
+		if (!exportedFile.exists() ||
+			!exportedFile.isFile() ||
+			exportedFile.length() <= 0) {
+
+			KeywordUtil.markFailedAndStop(
+					'Exported file is invalid.\n' +
+					'Path: ' +
+					exportedFile.getAbsolutePath()
+			)
+		}
+
+		String lowerName =
+				exportedFile
+				.getName()
+				.toLowerCase()
+
+		if (!lowerName.endsWith('.xlsx') &&
+			!lowerName.endsWith('.xlsm') &&
+			!lowerName.endsWith('.xls')) {
+
+			KeywordUtil.markFailedAndStop(
+					'Exported file does not have a supported Excel extension.\n' +
+					'File: ' +
+					exportedFile.getName()
+			)
 		}
 	}
 
 
-	private Map createEmptyResult(
-			String exportRootFolder,
-			String exportGroupFolder,
-			String exportFeatureFolder,
-			Integer columnIndex,
-			String expectedColumnName) {
+	private String buildAutomaticExportFileName(
+			String environment,
+			String featureName,
+			String exportLabelSuffix) {
 
-		return [
-			success             : false,
-			errors              : '',
-			passedDetails       : '',
-			exportRootFolder    : safeText(exportRootFolder),
-			exportGroupFolder   : safeText(exportGroupFolder),
-			exportFeatureFolder : safeText(exportFeatureFolder),
-			columnIndex         : columnIndex,
-			columnName          : safeText(expectedColumnName),
-			recColumnName       : '',
-			prdColumnName       : '',
-			selectedFolderPath  : '',
-			recFileName         : 'NOT FOUND',
-			prdFileName         : 'NOT FOUND',
-			recRows             : null,
-			prdRows             : null,
-			recNumericValues    : null,
-			prdNumericValues    : null,
-			recSum              : null,
-			prdSum              : null,
-			recMinimum          : null,
-			prdMinimum          : null,
-			recMaximum          : null,
-			prdMaximum          : null
+		String timestamp =
+				new SimpleDateFormat(
+						'yyyyMMdd_HHmmss'
+				).format(new Date())
+
+		String safeEnvironment = shortenFilePart(
+				sanitizeFileName(
+						environment == null ||
+						environment.trim().isEmpty()
+							? 'REC'
+							: environment
+				),
+				6
+		)
+
+		String safeFeatureName = shortenFilePart(
+				sanitizeFileName(
+						featureName == null ||
+						featureName.trim().isEmpty()
+							? 'Export'
+							: featureName
+				),
+				MAX_FEATURE_LENGTH
+		)
+
+		String safeExportLabelSuffix = shortenFilePart(
+				sanitizeFileName(
+						exportLabelSuffix == null
+							? ''
+							: exportLabelSuffix
+				),
+				MAX_LABEL_LENGTH
+		)
+
+		String baseFileName =
+				safeEnvironment +
+				'_' +
+				timestamp +
+				'_' +
+				safeFeatureName
+
+		if (safeExportLabelSuffix != null &&
+			!safeExportLabelSuffix.trim().isEmpty() &&
+			safeExportLabelSuffix != 'Export') {
+
+			baseFileName +=
+					'_' +
+					safeExportLabelSuffix
+		}
+
+		return baseFileName + '.xlsx'
+	}
+
+
+	private String resolveExportLabelSuffixForFileName(
+			String exportLabel) {
+
+		if (exportLabel == null ||
+			exportLabel.trim().isEmpty()) {
+
+			return ''
+		}
+
+		String value = sanitizeFileName(exportLabel)
+
+		value = value.replaceFirst('(?i)^REC_', '')
+		value = value.replaceFirst('(?i)^PRD_', '')
+		value = value.replaceFirst('(?i)^REC-', '')
+		value = value.replaceFirst('(?i)^PRD-', '')
+		value = value.replaceFirst('(?i)^REC ', '')
+		value = value.replaceFirst('(?i)^PRD ', '')
+
+		return value == null ||
+				value.trim().isEmpty()
+					? ''
+					: value
+	}
+
+
+	private String resolveEnvironmentName(
+			String targetEnvironment,
+			String exportLabel) {
+
+		String environment =
+				normalizeEnvironmentNameStrict(targetEnvironment)
+
+		if (environment != null) {
+			return environment
+		}
+
+		List<String> globalVariableNames = [
+			'targetEnvironment',
+			'currentEnvironment',
+			'environment',
+			'env',
+			'ENV',
+			'currentEnv',
+			'environmentName'
 		]
+
+		for (String variableName : globalVariableNames) {
+			environment = normalizeEnvironmentNameStrict(
+					getGlobalVariableValue(variableName)
+			)
+
+			if (environment != null) {
+				return environment
+			}
+		}
+
+		environment = normalizeEnvironmentNameStrict(
+				RunConfiguration.getExecutionProfile()
+		)
+
+		if (environment != null) {
+			return environment
+		}
+
+		environment = normalizeEnvironmentNamePrefixOnly(
+				exportLabel
+		)
+
+		return environment == null
+				? 'REC'
+				: environment
 	}
 
 
-	private Map createEmptyStatistics() {
-		return [
-			columnName   : '',
-			rows         : 0,
-			numericValues: 0,
-			sum          : null,
-			minimum      : null,
-			maximum      : null,
-			errors       : ''
-		]
-	}
+	private String normalizeEnvironmentNameStrict(
+			String rawEnvironment) {
 
+		if (rawEnvironment == null ||
+			rawEnvironment.trim().isEmpty()) {
 
-	private Map finalizeResult(
-			Map result,
-			StringBuilder errors,
-			StringBuilder passedDetails) {
-
-		result.errors = errors.toString().trim()
-		result.passedDetails = passedDetails.toString().trim()
-		result.success = result.errors.isEmpty()
-
-		return result
-	}
-
-
-	// ======================================================
-	// LEGACY EXCEL HELPERS
-	// ======================================================
-
-	private String readHeaderName(
-			Sheet sheet,
-			int columnIndex,
-			DataFormatter formatter) {
-
-		Row row = sheet.getRow(0)
-		Cell cell = row == null ? null : row.getCell(columnIndex)
-
-		return cell == null
-				? ''
-				: formatter.formatCellValue(cell).trim()
-	}
-
-
-	private BigDecimal getCellNumber(
-			Row row,
-			int columnIndex,
-			DataFormatter formatter) {
-
-		Cell cell = row == null ? null : row.getCell(columnIndex)
-
-		if (cell == null) {
 			return null
 		}
 
+		String value =
+				rawEnvironment
+				.trim()
+				.toUpperCase()
+
+		if (value == 'PRD' ||
+			value == 'PROD' ||
+			value == 'PRODUCTION' ||
+			value.startsWith('PRD_') ||
+			value.startsWith('PRD-') ||
+			value.startsWith('PRD ')) {
+
+			return 'PRD'
+		}
+
+		if (value == 'REC' ||
+			value == 'RECETTE' ||
+			value.startsWith('REC_') ||
+			value.startsWith('REC-') ||
+			value.startsWith('REC ')) {
+
+			return 'REC'
+		}
+
+		return null
+	}
+
+
+	private String normalizeEnvironmentNamePrefixOnly(
+			String rawEnvironment) {
+
+		return normalizeEnvironmentNameStrict(
+				rawEnvironment
+		)
+	}
+
+
+	private String getGlobalVariableValue(
+			String variableName) {
+
 		try {
-			if (cell.getCellType() == CellType.NUMERIC) {
-				return BigDecimal.valueOf(cell.getNumericCellValue())
+			def value =
+					GlobalVariable."${variableName}"
+
+			if (value != null &&
+				!value.toString().trim().isEmpty()) {
+
+				return value.toString()
 			}
-
-			if (cell.getCellType() == CellType.FORMULA &&
-					cell.getCachedFormulaResultType() == CellType.NUMERIC) {
-
-				return BigDecimal.valueOf(cell.getNumericCellValue())
-			}
-
-			return parseNumber(
-					formatter.formatCellValue(cell)
-			)
 		} catch (Exception ignored) {
-			return null
 		}
+
+		return null
 	}
 
 
-	private boolean isRowEmpty(
-			Row row,
-			DataFormatter formatter) {
+	private String resolveCurrentCollectionName() {
 
-		if (row == null || row.getLastCellNum() <= 0) {
-			return true
+		List<String> validParts =
+				getValidReportFolderParts()
+
+		return validParts.isEmpty()
+				? 'Collection'
+				: validParts[0]
+	}
+
+
+	private String resolveCurrentFeatureName() {
+
+		List<String> validParts =
+				getValidReportFolderParts()
+
+		return validParts.isEmpty()
+				? 'Export'
+				: validParts.last()
+	}
+
+
+	private List<String> getValidReportFolderParts() {
+
+		List<String> validParts = []
+
+		String reportFolderPath =
+				RunConfiguration.getReportFolder()
+
+		if (reportFolderPath == null ||
+			reportFolderPath.trim().isEmpty()) {
+
+			return validParts
 		}
 
-		for (int index = 0;
-				index < row.getLastCellNum();
-				index++) {
+		File executionRootFolder =
+				resolveExecutionRootFolder()
 
-			Cell cell = row.getCell(index)
+		String fullPath =
+				new File(reportFolderPath)
+				.getAbsolutePath()
 
-			if (cell != null &&
-					!formatter.formatCellValue(cell).trim().isEmpty()) {
+		String rootPath =
+				executionRootFolder
+				.getAbsolutePath()
 
+		if (!fullPath.toLowerCase().startsWith(
+				rootPath.toLowerCase())) {
+
+			return validParts
+		}
+
+		String relativePath =
+				fullPath
+				.substring(rootPath.length())
+				.replaceAll('^\\\\+', '')
+
+		if (relativePath.trim().isEmpty()) {
+			return validParts
+		}
+
+		List<String> parts =
+				relativePath
+				.replace('/', '\\')
+				.split('\\\\') as List<String>
+
+		for (String part : parts) {
+			if (isValidFeatureNamePart(part)) {
+				validParts.add(part.trim())
+			}
+		}
+
+		return validParts
+	}
+
+
+	private boolean isValidFeatureNamePart(String part) {
+
+		if (part == null ||
+			part.trim().isEmpty()) {
+
+			return false
+		}
+
+		String value = part.trim()
+		String lower = value.toLowerCase()
+
+		if (value ==~ /\d{8}_\d{6}/ ||
+			value ==~ /\d{14}/ ||
+			value ==~ /^\d+\.\s*.*/) {
+
+			return false
+		}
+
+		List<String> ignoredExactValues = [
+			'reports',
+			'evidences',
+			'exports',
+			'test cases',
+			'test suites',
+			'connection',
+			'authentication',
+			'login rec',
+			'login prd',
+			'katalon',
+			'temp'
+		]
+
+		if (ignoredExactValues.contains(lower)) {
+			return false
+		}
+
+		List<String> ignoredContainsValues = [
+			'filter export and validate',
+			'validation compare rec x prd',
+			'test tool validation',
+			'close application',
+			'open module',
+			'login'
+		]
+
+		for (String ignored : ignoredContainsValues) {
+			if (lower.contains(ignored)) {
 				return false
 			}
 		}
@@ -1010,190 +1026,264 @@ class RecPrdExportValidationKeywords {
 	}
 
 
-	// ======================================================
-	// NUMBER HELPERS
-	// ======================================================
+	private String sanitizeFileName(String text) {
 
-	private BigDecimal parseNumber(Object rawValue) {
+		if (text == null ||
+			text.trim().isEmpty()) {
 
-		String value = safeText(rawValue)
-
-		if (value.isEmpty()) {
-			return null
+			return 'Export'
 		}
 
-		value = value
-				.replace('\u00A0', ' ')
-				.replace('\u202F', ' ')
-				.replace('\u2212', '-')
-				.replace('\u2012', '-')
-				.replace('\u2013', '-')
-				.replace('\u2014', '-')
-				.replace('\u2015', '-')
-				.trim()
-
-		boolean parentheses =
-				value.startsWith('(') &&
-				value.endsWith(')')
-
-		boolean trailingMinus =
-				value.endsWith('-')
-
-		value = value
-				.replaceAll('[^0-9,\\.\\-\\(\\)]', '')
-				.replace('(', '')
-				.replace(')', '')
-
-		if (trailingMinus && value.endsWith('-')) {
-			value = value.substring(0, value.length() - 1)
-		}
-
-		boolean negative =
-				value.startsWith('-') ||
-				parentheses ||
-				trailingMinus
-
-		value = value.replace('-', '')
-
-		if (value.isEmpty()) {
-			return null
-		}
-
-		String normalizedNumber =
-				normalizeNumericSeparators(value)
-
-		try {
-			BigDecimal number = new BigDecimal(normalizedNumber)
-
-			if (negative && number.compareTo(BigDecimal.ZERO) > 0) {
-				number = number.negate()
-			}
-
-			return number
-		} catch (Exception ignored) {
-			return null
-		}
-	}
-
-
-	private String normalizeNumericSeparators(String value) {
-
-		int commaCount = countOccurrences(value, ',')
-		int dotCount = countOccurrences(value, '.')
-
-		if (commaCount > 0 && dotCount > 0) {
-			return value.lastIndexOf(',') > value.lastIndexOf('.')
-					? value.replace('.', '').replace(',', '.')
-					: value.replace(',', '')
-		}
-
-		if (commaCount > 0) {
-			return normalizeSingleSeparator(value, ',')
-		}
-
-		if (dotCount > 0) {
-			return normalizeSingleSeparator(value, '.')
-		}
-
-		return value
-	}
-
-
-	private String normalizeSingleSeparator(
-			String value,
-			String separator) {
-
-		int count = countOccurrences(value, separator)
-
-		if (count > 1) {
-			int lastSeparator = value.lastIndexOf(separator)
-			String decimals = value.substring(lastSeparator + 1)
-
-			if (decimals.length() == 1 || decimals.length() == 2) {
-				return value
-						.substring(0, lastSeparator)
-						.replace(separator, '') +
-						'.' +
-						decimals
-			}
-
-			return value.replace(separator, '')
-		}
-
-		int separatorIndex = value.indexOf(separator)
-		String before = value.substring(0, separatorIndex)
-		String after = value.substring(separatorIndex + 1)
-
-		if (after.length() == 3 &&
-				before.length() >= 1 &&
-				before.length() <= 3) {
-
-			return before + after
-		}
-
-		return separator == ','
-				? before + '.' + after
-				: value
-	}
-
-
-	private int countOccurrences(
-			String value,
-			String token) {
-
-		int count = 0
-		int index = 0
-
-		while ((index = value.indexOf(token, index)) >= 0) {
-			count++
-			index += token.length()
-		}
-
-		return count
-	}
-
-
-	private BigDecimal round2(BigDecimal value) {
-
-		return value == null
-				? null
-				: value.setScale(
-						2,
-						RoundingMode.HALF_EVEN
+		String normalized =
+				Normalizer
+				.normalize(
+						text,
+						Normalizer.Form.NFD
 				)
-	}
-
-
-	// ======================================================
-	// GENERAL HELPERS
-	// ======================================================
-
-	private String normalizeText(Object value) {
-
-		String text = safeText(value)
-
-		if (text.isEmpty()) {
-			return ''
-		}
-
-		return Normalizer
-				.normalize(text, Normalizer.Form.NFD)
 				.replaceAll(
 						'\\p{InCombiningDiacriticalMarks}+',
 						''
 				)
-				.toLowerCase()
-				.replace(' ', '_')
-				.replace('-', '_')
+
+		String cleaned =
+				normalized
+				.replaceAll('[\\\\/:*?"<>|]', '_')
+				.replaceAll('\\s+', '_')
 				.replaceAll('_+', '_')
+				.replaceAll('^_|_$', '')
 				.trim()
+
+		return cleaned.isEmpty()
+				? 'Export'
+				: cleaned
 	}
 
 
-	private String safeText(Object value) {
+	private String shortenFilePart(
+			String value,
+			Integer maximumLength) {
 
-		return value == null
-				? ''
-				: value.toString().trim()
+		if (value == null ||
+			value.trim().isEmpty()) {
+
+			return ''
+		}
+
+		int safeMaximum =
+				maximumLength == null ||
+				maximumLength <= 0
+					? 20
+					: maximumLength
+
+		String cleanValue =
+				sanitizeFileName(value)
+
+		return cleanValue.length() <= safeMaximum
+				? cleanValue
+				: cleanValue.substring(0, safeMaximum)
+	}
+
+
+	private void setFileName(String fileName) {
+
+		if (!focusFileNameField()) {
+			imageLoader.takeEvidence(
+					'FileNameFieldNotFocused.png'
+			)
+
+			KeywordUtil.markFailedAndStop(
+					'Could not focus export file name field before saving.\n' +
+					'Expected file name: ' +
+					fileName
+			)
+		}
+
+		clearFocusedField()
+		pasteText(fileName)
+		Windows.delay(1)
+	}
+
+
+	private boolean focusFileNameField() {
+
+		List<WindowsTestObject> candidateObjects = [
+			buildFileNameFieldByAutomationId(),
+			buildFileNameFieldByName('File name'),
+			buildFileNameFieldByName('Nom du fichier'),
+			buildFileNameFieldByName('Nome do ficheiro'),
+			buildFileNameFieldByName('Nome do arquivo')
+		]
+
+		for (WindowsTestObject object : candidateObjects) {
+			try {
+				if (Windows.verifyElementPresent(
+						object,
+						1,
+						FailureHandling.OPTIONAL)) {
+
+					Windows.click(object)
+					Windows.delay(1)
+					return true
+				}
+			} catch (Exception ignored) {
+			}
+		}
+
+		try {
+			Windows.click(
+					findWindowsObject(
+							'General/txtFileName'
+					)
+			)
+
+			Windows.delay(1)
+			return true
+		} catch (Exception ignored) {
+		}
+
+		try {
+			focusFileNameFieldWithShortcut()
+			Windows.delay(1)
+			return true
+		} catch (Exception ignored) {
+		}
+
+		return false
+	}
+
+
+	private WindowsTestObject buildFileNameFieldByAutomationId() {
+
+		WindowsTestObject object =
+				new WindowsTestObject(
+						'fileNameFieldAutomationId'
+				)
+
+		object.setLocatorStrategy(
+				LocatorStrategy.XPATH
+		)
+
+		object.setLocator(
+				"//*[@AutomationId='FileNameControlHost']"
+		)
+
+		return object
+	}
+
+
+	private WindowsTestObject buildFileNameFieldByName(
+			String name) {
+
+		WindowsTestObject object =
+				new WindowsTestObject(
+						'fileNameField_' +
+						sanitizeObjectName(name)
+				)
+
+		object.setLocatorStrategy(
+				LocatorStrategy.XPATH
+		)
+
+		object.setLocator(
+				"//*[contains(" +
+				"translate(@Name, " +
+				"'abcdefghijklmnopqrstuvwxyz', " +
+				"'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), " +
+				"'" + name.toUpperCase() + "')]"
+		)
+
+		return object
+	}
+
+
+	private WindowsTestObject buildXpathObject(String xpath) {
+
+		WindowsTestObject object =
+				new WindowsTestObject()
+
+		object.setLocatorStrategy(
+				LocatorStrategy.XPATH
+		)
+
+		object.setLocator(xpath)
+
+		return object
+	}
+
+
+	private String sanitizeObjectName(String text) {
+
+		return text == null
+				? 'empty'
+				: text.replaceAll(
+						'[^a-zA-Z0-9]',
+						'_'
+				)
+	}
+
+
+	private void focusFileNameFieldWithShortcut() {
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_ALT)
+		robot.keyPress(KeyEvent.VK_N)
+		robot.keyRelease(KeyEvent.VK_N)
+		robot.keyRelease(KeyEvent.VK_ALT)
+	}
+
+
+	private void clearFocusedField() {
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
+
+		Windows.delay(1)
+
+		robot.keyPress(KeyEvent.VK_BACK_SPACE)
+		robot.keyRelease(KeyEvent.VK_BACK_SPACE)
+	}
+
+
+	private void pasteAndEnter(String text) {
+
+		pasteText(text)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_ENTER)
+		robot.keyRelease(KeyEvent.VK_ENTER)
+	}
+
+
+	private void pasteText(String text) {
+
+		StringSelection selection =
+				new StringSelection(text)
+
+		Toolkit
+			.getDefaultToolkit()
+			.getSystemClipboard()
+			.setContents(
+					selection,
+					null
+			)
+
+		Windows.delay(1)
+
+		Robot robot = new Robot()
+		robot.setAutoDelay(150)
+
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_V)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
 	}
 }
