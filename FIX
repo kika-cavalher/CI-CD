@@ -1,1 +1,1542 @@
+Imagens novas ou reutilizadas
+
+Adicionar no grupo General do ImageLoader, sempre uma chave e valor por linha:
+
+'settingsButton':'Images/General/Settings.PNG',
+'changeEnvironmentButton':'Images/General/Change env.PNG',
+'iconeModal':'Images/General/iconeModal.png',
+'yesWarningButton':'Images/General/Yes.PNG',
+'checkOtherUser':'Images/General/checkOtherUser.png',
+
+
+
+
+
+
+
+
+
+
+No grupo authentication do WindowsObjectLoader:
+
+'settingsButton':'''//*[(@Name='Paramètres' or @Name='Settings' or @Name='Réglages') and (@LocalizedControlType='button' or contains(@ControlType,'Button'))]''',
+'changeEnvironmentButton':'''//*[@Name="Changer d'environnement" and (@LocalizedControlType='tree item' or contains(@ControlType,'TreeItem'))]''',
+'switchEnvironmentWarningYesButton':'''//*[@Name='Oui' and (@LocalizedControlType='button' or contains(@ControlType,'Button'))]''',
+'connectWithOtherUserCheckBox':'Object Repository/General/connectWithOtherUserCheckBox',
+'environmentCombo':'Environnement eMatch',
+'loggedUserName':'Object Repository/General/loggedUserName',
+
+WindowsObjectLoader_NEW_ENTRIES.txt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+package pageObject
+
+import java.awt.Robot
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
+import java.awt.event.InputEvent
+import java.awt.event.KeyEvent
+
+import com.katalon.keywords.windows.WindowsImageKeywords
+import com.kms.katalon.core.annotation.Keyword
+import com.kms.katalon.core.exception.StepFailedException
+import com.kms.katalon.core.model.FailureHandling
+import com.kms.katalon.core.testobject.WindowsTestObject
+import com.kms.katalon.core.util.KeywordUtil
+import com.kms.katalon.core.windows.keyword.WindowsBuiltinKeywords as Windows
+
+import commands.ImageLoader
+import commands.WindowsObjectLoader
+import internal.GlobalVariable
+
+
+class authenticationKeywords {
+
+	private static boolean fatalFailureDetected = false
+	private static String fatalFailureMessage = ''
+
+	private static final int MAIN_SCREEN_TIMEOUT_SECONDS = 90
+	private static final int VERSION_WINDOW_TIMEOUT_SECONDS = 90
+	private static final int VERSION_WINDOW_CHECK_SECONDS = 5
+	private static final int DEFAULT_SWITCH_USER_TIMEOUT_SECONDS = 90
+	private static final int SWITCH_USER_IMAGE_TIMEOUT_SECONDS = 5
+	private static final int SWITCH_USER_DELAY_SECONDS = 1
+
+	private static final String AUTHENTICATION_IMAGE_GROUP = 'General'
+	private static final String AUTHENTICATION_OBJECT_GROUP = 'authentication'
+
+	private static final Set<String> validatedVersionEnvironments =
+	new HashSet<String>()
+
+	private final ImageLoader imageLoader =
+	new ImageLoader()
+
+
+	@Keyword
+	def launchApplication(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		if (System.getProperty('user.name') == GlobalVariable.username) {
+			if (environment == 'REC') {
+				String cmd =
+						'Powershell.exe -executionpolicy remotesigned -File D:\\setResolution.ps1'
+
+				Runtime
+						.getRuntime()
+						.exec(cmd)
+			}
+
+			Windows.startApplicationWithTitle(
+					getShortcutPath(environment),
+					getVersion(environment)
+					)
+		} else {
+			if (environment == 'REC') {
+				startWinAppDriver()
+			}
+
+			Windows.startApplication(
+					getApplicationPath(environment)
+					)
+		}
+	}
+
+
+	@Keyword
+	def validateProductionVersionOnly(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		if (!isProductionEnvironment(environment)) {
+			KeywordUtil.markFailedAndStop(
+					'validateProductionVersionOnly can only be used for PRD/PROD.\n' +
+					'Received environment: ' + environment
+					)
+		}
+
+		validateCorrectVersionWindowOrStop(environment)
+		saveCurrentEnvironment(environment)
+
+		KeywordUtil.logInfo(
+				'PRD version validated successfully. ' +
+				'Credential modal, environment selector and connect button are not required for PRD.'
+				)
+	}
+
+
+	@Keyword
+	def switchToVersionWindow(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		validateCorrectVersionWindowOrStop(environment)
+
+		KeywordUtil.logInfo(
+				'Successfully switched to eMatch version window: ' +
+				getVersion(environment)
+				)
+
+		return true
+	}
+
+
+	@Keyword
+	def openEnvironmentSelector(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		if (isProductionEnvironment(environment)) {
+			KeywordUtil.logInfo(
+					'PRD does not use credential modal or environment selector. ' +
+					'Skipping environment selector.'
+					)
+
+			return
+		}
+
+		validateCorrectVersionWindowOrStop(environment)
+
+		if (!isLoginScreenVisibleSafely()) {
+			KeywordUtil.markFailedAndStop(
+					'Login screen is not visible, but it was expected before selecting environment.\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		WindowsTestObject environmentCombo =
+				WindowsObjectLoader.getObject(
+				'authentication',
+				'environmentCombo'
+				)
+
+		boolean isComboPresent =
+				Windows.verifyElementPresent(
+				environmentCombo,
+				5,
+				FailureHandling.OPTIONAL
+				)
+
+		if (!isComboPresent) {
+			KeywordUtil.markFailedAndStop(
+					'Environment combo was not found by NAME.\n' +
+					'Expected Name: Environnement eMatch\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		KeywordUtil.logInfo(
+				'Environment eMatch combo found. ' +
+				'Selection will be done in selectEnvironment.'
+				)
+	}
+
+
+	@Keyword
+	def selectEnvironment(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		if (isProductionEnvironment(environment)) {
+			KeywordUtil.logInfo(
+					'PRD does not use credential modal or environment selection. ' +
+					'Skipping environment selection.'
+					)
+
+			saveCurrentEnvironment(environment)
+			return
+		}
+
+		validateCorrectVersionWindowOrStop(environment)
+
+		if (!isLoginScreenVisibleSafely()) {
+			KeywordUtil.markFailedAndStop(
+					'Login screen is not visible, but it was expected for environment selection.\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		WindowsTestObject environmentCombo =
+				WindowsObjectLoader.getObject(
+				'authentication',
+				'environmentCombo'
+				)
+
+		boolean isComboPresent =
+				Windows.verifyElementPresent(
+				environmentCombo,
+				5,
+				FailureHandling.OPTIONAL
+				)
+
+		if (!isComboPresent) {
+			KeywordUtil.markFailedAndStop(
+					'Environment combo was not found by NAME.\n' +
+					'Expected Name: Environnement eMatch\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		KeywordUtil.logInfo(
+				'Selecting Environment eMatch: ' +
+				environment
+				)
+
+		clickElementCenterByCoordinates(environmentCombo)
+		Thread.sleep(300)
+
+		selectFocusedEMatchComboByKeyboard(environment)
+
+		saveCurrentEnvironment(environment)
+
+		KeywordUtil.logInfo(
+				'Environment eMatch selected: ' +
+				environment
+				)
+	}
+
+
+	@Keyword
+	def clickConnectIfPresent(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		if (isProductionEnvironment(environment)) {
+			KeywordUtil.logInfo(
+					'PRD does not use connect button. ' +
+					'Skipping connect action.'
+					)
+
+			saveCurrentEnvironment(environment)
+			return
+		}
+
+		validateCorrectVersionWindowOrStop(environment)
+
+		if (!isLoginScreenVisibleSafely()) {
+			KeywordUtil.markFailedAndStop(
+					'Login screen is not visible before clicking connect.\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		WindowsTestObject connectButton =
+				WindowsObjectLoader.getObject(
+				'authentication',
+				'connectButton'
+				)
+
+		boolean isButtonPresent =
+				Windows.verifyElementPresent(
+				connectButton,
+				5,
+				FailureHandling.OPTIONAL
+				)
+
+		if (!isButtonPresent) {
+			KeywordUtil.markFailedAndStop(
+					'Connect button was not found by NAME.\n' +
+					'Expected Name: Se connecter\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		try {
+			clickElementCenterByCoordinates(connectButton)
+		} catch (Exception e) {
+			KeywordUtil.logInfo(
+					'Coordinate click failed. Trying normal click. Reason: ' +
+					e.getMessage()
+					)
+
+			Windows.click(
+					connectButton,
+					FailureHandling.OPTIONAL
+					)
+		}
+
+		boolean loginClosed =
+				waitUntilLoginScreenIsClosed(
+				MAIN_SCREEN_TIMEOUT_SECONDS
+				)
+
+		if (!loginClosed) {
+			KeywordUtil.markFailedAndStop(
+					'Connect button was clicked, but login screen is still visible.\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		saveCurrentEnvironment(environment)
+
+		KeywordUtil.logInfo(
+				'Connect button clicked and login screen closed.'
+				)
+	}
+
+
+	@Keyword
+	def waitForMainScreen(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		boolean loginClosed =
+				waitUntilLoginScreenIsClosed(
+				MAIN_SCREEN_TIMEOUT_SECONDS
+				)
+
+		if (!loginClosed) {
+			KeywordUtil.markFailedAndStop(
+					'Main screen was not validated after login.\n' +
+					'Login screen is still visible.\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		saveCurrentEnvironment(environment)
+
+		KeywordUtil.logInfo(
+				'Main screen validated because login screen is closed.\n' +
+				'Current environment saved from targetEnvironment: ' +
+				environment
+				)
+
+		Windows.delay(1)
+	}
+
+
+	@Keyword
+	def multiFormatScreen(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+		waitForMainScreen(targetEnvironment)
+	}
+
+
+	@Keyword
+	def clickHomeTab(String targetEnvironment) {
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment =
+				normalizeEnvironment(targetEnvironment)
+
+		validateCorrectVersionWindowOrStop(environment)
+
+		WindowsTestObject homeTab =
+				WindowsObjectLoader.getObject(
+				'common',
+				'homeTab'
+				)
+
+		boolean isHomePresent =
+				Windows.verifyElementPresent(
+				homeTab,
+				5,
+				FailureHandling.OPTIONAL
+				)
+
+		if (!isHomePresent) {
+			KeywordUtil.markFailedAndStop(
+					'Home tab was not found by NAME.\n' +
+					'Expected Name: Modules\n' +
+					'Environment: ' + environment
+					)
+		}
+
+		try {
+			clickElementCenterByCoordinates(homeTab)
+		} catch (Exception e) {
+			KeywordUtil.logInfo(
+					'Coordinate click on Home tab failed. ' +
+					'Trying normal click. Reason: ' +
+					e.getMessage()
+					)
+
+			Windows.click(
+					homeTab,
+					FailureHandling.OPTIONAL
+					)
+		}
+
+		saveCurrentEnvironment(environment)
+
+		KeywordUtil.logInfo(
+				'Home tab Modules clicked.'
+				)
+
+		Windows.delay(1)
+	}
+
+
+	// ======================================================
+	// SWITCH TO OTHER USER
+	// ======================================================
+
+
+	@Keyword
+	Map switchToOtherUser(
+			String targetEnvironment,
+			String alternateUsername,
+			String alternatePassword,
+			Integer timeoutSeconds
+	) {
+
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String environment = normalizeEnvironment(targetEnvironment)
+		String username = safeAuthenticationText(alternateUsername)
+		String password = alternatePassword == null ? '' : alternatePassword.toString()
+		Integer timeout = timeoutSeconds != null && timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_SWITCH_USER_TIMEOUT_SECONDS
+
+		if (username.isEmpty()) {
+			KeywordUtil.markFailedAndStop('Alternate username cannot be empty.')
+			return [:]
+		}
+
+		if (password.isEmpty()) {
+			KeywordUtil.markFailedAndStop('Alternate password cannot be empty.')
+			return [:]
+		}
+
+		clickSwitchUserImageFirstThenObject(
+				'settingsButton',
+				'settingsButton',
+				'Settings button',
+				timeout
+				)
+
+		Windows.delay(SWITCH_USER_DELAY_SECONDS)
+
+		clickSwitchUserImageFirstThenObject(
+				'changeEnvironmentButton',
+				'changeEnvironmentButton',
+				'Change environment menu item',
+				timeout
+				)
+
+		Windows.delay(SWITCH_USER_DELAY_SECONDS)
+
+		confirmSwitchEnvironmentWarningIfPresent(timeout)
+
+		WindowsTestObject environmentCombo =
+				WindowsObjectLoader.getObject(
+				AUTHENTICATION_OBJECT_GROUP,
+				'environmentCombo'
+				)
+
+		if (!Windows.waitForElementPresent(
+				environmentCombo,
+				timeout,
+				FailureHandling.OPTIONAL
+				)) {
+			KeywordUtil.markFailedAndStop(
+					'Environment combo was not displayed after opening the switch-user login modal.\n' +
+					'Environment: ' +
+					environment
+					)
+
+			return [:]
+		}
+
+		clickElementCenterByCoordinates(
+				environmentCombo
+				)
+
+		Thread.sleep(300L)
+
+		selectFocusedEMatchComboByKeyboard(
+				environment
+				)
+
+		Windows.delay(
+				SWITCH_USER_DELAY_SECONDS
+				)
+
+		clickSwitchUserImageFirstThenObject(
+				'checkOtherUser',
+				'connectWithOtherUserCheckBox',
+				'Connect with another login checkbox',
+				timeout
+				)
+
+		Windows.delay(
+				SWITCH_USER_DELAY_SECONDS
+				)
+
+		typeAlternateCredentialsWithKeyboard(
+				username,
+				password
+				)
+
+		if (!waitUntilLoginScreenIsClosed(timeout)) {
+			KeywordUtil.markFailedAndStop(
+					'Alternate user credentials were submitted, but the main screen was not displayed.\n' +
+					'Environment: ' +
+					environment +
+					'\nExpected user: ' +
+					username
+					)
+
+			return [:]
+		}
+
+		WindowsTestObject loggedUserName =
+				WindowsObjectLoader.getObject(
+				AUTHENTICATION_OBJECT_GROUP,
+				'loggedUserName'
+				)
+
+		if (!Windows.waitForElementPresent(
+				loggedUserName,
+				timeout,
+				FailureHandling.OPTIONAL
+				)) {
+			KeywordUtil.markFailedAndStop(
+					'Logged username element was not displayed after switching user.\n' +
+					'Expected user: ' +
+					username
+					)
+
+			return [:]
+		}
+
+		String actualLoggedUser =
+				safeAuthenticationText(
+				Windows.getText(
+				loggedUserName
+				)
+				)
+
+		if (!actualLoggedUser.equalsIgnoreCase(username)) {
+			KeywordUtil.markFailedAndStop(
+					'Application was not logged with the expected alternate user.\n' +
+					'Expected: ' +
+					username +
+					'\nActual: ' +
+					actualLoggedUser
+					)
+
+			return [:]
+		}
+
+		saveCurrentEnvironment(environment)
+
+		KeywordUtil.logInfo(
+				'[PASS] Alternate user login completed successfully.\n' +
+				'Environment: ' +
+				environment +
+				'\nUser: ' +
+				actualLoggedUser
+				)
+
+		return [
+			environment : environment,
+			expectedUser: username,
+			actualUser  : actualLoggedUser
+		]
+	}
+
+
+	private void clickSwitchUserImageFirstThenObject(
+			String imageKey,
+			String objectKey,
+			String description,
+			Integer timeoutSeconds
+	) {
+
+		Integer timeout = timeoutSeconds != null && timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_SWITCH_USER_TIMEOUT_SECONDS
+		Integer imageTimeout = Math.min(timeout, SWITCH_USER_IMAGE_TIMEOUT_SECONDS)
+
+		try {
+			if (imageLoader.waitForImage(AUTHENTICATION_IMAGE_GROUP, imageKey, imageTimeout)) {
+				WindowsImageKeywords.clickImage(
+						imageLoader.getImage(AUTHENTICATION_IMAGE_GROUP, imageKey)
+						)
+				KeywordUtil.logInfo('[IMAGE] ' + description + ' clicked.')
+				return
+			}
+		} catch (Throwable imageError) {
+			KeywordUtil.logInfo(
+					'[IMAGE] Could not click ' + description +
+					'. Trying Windows object.\nReason: ' +
+					safeAuthenticationText(imageError.message)
+					)
+		}
+
+		WindowsTestObject targetObject = WindowsObjectLoader.getObject(AUTHENTICATION_OBJECT_GROUP, objectKey)
+
+		if (!Windows.waitForElementPresent(targetObject, timeout, FailureHandling.OPTIONAL)) {
+			KeywordUtil.markFailedAndStop(
+					description + ' was not found by image or Windows object.\n' +
+					'Image: ' + AUTHENTICATION_IMAGE_GROUP + '.' + imageKey + '\n' +
+					'Object: ' + AUTHENTICATION_OBJECT_GROUP + '.' + objectKey
+					)
+			return
+		}
+
+		Windows.click(targetObject, FailureHandling.STOP_ON_FAILURE)
+		KeywordUtil.logInfo('[OBJECT] ' + description + ' clicked.')
+	}
+
+
+	private void confirmSwitchEnvironmentWarningIfPresent(
+			Integer timeoutSeconds
+	) {
+
+		Integer timeout =
+				timeoutSeconds != null &&
+				timeoutSeconds > 0
+				? timeoutSeconds
+				: DEFAULT_SWITCH_USER_TIMEOUT_SECONDS
+
+		Integer shortTimeout =
+				Math.min(
+				timeout,
+				3
+				)
+
+		Boolean modalIconDisplayed = false
+		Boolean yesButtonDisplayed = false
+
+		try {
+			modalIconDisplayed =
+					imageLoader.waitForImage(
+					AUTHENTICATION_IMAGE_GROUP,
+					'iconeModal',
+					shortTimeout
+					)
+		} catch (Throwable ignored) {
+			modalIconDisplayed = false
+		}
+
+		try {
+			WindowsTestObject yesButton =
+					WindowsObjectLoader.getObject(
+					AUTHENTICATION_OBJECT_GROUP,
+					'switchEnvironmentWarningYesButton'
+					)
+
+			yesButtonDisplayed =
+					Windows.waitForElementPresent(
+					yesButton,
+					1,
+					FailureHandling.OPTIONAL
+					)
+		} catch (Throwable ignored) {
+			yesButtonDisplayed = false
+		}
+
+		if (!modalIconDisplayed &&
+			!yesButtonDisplayed) {
+
+			KeywordUtil.logInfo(
+					'[INFO] Switch environment warning modal was not displayed. Continuing to the login modal.'
+					)
+
+			return
+		}
+
+		clickSwitchUserImageFirstThenObject(
+				'yesWarningButton',
+				'switchEnvironmentWarningYesButton',
+				'Switch environment warning Yes button',
+				shortTimeout
+				)
+
+		Windows.delay(
+				SWITCH_USER_DELAY_SECONDS
+				)
+
+		KeywordUtil.logInfo(
+				'[PASS] Switch environment warning modal was confirmed.'
+				)
+	}
+
+
+	private void typeAlternateCredentialsWithKeyboard(
+			String username,
+			String password
+	) {
+
+		Robot robot =
+				new Robot()
+
+		robot.setAutoDelay(120)
+
+		pressRobotKey(
+				robot,
+				KeyEvent.VK_TAB
+				)
+
+		pasteTextWithRobot(
+				robot,
+				username
+				)
+
+		pressRobotKey(
+				robot,
+				KeyEvent.VK_TAB
+				)
+
+		pasteTextWithRobot(
+				robot,
+				password
+				)
+
+		pressRobotKey(
+				robot,
+				KeyEvent.VK_TAB
+				)
+
+		pressRobotKey(
+				robot,
+				KeyEvent.VK_ENTER
+				)
+
+		KeywordUtil.logInfo(
+				'[PASS] Alternate credentials submitted using keyboard navigation.\n' +
+				'Sequence: checkbox -> TAB -> username -> TAB -> password -> TAB -> ENTER'
+				)
+	}
+
+
+	private void pasteTextWithRobot(
+			Robot robot,
+			String value
+	) {
+
+		Toolkit
+				.getDefaultToolkit()
+				.getSystemClipboard()
+				.setContents(
+				new StringSelection(value),
+				null
+				)
+
+		robot.keyPress(
+				KeyEvent.VK_CONTROL
+				)
+		robot.keyPress(
+				KeyEvent.VK_V
+				)
+		robot.keyRelease(
+				KeyEvent.VK_V
+				)
+		robot.keyRelease(
+				KeyEvent.VK_CONTROL
+				)
+
+		Thread.sleep(250L)
+	}
+
+
+	private void pressRobotKey(
+			Robot robot,
+			Integer keyCode
+	) {
+
+		robot.keyPress(
+				keyCode
+				)
+
+		robot.keyRelease(
+				keyCode
+				)
+
+		Thread.sleep(200L)
+	}
+
+
+	private void replaceAuthenticationText(
+			String objectKey,
+			String value,
+			Integer timeoutSeconds
+	) {
+
+		WindowsTestObject inputObject = WindowsObjectLoader.getObject(AUTHENTICATION_OBJECT_GROUP, objectKey)
+
+		if (!Windows.waitForElementPresent(inputObject, timeoutSeconds, FailureHandling.OPTIONAL)) {
+			KeywordUtil.markFailedAndStop(
+					'Authentication input was not displayed.\n' +
+					'Object: ' + AUTHENTICATION_OBJECT_GROUP + '.' + objectKey
+					)
+			return
+		}
+
+		Windows.click(inputObject, FailureHandling.STOP_ON_FAILURE)
+
+		Robot robot = new Robot()
+		robot.keyPress(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_A)
+		robot.keyRelease(KeyEvent.VK_CONTROL)
+		robot.keyPress(KeyEvent.VK_BACK_SPACE)
+		robot.keyRelease(KeyEvent.VK_BACK_SPACE)
+
+		Windows.setText(inputObject, value)
+	}
+
+
+	private String safeAuthenticationText(Object value) {
+		return value == null ? '' : value.toString().trim()
+	}
+
+
+	private void validateCorrectVersionWindowOrStop(
+			String environment
+	) {
+
+		stopImmediatelyIfFatalFailureWasAlreadyDetected()
+
+		String normalizedEnvironment =
+				normalizeEnvironment(environment)
+
+		if (
+		validatedVersionEnvironments.contains(
+				normalizedEnvironment
+				)
+				) {
+			KeywordUtil.logInfo(
+					'Version validation already executed for environment: ' +
+					normalizedEnvironment +
+					'. Skipping repeated version validation.'
+					)
+
+			return
+		}
+
+		String expectedVersion =
+				getVersion(normalizedEnvironment)
+
+		WindowsTestObject versionWindow =
+				WindowsObjectLoader.getWindowByName(
+				expectedVersion
+				)
+
+		Exception lastError = null
+		boolean windowWasFound = false
+		int attempt = 0
+
+		long deadline =
+				System.currentTimeMillis() +
+				(VERSION_WINDOW_TIMEOUT_SECONDS * 1000L)
+
+		KeywordUtil.logInfo(
+				'Waiting for expected eMatch version window.\n' +
+				'Environment: ' + normalizedEnvironment + '\n' +
+				'Expected window Name: ' + expectedVersion + '\n' +
+				'Timeout: ' +
+				VERSION_WINDOW_TIMEOUT_SECONDS +
+				' seconds'
+				)
+
+		while (System.currentTimeMillis() < deadline) {
+			attempt++
+
+			long remainingMilliseconds =
+					deadline -
+					System.currentTimeMillis()
+
+			int remainingSeconds =
+					(int) Math.ceil(
+					remainingMilliseconds / 1000.0d
+					)
+
+			int checkTimeout =
+					Math.min(
+					VERSION_WINDOW_CHECK_SECONDS,
+					Math.max(1, remainingSeconds)
+					)
+
+			try {
+				Windows.switchToDesktop()
+
+				boolean windowExists =
+						Windows.verifyElementPresent(
+						versionWindow,
+						checkTimeout,
+						FailureHandling.OPTIONAL
+						)
+
+				if (!windowExists) {
+					KeywordUtil.logInfo(
+							'Expected eMatch version window is not ready yet.\n' +
+							'Attempt: ' + attempt + '\n' +
+							'Expected window Name: ' +
+							expectedVersion
+							)
+
+					Thread.sleep(500)
+					continue
+				}
+
+				windowWasFound = true
+
+				Windows.switchToWindow(versionWindow)
+				Thread.sleep(500)
+
+				validatedVersionEnvironments.add(
+						normalizedEnvironment
+						)
+
+				KeywordUtil.logInfo(
+						'Correct eMatch version window found by NAME: ' +
+						expectedVersion
+						)
+
+				KeywordUtil.logInfo(
+						'Version validation marked as completed for environment: ' +
+						normalizedEnvironment
+						)
+
+				return
+			} catch (Exception e) {
+				lastError = e
+
+				KeywordUtil.logInfo(
+						'Could not attach to expected eMatch version window.\n' +
+						'Attempt: ' + attempt + '\n' +
+						'Expected window Name: ' +
+						expectedVersion + '\n' +
+						'Reason: ' +
+						e.getMessage()
+						)
+
+				Thread.sleep(500)
+			}
+		}
+
+		if (windowWasFound && lastError != null) {
+			stopBecauseCouldNotAttachToVersionWindow(
+					normalizedEnvironment,
+					expectedVersion,
+					lastError
+					)
+
+			return
+		}
+
+		if (lastError != null) {
+			stopBecauseCouldNotAttachToVersionWindow(
+					normalizedEnvironment,
+					expectedVersion,
+					lastError
+					)
+
+			return
+		}
+
+		stopBecauseWrongVersion(
+				normalizedEnvironment,
+				expectedVersion
+				)
+	}
+
+
+	private void stopBecauseWrongVersion(
+			String environment,
+			String expectedVersion
+	) {
+
+		fatalFailureDetected = true
+
+		fatalFailureMessage =
+				'WRONG EMATCH VERSION DETECTED.\n' +
+				'The expected eMatch version window was not found.\n' +
+				'Execution will be stopped now.\n\n' +
+				'Environment: ' + environment + '\n' +
+				'Expected version/window Name: ' +
+				expectedVersion
+
+		KeywordUtil.markFailed(
+				fatalFailureMessage
+				)
+
+		throw new StepFailedException(
+		fatalFailureMessage
+		)
+	}
+
+
+	private void stopBecauseCouldNotAttachToVersionWindow(
+			String environment,
+			String expectedVersion,
+			Exception e
+	) {
+
+		fatalFailureDetected = true
+
+		fatalFailureMessage =
+				'COULD NOT ATTACH TO EMATCH VERSION WINDOW.\n' +
+				'The expected eMatch window exists or was being searched, but WinAppDriver/Katalon could not attach to it.\n' +
+				'This is not automatically a wrong version error.\n\n' +
+				'Environment: ' + environment + '\n' +
+				'Expected version/window Name: ' +
+				expectedVersion + '\n' +
+				'Original error: ' +
+				e.getMessage()
+
+		KeywordUtil.markFailed(
+				fatalFailureMessage
+				)
+
+		throw new StepFailedException(
+		fatalFailureMessage
+		)
+	}
+
+
+	private void stopImmediatelyIfFatalFailureWasAlreadyDetected() {
+		if (fatalFailureDetected) {
+			KeywordUtil.markFailed(
+					fatalFailureMessage
+					)
+
+			throw new StepFailedException(
+			fatalFailureMessage
+			)
+		}
+	}
+
+
+	private boolean waitUntilLoginScreenIsClosed(
+			int timeoutSeconds
+	) {
+
+		int elapsedMilliseconds = 0
+		int timeoutMilliseconds =
+				timeoutSeconds * 1000
+
+		while (
+		elapsedMilliseconds <
+				timeoutMilliseconds
+				) {
+			if (isHomeTabVisibleSafely()) {
+				return true
+			}
+
+			boolean loginVisible =
+					isLoginScreenVisibleSafely()
+
+			if (!loginVisible) {
+				return true
+			}
+
+			Thread.sleep(500)
+
+			elapsedMilliseconds =
+					elapsedMilliseconds + 500
+		}
+
+		return false
+	}
+
+
+	private boolean isLoginScreenVisibleSafely() {
+		try {
+			WindowsTestObject environmentCombo =
+					WindowsObjectLoader.getObject(
+					'authentication',
+					'environmentCombo'
+					)
+
+			boolean comboVisible =
+					Windows.verifyElementPresent(
+					environmentCombo,
+					1,
+					FailureHandling.OPTIONAL
+					)
+
+			if (comboVisible) {
+				return true
+			}
+
+			WindowsTestObject connectButton =
+					WindowsObjectLoader.getObject(
+					'authentication',
+					'connectButton'
+					)
+
+			boolean buttonVisible =
+					Windows.verifyElementPresent(
+					connectButton,
+					1,
+					FailureHandling.OPTIONAL
+					)
+
+			return buttonVisible
+		} catch (Exception e) {
+			KeywordUtil.logInfo(
+					'Could not verify login screen visibility. ' +
+					'Treating it as visible to avoid false pass. Reason: ' +
+					e.getMessage()
+					)
+
+			return true
+		}
+	}
+
+
+	private boolean isHomeTabVisibleSafely() {
+		try {
+			WindowsTestObject homeTab =
+					WindowsObjectLoader.getObject(
+					'common',
+					'homeTab'
+					)
+
+			return Windows.verifyElementPresent(
+					homeTab,
+					1,
+					FailureHandling.OPTIONAL
+					)
+		} catch (Exception e) {
+			return false
+		}
+	}
+
+
+	private void selectFocusedEMatchComboByKeyboard(
+			String environment
+	) {
+
+		int downCount =
+				getEMatchDownCount(environment)
+
+		KeywordUtil.logInfo(
+				'Selecting Environment eMatch with keyboard from PROD. ' +
+				'Environment: ' +
+				environment +
+				', down count: ' +
+				downCount
+				)
+
+		for (int i = 0; i < 6; i++) {
+			pressKey(KeyEvent.VK_UP)
+			Thread.sleep(120)
+		}
+
+		for (int i = 0; i < downCount; i++) {
+			pressKey(KeyEvent.VK_DOWN)
+			Thread.sleep(120)
+		}
+
+		pressKey(KeyEvent.VK_ENTER)
+		Thread.sleep(500)
+
+		KeywordUtil.logInfo(
+				'Environment eMatch selected with keyboard: ' +
+				environment
+				)
+	}
+
+
+	private int getEMatchDownCount(String environment) {
+		switch (environment) {
+			case 'PRD':
+			case 'PROD':
+				return 0
+
+			case 'PREX':
+				return 1
+
+			case 'REC2':
+				return 2
+
+			case 'REC':
+				return 3
+
+			case 'DEV2':
+				return 4
+
+			case 'DEV':
+				return 5
+
+			default:
+				return 3
+		}
+	}
+
+
+	private boolean isProductionEnvironment(
+			String environment
+	) {
+
+		return environment == 'PRD' ||
+				environment == 'PROD'
+	}
+
+
+	private void clickElementCenterByCoordinates(
+			WindowsTestObject object
+	) {
+
+		def rect =
+				Windows.getElementRect(object)
+
+		int x =
+				rect.getX() +
+				Math.floor(
+				rect.getWidth() / 2
+				).intValue()
+
+		int y =
+				rect.getY() +
+				Math.floor(
+				getSafeHeight(rect) / 2
+				).intValue()
+
+		mouseClick(x, y)
+	}
+
+
+	private int getSafeHeight(def rect) {
+		int height =
+				rect.getHeight()
+
+		if (height <= 0) {
+			return 20
+		}
+
+		return height
+	}
+
+
+	private void pressKey(int keyCode) {
+		Robot robot =
+				new Robot()
+
+		robot.setAutoDelay(80)
+
+		robot.keyPress(keyCode)
+		robot.keyRelease(keyCode)
+	}
+
+
+	private void mouseClick(
+			int x,
+			int y
+	) {
+
+		Robot robot =
+				new Robot()
+
+		robot.setAutoDelay(80)
+
+		robot.mouseMove(x, y)
+		Thread.sleep(80)
+
+		robot.mousePress(
+				InputEvent.BUTTON1_DOWN_MASK
+				)
+
+		Thread.sleep(80)
+
+		robot.mouseRelease(
+				InputEvent.BUTTON1_DOWN_MASK
+				)
+
+		Thread.sleep(150)
+	}
+
+
+	private String normalizeEnvironment(
+			String targetEnvironment
+	) {
+
+		if (
+		targetEnvironment == null ||
+				targetEnvironment.trim().isEmpty()
+				) {
+			return 'REC'
+		}
+
+		return targetEnvironment
+				.trim()
+				.toUpperCase()
+	}
+
+
+	private void saveCurrentEnvironment(
+			String environment
+	) {
+
+		String normalizedEnvironment =
+				normalizeEnvironment(environment)
+
+		if (normalizedEnvironment == 'PROD') {
+			normalizedEnvironment = 'PRD'
+		}
+
+		try {
+			GlobalVariable.currentEnvironment =
+					normalizedEnvironment
+
+			KeywordUtil.logInfo(
+					'Current environment saved after login: ' +
+					normalizedEnvironment
+					)
+		} catch (Exception saveError) {
+			KeywordUtil.logInfo(
+					'Could not save GlobalVariable.currentEnvironment. ' +
+					'Create this variable in the execution profile if needed. Reason: ' +
+					saveError.getMessage()
+					)
+		}
+	}
+
+
+	private String getVersion(String environment) {
+		switch (environment) {
+			case 'PRD':
+			case 'PROD':
+				return GlobalVariable.versionProd
+
+			default:
+				return GlobalVariable.version
+		}
+	}
+
+
+	private String getShortcutPath(String environment) {
+		switch (environment) {
+			case 'PRD':
+			case 'PROD':
+				return 'D:\\RunAseMatchPRD\\eMatch.lnk'
+
+			default:
+				return 'D:\\RunAseMatchReq\\eMatch.lnk'
+		}
+	}
+
+
+	private String getApplicationPath(String environment) {
+		switch (environment) {
+			case 'PRD':
+			case 'PROD':
+				return '\\\\cib.net\\soft\\ematch\\IHM\\PROD\\IXIS.Ematch.IHM.application'
+
+			default:
+				return '\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\REC\\IXIS.Ematch.IHM.application'
+		}
+	}
+
+
+	//'\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\N22M-3253\\IXIS.Ematch.IHM.application'
+
+	private void startWinAppDriver() {
+		String command =
+				'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
+
+		ProcessBuilder builder =
+				new ProcessBuilder(command)
+				.inheritIO()
+
+		builder.start()
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import com.kms.katalon.core.util.KeywordUtil
+
+
+// ======================================================
+// MODULE CONFIG
+// ======================================================
+
+String targetEnvironment = 'REC'
+
+String alternateUsername = 'ebn22tstusercthem'
+String alternatePassword = 'N22eMatch202512&'
+
+
+// ======================================================
+// TIMEOUT CONFIG
+// ======================================================
+
+Integer switchUserTimeout = 90
+
+
+// ======================================================
+// SWITCH USER
+// ======================================================
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+	'Switch application user\n' +
+	'Environment: ' +
+	targetEnvironment +
+	'\nExpected user: ' +
+	alternateUsername +
+	'\nFlow:\n' +
+	'- Open Settings\n' +
+	'- Change environment\n' +
+	'- Confirm warning\n' +
+	'- Validate optional warning modal\n' +
+	'- Select target environment\n' +
+	'- Click connect with another login\n' +
+	'- TAB to username and enter value\n' +
+	'- TAB to password and enter value\n' +
+	'- TAB to connect and press ENTER\n' +
+	'- Validate logged user'
+)
+
+Map switchResult =
+	CustomKeywords.
+	'pageObject.authenticationKeywords.switchToOtherUser'(
+		targetEnvironment,
+		alternateUsername,
+		alternatePassword,
+		switchUserTimeout
+	)
+
+CustomKeywords.'jiraIntegration.JiraReportSteps.note'(
+	'Alternate user login completed successfully\n' +
+	'Environment: ' +
+	switchResult.environment +
+	'\nExpected user: ' +
+	switchResult.expectedUser +
+	'\nActual user: ' +
+	switchResult.actualUser
+)
+
+KeywordUtil.markPassed(
+	targetEnvironment +
+	' alternate user login completed successfully.'
+)
+
 
