@@ -1,10 +1,3 @@
-Esta com cara que o winapp nao funcionou direito pq tem validação de nome e o erro apresentado é outro.
-Ele acontece quase sempre em REC e PRD tem uma forma de quando acontecer começar tudo de novo abrir um novo e tudo?
-Pelo menos mais uma vez ou tentar achar novamente com o winapp a janela
-qualquer forma de contornar, aumentar gtimeout algo que faça essa instabilidade diminuir
-
-
-
 
 package pageObject
 
@@ -39,6 +32,14 @@ class authenticationKeywords {
 	private static final int SWITCH_USER_IMAGE_TIMEOUT_SECONDS = 5
 	private static final int SWITCH_USER_DELAY_SECONDS = 1
 
+	private static final int APPLICATION_LAUNCH_MAX_ATTEMPTS = 2
+	private static final int APPLICATION_REATTACH_TIMEOUT_SECONDS = 20
+	private static final int APPLICATION_REATTACH_CHECK_SECONDS = 2
+
+	private static final long EMATCH_CLOSE_WAIT_MILLISECONDS = 2000L
+	private static final long WINAPPDRIVER_STOP_WAIT_MILLISECONDS = 1500L
+	private static final long WINAPPDRIVER_START_WAIT_MILLISECONDS = 3000L
+
 	private static final String AUTHENTICATION_IMAGE_GROUP = 'General'
 	private static final String AUTHENTICATION_OBJECT_GROUP = 'authentication'
 
@@ -56,7 +57,11 @@ class authenticationKeywords {
 		String environment =
 				normalizeEnvironment(targetEnvironment)
 
-		if (System.getProperty('user.name') == GlobalVariable.username) {
+		boolean useShortcutAndWindowTitle =
+				System.getProperty('user.name') ==
+				GlobalVariable.username
+
+		if (useShortcutAndWindowTitle) {
 			if (environment == 'REC') {
 				String cmd =
 						'Powershell.exe -executionpolicy remotesigned -File D:\\setResolution.ps1'
@@ -65,20 +70,496 @@ class authenticationKeywords {
 						.getRuntime()
 						.exec(cmd)
 			}
+		}
 
+		if (
+		environment == 'REC' ||
+			isProductionEnvironment(environment)
+				) {
+
+			validatedVersionEnvironments.remove(
+					environment
+					)
+
+			launchApplicationWithRecovery(
+					environment,
+					useShortcutAndWindowTitle
+					)
+
+			return
+		}
+
+		launchApplicationOnce(
+				environment,
+				useShortcutAndWindowTitle
+				)
+	}
+
+
+	private void launchApplicationWithRecovery(
+			String environment,
+			boolean useShortcutAndWindowTitle
+	) {
+
+		Throwable firstLaunchError = null
+
+		for (
+		int attempt = 1;
+			attempt <= APPLICATION_LAUNCH_MAX_ATTEMPTS;
+			attempt++
+				) {
+
+			try {
+				if (attempt > 1) {
+					KeywordUtil.logInfo(
+							'[RECOVERY] Starting complete eMatch and WinAppDriver recovery.\n' +
+							'Environment: ' +
+							environment +
+							'\nRecovery attempt: ' +
+							attempt +
+							'/' +
+							APPLICATION_LAUNCH_MAX_ATTEMPTS
+							)
+
+					recoverWindowsAutomation(
+							environment
+							)
+				}
+
+				KeywordUtil.logInfo(
+						'[LAUNCH] Opening eMatch application.\n' +
+						'Environment: ' +
+						environment +
+						'\nAttempt: ' +
+						attempt +
+						'/' +
+						APPLICATION_LAUNCH_MAX_ATTEMPTS +
+						'\nLaunch mode: ' +
+						(
+						useShortcutAndWindowTitle
+							? 'Shortcut with expected window title'
+							: 'Application path'
+						)
+						)
+
+				launchApplicationOnce(
+						environment,
+						useShortcutAndWindowTitle
+						)
+
+				KeywordUtil.logInfo(
+						'[PASS] eMatch launch command completed successfully.\n' +
+						'Environment: ' +
+						environment +
+						'\nAttempt: ' +
+						attempt
+						)
+
+				return
+			} catch (Throwable launchError) {
+				if (firstLaunchError == null) {
+					firstLaunchError =
+							launchError
+				}
+
+				KeywordUtil.logInfo(
+						'[WARNING] eMatch launch attempt failed.\n' +
+						'Environment: ' +
+						environment +
+						'\nAttempt: ' +
+						attempt +
+						'/' +
+						APPLICATION_LAUNCH_MAX_ATTEMPTS +
+						'\nError type: ' +
+						launchError
+								.getClass()
+								.getSimpleName() +
+						'\nReason: ' +
+						safeAuthenticationText(
+						launchError.message
+							)
+						)
+
+				boolean attachedToExistingWindow =
+						tryAttachToExistingVersionWindow(
+						environment,
+						APPLICATION_REATTACH_TIMEOUT_SECONDS
+							)
+
+				if (attachedToExistingWindow) {
+					KeywordUtil.logInfo(
+							'[RECOVERY PASS] eMatch was already open and Katalon attached to the existing window.\n' +
+							'Environment: ' +
+							environment +
+							'\nExpected window Name: ' +
+							getVersion(environment)
+							)
+
+					return
+				}
+
+				if (
+				attempt >=
+					APPLICATION_LAUNCH_MAX_ATTEMPTS
+						) {
+
+					stopBecauseApplicationLaunchFailedAfterRecovery(
+							environment,
+							firstLaunchError,
+							launchError
+							)
+
+					return
+				}
+
+				KeywordUtil.logInfo(
+						'[RECOVERY] Existing eMatch window could not be attached.\n' +
+						'eMatch and WinAppDriver will be restarted before one final launch attempt.'
+						)
+			}
+		}
+	}
+
+
+	private void launchApplicationOnce(
+			String environment,
+			boolean useShortcutAndWindowTitle
+	) {
+
+		if (useShortcutAndWindowTitle) {
 			Windows.startApplicationWithTitle(
 					getShortcutPath(environment),
 					getVersion(environment)
 					)
-		} else {
-			if (environment == 'REC') {
-				startWinAppDriver()
+
+			return
+		}
+
+		if (environment == 'REC') {
+			startWinAppDriver()
+		}
+
+		Windows.startApplication(
+				getApplicationPath(environment)
+				)
+	}
+
+
+	private boolean tryAttachToExistingVersionWindow(
+			String environment,
+			int timeoutSeconds
+	) {
+
+		String normalizedEnvironment =
+				normalizeEnvironment(environment)
+
+		String expectedVersion =
+				getVersion(normalizedEnvironment)
+
+		WindowsTestObject versionWindow =
+				WindowsObjectLoader.getWindowByName(
+				expectedVersion
+					)
+
+		long deadline =
+				System.currentTimeMillis() +
+				(timeoutSeconds * 1000L)
+
+		int attempt = 0
+
+		KeywordUtil.logInfo(
+				'[RECOVERY] Trying to attach to an existing eMatch window.\n' +
+				'Environment: ' +
+				normalizedEnvironment +
+				'\nExpected window Name: ' +
+				expectedVersion +
+				'\nTimeout: ' +
+				timeoutSeconds +
+				' seconds'
+				)
+
+		while (
+		System.currentTimeMillis() <
+			deadline
+				) {
+
+			attempt++
+
+			try {
+				Windows.switchToDesktop()
+
+				boolean windowExists =
+						Windows.verifyElementPresent(
+						versionWindow,
+						APPLICATION_REATTACH_CHECK_SECONDS,
+						FailureHandling.OPTIONAL
+							)
+
+				if (windowExists) {
+					Windows.switchToWindow(
+							versionWindow
+							)
+
+					Thread.sleep(500L)
+
+					validatedVersionEnvironments.add(
+							normalizedEnvironment
+							)
+
+					KeywordUtil.logInfo(
+							'[RECOVERY PASS] Attached to existing eMatch window.\n' +
+							'Attempt: ' +
+							attempt +
+							'\nWindow Name: ' +
+							expectedVersion
+							)
+
+					return true
+				}
+			} catch (Throwable attachError) {
+				KeywordUtil.logInfo(
+						'[RECOVERY] Existing eMatch window is not available for attachment yet.\n' +
+						'Attempt: ' +
+						attempt +
+						'\nReason: ' +
+						safeAuthenticationText(
+						attachError.message
+							)
+						)
 			}
 
-			Windows.startApplication(
-					getApplicationPath(environment)
+			Thread.sleep(750L)
+		}
+
+		return false
+	}
+
+
+	private void recoverWindowsAutomation(
+			String environment
+	) {
+
+		String normalizedEnvironment =
+				normalizeEnvironment(environment)
+
+		validatedVersionEnvironments.remove(
+				normalizedEnvironment
+				)
+
+		closeEMatchApplicationSafely()
+		restartWinAppDriverSafely()
+
+		KeywordUtil.logInfo(
+				'[RECOVERY] Windows automation recovery completed.\n' +
+				'Environment: ' +
+				normalizedEnvironment +
+				'\nA new eMatch launch will now be attempted.'
+				)
+	}
+
+
+	private void closeEMatchApplicationSafely() {
+		try {
+			Windows.closeApplication()
+
+			KeywordUtil.logInfo(
+					'[RECOVERY] Current Katalon Windows application session was closed.'
+					)
+		} catch (Throwable closeError) {
+			KeywordUtil.logInfo(
+					'[RECOVERY] Katalon could not close the current Windows application session.\n' +
+					'Operating-system process cleanup will be used.\n' +
+					'Reason: ' +
+					safeAuthenticationText(
+					closeError.message
+						)
 					)
 		}
+
+		try {
+			String stopEMatchCommand =
+					'''Get-Process -ErrorAction SilentlyContinue |
+Where-Object {
+	$_.ProcessName -like '*Ematch*' -or
+	$_.MainWindowTitle -like '*eMatch*'
+} |
+Stop-Process -Force -ErrorAction SilentlyContinue'''
+
+			Process process =
+					new ProcessBuilder(
+					'powershell.exe',
+					'-NoProfile',
+					'-ExecutionPolicy',
+					'Bypass',
+					'-Command',
+					stopEMatchCommand
+						)
+						.redirectErrorStream(true)
+						.start()
+
+			process
+					.getInputStream()
+					.getText('UTF-8')
+
+			process.waitFor()
+
+			KeywordUtil.logInfo(
+					'[RECOVERY] Remaining eMatch processes and windows were closed.'
+					)
+		} catch (Throwable processError) {
+			KeywordUtil.logInfo(
+					'[WARNING] Could not execute eMatch operating-system process cleanup.\n' +
+					'Reason: ' +
+					safeAuthenticationText(
+					processError.message
+						)
+					)
+		}
+
+		Thread.sleep(
+				EMATCH_CLOSE_WAIT_MILLISECONDS
+				)
+	}
+
+
+	private void restartWinAppDriverSafely() {
+		KeywordUtil.logInfo(
+				'[RECOVERY] Restarting WinAppDriver.'
+				)
+
+		stopWinAppDriverSafely()
+
+		Thread.sleep(
+				WINAPPDRIVER_STOP_WAIT_MILLISECONDS
+				)
+
+		startWinAppDriver()
+
+		Thread.sleep(
+				WINAPPDRIVER_START_WAIT_MILLISECONDS
+				)
+
+		if (!isWinAppDriverRunning()) {
+			throw new StepFailedException(
+			'WinAppDriver could not be restarted during automatic recovery.'
+			)
+		}
+
+		KeywordUtil.logInfo(
+				'[RECOVERY PASS] WinAppDriver restarted successfully.'
+				)
+	}
+
+
+	private void stopWinAppDriverSafely() {
+		try {
+			Process process =
+					new ProcessBuilder(
+					'cmd.exe',
+					'/c',
+					'taskkill /F /T /IM WinAppDriver.exe'
+						)
+						.redirectErrorStream(true)
+						.start()
+
+			String output =
+					process
+							.getInputStream()
+							.getText('UTF-8')
+
+			process.waitFor()
+
+			KeywordUtil.logInfo(
+					'[RECOVERY] WinAppDriver stop command completed.\n' +
+					'Output: ' +
+					safeAuthenticationText(output)
+					)
+		} catch (Throwable stopError) {
+			KeywordUtil.logInfo(
+					'[RECOVERY] WinAppDriver could not be stopped or was not running.\n' +
+					'Reason: ' +
+					safeAuthenticationText(
+					stopError.message
+						)
+					)
+		}
+	}
+
+
+	private boolean isWinAppDriverRunning() {
+		try {
+			Process process =
+					new ProcessBuilder(
+					'cmd.exe',
+					'/c',
+					'tasklist /FI "IMAGENAME eq WinAppDriver.exe" /NH'
+						)
+						.redirectErrorStream(true)
+						.start()
+
+			String output =
+					process
+							.getInputStream()
+							.getText('UTF-8')
+
+			process.waitFor()
+
+			return output
+					.toLowerCase()
+					.contains(
+					'winappdriver.exe'
+						)
+		} catch (Throwable checkError) {
+			KeywordUtil.logInfo(
+					'[WARNING] Could not verify whether WinAppDriver is running.\n' +
+					'Reason: ' +
+					safeAuthenticationText(
+					checkError.message
+						)
+					)
+
+			return false
+		}
+	}
+
+
+	private void stopBecauseApplicationLaunchFailedAfterRecovery(
+			String environment,
+			Throwable firstError,
+			Throwable finalError
+	) {
+
+		fatalFailureDetected = true
+
+		fatalFailureMessage =
+				'EMATCH APPLICATION COULD NOT BE STARTED AFTER AUTOMATIC RECOVERY.\n' +
+				'The initial launch failed, the existing window could not be attached, ' +
+				'eMatch and WinAppDriver were restarted and one final launch was attempted.\n\n' +
+				'Environment: ' +
+				environment +
+				'\nExpected version/window Name: ' +
+				getVersion(environment) +
+				'\nMaximum launch attempts: ' +
+				APPLICATION_LAUNCH_MAX_ATTEMPTS +
+				'\nExisting-window reattach timeout per launch failure: ' +
+				APPLICATION_REATTACH_TIMEOUT_SECONDS +
+				' seconds' +
+				'\n\nFirst error: ' +
+				safeAuthenticationText(
+				firstError?.message
+					) +
+				'\n\nFinal error: ' +
+				safeAuthenticationText(
+				finalError?.message
+					)
+
+		KeywordUtil.markFailed(
+				fatalFailureMessage
+				)
+
+		throw new StepFailedException(
+		fatalFailureMessage
+		)
 	}
 
 
@@ -153,14 +634,14 @@ class authenticationKeywords {
 				WindowsObjectLoader.getObject(
 				'authentication',
 				'environmentCombo'
-				)
+					)
 
 		boolean isComboPresent =
 				Windows.verifyElementPresent(
 				environmentCombo,
 				5,
 				FailureHandling.OPTIONAL
-				)
+					)
 
 		if (!isComboPresent) {
 			KeywordUtil.markFailedAndStop(
@@ -207,14 +688,14 @@ class authenticationKeywords {
 				WindowsObjectLoader.getObject(
 				'authentication',
 				'environmentCombo'
-				)
+					)
 
 		boolean isComboPresent =
 				Windows.verifyElementPresent(
 				environmentCombo,
 				5,
 				FailureHandling.OPTIONAL
-				)
+					)
 
 		if (!isComboPresent) {
 			KeywordUtil.markFailedAndStop(
@@ -273,14 +754,14 @@ class authenticationKeywords {
 				WindowsObjectLoader.getObject(
 				'authentication',
 				'connectButton'
-				)
+					)
 
 		boolean isButtonPresent =
 				Windows.verifyElementPresent(
 				connectButton,
 				5,
 				FailureHandling.OPTIONAL
-				)
+					)
 
 		if (!isButtonPresent) {
 			KeywordUtil.markFailedAndStop(
@@ -307,7 +788,7 @@ class authenticationKeywords {
 		boolean loginClosed =
 				waitUntilLoginScreenIsClosed(
 				MAIN_SCREEN_TIMEOUT_SECONDS
-				)
+					)
 
 		if (!loginClosed) {
 			KeywordUtil.markFailedAndStop(
@@ -334,7 +815,7 @@ class authenticationKeywords {
 		boolean loginClosed =
 				waitUntilLoginScreenIsClosed(
 				MAIN_SCREEN_TIMEOUT_SECONDS
-				)
+					)
 
 		if (!loginClosed) {
 			KeywordUtil.markFailedAndStop(
@@ -376,14 +857,14 @@ class authenticationKeywords {
 				WindowsObjectLoader.getObject(
 				'common',
 				'homeTab'
-				)
+					)
 
 		boolean isHomePresent =
 				Windows.verifyElementPresent(
 				homeTab,
 				5,
 				FailureHandling.OPTIONAL
-				)
+					)
 
 		if (!isHomePresent) {
 			KeywordUtil.markFailedAndStop(
@@ -472,13 +953,13 @@ class authenticationKeywords {
 				WindowsObjectLoader.getObject(
 				AUTHENTICATION_OBJECT_GROUP,
 				'environmentCombo'
-				)
+					)
 
 		if (!Windows.waitForElementPresent(
 				environmentCombo,
 				timeout,
 				FailureHandling.OPTIONAL
-				)) {
+					)) {
 			KeywordUtil.markFailedAndStop(
 					'Environment combo was not displayed after opening the switch-user login modal.\n' +
 					'Environment: ' +
@@ -534,13 +1015,13 @@ class authenticationKeywords {
 				WindowsObjectLoader.getObject(
 				AUTHENTICATION_OBJECT_GROUP,
 				'loggedUserName'
-				)
+					)
 
 		if (!Windows.waitForElementPresent(
 				loggedUserName,
 				timeout,
 				FailureHandling.OPTIONAL
-				)) {
+					)) {
 			KeywordUtil.markFailedAndStop(
 					'Logged username element was not displayed after switching user.\n' +
 					'Expected user: ' +
@@ -554,8 +1035,8 @@ class authenticationKeywords {
 				safeAuthenticationText(
 				Windows.getText(
 				loggedUserName
-				)
-				)
+					)
+					)
 
 		if (!actualLoggedUser.equalsIgnoreCase(username)) {
 			KeywordUtil.markFailedAndStop(
@@ -636,14 +1117,14 @@ class authenticationKeywords {
 		Integer timeout =
 				timeoutSeconds != null &&
 				timeoutSeconds > 0
-				? timeoutSeconds
-				: DEFAULT_SWITCH_USER_TIMEOUT_SECONDS
+					? timeoutSeconds
+					: DEFAULT_SWITCH_USER_TIMEOUT_SECONDS
 
 		Integer shortTimeout =
 				Math.min(
 				timeout,
 				3
-				)
+					)
 
 		Boolean modalIconDisplayed = false
 		Boolean yesButtonDisplayed = false
@@ -654,7 +1135,7 @@ class authenticationKeywords {
 					AUTHENTICATION_IMAGE_GROUP,
 					'iconeModal',
 					shortTimeout
-					)
+						)
 		} catch (Throwable ignored) {
 			modalIconDisplayed = false
 		}
@@ -664,14 +1145,14 @@ class authenticationKeywords {
 					WindowsObjectLoader.getObject(
 					AUTHENTICATION_OBJECT_GROUP,
 					'switchEnvironmentWarningYesButton'
-					)
+						)
 
 			yesButtonDisplayed =
 					Windows.waitForElementPresent(
 					yesButton,
 					1,
 					FailureHandling.OPTIONAL
-					)
+						)
 		} catch (Throwable ignored) {
 			yesButtonDisplayed = false
 		}
@@ -761,7 +1242,7 @@ class authenticationKeywords {
 				.setContents(
 				new StringSelection(value),
 				null
-				)
+					)
 
 		robot.keyPress(
 				KeyEvent.VK_CONTROL
@@ -861,7 +1342,7 @@ class authenticationKeywords {
 		WindowsTestObject versionWindow =
 				WindowsObjectLoader.getWindowByName(
 				expectedVersion
-				)
+					)
 
 		Exception lastError = null
 		boolean windowWasFound = false
@@ -890,13 +1371,13 @@ class authenticationKeywords {
 			int remainingSeconds =
 					(int) Math.ceil(
 					remainingMilliseconds / 1000.0d
-					)
+						)
 
 			int checkTimeout =
 					Math.min(
 					VERSION_WINDOW_CHECK_SECONDS,
 					Math.max(1, remainingSeconds)
-					)
+						)
 
 			try {
 				Windows.switchToDesktop()
@@ -906,7 +1387,7 @@ class authenticationKeywords {
 						versionWindow,
 						checkTimeout,
 						FailureHandling.OPTIONAL
-						)
+							)
 
 				if (!windowExists) {
 					KeywordUtil.logInfo(
@@ -1059,7 +1540,7 @@ class authenticationKeywords {
 
 		while (
 		elapsedMilliseconds <
-				timeoutMilliseconds
+			timeoutMilliseconds
 				) {
 			if (isHomeTabVisibleSafely()) {
 				return true
@@ -1088,14 +1569,14 @@ class authenticationKeywords {
 					WindowsObjectLoader.getObject(
 					'authentication',
 					'environmentCombo'
-					)
+						)
 
 			boolean comboVisible =
 					Windows.verifyElementPresent(
 					environmentCombo,
 					1,
 					FailureHandling.OPTIONAL
-					)
+						)
 
 			if (comboVisible) {
 				return true
@@ -1105,14 +1586,14 @@ class authenticationKeywords {
 					WindowsObjectLoader.getObject(
 					'authentication',
 					'connectButton'
-					)
+						)
 
 			boolean buttonVisible =
 					Windows.verifyElementPresent(
 					connectButton,
 					1,
 					FailureHandling.OPTIONAL
-					)
+						)
 
 			return buttonVisible
 		} catch (Exception e) {
@@ -1133,7 +1614,7 @@ class authenticationKeywords {
 					WindowsObjectLoader.getObject(
 					'common',
 					'homeTab'
-					)
+						)
 
 			return Windows.verifyElementPresent(
 					homeTab,
@@ -1228,13 +1709,13 @@ class authenticationKeywords {
 				rect.getX() +
 				Math.floor(
 				rect.getWidth() / 2
-				).intValue()
+					).intValue()
 
 		int y =
 				rect.getY() +
 				Math.floor(
 				getSafeHeight(rect) / 2
-				).intValue()
+					).intValue()
 
 		mouseClick(x, y)
 	}
@@ -1296,7 +1777,7 @@ class authenticationKeywords {
 
 		if (
 		targetEnvironment == null ||
-				targetEnvironment.trim().isEmpty()
+			targetEnvironment.trim().isEmpty()
 				) {
 			return 'REC'
 		}
@@ -1375,13 +1856,25 @@ class authenticationKeywords {
 	//'\\\\cib.net\\shareparis\\Soft\\ematch\\IHM\\Livraisons\\N22M-3253\\IXIS.Ematch.IHM.application'
 
 	private void startWinAppDriver() {
+		if (isWinAppDriverRunning()) {
+			KeywordUtil.logInfo(
+					'[WINAPPDRIVER] WinAppDriver is already running. A duplicate process will not be created.'
+					)
+
+			return
+		}
+
 		String command =
 				'C:\\Program Files (x86)\\Windows Application Driver\\WinAppDriver.exe'
 
 		ProcessBuilder builder =
 				new ProcessBuilder(command)
-				.inheritIO()
+						.inheritIO()
 
 		builder.start()
+
+		KeywordUtil.logInfo(
+				'[WINAPPDRIVER] WinAppDriver start command executed.'
+				)
 	}
 }
