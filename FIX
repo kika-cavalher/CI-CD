@@ -4,6 +4,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
 import java.math.RoundingMode
+import java.security.MessageDigest
 import java.text.Normalizer
 
 import javax.xml.parsers.SAXParserFactory
@@ -260,6 +261,8 @@ class RecPrdExportValidationKeywords {
 					prdData.blankValuesTreatedAsZero
 			result.recUnreadableValues = recData.unreadableValues
 			result.prdUnreadableValues = prdData.unreadableValues
+			result.recNonNumericDigest = recData.nonNumericDigest
+			result.prdNonNumericDigest = prdData.nonNumericDigest
 			result.recUnreadableSamples = recData.unreadableSamples
 			result.prdUnreadableSamples = prdData.unreadableSamples
 			result.recOnlyZeroValues = recData.onlyZeroValues
@@ -319,6 +322,20 @@ class RecPrdExportValidationKeywords {
 						.append(result.prdRows)
 						.append('\n')
 			}
+
+			appendColumnContentComparison(
+					errors,
+					passedDetails,
+					result.columnName as String,
+					result.recNumericValues as Integer,
+					result.prdNumericValues as Integer,
+					result.recUnreadableValues as Integer,
+					result.prdUnreadableValues as Integer,
+					result.recNonNumericDigest as String,
+					result.prdNonNumericDigest as String,
+					result.recColumnStatus as String,
+					result.prdColumnStatus as String
+					)
 
 			appendColumnValueSummary(
 					passedDetails,
@@ -476,8 +493,8 @@ class RecPrdExportValidationKeywords {
 			if (!sheets.hasNext()) {
 				throw new IllegalStateException(
 				environment +
-					' workbook does not contain worksheets.'
-					)
+				' workbook does not contain worksheets.'
+				)
 			}
 
 			sheetInput = sheets.next()
@@ -541,8 +558,8 @@ class RecPrdExportValidationKeywords {
 			if (workbook.getNumberOfSheets() == 0) {
 				throw new IllegalStateException(
 				environment +
-					' workbook does not contain worksheets.'
-					)
+				' workbook does not contain worksheets.'
+				)
 			}
 
 			Sheet sheet = workbook.getSheetAt(0)
@@ -588,6 +605,8 @@ class RecPrdExportValidationKeywords {
 		result.prdBlankValuesTreatedAsZero = null
 		result.recUnreadableValues = null
 		result.prdUnreadableValues = null
+		result.recNonNumericDigest = ''
+		result.prdNonNumericDigest = ''
 		result.recUnreadableSamples = []
 		result.prdUnreadableSamples = []
 		result.recOnlyZeroValues = false
@@ -660,6 +679,7 @@ class RecPrdExportValidationKeywords {
 			blankValues                : 0,
 			blankValuesTreatedAsZero   : 0,
 			unreadableValues           : 0,
+			nonNumericDigest           : '',
 			unreadableSamples          : [],
 			onlyZeroValues             : false,
 			columnStatus               : 'NOT_ANALYSED',
@@ -744,6 +764,9 @@ class RecPrdExportValidationKeywords {
 			int rows = 0
 			List<String> unreadableSamples = []
 
+			MessageDigest nonNumericDigest =
+					MessageDigest.getInstance('SHA-256')
+
 			for (int rowIndex = 1;
 					rowIndex <= sheet.getLastRowNum();
 					rowIndex++) {
@@ -787,6 +810,16 @@ class RecPrdExportValidationKeywords {
 						}
 					} else {
 						unreadableValues++
+
+						String nonNumericEntry =
+								(rowIndex + 1) +
+								'|' +
+								safeText(displayText) +
+								'\n'
+
+						nonNumericDigest.update(
+								nonNumericEntry.getBytes('UTF-8')
+								)
 
 						if (unreadableSamples.size() < 5) {
 							unreadableSamples.add(
@@ -833,6 +866,10 @@ class RecPrdExportValidationKeywords {
 			result.blankValuesTreatedAsZero =
 					blankValuesTreatedAsZero
 			result.unreadableValues = unreadableValues
+			result.nonNumericDigest =
+					unreadableValues > 0
+					? toHex(nonNumericDigest.digest())
+					: ''
 			result.unreadableSamples = unreadableSamples
 
 			if (rows == 0) {
@@ -867,42 +904,13 @@ class RecPrdExportValidationKeywords {
 							numericValues > 0
 							? 'NUMERIC_VALUES_WITH_NON_NUMERIC_CELLS'
 							: 'NON_NUMERIC_VALUES'
-
-					errors.append('[ERROR] ')
-							.append(environment)
-							.append(
-							' column contains non-numeric values.\n'
-							)
-							.append('Column: ')
-							.append(columnName)
-							.append('\n')
-
 				} else if (numericValues == 0 &&
 						blankValues == rows) {
 
 					result.columnStatus = 'EMPTY_COLUMN'
-
-					errors.append('[ERROR] ')
-							.append(environment)
-							.append(
-							' column is empty in every analysed data row.\n'
-							)
-							.append('Column: ')
-							.append(columnName)
-							.append('\n')
-
 				} else if (numericValues == 0) {
 
 					result.columnStatus = 'NO_NUMERIC_VALUES'
-
-					errors.append('[ERROR] ')
-							.append(environment)
-							.append(
-							' column contains no numeric values.\n'
-							)
-							.append('Column: ')
-							.append(columnName)
-							.append('\n')
 				}
 			}
 
@@ -955,6 +963,8 @@ class RecPrdExportValidationKeywords {
 			prdBlankValuesTreatedAsZero     : null,
 			recUnreadableValues             : null,
 			prdUnreadableValues             : null,
+			recNonNumericDigest             : '',
+			prdNonNumericDigest             : '',
 			recUnreadableSamples            : [],
 			prdUnreadableSamples            : [],
 			recOnlyZeroValues               : false,
@@ -995,6 +1005,7 @@ class RecPrdExportValidationKeywords {
 			selectedFolder: null
 		]
 
+		List<Map> validPairs = []
 		List<File> matchingFeatureFolders = []
 
 		collectMatchingFeatureFolders(
@@ -1004,58 +1015,25 @@ class RecPrdExportValidationKeywords {
 				matchingFeatureFolders
 				)
 
-		List<Map> validPairs = []
-
 		for (File featureFolder : matchingFeatureFolders) {
-
-			File[] folderFiles = featureFolder.listFiles()
-
-			if (folderFiles == null) {
-				continue
-			}
-
-			List<File> recFiles =
-					folderFiles.findAll { File file ->
-
-						isEnvironmentExcelFile(file, 'REC')
-					}
-
-			List<File> prdFiles =
-					folderFiles.findAll { File file ->
-
-						isEnvironmentExcelFile(file, 'PRD')
-					}
-
-			if (recFiles.isEmpty() ||
-					prdFiles.isEmpty()) {
-
-				continue
-			}
-
-			recFiles.sort { File first, File second ->
-
-				second.lastModified() <=>
-						first.lastModified()
-			}
-
-			prdFiles.sort { File first, File second ->
-
-				second.lastModified() <=>
-						first.lastModified()
-			}
-
-			File recFile = recFiles.get(0)
-			File prdFile = prdFiles.get(0)
-
-			validPairs.add([
-				recFile       : recFile,
-				prdFile       : prdFile,
-				selectedFolder: featureFolder,
-				pairTimestamp : Math.max(
-				recFile.lastModified(),
-					prdFile.lastModified()
+			collectPairCandidates(
+					featureFolder,
+					validPairs
 					)
-			])
+		}
+
+		if (validPairs.isEmpty()) {
+			KeywordUtil.logInfo(
+					'[REC X PRD SEARCH] No REC/PRD pair was found inside the exact feature folder. ' +
+					'Fallback search will match the feature name in folders and file names.'
+					)
+
+			collectFallbackPairCandidates(
+					exportRoot,
+					expectedGroupFolder,
+					expectedFeatureFolder,
+					validPairs
+					)
 		}
 
 		if (validPairs.isEmpty()) {
@@ -1078,6 +1056,293 @@ class RecPrdExportValidationKeywords {
 	}
 
 
+	private void collectPairCandidates(
+			File currentFolder,
+			List<Map> validPairs) {
+
+		if (currentFolder == null ||
+				!currentFolder.exists() ||
+				!currentFolder.isDirectory()) {
+
+			return
+		}
+
+		addPairCandidateFromFolder(
+				currentFolder,
+				validPairs
+				)
+
+		File[] children = currentFolder.listFiles()
+
+		if (children == null) {
+			return
+		}
+
+		for (File child : children) {
+			if (child != null &&
+					child.isDirectory()) {
+
+				collectPairCandidates(
+						child,
+						validPairs
+						)
+			}
+		}
+	}
+
+
+	private void addPairCandidateFromFolder(
+			File folder,
+			List<Map> validPairs) {
+
+		File[] folderFiles = folder.listFiles()
+
+		if (folderFiles == null) {
+			return
+		}
+
+		List<File> recFiles =
+				folderFiles.findAll { File file ->
+
+					isEnvironmentExcelFile(file, 'REC')
+				}
+
+		List<File> prdFiles =
+				folderFiles.findAll { File file ->
+
+					isEnvironmentExcelFile(file, 'PRD')
+				}
+
+		if (recFiles.isEmpty() ||
+				prdFiles.isEmpty()) {
+
+			return
+		}
+
+		recFiles.sort { File first, File second ->
+
+			second.lastModified() <=>
+					first.lastModified()
+		}
+
+		prdFiles.sort { File first, File second ->
+
+			second.lastModified() <=>
+					first.lastModified()
+		}
+
+		File recFile = recFiles.get(0)
+		File prdFile = prdFiles.get(0)
+
+		boolean pairAlreadyAdded =
+				validPairs.any { Map existingPair ->
+
+					File existingFolder =
+							existingPair.selectedFolder as File
+
+					existingFolder != null &&
+							existingFolder.getAbsolutePath().equalsIgnoreCase(
+							folder.getAbsolutePath()
+							)
+				}
+
+		if (pairAlreadyAdded) {
+			return
+		}
+
+		validPairs.add([
+			recFile       : recFile,
+			prdFile       : prdFile,
+			selectedFolder: folder,
+			pairTimestamp : Math.max(
+			recFile.lastModified(),
+			prdFile.lastModified()
+			)
+		])
+	}
+
+
+	private void collectFallbackPairCandidates(
+			File currentFolder,
+			String expectedGroupFolder,
+			String expectedFeatureFolder,
+			List<Map> validPairs) {
+
+		if (currentFolder == null ||
+				!currentFolder.exists() ||
+				!currentFolder.isDirectory()) {
+
+			return
+		}
+
+		File[] folderFiles = currentFolder.listFiles()
+
+		if (folderFiles == null) {
+			return
+		}
+
+		List<File> recFiles =
+				folderFiles.findAll { File file ->
+
+					isEnvironmentExcelFile(file, 'REC')
+				}
+
+		List<File> prdFiles =
+				folderFiles.findAll { File file ->
+
+					isEnvironmentExcelFile(file, 'PRD')
+				}
+
+		if (!recFiles.isEmpty() &&
+				!prdFiles.isEmpty() &&
+				matchesExpectedExportFeature(
+				currentFolder,
+				recFiles,
+				prdFiles,
+				expectedGroupFolder,
+				expectedFeatureFolder
+				)) {
+
+			addPairCandidateFromFolder(
+					currentFolder,
+					validPairs
+					)
+		}
+
+		for (File child : folderFiles) {
+			if (child != null &&
+					child.isDirectory()) {
+
+				collectFallbackPairCandidates(
+						child,
+						expectedGroupFolder,
+						expectedFeatureFolder,
+						validPairs
+						)
+			}
+		}
+	}
+
+
+	private boolean matchesExpectedExportFeature(
+			File folder,
+			List<File> recFiles,
+			List<File> prdFiles,
+			String expectedGroupFolder,
+			String expectedFeatureFolder) {
+
+		StringBuilder candidateText = new StringBuilder()
+
+		candidateText
+				.append(folder.getAbsolutePath())
+				.append(' ')
+
+		for (File file : recFiles) {
+			candidateText
+					.append(file.getName())
+					.append(' ')
+		}
+
+		for (File file : prdFiles) {
+			candidateText
+					.append(file.getName())
+					.append(' ')
+		}
+
+		String normalizedCandidate =
+				normalizeSearchToken(
+				candidateText.toString()
+				)
+
+		List<String> featureTokens =
+				buildSearchTokens(
+				expectedFeatureFolder
+				)
+
+		if (!matchesAnySearchToken(
+				normalizedCandidate,
+				featureTokens
+				)) {
+
+			return false
+		}
+
+		List<String> groupTokens =
+				buildSearchTokens(
+				expectedGroupFolder
+				)
+
+		return groupTokens.isEmpty() ||
+				matchesAnySearchToken(
+				normalizedCandidate,
+				groupTokens
+				)
+	}
+
+
+	private List<String> buildSearchTokens(
+			String value) {
+
+		List<String> tokens = []
+		String normalized =
+				normalizeSearchToken(value)
+
+		if (normalized.isEmpty()) {
+			return tokens
+		}
+
+		tokens.add(normalized)
+
+		if (normalized.endsWith('s') &&
+				normalized.length() > 1) {
+
+			tokens.add(
+					normalized.substring(
+					0,
+					normalized.length() - 1
+					)
+					)
+		}
+
+		if (normalized.endsWith('ee') &&
+				normalized.length() > 2) {
+
+			tokens.add(
+					normalized.substring(
+					0,
+					normalized.length() - 1
+					)
+					)
+		}
+
+		return tokens.unique()
+	}
+
+
+	private boolean matchesAnySearchToken(
+			String candidate,
+			List<String> tokens) {
+
+		for (String token : tokens) {
+			if (!safeText(token).isEmpty() &&
+					candidate.contains(token)) {
+
+				return true
+			}
+		}
+
+		return false
+	}
+
+
+	private String normalizeSearchToken(
+			Object value) {
+
+		return normalizeText(value)
+				.replace('_', '')
+	}
+
+
 	private void collectMatchingFeatureFolders(
 			File currentFolder,
 			String expectedGroupFolder,
@@ -1096,17 +1361,17 @@ class RecPrdExportValidationKeywords {
 		boolean featureMatches =
 				normalizeText(
 				currentFolder.getName()
-					).equals(
+				).equals(
 				normalizeText(expectedFeatureFolder)
-					)
+				)
 
 		boolean groupMatches =
 				parentFolder != null &&
 				normalizeText(
 				parentFolder.getName()
-					).equals(
+				).equals(
 				normalizeText(expectedGroupFolder)
-					)
+				)
 
 		if (featureMatches &&
 				groupMatches) {
@@ -1158,8 +1423,8 @@ class RecPrdExportValidationKeywords {
 				.startsWith(
 				safeText(environment)
 				.toUpperCase() +
-					'_'
-					) &&
+				'_'
+				) &&
 				isExcelFileName(fileName)
 	}
 
@@ -1337,9 +1602,9 @@ class RecPrdExportValidationKeywords {
 						evaluator == null
 						? formatter.formatCellValue(cell)
 						: formatter.formatCellValue(
-							cell,
-							evaluator
-							)
+						cell,
+						evaluator
+						)
 			} catch (Exception ignored) {
 				formattedText =
 						formatter.formatCellValue(cell)
@@ -1488,6 +1753,147 @@ class RecPrdExportValidationKeywords {
 		}
 
 		return true
+	}
+
+
+	private void appendColumnContentComparison(
+			StringBuilder errors,
+			StringBuilder passedDetails,
+			String columnName,
+			Integer recNumericValues,
+			Integer prdNumericValues,
+			Integer recUnreadableValues,
+			Integer prdUnreadableValues,
+			String recNonNumericDigest,
+			String prdNonNumericDigest,
+			String recColumnStatus,
+			String prdColumnStatus) {
+
+		int recNumeric =
+				recNumericValues == null
+				? 0
+				: recNumericValues.intValue()
+
+		int prdNumeric =
+				prdNumericValues == null
+				? 0
+				: prdNumericValues.intValue()
+
+		int recUnreadable =
+				recUnreadableValues == null
+				? 0
+				: recUnreadableValues.intValue()
+
+		int prdUnreadable =
+				prdUnreadableValues == null
+				? 0
+				: prdUnreadableValues.intValue()
+
+		if (recNumeric != prdNumeric) {
+			errors.append(
+					'[ERROR] Number of numeric values is different.\n'
+					)
+					.append('Column: ')
+					.append(columnName)
+					.append('\nREC: ')
+					.append(recNumeric)
+					.append('\nPRD: ')
+					.append(prdNumeric)
+					.append('\n')
+		} else {
+			passedDetails.append(
+					'[PASS] Number of numeric values is equal.\n'
+					)
+					.append('Column: ')
+					.append(columnName)
+					.append('\nValue: ')
+					.append(recNumeric)
+					.append('\n')
+		}
+
+		boolean sameNonNumericValues =
+				recUnreadable == prdUnreadable &&
+				safeText(recNonNumericDigest).equals(
+				safeText(prdNonNumericDigest)
+				)
+
+		if (!sameNonNumericValues) {
+			errors.append(
+					'[ERROR] Non-numeric values are different.\n'
+					)
+					.append('Column: ')
+					.append(columnName)
+					.append('\nREC non-numeric values: ')
+					.append(recUnreadable)
+					.append('\nPRD non-numeric values: ')
+					.append(prdUnreadable)
+					.append('\n')
+
+			return
+		}
+
+		if (recUnreadable > 0) {
+			passedDetails.append('[WARNING] ')
+
+			if (recNumeric == 0 &&
+					prdNumeric == 0) {
+
+				passedDetails.append(
+						'No numeric values were found. REC and PRD contain the same non-numeric values.\n'
+						)
+			} else {
+				passedDetails.append(
+						'REC and PRD contain the same non-numeric values.\n'
+						)
+			}
+
+			passedDetails
+					.append('Column: ')
+					.append(columnName)
+					.append('\nNon-numeric values: ')
+					.append(recUnreadable)
+					.append('\n')
+
+			return
+		}
+
+		if (recNumeric == 0 &&
+				prdNumeric == 0) {
+
+			passedDetails.append(
+					'[WARNING] No numeric values were found in REC or PRD.\n'
+					)
+					.append('Column: ')
+					.append(columnName)
+					.append('\nREC status: ')
+					.append(safeText(recColumnStatus))
+					.append('\nPRD status: ')
+					.append(safeText(prdColumnStatus))
+					.append('\n')
+		}
+	}
+
+
+	private String toHex(byte[] bytes) {
+
+		if (bytes == null ||
+				bytes.length == 0) {
+
+			return ''
+		}
+
+		StringBuilder result = new StringBuilder()
+
+		for (byte currentByte : bytes) {
+			result.append(
+					String.format(
+					'%02x',
+					currentByte & 0xff
+					)
+					)
+		}
+
+		return result.toString()
 	}
 
 
@@ -1857,25 +2263,25 @@ class RecPrdExportValidationKeywords {
 				validateSyntheseExcelFile(
 				recFilePath,
 				'REC Synthèse export'
-					)
+				)
 
 		File prdFile =
 				validateSyntheseExcelFile(
 				prdFilePath,
 				'PRD Synthèse export'
-					)
+				)
 
 		Map recData =
 				readSyntheseWorkbookData(
 				recFile,
 				'REC'
-					)
+				)
 
 		Map prdData =
 				readSyntheseWorkbookData(
 				prdFile,
 				'PRD'
-					)
+				)
 
 		List<String> errors = []
 		List<String> passedDetails = []
@@ -1968,8 +2374,8 @@ class RecPrdExportValidationKeywords {
 			if (workbook.numberOfSheets <= 0) {
 				throw new IllegalStateException(
 				environment +
-					' Synthèse export does not contain worksheets.'
-					)
+				' Synthèse export does not contain worksheets.'
+				)
 			}
 
 			Sheet sheet = workbook.getSheetAt(0)
@@ -2055,8 +2461,8 @@ class RecPrdExportValidationKeywords {
 				numericValueCount : numericValueCount,
 				numericChecksum   : numericChecksum.setScale(
 				2,
-					RoundingMode.HALF_EVEN
-					)
+				RoundingMode.HALF_EVEN
+				)
 			]
 		} finally {
 			closeWorkbook(workbook)
@@ -2075,7 +2481,7 @@ class RecPrdExportValidationKeywords {
 				Math.min(
 				sheet.lastRowNum,
 				30
-					)
+				)
 
 		for (Integer rowIndex = 0;
 				rowIndex <= maxRowIndex;
@@ -2225,7 +2631,7 @@ class RecPrdExportValidationKeywords {
 				Math.max(
 				recHeaders.size(),
 				prdHeaders.size()
-					)
+				)
 
 		List<String> differences = []
 
@@ -2360,13 +2766,13 @@ class RecPrdExportValidationKeywords {
 				validateSyntheseExcelFile(
 				recFilePath,
 				'REC Ajustements IPV export'
-					)
+				)
 
 		File prdFile =
 				validateSyntheseExcelFile(
 				prdFilePath,
 				'PRD Ajustements IPV export'
-					)
+				)
 
 		String amountHeader =
 				safeText(expectedAmountHeader)
@@ -2384,7 +2790,7 @@ class RecPrdExportValidationKeywords {
 				recFile,
 				amountHeader,
 				'REC'
-					)
+				)
 
 		System.gc()
 
@@ -2393,7 +2799,7 @@ class RecPrdExportValidationKeywords {
 				prdFile,
 				amountHeader,
 				'PRD'
-					)
+				)
 
 		System.gc()
 
@@ -2527,8 +2933,8 @@ class RecPrdExportValidationKeywords {
 			if (!sheets.hasNext()) {
 				throw new IllegalStateException(
 				environment +
-					' Ajustements IPV export does not contain worksheets.'
-					)
+				' Ajustements IPV export does not contain worksheets.'
+				)
 			}
 
 			sheetInput = sheets.next()
@@ -2607,8 +3013,8 @@ class RecPrdExportValidationKeywords {
 			if (workbook.getNumberOfSheets() <= 0) {
 				throw new IllegalStateException(
 				environment +
-					' Ajustements IPV export does not contain worksheets.'
-					)
+				' Ajustements IPV export does not contain worksheets.'
+				)
 			}
 
 			Sheet sheet = workbook.getSheetAt(0)
@@ -2648,7 +3054,7 @@ class RecPrdExportValidationKeywords {
 					headerRow,
 					formatter,
 					evaluator
-						)
+					)
 					)
 
 			Integer amountColumnIndex =
@@ -2737,7 +3143,7 @@ class RecPrdExportValidationKeywords {
 				Math.min(
 				sheet.getLastRowNum(),
 				50
-					)
+				)
 
 		for (Integer rowIndex = 0;
 				rowIndex <= maximumRow;
@@ -2825,8 +3231,8 @@ class RecPrdExportValidationKeywords {
 				safeText(
 				result.get(
 				result.size() - 1
-					)
-					).isEmpty()) {
+				)
+				).isEmpty()) {
 
 			result.remove(
 					result.size() - 1
@@ -2966,7 +3372,7 @@ class RecPrdExportValidationKeywords {
 		int firstLetterValue =
 				Character.getNumericValue(
 				'A'.charAt(0)
-					)
+				)
 
 		for (Integer characterIndex = 0;
 				characterIndex < letters.length();
@@ -3078,7 +3484,7 @@ class RecPrdExportValidationKeywords {
 					parseNumber(
 					currentRowValues.get(
 					amountColumnIndex
-						)
+					)
 					)
 
 			if (amountValue == null) {
@@ -3138,4 +3544,3 @@ class RecPrdExportValidationKeywords {
 		}
 	}
 }
-
